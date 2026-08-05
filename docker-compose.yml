@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    image: secure-context-pipeline:1.0.0
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Encrypted blobs + SQLite. Ciphertext only -- no plaintext ever lands here.
+      - ./data:/app/data
+    environment:
+      SCP_DATA_DIR: /app/data
+    restart: unless-stopped

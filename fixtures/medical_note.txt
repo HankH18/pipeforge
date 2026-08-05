@@ -1,0 +1,62 @@
+LARKSPUR VALLEY HOSPITAL
+HOSPITALIST SERVICE -- DAILY PROGRESS NOTE
+Note filed 02/15/2025 by physician Joshua Gonzalez, MD, and nurse Christopher Lewis, RN.
+
+PATIENT IDENTIFICATION
+    Patient name: David Ochoa
+    DOB: 04/13/1956 (age 69)
+    MRN: 9224297
+    Insurance: Pinnacle Grove Benefit Trust, member ID PNCL921245821
+    Phone: 704-555-0151
+    Email: david.ochoa@example.com
+    Emergency contact is spouse Nicole Cruz, reachable at 503-555-0190.
+
+ENCOUNTER HISTORY
+    Admitted 02/08/2025 through the emergency department.
+    Prior ambulatory visits: 02/06/2024, 04/24/2024, and 05/18/2024.
+    Discharge planning conference scheduled for 03/18/2025.
+
+SUBJECTIVE
+    Mr. Ochoa is a 69-year-old patient carrying a documented history of
+    chronic low back pain and asthma. Overnight the patient slept in two blocks and
+    tolerated a full oral diet. Mr. Ochoa denies chest pain, palpitations, or new
+    shortness of breath, and reports that the swelling in both ankles is softer than it
+    was at the 02/08/2025 presentation. Mr. Ochoa does report morning dizziness on
+    standing, which he attributes to the timing of his morning doses rather than to the underlying
+    asthma. The home dosing schedule below was confirmed at the bedside by
+    spouse Nicole Cruz, who keeps the pill organiser.
+
+OBJECTIVE
+    Vitals over the last twelve hours have been stable, with no fevers recorded and
+    oxygen saturation in the mid-nineties on room air. Weight is down two kilograms
+    from the 02/08/2025 admission weight.
+
+    Laboratory results drawn 02/11/2025:
+    creatinine of 2.2 mg/dL
+    WBC 7.3 K/uL
+    LDL 99 mg/dL
+    HDL 29 mg/dL
+    HbA1c of 8.3 percent
+
+ASSESSMENT
+    1. Poorly controlled chronic low back pain. The trajectory since the 05/18/2024 visit is
+       consistent with intermittent adherence rather than with primary treatment
+       failure.
+    2. Progressive asthma. Every agent on the list below has been dose-checked
+       against renal function, and pharmacy reviewed the chart on 02/11/2025.
+
+MEDICATIONS (active, reconciled at the bedside)
+    lisinopril 20 mg PO daily
+    pantoprazole 40 mg PO daily
+    gabapentin 300 mg PO TID
+
+PLAN
+    Continue the current regimen through discharge and repeat the metabolic panel
+    before the 03/18/2025 follow-up. Care management has been consulted and will see
+    Mr. Ochoa before discharge. Mr. Ochoa will call the clinic at 704-555-0151 for
+    any recurrence of the dizziness, and results will be routed to david.ochoa@example.com. A copy of
+    this note goes to the primary care panel at Larkspur Valley Hospital, and the insurance
+    authorisation for the follow-up study has been filed with Pinnacle Grove Benefit Trust under member ID
+    PNCL921245821.
+
+Electronically signed by physician Joshua Gonzalez, MD, on 02/15/2025.

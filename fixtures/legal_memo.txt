@@ -1,0 +1,35 @@
+PRIVILEGED AND CONFIDENTIAL -- ATTORNEY WORK PRODUCT
+Prepared in anticipation of litigation. Do not circulate outside the engagement team.
+
+MEMORANDUM
+
+TO:      general counsel Jamie Kent, Northwind Composites LLC
+FROM:    partner Brandon Rojas, Cranemoor Partners LLP
+DATE:    04/18/2024
+RE:      Wright v. Northwind Composites LLC -- Case No. 3:19-cv-88307
+
+1. SCOPE AND PRIVILEGE
+
+This memorandum was prepared at your request and is protected by the attorney-client privilege; it is also work product prepared because of anticipated litigation. It evaluates our exposure in Case No. 3:19-cv-88307, the coordinated state action docketed as 19-CV-88307, and the third-party contribution claim carried under Case No. 1:19-md-11923.
+
+2. PARTIES AND COUNSEL
+
+Our client is Northwind Composites LLC. The client contact for the engagement is general counsel Jamie Kent, reachable at jamie.kent@example.net or (406) 555-0104; day-to-day handling sits with partner Brandon Rojas and associate Michael Gonzalez, and my direct line is 415-555-0109 with copy traffic to brandon.rojas@example.org. The case was filed on 02/16/2024 by plaintiff Mark Wright. Opposing counsel is attorney Steven Lopez, of Jarrowdale & Hallowfield LLP. The co-defendant carrier is represented by attorney John Castillo, and attorney Douglas Griffith has entered a limited appearance for the third-party defendant in the matter docketed as 19-MD-11923. The parties have retained mediator David Ford for the 05/08/2024 session.
+
+3. CURRENT POSTURE
+
+Counsel for the plaintiff transmitted a settlement demand of $2,216,603 on 03/14/2024, framed as a global resolution of both dockets. At the close of the first session mediator David Ford floated a settlement figure of $1,313,179 without commitment from either side. The client has authorised us to settle the coordinated matters at or below $1,257,824, and the carrier has confirmed that figure in writing. If the release language can be broadened to cover the affiliates, the client would accept $825,236 in exchange for a full settlement and dismissal with prejudice.
+
+4. EXPOSURE
+
+The plaintiff's damages model rests on a three-year projection that our economist calls unsupported on the record produced so far. The contract contains a limitation-of-liability clause that, if enforced, caps the recoverable amount well under the number now demanded. The contribution claim tracked in Case No. 1:19-md-11923 is likely to resolve on the papers.
+
+5. RECOMMENDED APPROACH
+
+The defense position is that the indemnity clause bars the third count outright. We are prepared to accept a structured payout over thirty-six months. We plan to preserve the arbitration-clause defense through the evidentiary hearing.
+
+Our negotiation approach is to concede the interest calculation and contest the multiplier. We intend to depose the corporate designee before the close of fact discovery. Nothing in this section is intended for production, and it should be withheld on the privilege log as work product.
+
+6. NEXT STEPS
+
+Confirm the mediation logistics with attorney Steven Lopez before 05/08/2024, circulate the revised release to jamie.kent@example.net, and calendar the pretrial conference deadlines that attach to the case docketed as 19-CV-88307.

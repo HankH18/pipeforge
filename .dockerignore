@@ -1,0 +1,43 @@
+# The Dockerfile uses an explicit COPY allow-list, so nothing here is load-bearing
+# for what ends up in the image. This file exists for the other half of the
+# problem: everything below is otherwise uploaded to the daemon as build context
+# on every build (the host virtualenv alone is ~750 MB), and it keeps a future
+# `COPY . .` from silently re-introducing a secret.
+
+# secrets -- must never reach a layer, a build cache, or a registry
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# runtime data: encrypted blobs, the session vault, the audit chain
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# host virtualenv -- wrong platform, and ~750 MB of build context
+.venv/
+venv/
+
+# vcs + agent/editor state
+.git/
+.gitignore
+.claude/
+.DS_Store
+
+# python build artefacts and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# demo artefacts
+wire_dump*.txt

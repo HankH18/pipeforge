@@ -1,0 +1,321 @@
+# Entity registry -- the ONLY place entity types are defined (build doc section 6.2).
+#
+# The detector builds Presidio recognizers from this file. The engine, vault,
+# restorer, and audit logger treat `entity_type` as an OPAQUE STRING. That is what
+# makes "add a new entity type via config only" true, and tests/test_extensibility.py
+# proves it by adding PASSPORT_NUMBER with zero package-code changes.
+#
+# Field semantics
+#   category                 PII | PHI | LEGAL | FIN
+#   presidio                 remap a Presidio built-in recognizer
+#   patterns                 build a PatternRecognizer from these regexes
+#   gazetteer                build a phrase-list recognizer from detection/data/<file>
+#   context                  words near a match that boost its score (Presidio's
+#                            context enhancer) and, for a `presidio:`-backed entity,
+#                            decide which registry entity claims a shared built-in
+#                            hit (see DOB vs DATE)
+#   only_in_doc_categories   restrict this entity to documents tagged with one of these
+#   threshold                per-entity override of SCP_THRESHOLD_OBFUSCATE
+#   strategy                 per-entity override of the configured strategy
+#   tier                     pseudonymization tier (section 9.3); default 1
+#   hint                     emit class-annotated tokens from the gazetteer class column
+#   action                   strip  -> remove the span entirely, no vault entry
+#                            redact -> force [REDACTED_<TYPE>] regardless of confidence
+#
+# A property of `context` that is not obvious from the build doc and cost real recall:
+# Presidio's LemmaContextAwareEnhancer compares each configured context word against
+# the five tokens preceding the match, and the test is `configured_word in word` --
+# a substring test, in that direction. So an inflected context word can never fire:
+# the lemma of "filed" is "file", and "filed" is not a substring of "file". The build
+# doc's registry ships five such words -- CASE_ID "filed", DIAGNOSIS "presents",
+# MEDICATION "prescribed"/"takes", ACCOUNT_NUMBER "routing" -- all silently inert.
+# Each is replaced here by the stem that does match. Keeping the doc's spelling
+# alongside was tried and rejected: a config value that provably cannot fire is dead
+# weight a reader has to re-derive.
+#
+# There is a second filter behind the first, and the stem rule alone does not survive
+# it. The enhancer does not search the raw lemmas: `_extract_surrounding_words` keeps
+# a preceding lemma only when it also appears in `nlp_artifacts.keywords`, which is
+# the lemma list with spaCy's stop words removed. "take" is its own stem, passes the
+# lemma rule, and is still unreachable -- spaCy classes it as a stop word, so it never
+# reaches the substring test at all. The doc's "takes" therefore has no working
+# spelling in this position and MEDICATION ships without it.
+# `tests/test_detection.py::test_every_context_word_can_boost_a_real_match` asserts
+# against the keyword list rather than the lemma list, so it fails on either mistake.
+#
+# NOTE (deviation from build doc section 6.2): CASE_ID's patterns are written with
+# single backslashes here. The doc shows `\\b`, which inside YAML single quotes is a
+# literal backslash followed by "b" -- not a word boundary. Every other entry in the
+# doc uses single backslashes; CASE_ID is normalised to match.
+
+categories: [PII, PHI, LEGAL, FIN]
+
+entities:
+
+  # --- Presidio built-ins, remapped ---------------------------------------
+  NAME:
+    category: PII
+    presidio: PERSON
+    tier: 1
+
+  SSN:
+    category: PII
+    presidio: US_SSN
+    tier: 1
+
+  EMAIL:
+    category: PII
+    presidio: EMAIL_ADDRESS
+    # Presidio's EmailRecognizer validates every candidate through
+    # `tldextract`, which resolves the domain against the Public Suffix List.
+    # An address whose suffix is not on that list scores zero and is dropped
+    # silently -- which is every internal corporate domain a real enterprise
+    # document carries (@acme.internal, @hospital.local, @mail.corp) and every
+    # gTLD newer than the PSL snapshot bundled with the installed tldextract.
+    # Measured: 5/5 internal-domain addresses missed, 0.0 recall, no warning.
+    # This backstop pattern asks only for an @ and a dotted domain, so it does
+    # not depend on a registry of suffixes that can go stale. Presidio still
+    # supplies the higher score (1.0 vs 0.7) on PSL-resolvable addresses; the
+    # two hits cover the same span and collapse in overlap resolution.
+    #
+    # The leading anchor is a negative lookbehind on the local-part class, not the
+    # '\b' this pattern was first written with. '\b' fires between every letter and
+    # every dot, so on a long dotted run that never reaches an "@" the scan restarts
+    # at each of ~n/2 positions and walks to the end from each: quadratic, measured
+    # at a clean 4x per doubling and 301 ms on 16,000 characters. The lookbehind
+    # admits only positions not already inside a local part, which leaves one start
+    # per run -- 0.19 ms on the same input, and 2.00x per doubling. Matches are
+    # unchanged on every fixture and near-miss in the suite; where the two forms can
+    # differ at all the lookbehind starts one character earlier, which widens the
+    # masked span rather than narrowing it.
+    patterns: ['(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+']
+    # "mail" rather than "e-mail": spaCy splits the hyphenated form into
+    # ['e', '-', 'mail'], and "mail" is what matches the lemma that survives.
+    context: [email, mail, contact, reply]
+    tier: 1
+
+  PHONE:
+    category: PII
+    presidio: PHONE_NUMBER
+    tier: 1
+
+  ADDRESS:
+    category: PII
+    presidio: LOCATION
+    # Verbatim from the build doc and, on this registry, decorative. A `presidio:`-only
+    # entity's context never reaches a recognizer -- build_recognizers only builds for
+    # `patterns:`/`gazetteer:` -- so its sole consumer is _resolve_builtin's tie-break
+    # between the registry entities claiming one built-in. LOCATION has exactly one
+    # claimant and ADDRESS is not `requires_context`, so the tie-break has nothing to
+    # decide and these four words change no detection: measured, dropping the whole
+    # list leaves every span in the corpus bit-identical. Kept rather than deleted
+    # because it is spec-mandated and becomes live the moment a second LOCATION
+    # claimant is added; test_context_lists_have_a_live_consumer holds the exemption
+    # and fails when that happens, so the note cannot quietly go stale.
+    context: [address, street, residence, lives]
+    tier: 1
+
+  DOB:
+    category: PII
+    presidio: DATE_TIME
+    # "d.o.b" is here because the context test is a word-boundary match on each
+    # listed word: "\bdob\b" does not match "D.O.B." (the dots are word boundaries),
+    # so "Patient D.O.B. 03/12/1985" lost its birth context and fell through to
+    # DATE -- which only exists in medical documents, so outside one the date was
+    # dropped entirely. "\bd\.o\.b\b" matches the punctuated spelling.
+    context: [dob, born, birth, birthdate, d.o.b]
+    # Without a birth-context word nearby a bare date is NOT a DOB. In a medical
+    # doc the DATE entry picks it up (HIPAA treats individual-related dates as
+    # identifiers); elsewhere it passes through. See section 9.2 "DOB vs DATE".
+    requires_context: true
+    require_digit: true
+    tier: 2
+
+  DATE:
+    category: PHI
+    presidio: DATE_TIME
+    only_in_doc_categories: [medical]
+    # Presidio's DATE_TIME also fires on relative prose ("daily", "overnight",
+    # "the last twelve hours"). Those are not identifiers, and vaulting them poisons
+    # the egress gate: a common English word in the originals set blocks every
+    # payload that contains it. A date that identifies someone carries a numeral.
+    require_digit: true
+    tier: 2
+
+  # --- custom pattern recognizers -----------------------------------------
+  # Separators and the spelled-out label are widened past the build doc's
+  # '\bMRN[:#\s]*\d{6,10}\b'. That form is case-sensitive and only accepts colon,
+  # hash or whitespace, so it misses "MRN-4471902", "mrn 4471902" and
+  # "Medical Record Number: 4471902" -- ordinary chart-header spellings, and a
+  # miss here is an unobfuscated identifier, the one failure the system cannot
+  # recover from. The digit run still carries the specificity, so widening the
+  # label does not widen what can match.
+  #
+  # What is still not covered, measured on a held-out corpus: every spelling that
+  # names the field without saying "MRN" or "medical record" -- "Patient ID 8814027",
+  # "Chart No. 2207731", "Subject record 4402198", and a bare seven-digit column in a
+  # CSV export. Closing those needs either another literal anchor per spelling or a
+  # bare-digit rule, and a bare-digit rule fires on every order number and zip+4 in
+  # the document. The gap is documented rather than closed, and nothing downstream
+  # closes it either: the egress gate's first pass scans for *vaulted* originals and
+  # its second re-runs this same detector, so a value neither pattern anchors on is
+  # invisible to both.
+  MRN:
+    category: PHI
+    patterns:
+      - '(?i)\bmrn[\s:#.\-]*\d{6,10}\b'
+      - '(?i)\bmedical\s+record\s+(?:number|no\.?|#)[\s:#]*\d{6,10}\b'
+      - '(?i)\bmr\s*#\s*\d{6,10}\b'
+    context: [medical, record, chart]
+    tier: 1
+
+  INSURANCE_ID:
+    category: PHI
+    patterns: ['\b[A-Z]{2,4}\d{7,12}\b']
+    context: [insurance, member, policy, payer]
+    tier: 1
+
+  DIAGNOSIS:
+    category: PHI
+    gazetteer: diagnoses.txt
+    tier: 3
+    hint: true
+    # "present" replaces the build doc's "presents" -- see the header note; the
+    # stem is what matches, and it covers "presents" and "presenting" too.
+    context: [diagnosis, dx, condition, present]
+
+  MEDICATION:
+    category: PHI
+    gazetteer: medications.txt
+    tier: 3
+    hint: true
+    # "prescribe" replaces the doc's "prescribed"; the doc's "takes" is dropped
+    # outright because neither it nor its stem can reach the enhancer (header note).
+    context: [mg, dose, prescribe, medication]
+
+  # Three changes to the build doc's pattern, all measured on the recall corpus in
+  # tests/test_detection.py:
+  #   (?i)  -- a chart writes "Creatinine" at the head of a table row and "a1c" in
+  #            running prose. The analyte names carry the specificity; case does not.
+  #   {0,20}? lazy -- greedy, "your LDL is 162 and your A1C came back at 7.4" matched
+  #            the single span "LDL is 162 and your A1" (the "1" of "A1C" satisfying
+  #            \d+) and swallowed the start of the second analyte, so the 7.4 escaped.
+  #            Lazy stops at the first number after each analyte, giving two spans.
+  #   NEWLINE_TAIL -- see the note above CASE_STRATEGY at the foot of this file; a
+  #            value in the next column of a wrapped table row is one newline away
+  #            from its analyte.
+  LAB_RESULT:
+    category: PHI
+    patterns: ['(?i)\b(?:A1C|HbA1c|LDL|HDL|WBC|eGFR|creatinine)\b(?:[^.\n]|\n(?![ \t\r]*\n)){0,20}?\d+(?:\.\d+)?']
+    context: [lab, result]
+    tier: 4
+
+  # Widened past the build doc's '\b(?:acct|account)[:#\s]*\d{8,17}\b', which is
+  # case-sensitive and allows no label between the word and the digits. It therefore
+  # misses "Account: ...", "Account No. ...", "Account Number: ..." and "Acct. ..."
+  # -- the four ways a statement or wire instruction actually writes it. The 8-17
+  # digit run is what makes the match specific; the label is only the anchor.
+  ACCOUNT_NUMBER:
+    category: FIN
+    # The optional label keeps its own leading whitespace inside the group. Writing
+    # it as '\.?\s*(?:number|no\.?|#)?[\s:#]*' instead puts two whitespace-matching
+    # quantifiers either side of an optional group, and the two can split a run of
+    # spaces between them any number of ways -- quadratic backtracking on
+    # "account" followed by a long blank run (measured 0.28/1.1/4.4 ms at 200/400/800
+    # spaces, a clean 4x per doubling).
+    patterns: ['(?i)\b(?:acct|account|a/c)\.?(?:\s*(?:number|no\.?|#))?[\s:#]*\d{8,17}\b']
+    # "rout" is not a typo: it is what spaCy lemmatises the doc's "routing" to,
+    # and the enhancer matches against the lemma (header note).
+    context: [account, bank, rout]
+    tier: 1
+
+  TAX_ID:
+    category: FIN
+    patterns: ['\b\d{2}-\d{7}\b']
+    context: [ein, tax, taxpayer]
+    tier: 1
+
+  AMOUNT:
+    category: FIN
+    patterns: ['\$\s?[\d,]{1,12}(?:\.\d{2})?\b']
+    only_in_doc_categories: [financial]
+    tier: 4
+    context: [transaction, payment, deposit, withdrawal, balance]
+
+  # --- legal ---------------------------------------------------------------
+  CLIENT_IDENTITY:
+    category: LEGAL
+    presidio: PERSON
+    only_in_doc_categories: [legal]
+    tier: 1
+
+  # The build doc's first pattern only fires behind a literal "Case No." and only
+  # for a lowercase two-letter division code, so it misses the bare docket number
+  # ("filed in 1:23-cv-04567"), which is how the number is written everywhere in a
+  # brief after the caption, and it misses "1:23-CV-04567". Worse than a miss: the
+  # uppercase form fell through to the second pattern, which matched only
+  # "23-CV-04567" and left the district prefix "1:" in the clear. Pattern 2 below
+  # matches the docket shape on its own; the labelled pattern is kept because its
+  # longer span wins overlap resolution and takes the label with it. The third
+  # pattern stays case-SENSITIVE on purpose -- '\d{2}-[a-z]{1,4}-\d{3,6}' would
+  # match ordinary hyphenated prose.
+  CASE_ID:
+    category: LEGAL
+    patterns:
+      # '\s*[:#]?\s*' (as the build doc writes it) is the same quadratic shape as
+      # ACCOUNT_NUMBER's above: two whitespace quantifiers around an optional
+      # separator. One character class does the same job in linear time.
+      - '(?i)\b(?:case|docket)\s+no\.?[\s:#]*\d{1,2}:\d{2}-[a-z]{2,4}-\d{3,6}\b'
+      - '(?i)\b\d{1,2}:\d{2}-[a-z]{2,4}-\d{3,6}\b'
+      - '\b\d{2}-[A-Z]{1,4}-\d{3,6}\b'
+    # "file" replaces the doc's "filed" (header note); it matches the lemma of
+    # "filed", "filing" and "files" alike.
+    context: [case, docket, matter, court, file]
+    tier: 1
+
+  # Case-folded and newline-tolerant (NEWLINE_TAIL, below) against the build doc's
+  # form. "Settlement demand of $1,250,000" opens a sentence, so the capital S is the
+  # common spelling and the doc's case-sensitive '\bsettle' misses it outright.
+  SETTLEMENT_TERM:
+    category: LEGAL
+    patterns:
+      - '(?i)\bsettle(?:ment)?(?:[^.\n]|\n(?![ \t\r]*\n)){0,60}\$\s?[\d,]+(?:\.\d+)?'
+      - '(?i)\$\s?[\d,]+(?:\.\d+)?(?:[^.\n]|\n(?![ \t\r]*\n)){0,40}settlement'
+    context: [settlement, demand, offer]
+    tier: 4
+
+  # 'attorney\s+work\s+product' is added ahead of the bare 'work\s+product' because
+  # alternation is leftmost-first: on "ATTORNEY WORK PRODUCT" the doc's form matched
+  # only the trailing two words and left the word "Attorney" behind, which is a
+  # privilege assertion the strip exists to remove.
+  PRIVILEGED_MARKER:
+    category: LEGAL
+    patterns:
+      - '(?i)\b(privileged\s+(?:and|&)\s+confidential|attorney[\s-]client|attorney\s+work\s+product|work\s+product)\b'
+    action: strip
+
+  # NEWLINE_TAIL. The build doc writes the sentence tail as '[^.\n]{0,120}', which
+  # ends the span at the first newline. Every document that reaches this pipeline has
+  # been through the text extractor, and PDF, DOCX and TXT all arrive hard-wrapped at
+  # 70-80 columns -- so on a real document the tail stops mid-sentence and the rest of
+  # the strategy sentence goes to the provider in the clear. That is the one thing
+  # `action: redact` exists to prevent, and it is not a corner case: it happens to
+  # every strategy sentence longer than one output line.
+  #
+  # '(?:[^.\n]|\n(?![ \t\r]*\n)){0,240}' consumes a newline only when it is a soft
+  # wrap -- a blank line still ends the span, so the redaction cannot run away into
+  # the next paragraph. The two branches are disjoint on their first character, so
+  # the alternation is deterministic and the bound keeps it linear (the ReDoS test
+  # covers it).
+  #
+  # The bound itself is 240 rather than the doc's 120: two lines of wrapped text is
+  # an ordinary length for a sentence stating a legal position, and the corpus had
+  # one that 120 truncated. Over-running is the safe direction for a `redact`
+  # entity, and CHUNK_OVERLAP_CHARS is sized to stay ahead of whatever this is.
+  CASE_STRATEGY:
+    category: LEGAL
+    patterns:
+      - '(?i)\b(?:our|the)\s+(?:litigation|settlement|trial|defense|defence|negotiation)\s+(?:strategy|approach|posture|position)\b(?:[^.\n]|\n(?![ \t\r]*\n)){0,240}'
+      - '(?i)\bwe\s+(?:should|recommend|intend|plan|propose|are\s+prepared|are\s+inclined)\s+to\b(?:[^.\n]|\n(?![ \t\r]*\n)){0,240}'
+    only_in_doc_categories: [legal]
+    action: redact

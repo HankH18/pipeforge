@@ -1,0 +1,32 @@
+# secrets -- never commit
+.env
+*.pem
+*.key
+
+# runtime data (encrypted blobs + sqlite)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# demo artifacts
+wire_dump*.txt
+
+# os
+.DS_Store

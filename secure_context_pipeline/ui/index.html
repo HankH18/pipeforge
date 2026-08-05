@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Panels 1 and 3 render two strings this page must treat as hostile: the
+     document's own text, and whatever the LLM sent back. app.js HTML-escapes
+     every one of them before it becomes markup, and that is the control. This
+     is the second line: no inline script can run even if an escape is ever
+     missed, and nothing on the page may reach a third-party host -- which is
+     the whole premise of the pipeline, so it should be enforced rather than
+     merely true today. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Secure Context Pipeline — demo</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>Secure Context Pipeline <span class="sub">demo instrument</span></h1>
+  <div id="health" class="badge muted">health: …</div>
+</header>
+
+<section class="controls">
+  <div class="grp">
+    <label for="user">user_id</label>
+    <input id="user" value="demo-user" size="12">
+  </div>
+
+  <div class="grp">
+    <button id="btn-session" class="go">Create session</button>
+    <span id="session-badge" class="badge muted">no session</span>
+  </div>
+
+  <div class="grp">
+    <label for="fixture">fixture</label>
+    <select id="fixture">
+      <option value="">— pick a file —</option>
+      <option value="medical_note.txt" data-cat="medical">medical_note.txt</option>
+      <option value="legal_memo.txt" data-cat="legal">legal_memo.txt</option>
+      <option value="financial_disclosure.txt" data-cat="financial">financial_disclosure.txt</option>
+      <option value="legal_brief_large.txt" data-cat="legal">legal_brief_large.txt</option>
+    </select>
+    <input type="file" id="file" accept=".txt,.md,.pdf,.docx">
+    <span class="hint">choose the fixture from <code>fixtures/</code>, or any file</span>
+  </div>
+
+  <div class="grp">
+    <label for="category">doc_category</label>
+    <select id="category">
+      <option value="">(none)</option>
+      <option value="medical">medical</option>
+      <option value="legal">legal</option>
+      <option value="financial">financial</option>
+      <option value="general">general</option>
+    </select>
+  </div>
+
+  <div class="grp">
+    <label for="strategy">strategy</label>
+    <select id="strategy">
+      <option value="tokenization">tokenization</option>
+      <option value="pseudonymization">pseudonymization</option>
+    </select>
+  </div>
+
+  <div class="grp wide">
+    <label for="prompt">prompt</label>
+    <input id="prompt" value="Summarize this document and list the key facts.">
+  </div>
+</section>
+
+<section class="controls danger" id="review-pair">
+  <span class="tag">LIVE REVIEW &mdash; vault-miss demo: click <b>Run</b>, then <b>Destroy session</b>, then <b>Run</b> again</span>
+  <button id="btn-run" class="go big">Run <span id="spin" class="spin" hidden></span></button>
+  <button id="btn-destroy" class="danger-btn big">Destroy session</button>
+</section>
+
+<div id="banner" class="banner" hidden></div>
+
+<section class="stats" id="stats"></section>
+
+<section class="legend">
+  <span class="key"><i class="c-PII"></i>PII</span>
+  <span class="key"><i class="c-PHI"></i>PHI</span>
+  <span class="key"><i class="c-LEGAL"></i>LEGAL</span>
+  <span class="key"><i class="c-FIN"></i>FIN</span>
+  <span class="key"><i class="c-RED"></i>[REDACTED_*]</span>
+  <span class="key"><i class="rest"></i>restored region</span>
+</section>
+
+<main class="panels">
+  <div class="panel">
+    <h2>1 · Original text <span id="c1" class="count"></span></h2>
+    <pre id="p1" class="body">Create a session, choose a file, press Run.</pre>
+  </div>
+  <div class="panel">
+    <h2>2 · Outbound obfuscated payload <span id="c2" class="count"></span></h2>
+    <pre id="p2" class="body">—</pre>
+  </div>
+  <div class="panel">
+    <h2>3 · Raw LLM response <span id="c3" class="count"></span></h2>
+    <pre id="p3" class="body">—</pre>
+  </div>
+  <div class="panel">
+    <h2>4 · Restored response <span id="c4" class="count"></span></h2>
+    <pre id="p4" class="body">—</pre>
+  </div>
+</main>
+
+<section class="audit">
+  <h2>Audit tail <span id="audit-run" class="count"></span>
+    <button id="btn-verify">Verify chain</button>
+    <span id="verify-badge" class="badge muted">chain: unverified</span>
+  </h2>
+  <div class="tablewrap">
+    <table id="audit-table">
+      <thead><tr><th>seq</th><th>event_type</th><th>entity_type</th><th>token_id</th><th>detail</th></tr></thead>
+      <tbody id="audit-body"><tr><td colspan="5" class="muted">no run yet</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

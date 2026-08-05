@@ -1,0 +1,132 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "secure-context-pipeline"
+version = "1.0.0"
+description = "Secure Context Pipeline: detect -> obfuscate -> LLM -> restore, with a fail-closed egress gate."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+
+dependencies = [
+    # web layer
+    "fastapi>=0.115,<0.120",
+    "uvicorn[standard]>=0.32,<0.40",
+    # Required for multipart upload on POST /documents. FastAPI raises at
+    # ROUTE-REGISTRATION time without it, so create_app() fails and the container
+    # never boots -- not a lazy import failure.
+    "python-multipart>=0.0.9,<1",
+    # models / config
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "PyYAML>=6.0,<7",
+    # detection
+    "presidio-analyzer>=2.2.355,<3",
+    "spacy>=3.7,<3.9",
+    # crypto
+    "cryptography>=43.0,<47",
+    # storage / io
+    "aiosqlite>=0.20,<0.22",
+    "aiofiles>=24.1,<25",
+    # extraction
+    "pypdf>=5.1,<7",
+    "python-docx>=1.1,<2",
+    # llm
+    "anthropic>=0.40,<1",
+    "httpx>=0.27,<1",
+    # misc
+    "python-dotenv>=1.0,<2",
+    "Faker>=30.0,<40",
+    "python-dateutil>=2.9,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<2",
+    # A pathological state (e.g. a wedged detector) otherwise spins the suite at
+    # 100% CPU forever, and a failing async test that leaves an aiosqlite
+    # connection open hangs the interpreter in Py_FinalizeEx after the summary
+    # prints -- CI sees a job timeout instead of a red test.
+    "pytest-timeout>=2.3,<3",
+    "mypy>=1.13,<2",
+    "ruff>=0.8,<1",
+    "types-PyYAML",
+    "types-aiofiles",
+    "types-python-dateutil",
+]
+
+[tool.setuptools.packages.find]
+include = ["secure_context_pipeline*"]
+
+[tool.setuptools.package-data]
+secure_context_pipeline = ["detection/data/*.txt", "ui/*", "py.typed"]
+
+# --------------------------------------------------------------------------
+# pytest
+# --------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# No single test should take two minutes. A hang must surface as a red test, not
+# as a CI job timeout -- that is the one failure mode a security suite cannot afford.
+timeout = 120
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "leakage: 100-run zero-PII-in-transit harness (section 10.5)",
+    "bench: performance benchmarks (section 12)",
+    "real_llm: requires ANTHROPIC_API_KEY and network; skipped by default",
+]
+
+# --------------------------------------------------------------------------
+# mypy --strict on the package
+# --------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["secure_context_pipeline"]
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+no_implicit_reexport = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+    "presidio_analyzer.*",
+    "spacy.*",
+    "faker.*",
+    "docx.*",
+    "aiosqlite.*",
+]
+ignore_missing_imports = true
+
+# --------------------------------------------------------------------------
+# ruff
+# --------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "ASYNC",         # async correctness
+    "S",             # bandit (security)
+    "T20",           # flake8-print -- no print() in the package (section 9.8)
+    "RUF",
+]
+ignore = [
+    "S101",  # assert is used deliberately in post-restore assertions + tests
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "T20"]
+"demo.py" = ["T20"]
+"fixtures/*" = ["S", "T20"]
