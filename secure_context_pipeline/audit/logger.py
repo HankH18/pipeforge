@@ -45,6 +45,7 @@ blocks the event loop.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -141,6 +142,21 @@ DEFAULT_DB_FILENAME = "audit.db"
 #: ``prev_hash`` of the first row. Empty string, not NULL, so the hash input of
 #: the genesis entry is as well-defined as every other entry's.
 GENESIS_HASH = ""
+
+#: What "this database is unreadable" looks like when raised from inside a row
+#: walk. **One definition, used by every reader**, because this codebase has
+#: already been bitten by a rule that was correct in one copy and stale in
+#: another: ``_high_water_seq`` degraded on ``sqlite3.Error`` while the main
+#: chain walk did not, and the asymmetry was the bug.
+#:
+#: ``ValueError``/``TypeError`` belong here alongside ``sqlite3.Error`` because a
+#: row is not trustworthy just because SQLite handed it over. A tampered ``ts``
+#: holding ``'not-a-number'`` reaches ``float()`` as a ``ValueError``, and a page
+#: that a truncated file returns as ``NULL`` reaches it as a ``TypeError`` -- both
+#: are crashes *on the tamper-detection path, caused by the tamper being looked
+#: for*. ``tests/test_audit.py::test_every_audit_reader_shares_one_unreadable_rule``
+#: fails if a reader stops using this tuple.
+_UNREADABLE = (sqlite3.Error, ValueError, TypeError)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -284,25 +300,55 @@ class AuditLogger:
 
     @classmethod
     async def open(cls, db_path: str | Path) -> Self:
-        """Connect, enable WAL, and create the schema if it does not exist."""
+        """Connect, enable WAL, and create the schema if it does not exist.
+
+        Propagates ``sqlite3.DatabaseError`` if the file is not a database this
+        process can set up -- but does not leak the connection on the way out; see
+        :meth:`_connect`.
+        """
         instance = cls(db_path)
         await instance._connect()
         return instance
 
     async def _connect(self) -> None:
+        """Open the connection and run the setup statements, or close it and re-raise.
+
+        ``aiosqlite.connect`` starts a **non-daemon** worker thread and hands back a
+        connection object before any of the setup below has touched the file, so
+        the first statement that reads a page is the first that can fail. On a
+        corrupt or truncated file that is ``PRAGMA journal_mode=WAL`` -- verified,
+        not assumed: see
+        ``test_a_failed_open_does_not_leak_the_connection_thread``.
+
+        Without the ``try`` that failure escaped ``open()`` with ``self._conn``
+        still ``None``, so the caller held no handle to the live connection and had
+        no way to close it. The worker thread is not a daemon, so it kept the
+        interpreter alive: a process that opened a corrupt audit DB could not exit,
+        and each retry leaked another thread. Closing here is the only place with a
+        reference to ``conn``, which is what makes this the fix rather than
+        something the caller could have done.
+        """
         if self._conn is not None:
             return
         parent = self._db_path.parent
         if str(parent):
             await asyncio.to_thread(parent.mkdir, parents=True, exist_ok=True)
         conn = await aiosqlite.connect(self._db_path)
-        conn.row_factory = aiosqlite.Row
-        # WAL: concurrent readers (the API's /audit endpoints) never block the
-        # single writer. NORMAL sync is the standard WAL durability trade.
-        await conn.execute("PRAGMA journal_mode=WAL")
-        await conn.execute("PRAGMA synchronous=NORMAL")
-        await conn.executescript(_SCHEMA)
-        await conn.commit()
+        try:
+            conn.row_factory = aiosqlite.Row
+            # WAL: concurrent readers (the API's /audit endpoints) never block the
+            # single writer. NORMAL sync is the standard WAL durability trade.
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.executescript(_SCHEMA)
+            await conn.commit()
+        except BaseException:
+            # BaseException, not Exception: a CancelledError here leaks the thread
+            # exactly as a DatabaseError does, and cancellation of an open() is the
+            # realistic case (a startup timeout) rather than the exotic one.
+            with contextlib.suppress(Exception):
+                await conn.close()
+            raise
         self._conn = conn
         logger.debug("audit log opened", extra={"audit_db": str(self._db_path)})
 
@@ -419,6 +465,22 @@ class AuditLogger:
 
         Results are ordered by ``seq`` ascending -- i.e. chain order, which is
         also insertion order.
+
+        A database this method cannot read raises :class:`PipelineError` with
+        ``reason="audit_log_unreadable"`` rather than letting a raw
+        ``sqlite3.DatabaseError`` -- or, on a partially readable file, a bare
+        ``TypeError`` from ``float(row["ts"])`` where a page came back as ``NULL``
+        -- escape from the middle of a row loop. Both were observed on a
+        physically corrupted file that ``open()`` accepted; see
+        ``test_query_reports_an_unreadable_database_as_a_typed_error``.
+
+        It does **not** return the rows it managed to read before the failure.
+        Truncation is precisely the attack the chain verifier exists to catch, and
+        a partial answer with a 200 on it is indistinguishable from a complete one
+        to every caller. Never returning a silently short log is the same
+        fail-closed direction :meth:`verify_chain` resolves in; the difference is
+        only that "no opinion" is expressible as ``False`` there and is not
+        expressible as a ``list`` here.
         """
         if limit < 1:
             raise PipelineError(reason="audit_query_limit_out_of_range", limit=limit)
@@ -436,9 +498,14 @@ class AuditLogger:
             "offset": offset,
         }
         events: list[AuditEvent] = []
-        async with conn.execute(_QUERY_SQL, params) as cursor:
-            async for row in cursor:
-                events.append(_row_to_event(row))
+        try:
+            async with conn.execute(_QUERY_SQL, params) as cursor:
+                async for row in cursor:
+                    events.append(_row_to_event(row))
+        except _UNREADABLE as exc:
+            raise PipelineError(
+                reason="audit_log_unreadable", error=type(exc).__name__
+            ) from exc
         return events
 
     async def verify_chain(self, session_id: str | None = None) -> bool:
@@ -544,15 +611,24 @@ class AuditLogger:
                     expected_prev = stored_hash
                     expected_seq = seq + 1
                     last_seq = seq
-        except (sqlite3.Error, ValueError, TypeError) as exc:
-            # ValueError/TypeError as well as sqlite3.Error: a tampered row can hold
-            # anything at all, and ``int(row["seq"])`` / ``float(row["ts"])`` on a
-            # column an attacker rewrote to a non-numeric string is a crash on the
-            # tamper-detection path. Unreadable is not clean.
+        except _UNREADABLE as exc:
+            # The shared rule -- see _UNREADABLE. Unreadable is not clean.
             _log_break(last_seq, f"chain_unreadable:{type(exc).__name__}")
             return False
 
-        high_water = await self._high_water_seq()
+        # Outside the walk's try on purpose, so it needs its own. A high-water mark
+        # that is *present but not a number* is tamper evidence, not absence: the
+        # attacker who deletes the newest rows has every reason to blank this value
+        # too, because it is the only thing that notices. Letting it degrade to
+        # "no opinion" would hand them a clean bill of health, and letting it
+        # propagate would break "returns False rather than raising" -- turning
+        # GET /audit/verify into a 500 on precisely the tamper it exists to report,
+        # which is the bug the walk above was already fixed for.
+        try:
+            high_water = await self._high_water_seq()
+        except _UNREADABLE as exc:
+            _log_break(last_seq, f"high_water_unreadable:{type(exc).__name__}")
+            return False
         if high_water is not None and last_seq != high_water:
             valid = False
             _log_break(last_seq, "tail_truncated")
@@ -571,6 +647,15 @@ class AuditLogger:
         detection needs. ``None`` on a log that has never been written to (the row
         does not exist yet) and on any SQLite error, so a missing or unreadable
         bookkeeping table degrades to "no opinion" rather than a false alarm.
+
+        **A row that exists but does not hold an integer is a different case and
+        raises**, deliberately. ``sqlite_sequence`` is an ordinary writable table:
+        ``UPDATE sqlite_sequence SET seq = NULL`` is accepted by SQLite, and it is
+        the natural second move for an attacker who has just deleted the newest
+        rows, since this mark is the only thing that notices. Folding that into the
+        ``None`` above would make erasure read as cleanliness. :meth:`verify_chain`
+        catches it and returns ``False``; see
+        ``test_verify_chain_survives_a_tampered_high_water_mark``.
         """
         conn = self._connection()
         try:
@@ -610,6 +695,14 @@ class AuditLogger:
             complete = len(events) == total   # otherwise: keep paging
 
         ``since``/``until`` are inclusive ``ts`` bounds, matching :meth:`query`.
+
+        Unreadable resolves the same way :meth:`query` resolves it -- a typed
+        :class:`PipelineError` with ``reason="audit_log_unreadable"`` rather than a
+        raw ``sqlite3.DatabaseError`` from inside the row fetch. Worth stating
+        because ``GET /audit/verify`` calls :meth:`verify_chain` and *then* this,
+        so hardening only the first one leaves the endpoint failing on the same
+        corrupt file for the second reason; ``/health`` already treats any
+        exception here as ``db_reachable=False``.
         """
         conn = self._connection()
         params: dict[str, str | float | None] = {
@@ -619,9 +712,14 @@ class AuditLogger:
             "since": since,
             "until": until,
         }
-        async with conn.execute(_COUNT_SQL, params) as cursor:
-            row = await cursor.fetchone()
-        return 0 if row is None else int(row["n"])
+        try:
+            async with conn.execute(_COUNT_SQL, params) as cursor:
+                row = await cursor.fetchone()
+            return 0 if row is None else int(row["n"])
+        except _UNREADABLE as exc:
+            raise PipelineError(
+                reason="audit_log_unreadable", error=type(exc).__name__
+            ) from exc
 
 
 def _log_break(seq: int, reason: str) -> None:

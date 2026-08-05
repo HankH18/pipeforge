@@ -233,6 +233,15 @@ class EncryptedDocumentStore:
         happens not to yield to the event loop -- so a single added ``await``
         would turn a declared ``aiosqlite.Connection`` into ``None``. Binding
         the local makes it a property of the code rather than of the scheduler.
+
+        That argument covers the slow path only. The lock-free fast path at the
+        top reads ``self._db`` with no lock at all, and is safe for a separate,
+        equally deliberate reason: :meth:`close` swaps ``self._db`` to ``None``
+        *before* it awaits the connection closed, so a non-``None`` value read
+        here is never one that a close is already part-way through. While
+        ``close`` detached only afterwards, this path handed callers the exact
+        connection being closed -- observed, not theorised -- and the next
+        statement to use it raised ``ValueError: no active connection``.
         """
         cached = self._db
         if cached is not None:
@@ -255,11 +264,27 @@ class EncryptedDocumentStore:
             return db
 
     async def close(self) -> None:
-        """Close the metadata connection. Idempotent."""
-        async with self._open_lock:
-            if self._db is not None:
-                await self._db.close()
-                self._db = None
+        """Close the metadata connection. Idempotent.
+
+        Two orderings here are load-bearing and neither is cosmetic.
+
+        ``_write_lock`` is taken **before** ``_open_lock``. :meth:`put` resolves
+        its connection while already holding ``_write_lock``, and
+        :meth:`_connection` takes ``_open_lock`` inside that -- so this method
+        must acquire them in the same order or the two deadlock. Taking
+        ``_write_lock`` at all is what stops a shutdown from detaching the
+        connection out from under an upload that is between its blob writes and
+        its metadata INSERT.
+
+        ``self._db`` is detached **before** the connection is awaited closed, so
+        :meth:`_connection`'s lock-free fast path can never return the very
+        connection this method is closing.
+        """
+        async with self._write_lock:
+            async with self._open_lock:
+                db, self._db = self._db, None
+            if db is not None:
+                await db.close()
 
     async def __aenter__(self) -> Self:
         await self._connection()
@@ -321,8 +346,6 @@ class EncryptedDocumentStore:
         raw_blob = encrypt(key, content, aad)
         text_blob = encrypt(key, text.encode("utf-8"), aad)
 
-        db = await self._connection()
-
         # One failure domain for both blob writes and the metadata insert. The
         # second write failing (ENOSPC, EIO) used to leave the first blob behind
         # with no row pointing at it: unreachable, undeletable, and counted
@@ -332,7 +355,16 @@ class EncryptedDocumentStore:
         try:
             await self._write_blob(self._raw_path(doc_id), raw_blob)
             await self._write_blob(self._text_path(doc_id), text_blob)
+            # Resolved *inside* ``_write_lock``, which ``close`` also takes
+            # before it detaches the connection. Resolving it before the blob
+            # writes instead meant this frame carried a handle across two real
+            # awaits, so a ``close`` landing there -- a shutdown during an
+            # upload, not an exotic interleaving -- made the INSERT raise a bare
+            # ``ValueError: no active connection`` out of a method that raises
+            # ``PipelineError`` and nothing else. Under the lock the connection
+            # cannot be detached between resolving it and using it.
             async with self._write_lock:
+                db = await self._connection()
                 await db.execute(
                     "INSERT INTO documents "
                     "(doc_id, user_id, filename, doc_category, created_at, size_bytes) "

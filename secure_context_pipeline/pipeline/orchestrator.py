@@ -169,6 +169,17 @@ class PipelineOrchestrator:
         payload = self._injector.build(
             strategy=chosen, user_prompt=user_prompt, obfuscated_document=obf.obfuscated_text
         )
+        # The exact strings this run spliced into the document. This one line is the
+        # load-bearing half of the gate's pass-2 skip-list: ``_protected_spans``
+        # protects a token-shaped span by grammar and a surrogate by *string
+        # equality*, and only the second can be trusted, because the emitter and the
+        # matcher can drift (``format_surrogate`` anchors its validators with ``$``,
+        # which also matches before a trailing newline, so it can emit a token
+        # ``STRICT_TOKEN_RE`` rejects). Sending ``frozenset()`` here would false-block
+        # every pseudonymization run on its own well-formed output while leaving the
+        # gate's own tests green, since they hand ``check()`` their surrogates
+        # directly -- so the seam is pinned from this side by
+        # ``test_the_gate_is_handed_the_surrogates_this_run_actually_emitted``.
         surrogates = frozenset(t.surrogate for t in obf.tokens)
         stats["inject_ms"] = _ms(mark)
 

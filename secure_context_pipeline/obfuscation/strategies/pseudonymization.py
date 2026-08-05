@@ -93,9 +93,14 @@ construction**. Every generator reports that itself, in :class:`_Candidate`:
   the source" would put the real surname on the wire inside our own surrogate.
   Measured at ~1.9% of person spans before the split existed.
 
-**Tier 2 deliberately has no collision guard.** The date shift is a bijection;
-regenerating one date to dodge a collision would break the interval property that
-is the entire reason the tier exists.
+**Tier 2 never regenerates on collision; it degrades.** The date shift is a
+bijection, so varying it per date to dodge a collision would break the interval
+property that is the entire reason the tier exists. It still has to be guarded,
+because a shifted date is a *rendered string* and can carry a real original --
+either by equalling one or by containing one, as ``29 April 2024`` contains the
+separately vaulted ``April 2024``. The single colliding date therefore degrades to
+a plain token and loses only its own temporal relation; every other date in the
+document keeps the shared shift. See :meth:`PseudonymizationStrategy._shift_date`.
 
 Nothing in this module logs, raises, or reprs an original value.
 """
@@ -125,6 +130,7 @@ from secure_context_pipeline.obfuscation.strategies.base import (
     StrategyContext,
     register_strategy,
 )
+from secure_context_pipeline.pipeline.egress_gate import _occurs_as_a_unit
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle avoidance / typing only
     from random import Random
@@ -841,6 +847,46 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         keeps the shared shift, so all intervals among them survive; only the
         colliding date loses its temporal relation, and it stays fully restorable.
         Blocking the whole request instead would be a strictly worse trade.
+
+        The date can also collide with **itself**, and that case needs its own test
+        rather than the originals-set one. A ``Month YYYY`` span parses to the first
+        of the month, so a ``+30`` shift out of a 31-day month re-renders the *same*
+        month and year: ``January 2024`` shifts to ``January 2024``, byte for byte.
+        The originals set cannot be relied on to notice, because the value being
+        replaced is written to the vault only once its surrogate exists -- it is in
+        ``reserved_originals`` only while the engine happens to seed it, which is a
+        caller's habit rather than this method's guarantee. So the source string is
+        compared directly, exactly as :meth:`_fake_identifier` forbids its own
+        words directly.
+
+        The collision that matters is **containment, not equality**, and a
+        whole-string test cannot see it. A shifted date does not have to *equal*
+        another original to carry it: it can *render* one. ``April 2024`` is vaulted
+        from one document; a later document's ``17 March 2024`` shifts to
+        ``29 April 2024``, and the payload now holds ``April 2024`` verbatim, as a
+        word-bounded unit. ``'29 april 2024' != 'april 2024'``, so equality passes it,
+        and the engine's residual sweep cannot catch it either -- the sweep runs on
+        the ORIGINAL text before splicing, so it never inspects a surrogate it
+        spliced in. The egress gate then blocks our own output with
+        ``reason='vault_original'`` and the document becomes unprocessable, which is
+        exactly the failure the sweep exists to prevent. This is the same
+        word-versus-whole-string reasoning :meth:`_fake_identifier` applies through
+        :meth:`_invents_a_real_word`; Tier 2 needs it too.
+
+        The containment test calls the egress gate's own
+        :func:`~secure_context_pipeline.pipeline.egress_gate._occurs_as_a_unit`
+        rather than re-deriving a boundary rule here. Re-deriving it is how five
+        separate copies of ``(?<!\\w)...(?!\\w)`` came to share one blind spot; a
+        guard whose job is "do not emit what the gate will block" should be asking
+        the gate's question, not a lookalike. Whole-string equality against the
+        originals set is subsumed by it -- a needle equal to the haystack occurs in
+        it as a unit -- so it is not also tested separately.
+
+        Cost: one pass over the session's originals per Tier-2 span, rejected by the
+        C-level substring pre-filter inside ``_occurs_as_a_unit`` on all but a
+        handful. The haystack is a date, so it is tens of characters rather than a
+        payload; this is the same shape as the gate's own pass 1 and inherits the
+        same answer at scale (an incremental Aho-Corasick automaton, README Q1).
         """
         raw = detection.text
         stripped = raw.strip()
@@ -855,9 +901,13 @@ class PseudonymizationStrategy(ObfuscationStrategy):
             return self.plain_token(detection, token_id)
 
         shifted = f"{lead}{parsed.render(parsed.value + timedelta(days=self._shift_days))}{trail}"
-        if normalize(shifted) in self._normalized_originals(vault, session_id):
+        rendered = normalize(shifted)
+        originals = self._normalized_originals(vault, session_id)
+        if rendered == normalize(raw) or any(
+            _occurs_as_a_unit(value, rendered) for value in originals
+        ):
             logger.info(
-                "shifted date collides with another original; emitting a plain token",
+                "shifted date collides with an original; emitting a plain token",
                 extra={"entity_type": detection.entity_type, "token_id": token_id},
             )
             return self.plain_token(detection, token_id)

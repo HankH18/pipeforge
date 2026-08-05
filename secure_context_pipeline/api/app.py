@@ -10,7 +10,8 @@
     GET    /health                    liveness                  -> {status, ...}
     GET    /                          demo UI (static mount of ui/)
 
-Three properties of this module are load-bearing.
+The properties below are load-bearing, and each one is here because it was once
+false. They are the module's contract, not a summary of it.
 
 **Nothing expensive happens per request.** The spaCy pipeline behind Presidio
 costs tens of seconds to load. It is built exactly once, in the lifespan, on a
@@ -21,7 +22,16 @@ request handler only wires arguments into an already-constructed pipeline.
 **Error mapping is a security control, not ergonomics.**
 :class:`~secure_context_pipeline.errors.StoreAuthError` becomes ``404 NOT_FOUND``
 so that "not your document" and "no such document" are byte-identical responses
--- an existence oracle would undo the store's per-user key derivation.
+-- an existence oracle would undo the store's per-user key derivation. *Byte*-
+identical is the exact claim and the limit of it: the two paths are not
+*time*-identical, because a document that exists is read off disk and fails GCM
+authentication while an absent one fails at ``open``. Measured on this build,
+400 interleaved pairs: median 0.40 ms absent against 0.57 ms not-yours, the
+existing document slower in 96% of pairs. A ``doc_id`` is 128 random bits, so
+this cannot be used to *find* one; it confirms one the caller already holds.
+Equalising it belongs in
+:meth:`~secure_context_pipeline.store.document_store.EncryptedDocumentStore._read_blob`,
+which is where the asymmetry is.
 :class:`~secure_context_pipeline.errors.SessionExpiredError` becomes ``401`` for
 expired, destroyed, unknown *and* missing session IDs, for the same reason.
 :class:`~secure_context_pipeline.errors.EgressBlockedError` becomes ``422
@@ -58,6 +68,19 @@ scope must now be *proved*: the claimed ``user_id`` is checked against the owner
 recorded in the log itself, and an unproved scope reads as empty rather than
 forbidden.
 
+**And that proof is exactly as strong as ``user_id`` is secret, which is not
+very.** ``POST /sessions`` mints a session for any ``user_id`` an anonymous
+caller asks for, so a ``user_id`` is an identity *claim*, not a credential, and
+these two endpoints answer right-or-wrong about it: measured on this build, 500
+wrong guesses against one ``run_id`` returned an identical empty page each time,
+wrote no audit row, cost no delay and triggered no lockout, and the 501st -- the
+real owner's name -- returned the run's seven events including its ``session_id``
+and ``doc_id``. What the proof buys is therefore real but bounded: an attacker
+who has come by one ``run_id`` or ``session_id`` must also guess a human-readable
+username to complete the chain, where before they were handed it. Closing the
+rest of the gap needs authentication, not a better check here -- the check has no
+secret to verify -- which is why it heads the production list below.
+
 **A session belongs to one user.** ``POST /sessions`` records the creating
 ``user_id``, and every endpoint that takes both a session and a ``user_id``
 checks that they agree -- answering the same ``401 SESSION_EXPIRED`` as an
@@ -67,18 +90,34 @@ reached that user's data, and the only obstacle was the ``doc_id`` being
 unguessable. That is obscurity, and it sat directly underneath the per-user-key
 isolation this design claims.
 
+**A request may not choose how much memory the server spends.** Every schema
+ceiling here -- ``user_id`` at 64 characters, ``prompt`` at 8 000,
+:data:`MAX_UPLOAD_BYTES` at 16 MB -- is checked against a value that has already
+been built, and FastAPI builds it from a body it has already read to the end. The
+ceilings therefore described the *answer*, not the allocation: one anonymous
+``POST /sessions`` streaming a 256 MB body returned the correct ``422`` after the
+process had grown by 768 MB. :class:`_BodyLimit` counts bytes as they arrive and
+refuses at :data:`MAX_BODY_BYTES`, before the JSON decoder or the multipart
+parser sees any of them.
+
 Authentication is the bare ``user_id`` claim the caller sends. That is take-home
 scope, and it is deliberate rather than overlooked: the interesting isolation
 property (a wrong ``user_id`` derives a different HKDF key and simply cannot
-decrypt) holds regardless of how the claim is obtained. **Production work:** real
-authentication (OIDC/mTLS) so the ``user_id`` is proven rather than asserted,
-per-user rate limiting, CSRF protection for the browser client, and a signed,
+decrypt) holds regardless of how the claim is obtained. It is also the single
+assumption the rest of this docstring leans on -- the audit-scope proof, logout's
+owner check and ``/documents/{doc_id}/text`` all compare against a string the
+caller asserts about itself. **Production work, in priority order:** real
+authentication (OIDC/mTLS) so the ``user_id`` is proven rather than asserted;
+per-caller rate limiting, since every route here is anonymous and unmetered and
+three of them (``POST /sessions``, ``POST /documents``, ``DELETE /sessions/{id}``)
+write durably on each call; CSRF protection for the browser client; and a signed,
 ``HttpOnly`` session cookie in place of the ``X-Session-Id`` header.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 import time
@@ -151,6 +190,7 @@ __all__ = [
     "CONTENT_SECURITY_POLICY",
     "DEFAULT_AUDIT_PAGE",
     "MAX_AUDIT_PAGE",
+    "MAX_BODY_BYTES",
     "MAX_UPLOAD_BYTES",
     "SECURITY_HEADERS",
     "UI_DIRNAME",
@@ -168,8 +208,25 @@ logger = logging.getLogger(__name__)
 UI_DIRNAME = "ui"
 
 #: Ceiling on an uploaded file. Keeps a single request from pinning an arbitrary
-#: amount of memory in the extractor. Enforced by :func:`_read_capped` while the
-#: body is consumed, not only against a declared ``Content-Length``.
+#: amount of memory in the extractor.
+#:
+#: On the live route the enforcement is the ``file.size`` pre-check in
+#: :func:`upload_document`, not :func:`_read_capped`: Starlette's multipart
+#: parser maintains ``UploadFile.size`` as it writes each part, so the size is
+#: known before the handler runs whether or not the client declared a
+#: ``Content-Length`` (measured -- a chunked upload with no ``Content-Length``
+#: arrives with ``file.size`` already set). :func:`_read_capped` is the backstop
+#: for an ``UploadFile`` whose size is unknown, and both are downstream of
+#: :data:`MAX_BODY_BYTES`, which is the limit that actually bounds allocation.
+#:
+#: **This literal is load-bearing for a second ceiling.** :data:`MAX_BODY_BYTES`
+#: is *defined* in terms of it, so raising this number raises the request-body
+#: limit with it -- and every assertion that phrases the body limit relative to
+#: these constants keeps agreeing. Changing ``16`` to ``1024`` here re-created the
+#: out-of-memory primitive :data:`MAX_BODY_BYTES` exists to remove (measured: an
+#: anonymous 256 MB ``POST /sessions`` again answered 422 after +537 MB RSS) with
+#: the entire API test file still green. Both ceilings are therefore pinned to
+#: absolute byte counts in ``tests/test_api.py``, not to each other.
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 
 #: Read granularity for :func:`_read_capped`. Small enough that the overshoot
@@ -177,8 +234,32 @@ MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 #: to a few hundred reads.
 UPLOAD_CHUNK_BYTES = 64 * 1024
 
+#: Ceiling on the *entire* request body, counted as it arrives and enforced by
+#: :class:`_BodyLimit` before any handler or parser sees it.
+#:
+#: :data:`MAX_UPLOAD_BYTES` bounds one field of one route. Every other body was
+#: unbounded, and the schema ceilings that look like the bound are not one:
+#: ``user_id`` is capped at 64 characters and ``prompt`` at 8 000, but pydantic
+#: only rejects a value it has already been handed, and FastAPI only hands it one
+#: after ``await request.body()`` has materialised the whole payload. Measured on
+#: this build: one anonymous ``POST /sessions`` streaming a 256 MB body answered
+#: the correct ``422 VALIDATION_ERROR`` after the process had grown by 768 MB.
+#: A cap that allocates first is not a cap; it is an out-of-memory primitive with
+#: a polite error, available with no session and no credential.
+#:
+#: The slack over :data:`MAX_UPLOAD_BYTES` is multipart framing -- boundaries,
+#: per-part headers, and the ``user_id``/``doc_category`` fields -- so a 16 MB
+#: file still reaches :func:`_read_capped` and still gets ``UPLOAD_TOO_LARGE``.
+MAX_BODY_BYTES = MAX_UPLOAD_BYTES + (1024 * 1024)
+
 #: ``GET /audit`` page size. The log is append-only and grows without bound; a
-#: compliance reader pages through it.
+#: compliance reader pages through it, and the route is anonymous, so an
+#: unbounded ``limit`` lets one request choose how many rows the process
+#: materialises and serialises. Both halves of the enforcement were once free:
+#: deleting ``le=MAX_AUDIT_PAGE`` from the ``limit`` parameter and raising this
+#: constant to a billion each left the whole API test file green
+#: (``limit=1000000000`` went from 422 to 200). The refusal is now asserted at
+#: absolute row counts, not relative to this name.
 MAX_AUDIT_PAGE = 1_000
 DEFAULT_AUDIT_PAGE = 100
 
@@ -189,6 +270,15 @@ DEFAULT_AUDIT_PAGE = 100
 #: ignored in meta by specification. Framing matters here specifically: the demo
 #: UI's "Destroy session" button is one click away from an irreversible
 #: cryptographic erasure, so an unframable page is a control, not a nicety.
+#:
+#: Every directive is pinned by
+#: ``test_the_content_security_policy_is_restrictive_in_every_directive``, and by
+#: value rather than by presence: no source here may name a host, a scheme or a
+#: wildcard, and the ``<meta>`` copy in ``ui/index.html`` must declare the same
+#: policy minus ``frame-ancestors``. Before that, nothing in the suite referred
+#: to this constant at all -- ``script-src https:`` (any host on the internet, on
+#: a page whose premise is that nothing reaches a third party), ``img-src *``,
+#: ``base-uri 'self'`` and ``form-action 'self'`` were all green.
 CONTENT_SECURITY_POLICY = (
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
     "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
@@ -469,12 +559,20 @@ async def _owns_session(services: Services, session_id: str, user_id: str) -> bo
     """Whether ``session_id`` is live *and* owned by ``user_id``. Never raises.
 
     Deliberately **not** :meth:`SessionRegistry.belongs_to`, which is otherwise
-    exactly this: that helper compares the two IDs as ``str`` and so inherits the
-    ``TypeError`` described in :func:`_same_id`, which turned ``DELETE
-    /sessions/{id}?user_id=<non-ASCII>`` into an unauthenticated 500. Logout must
-    not be crashable by the claim it is checking, so the route does the
-    comparison itself. (The registry's own copy of the bug is reported
-    separately; it is not this module's to fix.)
+    exactly this. The original reason was a defect: that helper compared the two
+    IDs as ``str`` and so inherited the ``TypeError`` described in
+    :func:`_same_id`, which turned ``DELETE /sessions/{id}?user_id=<non-ASCII>``
+    into an unauthenticated 500. **That copy has since been fixed** -- verified,
+    not assumed: ``belongs_to`` now answers ``True`` for a non-ASCII owner instead
+    of raising -- so the two are equivalent again and this is no longer a
+    workaround.
+
+    It stays inline anyway, for the reason the workaround exposed rather than the
+    workaround itself. The route's promise is that logout is oracle-free, and a
+    promise discharged by calling into another component is only as good as that
+    component's current implementation; when the two shared a bug, the shared bug
+    is precisely what nothing could see. One comparison, in the frame that makes
+    the guarantee, using the helper this module can reason about.
     """
     try:
         owner = await services.sessions.owner(session_id)
@@ -507,6 +605,17 @@ async def _audit_scope_owner(
     recorded owner -- events written by machinery that never went through
     ``POST /sessions``. Callers must treat that identically to a wrong owner:
     fail closed, and give an unreadable scope the same answer as an empty one.
+
+    That ``None`` branch had no test of its own for a while, and every existing
+    ownership test exercises only the *wrong-owner* one: they all use a session
+    created through ``POST /sessions``, for which this never returns ``None``.
+    Inverting the callers' guard to ``owner is not None and not _same_id(...)``
+    therefore stayed green while making every ownerless scope world-readable --
+    a ``DETECT`` row and its ``doc_id`` came back to an arbitrary ``user_id``,
+    and ``/audit/verify`` went from ``length: 0`` to ``length: 1``, restoring the
+    existence oracle. ``test_an_audit_scope_with_no_recorded_owner_reads_as_empty``
+    covers it, and proves the row is really in the log first, so an empty page
+    cannot pass for the wrong reason.
     """
     target = session_id
     if not target:
@@ -526,21 +635,38 @@ async def _audit_scope_owner(
 async def _read_capped(file: UploadFile) -> bytes:
     """Read an upload, refusing past :data:`MAX_UPLOAD_BYTES`.
 
-    ``file.size`` is only populated when the client declared a length, so the
-    cheap pre-check above it is *advisory*: withhold ``Content-Length`` and it is
-    skipped entirely. The previous fallback -- ``await file.read()`` and then
-    measure -- caught the oversize request but only after materialising all of it,
-    which let a caller choose how much memory the handler allocated. Reading in
-    bounded chunks and stopping one chunk past the ceiling makes the limit hold
-    whatever the client declares, and caps this frame's allocation at the ceiling
-    rather than at whatever was sent.
+    Reading in bounded chunks and stopping one chunk past the ceiling caps this
+    frame's allocation at the ceiling rather than at whatever was sent. The
+    fallback it replaced -- ``await file.read()`` and then measure -- answered
+    413 correctly but only after materialising all of it, so the caller picked
+    the allocation.
 
-    **Scope.** This bounds what the *handler* buffers. Starlette has already
-    spooled the multipart body (to disk past its own threshold) by the time a
-    route runs, so a true request-body limit belongs in front of the application
-    -- ``uvicorn``'s ``--limit-max-requests`` peers, or a reverse proxy's
-    ``client_max_body_size``. That is deployment configuration; this is the
-    guarantee the application can make on its own.
+    Stopping one chunk past the ceiling also means the ``bytes`` this reports is
+    a *read total*, not the upload's size: always ``MAX_UPLOAD_BYTES`` rounded up
+    to a whole :data:`UPLOAD_CHUNK_BYTES`, i.e. 16 842 752 for every oversize
+    body. That is the observable difference between this control and the
+    pre-check, and it is what
+    ``test_an_oversize_upload_is_refused_before_a_byte_of_it_is_read`` asserts --
+    removing the pre-check was once reported as having no testable effect.
+
+    **This is a backstop, not the live enforcement point, and the difference is
+    worth stating because it was once documented the other way round.** The claim
+    was that ``file.size`` is populated only when the client declares a length,
+    which would make the pre-check in :func:`upload_document` advisory and this
+    the control that actually holds. It is the reverse: Starlette's multipart
+    parser increments ``UploadFile.size`` on every write, so by the time the
+    handler runs the size is known exactly -- measured, for a chunked upload sent
+    with no ``Content-Length`` at all. The pre-check therefore fires first for
+    every real multipart request and this loop never sees an oversize body. What
+    is left to it is the case its own test constructs: an ``UploadFile`` whose
+    ``size`` is ``None``, which is what a non-multipart caller of this helper
+    would hand it.
+
+    **Scope.** Both of those bound what the *handler* buffers, and neither is the
+    request-body limit: :class:`_BodyLimit` is, and it runs before the multipart
+    parser has spooled anything. Past that, a production deployment still wants a
+    reverse proxy's ``client_max_body_size`` in front, because concurrency is a
+    limit this process cannot impose on itself.
     """
     chunks: list[bytes] = []
     total = 0
@@ -1067,6 +1193,109 @@ class _SecurityHeaders:
         await self.app(scope, receive, send_with_headers)
 
 
+async def _send_too_large(send: Send, *, limit: int, received: int) -> None:
+    """Emit the one documented error shape straight onto the ASGI channel.
+
+    :class:`_BodyLimit` runs outside the exception middleware, so it cannot raise
+    its way to :func:`_json`; the body is built from the same
+    :class:`~secure_context_pipeline.api.schemas.ErrorResponse` model so the
+    ``{code, detail}`` contract holds on this path too. ``received`` is the
+    caller's own byte count, never a byte of what was sent, and ``limit`` comes
+    from the middleware instance rather than the module constant so a differently
+    configured one cannot report a ceiling it is not enforcing.
+    """
+    payload = json.dumps(
+        ErrorResponse(
+            code="REQUEST_TOO_LARGE",
+            detail={"max_bytes": limit, "bytes": received},
+        ).model_dump(mode="json")
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": HTTP_413_TOO_LARGE,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})
+
+
+class _BodyLimit:
+    """Refuse an over-long request body *while it arrives*, not after.
+
+    Raw ASGI, and outside everything else, because that is the only layer at
+    which the refusal can precede the allocation. By the time a FastAPI handler
+    runs, ``await request.body()`` (JSON) or ``await request.form()`` (multipart)
+    has already consumed the stream to completion, and every ceiling downstream
+    of that point -- :data:`MAX_ID_LEN`, :data:`MAX_PROMPT_CHARS`,
+    :data:`MAX_UPLOAD_BYTES` -- describes what the server will *answer*, not what
+    it will *hold*. A caller with no session and no credential chose the second
+    number by choosing how much to send.
+
+    Two enforcement points, because either alone is bypassable:
+
+    * a declared ``Content-Length`` over the ceiling is refused before the body
+      is read at all -- one round trip, nothing allocated;
+    * bytes are counted as they are received, so withholding the header (or
+      lying about it, which is the same thing to an ASGI server that streams)
+      buys at most one more chunk.
+
+    Going over converts the stream into ``http.disconnect``. The application
+    unwinds on its own -- Starlette raises ``ClientDisconnect``, FastAPI renders
+    it -- and that response is *suppressed* so this middleware's 413 is the one
+    the caller sees; without the suppression the answer would be FastAPI's
+    generic ``400``, which says the body was malformed rather than too large.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    def _declared_length(self, scope: Scope) -> int | None:
+        for name, value in scope.get("headers", ()):
+            if name == b"content-length":
+                try:
+                    return int(value)
+                except ValueError:
+                    return None
+        return None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared = self._declared_length(scope)
+        if declared is not None and declared > self.max_bytes:
+            await _send_too_large(send, limit=self.max_bytes, received=declared)
+            return
+
+        received = 0
+        over = False
+
+        async def limited_receive() -> Message:
+            nonlocal received, over
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    over = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message: Message) -> None:
+            if over:
+                return
+            await send(message)
+
+        await self.app(scope, limited_receive, guarded_send)
+        if over:
+            await _send_too_large(send, limit=self.max_bytes, received=received)
+
+
 class _NullSafeStaticFiles(StaticFiles):
     """``StaticFiles`` that answers 404 for a path it cannot even look up.
 
@@ -1150,6 +1379,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=None,
         redoc_url=None,
     )
+    # Order matters, and it is the reverse of the call order: the last
+    # ``add_middleware`` wins the outermost position. ``_SecurityHeaders`` has to
+    # be outside ``_BodyLimit`` so the 413 that never reaches the application is
+    # still stamped with the CSP and ``nosniff`` every other response carries.
+    app.add_middleware(_BodyLimit)
     app.add_middleware(_SecurityHeaders)
     _register_handlers(app)
     _register_routes(app)

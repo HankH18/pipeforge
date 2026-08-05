@@ -531,6 +531,17 @@ class ObfuscationEngine:
             )
             if existing is not None:
                 # Determinism within a session: the first mapping wins, forever.
+                #
+                # Deleting this branch changes no byte of any payload -- ``put`` is
+                # idempotent per ``(entity_type, normalize(original))`` and the
+                # read-back below returns the first record either way. What it does
+                # change is that every repeat mention re-derives a value that
+                # collides with ITSELF: its token ID is held by its own row, and
+                # every fake the guard draws is already vaulted. Measured on a
+                # two-entity document, the second call emits five collision
+                # warnings where it should emit none -- burying the one real 32-bit
+                # collision this system cannot survive. See
+                # ``test_a_value_the_session_already_mapped_is_never_re_derived``.
                 resolved[key] = existing
                 continue
 
@@ -555,7 +566,13 @@ class ObfuscationEngine:
                 group.first.text,
             )
             # The vault is the authority on what was stored; read it back rather
-            # than trusting what we passed in.
+            # than trusting what we passed in. This is what decides which string
+            # reaches the payload, because the splice below reads ``records``, not
+            # the strategy's return value -- so if anything else vaulted this value
+            # first, our ``put`` was a no-op and the surrogate we just rendered is
+            # one the vault does not hold. Splicing it would put a token in the
+            # payload that ``get_by_surrogate`` cannot resolve. See
+            # ``test_the_payload_carries_the_surrogate_the_vault_actually_holds``.
             stored = await self._vault.get_by_original(
                 session_id, group.entity_type, group.normalized
             )
@@ -582,7 +599,24 @@ class ObfuscationEngine:
         it cannot rewrite the surrogate string the strategy already rendered
         around that ID. Since the restorer keys on the 8-hex core, an ID chosen
         after the surrogate was built would restore the wrong entity. So the
-        engine settles the ID first, and the vault's loop never fires.
+        engine settles the ID first.
+
+        Scope of that guarantee, stated rather than implied: it holds for one
+        ``obfuscate`` call at a time on a session. The check below and the
+        ``put`` that follows it are separated by ``make_surrogate``, so two
+        coroutines obfuscating the *same* session concurrently can both find one
+        ID free and both claim it -- and the second ``put`` then re-derives,
+        leaving the payload's surrogate built around an ID no vault row carries.
+        The read-back in :meth:`_resolve_groups` detects that and logs it; it
+        cannot repair it, because the ID is baked into a string already rendered.
+        It needs a 32-bit ID collision *and* two concurrent calls on one session,
+        so it is a known remote corner, not a covered one.
+
+        That limit is specific to the ID being *inside* the surrogate, and does not
+        generalise: in the far likelier race -- two concurrent calls on the same
+        *value* -- the read-back repairs completely, because the splice takes the
+        stored record's surrogate rather than the one this call rendered. Only the
+        ID-collision case is beyond it.
         """
         for counter in range(MAX_TOKEN_COLLISION_RETRIES + 1):
             token_id = derive_token_id(

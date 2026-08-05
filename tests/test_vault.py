@@ -25,6 +25,7 @@ claim being made is about what an attacker with database write access can do.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import secrets
 import sqlite3
 import threading
@@ -143,6 +144,40 @@ async def put_value(
     return stored
 
 
+def lock_waiters(lock: asyncio.Lock) -> int:
+    """How many coroutines are currently parked on ``lock``.
+
+    ``asyncio.Lock`` publishes no waiter count, and the race tests below need
+    one. Without it, "this task is queued on the lock" can only be *inferred*
+    from "it has not finished yet", which is the same inference that made
+    ``test_destroy_races_concurrent_writes`` depend on how many event-loop steps
+    each coroutine happened to spend before its acquire. Reading the deque turns
+    that inference into an observation, so the queue order becomes a property of
+    the test rather than of the scheduler.
+
+    ``_waiters`` is private, but this is a mechanism test that already reaches
+    for ``vault._lock`` directly; a cancelled future stays in the deque until
+    the next release, so cancelled entries are not counted.
+    """
+    waiters = getattr(lock, "_waiters", None) or ()
+    return sum(1 for waiter in waiters if not waiter.cancelled())
+
+
+async def park_on_lock(lock: asyncio.Lock, expected: int, *, what: str) -> None:
+    """Run the event loop until ``expected`` coroutines are queued on ``lock``.
+
+    Bounded rather than unbounded so a coroutine that never reaches the acquire
+    fails the test with a message instead of hanging until the suite timeout.
+    """
+    for _ in range(10_000):
+        if lock_waiters(lock) >= expected:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        f"{what}: {lock_waiters(lock)} coroutines queued on the lock, expected {expected}"
+    )
+
+
 def read_rows(db_path: Path, session_id: str) -> list[sqlite3.Row]:
     """All rows for a session, straight off disk."""
     conn = sqlite3.connect(db_path)
@@ -168,6 +203,28 @@ def read_row(db_path: Path, session_id: str, token_id: str) -> sqlite3.Row | Non
             " FROM vault_entries WHERE session_id = ? AND token_id = ?",
             (session_id, token_id),
         ).fetchone()
+    finally:
+        conn.close()
+
+
+def reinsert_row(db_path: Path, row: sqlite3.Row) -> None:
+    """Put a row back byte for byte, under its own identity.
+
+    Models the two ordinary ways a row outlives ``destroy``'s best-effort
+    DELETE: a backup restored over the file, or the DELETE simply failing.
+    Unlike :func:`splice_row` it does not rename the surrogate, so the row is
+    still reachable by *every* accessor -- which is what makes it usable for
+    testing the surrogate lookup rather than only the token one.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_entries"
+            " (session_id, token_id, entity_type, surrogate, nonce, ciphertext, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            tuple(row),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -470,6 +527,96 @@ async def test_destroy_surviving_row_is_undecryptable(
             )
 
 
+async def test_destroy_is_cryptographic_erasure_by_every_route_we_can_construct(
+    vault: SessionVault,
+    session_registry: SessionRegistry,
+    settings: Settings,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Irreversibility is a headline claim, so attack it rather than assert it.
+
+    ``test_destroy_surviving_row_is_undecryptable`` shows one route: a random
+    key and a *different* session's key both fail. That leaves the routes an
+    actual attacker would reach for, and each is tried here against a row
+    deliberately preserved from before the destroy:
+
+    1. **The files on disk**, not the table. A ``SELECT`` cannot see the
+       write-ahead log or the shared-memory sidecar, and a DELETE leaves freed
+       pages behind; every byte the store ever wrote is swept instead.
+    2. **A cached object** -- the hot index, the memoised egress view, and the
+       ``repr`` of both components.
+    3. **A session re-created under the same ID.** Session IDs are the only
+       identifier an attacker sees, so "make another session called that" is the
+       obvious move; it must not reconstitute the key.
+    4. **The process master key.** This is the sharpest of the four: a session
+       key is fresh entropy, *not* an HKDF of the master, so compromising the
+       env key and stealing the database still yields nothing. Deriving session
+       keys from the master would be a natural-looking "simplification" that
+       silently converts erasure into "we deleted the row", and this is what
+       would notice.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await put_value(vault, session_registry, session_id, VALUE_A)
+    survivor = read_row(db_path, session_id, record.token_id)
+    assert survivor is not None
+
+    await vault.destroy(session_id)
+    assert await session_registry.destroy(session_id) is True
+    # The confidentiality control is the key, not the DELETE -- so put the row
+    # back and let it survive everything below.
+    reinsert_row(db_path, survivor)
+    assert read_row(db_path, session_id, record.token_id) is not None
+
+    # -- route 1: every byte the store ever wrote, sidecars included ---------
+    files = sorted(p for p in db_path.parent.rglob("*") if p.is_file())
+    assert files, "expected at least the database file"
+    for path in files:
+        assert VALUE_A.encode() not in path.read_bytes(), f"plaintext survived in {path.name}"
+
+    # -- route 2: a cached object -------------------------------------------
+    assert vault.originals_for_session(session_id) == frozenset()
+    assert vault.cached_session_ids() == frozenset()
+    rendered = f"{vault!r} {vault} {session_registry!r} {session_registry}"
+    assert VALUE_A not in rendered
+
+    # -- route 3: a new session claiming the same ID -------------------------
+    monkeypatch.setattr(registry_module.uuid, "uuid4", lambda: uuid.UUID(hex=session_id))
+    reborn, _ = await session_registry.create("test-user")
+    assert reborn == session_id, "the session ID was not actually reused"
+    reborn_key = await session_registry.key(reborn)
+
+    # -- route 4: the master key -------------------------------------------
+    master = settings.master_key_bytes()
+    assert len(master) == 32
+    assert master != reborn_key, "a session key must not be the master key"
+
+    blob = bytes(survivor["ciphertext"])
+    assert VALUE_A.encode() not in blob
+    candidates = {
+        "a same-ID session re-created after the destroy": reborn_key,
+        "the process master key": master,
+    }
+    for label, candidate in candidates.items():
+        try:
+            aead.decrypt_split(
+                derive_vault_key(candidate, session_id),
+                bytes(survivor["nonce"]),
+                blob,
+                aead.vault_aad(session_id, record.token_id),
+                scope="vault",
+            )
+        except CryptoAuthError:
+            continue
+        raise AssertionError(f"{label} decrypted a destroyed session's row")
+
+    # And the vault itself will not serve it either: the reborn session is a
+    # different session that happens to share a name.
+    with pytest.raises(VaultMissError):
+        await vault.get_by_token(reborn, record.token_id)
+    assert vault.originals_for_session(reborn) == frozenset()
+
+
 async def test_destroy_is_final_for_later_writes(
     vault: SessionVault, session_registry: SessionRegistry, db_path: Path
 ) -> None:
@@ -643,10 +790,32 @@ async def test_destroy_races_concurrent_writes(
     guard stopped that from passing silently.
 
     Holding the lock while the tasks are created removes the guesswork: each one
-    runs exactly as far as the acquire and stops there, in creation order, so
-    releasing it replays them in that order. The outcome is then pinned
-    position-by-position rather than as "both values appear somewhere", which is
-    what makes a change in wakeup order a failure instead of a weaker test.
+    runs exactly as far as the acquire and stops there, so releasing the lock
+    replays them in queue order. The outcome is then pinned position-by-position
+    rather than as "both values appear somewhere", which is what makes a change
+    in wakeup order a failure instead of a weaker test.
+
+    **Queue order is established, not assumed.** An earlier version of this test
+    created all 41 tasks, spun the loop 20 times, and took *creation* order to be
+    *queue* order. That held only while neither ``put`` nor ``destroy`` yielded
+    on its way to ``self._lock``, and it was one ``await`` away from evaporating
+    on **either** side of the race -- both directions measured, not reasoned
+    about, by injecting a single ``await asyncio.sleep(0)`` before each acquire
+    in turn:
+
+    * before ``put``'s acquire, the destroyer queues first, all forty writes are
+      refused, and the test failed on ``assert "stored" in outcomes``;
+    * before ``SessionVault.destroy``'s acquire, the destroyer queues *last*, all
+      forty writes are stored, and the test failed on the opposite guard,
+      ``"no write landed after the destroy; the race did not happen"``.
+
+    Neither failure was the vault breaking -- in both the security block at the
+    bottom still held -- but in both the test stopped testing the race it is
+    named for, and a maintainer looking at a red ordering assertion is one step
+    from relaxing it. So each task is now driven onto the lock's wait queue and
+    *observed* there (``park_on_lock``) before the next one is created. Queue
+    order is a property of this code, and no number of awaits added ahead of
+    either acquire can change it.
     """
     session_id, _ = await session_registry.create("test-user")
     values = [f"Synthetic Subject {index:02d}" for index in range(40)]
@@ -666,20 +835,31 @@ async def test_destroy_races_concurrent_writes(
     # Queued in the middle of the writers so the destroy genuinely lands between
     # two writes rather than after all of them.
     await vault._lock.acquire()
-    scheduled: list[asyncio.Task[str]] = [
-        asyncio.create_task(writer(value)) for value in values[:20]
-    ]
-    scheduled.append(asyncio.create_task(destroyer()))
-    scheduled.extend(asyncio.create_task(writer(value)) for value in values[20:])
-    # Let every task run up to -- and no further than -- the acquire. The lock
-    # is the only thing any of them can block on while the test holds it, so
-    # "none has finished" is "all are parked on it, in creation order".
-    for _ in range(20):
-        await asyncio.sleep(0)
-    assert not any(task.done() for task in scheduled), (
-        "a coroutine got past the vault lock while the test held it"
-    )
-    vault._lock.release()
+    scheduled: list[asyncio.Task[str]] = []
+
+    async def enqueue(coro: Any, what: str) -> None:
+        """Start ``coro`` and do not return until it is parked on the vault lock."""
+        scheduled.append(asyncio.create_task(coro))
+        await park_on_lock(vault._lock, len(scheduled), what=what)
+
+    try:
+        for value in values[:20]:
+            await enqueue(writer(value), f"writer for {value!r} before the destroy")
+        await enqueue(destroyer(), "the destroyer")
+        for value in values[20:]:
+            await enqueue(writer(value), f"writer for {value!r} after the destroy")
+
+        assert not any(task.done() for task in scheduled), (
+            "a coroutine got past the vault lock while the test held it"
+        )
+    finally:
+        # Released in a ``finally`` because ``SessionVault.close`` -- which the
+        # fixture calls on teardown -- takes this same lock. Any assertion above
+        # firing while the test still holds it deadlocks the teardown, and the
+        # run then dies on the suite-wide timeout instead of reporting a red
+        # test. ``pyproject.toml`` calls that out as the one failure mode a
+        # security suite cannot afford; measured, not assumed.
+        vault._lock.release()
 
     outcomes = await asyncio.gather(*scheduled)
     assert "stored" in outcomes, "no write landed before the destroy"
@@ -710,22 +890,41 @@ async def test_logout_in_api_order_is_final_for_in_flight_writes(
     and ``asyncio.Lock`` wakes waiters FIFO, so a write either lands before this
     ``destroy`` (and is cleaned up by it) or finds the key already gone.
 
-    Sweeping the number of event-loop yields before logout walks the write
-    across every interleaving, including the one where it is mid-``INSERT``.
+    Yields are swept on **both** sides, and that is not symmetry for its own
+    sake. Sweeping only the logout side measures the race from one end: a single
+    ``await asyncio.sleep(0)`` injected before ``SessionRegistry.destroy``'s lock
+    acquire pushed every one of the six interleavings onto the "stored" side, and
+    the run ended on this test's own coverage guard
+    (``the sweep did not exercise both sides of the race: {'stored'}``) -- not
+    because the vault had regressed, but because the sweep could no longer reach
+    the other side. Delaying the *writer* is the compensating direction, so one
+    added ``await`` in either destroy path shifts which cell of the grid produces
+    which outcome without emptying either side of it.
+
+    The security block runs on every cell, so it is the coverage guard -- never
+    the confidentiality assertions -- that a scheduling change can reach.
     """
     outcomes: set[str] = set()
-    for yields in range(6):
+    for writer_yields, logout_yields in itertools.product(range(4), range(4)):
         session_id, _ = await session_registry.create("test-user")
         await put_value(vault, session_registry, session_id, VALUE_A)
         record = await make_record(session_registry, session_id, VALUE_B)
+        cell = f"writer_yields={writer_yields} logout_yields={logout_yields}"
 
-        async def logout(sid: str = session_id, steps: int = yields) -> None:
+        async def write(
+            sid: str = session_id, rec: TokenRecord = record, steps: int = writer_yields
+        ) -> None:
+            for _ in range(steps):
+                await asyncio.sleep(0)
+            await vault.put(sid, rec, VALUE_B)
+
+        async def logout(sid: str = session_id, steps: int = logout_yields) -> None:
             for _ in range(steps):
                 await asyncio.sleep(0)
             await session_registry.destroy(sid)
             await vault.destroy(sid)
 
-        writer = asyncio.create_task(vault.put(session_id, record, VALUE_B))
+        writer = asyncio.create_task(write())
         await logout()
         try:
             await writer
@@ -736,14 +935,269 @@ async def test_logout_in_api_order_is_final_for_in_flight_writes(
 
         # Whatever the interleaving, the session is gone: no plaintext in RAM,
         # no ciphertext on disk, no readable token.
-        assert vault.originals_for_session(session_id) == frozenset(), f"yields={yields}"
-        assert session_id not in vault.cached_session_ids(), f"yields={yields}"
-        assert read_rows(db_path, session_id) == [], f"yields={yields}"
+        assert vault.originals_for_session(session_id) == frozenset(), cell
+        assert session_id not in vault.cached_session_ids(), cell
+        assert read_rows(db_path, session_id) == [], cell
+        # The surrogate the writer minted is unreadable in every cell. In this
+        # order the refusal comes from the *key* being gone rather than from a
+        # tombstone -- which is the whole claim of this test -- so the error is
+        # ``SessionExpiredError`` from ``registry.key()``, not ``VaultMissError``.
+        with pytest.raises(SessionExpiredError):
+            await vault.get_by_surrogate(session_id, record.surrogate)
         assert not vault._destroyed, "the API order must not accumulate tombstones"
 
     assert outcomes == {"stored", "refused"}, (
         f"the sweep did not exercise both sides of the race: {outcomes}"
     )
+
+
+async def test_put_reads_the_session_key_inside_the_lock(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """A yield between the key read and the tombstone check must not exist.
+
+    ``put``'s docstring says the key read is inside ``self._lock`` because
+    "anything added there (an audit emit, a metric, a thread hop) would have let
+    a write land after logout and rebuild the plaintext cache for a destroyed
+    session". Every other test takes that on trust: hoisting the read back out
+    of the lock leaves all of ``test_vault.py`` green, because none of them puts
+    an ``await`` in the gap the ordering exists to close, and without one the
+    hoisted version *happens* to behave identically. Correct by accident is not
+    correct.
+
+    So this test supplies the missing await, exactly as described -- a yield
+    immediately after ``registry.key()`` returns -- and then runs the API's
+    logout order (key first, vault second) inside it. Where that yield lands
+    relative to ``self._lock`` is the entire question:
+
+    * key read **inside** the lock: the writer is parked while *holding* the
+      lock, so ``vault.destroy`` cannot start. The write lands first and the
+      destroy that follows collects it.
+    * key read **outside** the lock: the writer is parked holding nothing, the
+      whole logout completes -- recording no tombstone, because in this order
+      the key is already gone by the time ``destroy`` looks -- and the write
+      then acquires a free lock, sees an empty ``_destroyed``, and files a
+      durable row plus a plaintext cache for a session that no longer exists,
+      with nothing left to collect either.
+
+    The assertions are therefore on the *residue*, not on which side won the
+    race: either interleaving may store the value, but neither may leave it
+    behind.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await make_record(session_registry, session_id, VALUE_A)
+
+    parked = asyncio.Event()
+    resume = asyncio.Event()
+    real_key = session_registry.key
+
+    async def key_then_yield(sid: str) -> bytes:
+        key = await real_key(sid)
+        # Only the first caller parks; ``destroy`` also asks for the key and
+        # must be free to discover that it is gone.
+        if not parked.is_set():
+            parked.set()
+            await resume.wait()
+        return key
+
+    session_registry.key = key_then_yield  # type: ignore[method-assign]
+
+    writer = asyncio.create_task(vault.put(session_id, record, VALUE_A))
+    await parked.wait()
+    assert not writer.done(), "the writer was supposed to park on the injected yield"
+
+    # The API's logout order, in full, while the writer sits in that gap.
+    await session_registry.destroy(session_id)
+    destroyer = asyncio.create_task(vault.destroy(session_id))
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    resume.set()
+    try:
+        await writer
+    except SessionExpiredError:
+        pass
+    await destroyer
+
+    assert not vault._destroyed, "the API order records no tombstone; that is the premise here"
+    assert vault.originals_for_session(session_id) == frozenset(), (
+        "a write that lost the race rebuilt the plaintext cache of a destroyed session"
+    )
+    assert session_id not in vault.cached_session_ids()
+    assert read_rows(db_path, session_id) == [], (
+        "a write that lost the race left a durable row for a destroyed session"
+    )
+
+
+async def test_get_by_original_refuses_a_tombstoned_session_with_a_live_cache(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """The last of three layers, tested by making the first two fail.
+
+    ``get_by_original``'s tombstone check is defence in depth and its docstring
+    says so: the method answers only out of the cache, and no public sequence
+    can produce a destroyed session that still *has* a cache, because
+    ``destroy`` pops it, ``put`` refuses to recreate it and ``_decrypt_row``
+    declines to repopulate it. That honesty is worth keeping -- but "unreachable
+    today" is a statement about the other two layers, and the way to test a
+    third layer is to break the two above it rather than to delete the test.
+
+    So the disagreement is manufactured directly: tombstone the session *without*
+    popping its cache, which is precisely the state a future edit reordering
+    ``destroy`` (tombstone before pop, with an ``await`` in between) would make
+    reachable. The record must still not come back.
+
+    Reaching into ``_destroyed`` is deliberate and is the only way to reach this
+    branch; a test that could get here through the public API would be evidence
+    that one of the other two layers had already failed.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await put_value(vault, session_registry, session_id, VALUE_A)
+
+    found = await vault.get_by_original(session_id, record.entity_type, normalize(VALUE_A))
+    assert found is not None and found.token_id == record.token_id
+
+    # Layers one and two fail: the session is tombstoned, the cache survives.
+    vault._destroyed.add(session_id)
+    assert session_id in vault.cached_session_ids(), (
+        "this test is vacuous unless the cache really is still populated"
+    )
+    assert vault._caches[session_id].by_original, "the cache still holds the by_original index"
+
+    assert (
+        await vault.get_by_original(session_id, record.entity_type, normalize(VALUE_A))
+    ) is None, "a destroyed session's record was handed back out of a surviving cache"
+
+
+async def test_get_by_surrogate_refuses_a_row_that_outlived_destroy(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """The surrogate lookup needs its *own* tombstone check, not the token path's.
+
+    Every other destroy test reaches ``get_by_surrogate`` only once the rows are
+    already gone, so the miss comes from an empty table and the tombstone check
+    above it never answers. Deleting that check therefore left the whole suite
+    green -- while a row that outlived the best-effort DELETE (a backup, a
+    snapshot, a statement that failed) decrypted straight back into the cache of
+    a session that had already been destroyed.
+
+    The premise is established before the assertion: the row is put back
+    verbatim and shown to be genuinely decryptable under the still-live session
+    key, so the refusal below is the vault declining a value it *could* have
+    returned, not an absence dressed up as a policy.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await put_value(vault, session_registry, session_id, VALUE_A)
+    survivor = read_row(db_path, session_id, record.token_id)
+    assert survivor is not None
+
+    await vault.destroy(session_id)
+    reinsert_row(db_path, survivor)
+
+    restored = read_row(db_path, session_id, record.token_id)
+    assert restored is not None, "the row was not actually restored"
+    assert str(restored["surrogate"]) == record.surrogate
+    vault_key = derive_vault_key(await session_registry.key(session_id), session_id)
+    assert (
+        aead.decrypt_split(
+            vault_key,
+            bytes(restored["nonce"]),
+            bytes(restored["ciphertext"]),
+            aead.vault_aad(session_id, record.token_id),
+            scope="vault",
+        ).decode()
+        == VALUE_A
+    ), "the surviving row is not decryptable, so the refusal below proves nothing"
+
+    with pytest.raises(VaultMissError):
+        await vault.get_by_surrogate(session_id, record.surrogate)
+    assert vault.cached_session_ids() == frozenset(), "a destroyed session was re-cached"
+    assert vault.originals_for_session(session_id) == frozenset()
+
+
+async def test_destroy_records_no_tombstone_for_a_key_that_died_while_it_queued(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """``destroy`` must read liveness under the lock, not before queuing on it.
+
+    The tombstone set answers "was the key still live when I destroyed this?",
+    and that is only meaningful read at the moment it is acted on. Read before
+    the acquire it is stale: a ``registry.destroy()`` landing in the gap records
+    a tombstone for a session whose key is already gone -- per-session state
+    retained until ``close`` for a session no accessor can reach anyway. Since
+    ``destroy`` sits behind ``DELETE /session/{id}``, that is a caller-driven
+    growth lever.
+
+    ``test_logout_in_api_order_is_final_for_in_flight_writes`` cannot see this:
+    its logout awaits ``registry.destroy`` to completion *before* calling
+    ``vault.destroy``, so the two never overlap and the stale read never
+    happens.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    await put_value(vault, session_registry, session_id, VALUE_A)
+
+    await vault._lock.acquire()
+    destroyer = asyncio.create_task(vault.destroy(session_id))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not destroyer.done(), "the destroy got past the lock while the test held it"
+
+    # The key dies while the destroy is parked -- exactly the window a liveness
+    # read taken before the acquire would have missed.
+    assert await session_registry.destroy(session_id) is True
+    vault._lock.release()
+    await destroyer
+
+    assert vault._destroyed == set(), "a tombstone was recorded for an already-dead key"
+    assert vault.cached_session_ids() == frozenset()
+
+
+async def test_a_close_queued_ahead_of_a_write_fails_closed(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """A connection handle must be resolved under the lock that ``close`` takes.
+
+    ``put``, ``_fetch_one`` and ``sweep_orphans`` each reach for ``self._conn``
+    and then queue on ``self._lock``; ``close`` takes that same lock. So a close
+    already queued on it runs *first*, and a handle resolved before the acquire
+    was live when it was read and closed by the time it was used. The result was
+    a bare ``sqlite3.ProgrammingError`` escaping a module whose entire contract
+    for this state is ``PipelineError(reason="vault_closed")`` -- an
+    unstructured 500 in place of a structured refusal.
+
+    Nothing is patched and no ``sleep`` is inserted: this interleaving is
+    reachable in the shipped code. Holding the lock only makes the queue order
+    deterministic instead of a function of how many scheduling steps each
+    coroutine happens to spend getting there.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    await put_value(vault, session_registry, session_id, VALUE_A)
+    later = await make_record(session_registry, session_id, VALUE_B)
+
+    await vault._lock.acquire()
+    closer = asyncio.create_task(vault.close())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    victims: list[asyncio.Task[Any]] = [
+        asyncio.create_task(vault.put(session_id, later, VALUE_B)),
+        asyncio.create_task(vault.row_count(session_id)),
+        asyncio.create_task(vault.sweep_orphans([session_id])),
+    ]
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not any(task.done() for task in victims), (
+        "a caller got past the vault lock while the test held it"
+    )
+    assert not closer.done()
+    vault._lock.release()
+
+    await closer
+    outcomes = await asyncio.gather(*victims, return_exceptions=True)
+    for outcome in outcomes:
+        assert isinstance(outcome, PipelineError), (
+            f"an unstructured {type(outcome).__name__} escaped the vault: {outcome!r}"
+        )
+        assert outcome.detail["reason"] == "vault_closed"
 
 
 async def test_destroying_an_unknown_session_stores_no_state(
@@ -912,6 +1366,211 @@ def test_originals_for_session_is_sync_and_cache_backed(vault: SessionVault) -> 
     assert vault.originals_for_session("never-existed") == frozenset()
 
 
+async def test_the_egress_view_is_rebuilt_by_a_put_that_follows_a_read(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """A ``put`` after a gate read must invalidate the memo. A stale memo is a leak.
+
+    ``originals_for_session`` memoises its frozenset, and the EgressGate scans
+    outbound payloads for exactly the values it returns. So a memo that is not
+    invalidated on write does not fail loudly -- it silently narrows the gate's
+    search set, which is the one failure direction that ends in an original
+    reaching the provider.
+
+    Every other test in this file reads the view only *after* all of its puts,
+    so the memo is always still cold when it is first built and the invalidation
+    in ``_SessionCache.add`` is never exercised *here*. It was not, however,
+    unobserved repo-wide, and saying so was wrong: deleting the line also turns
+    ``tests/test_obfuscation.py::test_tokens_declare_every_surrogate_in_the_payload``
+    red, and that test predates this one. The reason is the second half of the
+    contract, below -- the pseudonymisation strategy reads the view, puts, and
+    reads again inside a single obfuscation run, so it is the one existing caller
+    that could see a stale memo. What this test adds is a *local* pin: the vault's
+    own file should not need a strategy test to notice its cache going stale.
+
+    **Two properties, not one, and the second has a real consumer.**
+    ``ObfuscationStrategy._normalized_originals`` caches its normalised copy on
+    the *identity* of the frozenset this method returns -- ``if current is not
+    self._originals_source`` -- so the vault owes it both directions: a new
+    object whenever the contents change, and the *same* object when they have
+    not. Returning a fresh ``frozenset`` each call would keep every equality
+    assertion above green while silently making that cache never hit.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    await put_value(vault, session_registry, session_id, VALUE_A)
+
+    first = vault.originals_for_session(session_id)
+    assert first == frozenset({VALUE_A}), "the memo was not built by the first read"
+    assert vault.originals_for_session(session_id) is first, (
+        "the memo is not being reused; a caller keyed on its identity would never hit"
+    )
+
+    await put_value(vault, session_registry, session_id, VALUE_B)
+
+    second = vault.originals_for_session(session_id)
+    assert second == frozenset({VALUE_A, VALUE_B}), (
+        "the gate would have gone on scanning for a stale set of originals"
+    )
+    assert second is not first, "the write must hand out a new object, not mutate the old one"
+    # The snapshot already handed to a caller is immutable, which is what lets
+    # the gate hold one across a payload without copying it.
+    assert first == frozenset({VALUE_A})
+
+
+async def test_the_egress_view_is_rebuilt_by_a_read_through_that_follows_a_read(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """The *other* writer into the memo is ``note``, and it needs its own test.
+
+    ``_SessionCache`` has two write paths -- ``add`` from ``put`` and ``note``
+    from ``_decrypt_row``'s read-through -- and both must invalidate the memoised
+    frozenset. The test above pins only ``add``. Deleting the invalidation from
+    ``note`` instead left all 139 tests in this section green, because every
+    other test that exercises read-through either never reads the view first or
+    never reads it again afterwards.
+
+    The consequence is identical to the one the ``add`` test exists for, and it
+    is the leak direction rather than the loud one: the EgressGate scans outbound
+    payloads for exactly the originals this view reports, so a memo that misses a
+    value recovered from a row means the gate never looks for that value. It does
+    not fail; it passes a payload it should have blocked.
+
+    The interleaving is the cold-start one, which is ordinary rather than exotic:
+    the process restarted (or a second instance picked up the session), so the
+    cache is empty and is filled only by decrypting rows. Gate turn one, recover
+    another entity for turn two, gate again.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    first_record = await put_value(vault, session_registry, session_id, VALUE_A)
+    second_record = await put_value(vault, session_registry, session_id, VALUE_B)
+
+    cold = await SessionVault.open(db_path, session_registry)
+    try:
+        assert cold.originals_for_session(session_id) == frozenset(), "cold cache, nothing yet"
+
+        # Turn one: one value recovered from a row, then the gate reads the view.
+        assert await cold.get_by_token(session_id, first_record.token_id) == VALUE_A
+        built = cold.originals_for_session(session_id)
+        assert built == frozenset({VALUE_A}), "the memo was not built by the first gate read"
+
+        # Turn two: a second value arrives by read-through, not by put.
+        assert await cold.get_by_token(session_id, second_record.token_id) == VALUE_B
+
+        refreshed = cold.originals_for_session(session_id)
+        assert refreshed == frozenset({VALUE_A, VALUE_B}), (
+            "the gate would scan for a stale, narrower set and pass an original through"
+        )
+        assert refreshed is not built, "a changed set must be a new object; callers key on identity"
+    finally:
+        await cold.close()
+
+
+async def test_read_through_populates_both_lookup_indexes(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """One decrypt must fill ``by_token`` *and* ``by_surrogate``, or the hot path re-reads disk.
+
+    Dropping the surrogate half of ``_SessionCache.note`` is invisible to any
+    correctness assertion: ``get_by_surrogate`` still returns the right value,
+    it just fetches and decrypts a row every single time. ``get_by_surrogate``
+    is the de-obfuscation hot path and the p99 budget in build doc section 10.1
+    is the cached path's, not SQLite's -- so what is asserted here is that the
+    second lookup does not touch the database at all.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await put_value(vault, session_registry, session_id, VALUE_A)
+
+    cold = await SessionVault.open(db_path, session_registry)
+    try:
+        fetches = 0
+        real_fetch = cold._fetch_one
+
+        async def counting_fetch(sql: str, params: tuple[object, ...]) -> Any:
+            nonlocal fetches
+            fetches += 1
+            return await real_fetch(sql, params)
+
+        cold._fetch_one = counting_fetch  # type: ignore[method-assign]
+
+        assert await cold.get_by_token(session_id, record.token_id) == VALUE_A
+        assert fetches == 1, "the cold read was not served from SQLite"
+
+        assert await cold.get_by_surrogate(session_id, record.surrogate) == VALUE_A
+        assert fetches == 1, "the surrogate index was not filled by the read-through"
+
+        # ...and the token index too, from that same single decrypt.
+        assert await cold.get_by_token(session_id, record.token_id) == VALUE_A
+        assert fetches == 1
+    finally:
+        await cold.close()
+
+
+async def test_a_cold_cache_collision_replaces_a_row_rather_than_re_deriving(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """The collision guard reads the cache, never the database. Pinned, not claimed.
+
+    ``_resolve_token_id`` asks ``_SessionCache.taken()``, and ``put`` writes with
+    ``INSERT OR REPLACE``. A row this *instance* has neither written nor read
+    back is therefore invisible to the guard, so a genuine 4-byte HMAC collision
+    against such a row silently overwrites it instead of re-deriving: one value
+    becomes permanently unrecoverable and its surrogate stops resolving.
+
+    Two things bound it. It needs a real truncation collision -- ~n²/2³³, so
+    ~10⁻³ at the few thousand entities per session the build doc anticipates --
+    *and* a second ``SessionVault`` over the same file with a cold cache. The
+    shipped app builds exactly one vault per process and session keys do not
+    survive a restart, so the second condition does not arise in the deployed
+    configuration; it is reachable here only because the tests open a second
+    instance deliberately.
+
+    ``INSERT OR REPLACE`` is not the bug and must not be "fixed" to a plain
+    ``INSERT``: ``test_read_through_does_not_fork_a_value_into_two_tokens``
+    depends on a cold re-put of the *same* value rewriting its own row. This
+    test exists so that the guard's scope cannot quietly be restated as
+    "collisions are handled" -- narrowing it has to change a test, not a
+    docstring.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    collided = "deadbeef"
+
+    def colliding_record(value: str) -> TokenRecord:
+        return TokenRecord(
+            session_id=session_id,
+            token_id=collided,
+            entity_type="PATIENT_NAME",
+            category=EntityCategory.PHI,
+            surrogate=f"[PHI_PATIENT_NAME_{collided}_{value[:1]}]",
+            created_at=time.time(),
+        )
+
+    first = colliding_record(VALUE_A)
+    await vault.put(session_id, first, VALUE_A)
+    assert await vault.get_by_token(session_id, collided) == VALUE_A
+
+    # In-process the cache *is* authoritative, so the guard works: a second
+    # value claiming the same token is re-derived onto its own row.
+    await vault.put(session_id, colliding_record(VALUE_B), VALUE_B)
+    assert len(read_rows(db_path, session_id)) == 2
+    assert await vault.get_by_token(session_id, collided) == VALUE_A
+
+    # A cold instance cannot see either row until it reads one, so the same
+    # collision now replaces rather than re-derives.
+    cold = await SessionVault.open(db_path, session_registry)
+    try:
+        third = colliding_record("Rowan Delacroix-Sung")
+        await cold.put(session_id, third, "Rowan Delacroix-Sung")
+        assert await cold.get_by_token(session_id, collided) == "Rowan Delacroix-Sung"
+        with pytest.raises(VaultMissError):
+            await cold.get_by_surrogate(session_id, first.surrogate)
+    finally:
+        await cold.close()
+
+    assert len(read_rows(db_path, session_id)) == 2, (
+        "the colliding put should have replaced a row, not added one"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 8. expiry
 # ---------------------------------------------------------------------------
@@ -1072,10 +1731,22 @@ async def test_owner_gives_no_existence_oracle(session_registry: SessionRegistry
 
 
 async def test_registry_never_reveals_keys_in_repr(session_registry: SessionRegistry) -> None:
+    """A key must not reach a log line, a traceback or a REPL -- in *any* rendering.
+
+    ``key.hex()`` is not how Python prints ``bytes``. A ``__repr__`` that leaked
+    the session map would render ``_Session(key=b'\\x8f\\xa2...', ...)``, and the
+    hex string appears nowhere in that -- so a test that greps only for the hex
+    form is a checker carrying the same blind spot as the thing it checks, and it
+    passes while the key goes to disk in a log. The byte rendering is asserted
+    alongside it, and it is the one that actually catches the mistake.
+    """
     session_id, _ = await session_registry.create("test-user")
     key = await session_registry.key(session_id)
     rendered = f"{session_registry!r} {session_registry}"
     assert key.hex() not in rendered
+    assert repr(key) not in rendered, "the session key was rendered as bytes"
+    assert repr(key)[2:-1] not in rendered, "the escaped key body was rendered"
+    assert "_Session" not in rendered, "the session map itself was rendered"
     assert "active=1" in rendered
     assert await session_registry.destroy(session_id) is True
     assert await session_registry.destroy(session_id) is False

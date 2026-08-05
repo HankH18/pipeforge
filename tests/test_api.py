@@ -26,7 +26,9 @@ own ``session_id`` or ``run_id``.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import importlib.metadata
 import secrets
 import sys
 import tempfile
@@ -42,8 +44,12 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI, UploadFile
 from httpx import ASGITransport, AsyncClient
+from packaging.requirements import Requirement
 
 from secure_context_pipeline.api.app import (
+    DEFAULT_AUDIT_PAGE,
+    MAX_AUDIT_PAGE,
+    MAX_BODY_BYTES,
     MAX_UPLOAD_BYTES,
     UPLOAD_CHUNK_BYTES,
     ApiError,
@@ -51,6 +57,7 @@ from secure_context_pipeline.api.app import (
     _read_capped,
     create_app,
 )
+from secure_context_pipeline.api.schemas import MAX_ID_LEN
 from secure_context_pipeline.audit.logger import (
     DETECT,
     EGRESS_PASS,
@@ -58,8 +65,12 @@ from secure_context_pipeline.audit.logger import (
     SESSION_CREATE,
 )
 from secure_context_pipeline.config import Settings
-from secure_context_pipeline.errors import PipelineError, SessionExpiredError
-from secure_context_pipeline.models import TokenRecord
+from secure_context_pipeline.errors import (
+    MAX_DETAIL_VALUE_LEN,
+    PipelineError,
+    SessionExpiredError,
+)
+from secure_context_pipeline.models import AuditEvent, TokenRecord
 
 # Every test in this module runs on one event loop, shared with the module-scoped
 # client fixture. aiosqlite connections and asyncio.Lock instances built during
@@ -1238,6 +1249,54 @@ async def test_a_null_byte_in_a_static_path_is_a_404_not_a_500(client: AsyncClie
 # ---------------------------------------------------------------------------
 # 12. The image must not be able to carry a secret
 # ---------------------------------------------------------------------------
+def _copy_sources(copy_line: str) -> list[str]:
+    """The source arguments of a ``COPY``, normalised to compare against ``.``.
+
+    Written as a function with its own test (below) because the naive version --
+    ``copy_line.split()[1:-1]`` compared against the literal ``"."`` -- passed
+    ``COPY ./ ./``, which is byte-for-byte the blanket copy the check exists to
+    forbid. Three spellings have to normalise to the same thing: ``.``, ``./``,
+    and the exec form ``["." , "."]``; and ``--chown``/``--from`` flags are not
+    sources at all, so a flag must not be able to shift the destination out of
+    the last position.
+    """
+    tokens = [
+        token.strip("[],\"'")
+        for token in copy_line.split()[1:]
+        if not token.startswith("--")
+    ]
+    return [(token.rstrip("/") or "/") for token in tokens[:-1]]
+
+
+async def test_the_copy_source_parser_recognises_every_spelling_of_a_blanket_copy() -> None:
+    """The check above is only as good as this parse, so the parse is tested.
+
+    Each line below is a real way to write ``COPY . .``. The previous parser --
+    ``split()[1:-1]`` with ``"." not in sources`` -- accepted the second, third
+    and fourth of them, which is how a mutation that ships ``.env`` into a layer
+    kept the suite green.
+    """
+    blanket = [
+        "COPY . .",
+        "COPY ./ ./",
+        "COPY --chown=scp:scp . .",
+        'COPY [".", "."]',
+        "COPY .// ./",
+    ]
+    for line in blanket:
+        assert "." in _copy_sources(line), line
+
+    allowed = [
+        "COPY pyproject.toml README.md ./",
+        "COPY entities.yaml ./",
+        "COPY secure_context_pipeline/ secure_context_pipeline/",
+        "COPY --from=base /app /app",
+    ]
+    for line in allowed:
+        assert "." not in _copy_sources(line), line
+        assert _copy_sources(line), line
+
+
 async def test_dockerfile_never_copies_the_working_tree_wholesale() -> None:
     """``COPY . .`` put ``.env`` -- and therefore ``SCP_MASTER_KEY`` -- in a layer.
 
@@ -1258,9 +1317,12 @@ async def test_dockerfile_never_copies_the_working_tree_wholesale() -> None:
     ]
     assert copy_lines, "the Dockerfile must copy something"
     for copy_line in copy_lines:
-        # `COPY <src>... <dest>` -- every source but the trailing destination.
-        sources = copy_line.split()[1:-1]
-        assert "." not in sources, f"blanket COPY re-introduces the secret leak: {copy_line}"
+        sources = _copy_sources(copy_line)
+        assert sources, f"a COPY with no source: {copy_line}"
+        for source in sources:
+            assert source not in (".", "..", "*", "/"), (
+                f"blanket COPY re-introduces the secret leak: {copy_line}"
+            )
 
     # And the deny-list backstop names the two things that must never ship.
     dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").split()
@@ -1293,6 +1355,16 @@ async def test_dockerfile_runs_unprivileged_and_declares_a_healthcheck() -> None
     every request 503s", which is precisely the failure ``/health`` was built to
     report -- ``_build_services`` deliberately boots anyway so the failure is
     *reportable*, and that only pays off if something asks.
+
+    **``!= "root"`` was not the check it looked like.** Docker resolves ``USER``
+    by name *or* by id, so ``USER 0`` is root spelled differently and passed a
+    string comparison against ``"root"`` unchanged -- as did ``USER 10001:0``,
+    which keeps the uid but takes the root *group*. What is asserted instead is
+    the property the rest of the file depends on: the final ``USER`` names the
+    account ``useradd`` created (by name or by its uid), and neither its user nor
+    its group half is uid/gid 0. That is not a stylistic preference -- ``/app``
+    and the data volume are chowned to exactly that account, so any other value
+    is simultaneously a privilege bug and a broken mount.
     """
     lines = [
         stripped
@@ -1300,15 +1372,32 @@ async def test_dockerfile_runs_unprivileged_and_declares_a_healthcheck() -> None
         if (stripped := line.strip())
     ]
 
-    user_lines = [line for line in lines if line.upper().startswith("USER ")]
-    assert user_lines, "the container must not run as root"
-    assert user_lines[-1].split()[1] != "root", user_lines[-1]
-
     # The account has to exist with a fixed, non-zero uid: a bind-mounted volume
     # is chowned to it, and a uid that drifts between builds breaks the mount.
     useradd = [line for line in lines if "useradd" in line]
     assert useradd, "the runtime user must be created explicitly"
     assert "--uid 10001" in useradd[0], useradd[0]
+    # `RUN useradd --create-home --uid 10001 scp \` -- drop the continuation.
+    created_account = useradd[0].rstrip("\\").split()[-1]
+    created_uid = useradd[0].split("--uid", 1)[1].split()[0]
+    assert created_uid != "0", useradd[0]
+
+    user_lines = [line for line in lines if line.upper().startswith("USER ")]
+    assert user_lines, "the container must not run as root"
+    account, _, group = user_lines[-1].split()[1].partition(":")
+    assert account not in ("root", "0"), (
+        f"USER resolves to uid 0: {user_lines[-1]!r} -- docker accepts a numeric id, "
+        f"so comparing against the string 'root' does not exclude root"
+    )
+    assert group not in ("root", "0"), (
+        f"USER takes the root group: {user_lines[-1]!r} -- /app is chowned to "
+        f"{created_account}:{created_account}, so gid 0 is both a privilege bug and a "
+        f"broken volume"
+    )
+    assert account in (created_account, created_uid), (
+        f"USER {account!r} is not the account useradd created "
+        f"({created_account!r}/uid {created_uid!r}); the data volume is chowned to that one"
+    )
 
     healthcheck = [line for line in lines if line.upper().startswith("HEALTHCHECK")]
     assert healthcheck, "the image must declare a HEALTHCHECK"
@@ -1328,12 +1417,35 @@ async def test_multipart_dependency_is_declared_or_the_app_cannot_boot() -> None
     a 500 on first upload that someone notices in staging; it is a container that
     exits before it ever listens. Asserted both ways: the declaration is present,
     and its absence really is fatal at registration.
+
+    **"The substring is present" is not the property.** ``pip`` does not install
+    a declaration; it installs one whose *environment marker* evaluates true and
+    whose specifier a real version satisfies. Appending ``; python_version<'3'``
+    leaves the substring, the file, and this test untouched while guaranteeing the
+    wheel is never installed -- so the image builds, the container starts, and
+    ``create_app()`` raises at import. The declaration is therefore parsed and
+    evaluated the way the installer does, and checked against what is actually
+    installed here.
     """
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    dependencies = "\n".join(pyproject["project"]["dependencies"])
-    assert "python-multipart" in dependencies, (
-        "python-multipart must be a runtime dependency: pip install . in the "
-        "Dockerfile is what puts it in the image"
+    declarations = [Requirement(text) for text in pyproject["project"]["dependencies"]]
+    multipart = [
+        requirement
+        for requirement in declarations
+        if requirement.name.lower().replace("_", "-") == "python-multipart"
+    ]
+    assert len(multipart) == 1, (
+        "python-multipart must be a runtime dependency exactly once: pip install . "
+        f"in the Dockerfile is what puts it in the image -- got {multipart}"
+    )
+    requirement = multipart[0]
+    assert requirement.marker is None or requirement.marker.evaluate(), (
+        f"{requirement} carries an environment marker that is false here, so pip "
+        f"never installs it and the container boot-fails inside create_app()"
+    )
+    installed = importlib.metadata.version("python-multipart")
+    assert requirement.specifier.contains(installed, prereleases=True), (
+        f"{requirement} is not satisfied by the installed {installed}"
     )
 
     # And the failure mode is registration-time, which is what makes the
@@ -1406,3 +1518,636 @@ async def test_the_demo_ui_sends_the_credentials_every_route_requires() -> None:
     assert "'?user_id=' + encodeURIComponent(userId())" in app_js, (
         "the UI's logout must present a user_id"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. Request bodies: the cap has to precede the allocation
+# ---------------------------------------------------------------------------
+async def _streamed(total_bytes: int, counter: list[int]) -> AsyncIterator[bytes]:
+    """Yield ``total_bytes`` in 256 KiB chunks, recording how many were pulled.
+
+    The count is the whole point: a server that answers 413 after reading
+    everything and one that stops reading are indistinguishable by status code,
+    and it is the second that bounds memory.
+    """
+    chunk = b"A" * (256 * 1024)
+    sent = 0
+    while sent < total_bytes:
+        take = min(len(chunk), total_bytes - sent)
+        counter[0] += take
+        sent += take
+        yield chunk[:take]
+
+
+async def test_a_json_body_is_capped_while_it_arrives_not_after(
+    client: AsyncClient,
+) -> None:
+    """``POST /sessions`` is anonymous and had no body limit at all.
+
+    ``user_id`` is capped at 64 characters, which looks like the bound and is
+    not one: pydantic can only reject a value FastAPI has already built, and
+    FastAPI builds it from ``await request.body()`` -- the whole payload,
+    materialised first. Measured on this build before the fix: one anonymous
+    request streaming a 256 MB body returned the correct ``422
+    VALIDATION_ERROR`` after the process had grown by 768 MB. The status code
+    was right and the server was the attacker's to size.
+
+    So the assertion is on how much of the body the transport was asked for, not
+    on the status code, because the status code cannot tell the two
+    implementations apart.
+    """
+    pulled = [0]
+    oversize = MAX_BODY_BYTES + (16 * 1024 * 1024)
+    response = await client.post(
+        "/sessions",
+        content=_streamed(oversize, pulled),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413, response.text
+    body = response.json()
+    assert body["code"] == "REQUEST_TOO_LARGE", body
+    assert set(body["detail"]) == {"max_bytes", "bytes"}, body
+    assert body["detail"]["max_bytes"] == MAX_BODY_BYTES
+    # Nothing of the caller's content, only their own byte total.
+    assert isinstance(body["detail"]["bytes"], int)
+
+    assert pulled[0] < oversize, "the whole body was read before it was refused"
+    assert pulled[0] <= MAX_BODY_BYTES + (256 * 1024), pulled[0]
+
+    # The mechanism is not the whole control. Every assertion above is relative
+    # to ``MAX_BODY_BYTES``, so they all stay green if the ceiling is raised to a
+    # gigabyte -- which is a cap in name only and still an out-of-memory
+    # primitive. The value is pinned too: the ceiling exists to admit one legal
+    # upload plus its multipart framing, and nothing else.
+    assert MAX_UPLOAD_BYTES < MAX_BODY_BYTES <= 2 * MAX_UPLOAD_BYTES, MAX_BODY_BYTES
+
+    # And the refusal is still a first-class response: same error shape, same
+    # security headers as every other path.
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+async def test_a_declared_content_length_over_the_ceiling_is_refused_unread(
+    client: AsyncClient,
+) -> None:
+    """The cheap half: an honest client is turned away before it sends anything."""
+    pulled = [0]
+    oversize = MAX_BODY_BYTES + 4096
+    response = await client.post(
+        "/sessions",
+        content=_streamed(oversize, pulled),
+        headers={
+            "content-type": "application/json",
+            "content-length": str(oversize),
+        },
+    )
+    assert response.status_code == 413, response.text
+    assert response.json()["code"] == "REQUEST_TOO_LARGE"
+    assert response.json()["detail"]["bytes"] == oversize
+    assert pulled[0] == 0, "a declared over-length body must not be read at all"
+
+
+async def test_a_normal_request_is_untouched_by_the_body_limit(
+    client: AsyncClient,
+) -> None:
+    """The limit must not be reachable by anything a real client sends."""
+    session_id = await _create_session(client)
+    doc_id = await _upload(client)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+
+    # A file just under the upload ceiling still reaches the route's own check,
+    # which is the one that names the *upload* limit rather than the body limit.
+    near_ceiling = await client.post(
+        "/documents",
+        files={"file": ("big.txt", b"A" * (MAX_UPLOAD_BYTES + 1024), "text/plain")},
+        data={"user_id": OWNER},
+    )
+    assert near_ceiling.status_code == 413
+    assert near_ceiling.json()["code"] == "UPLOAD_TOO_LARGE", (
+        "the body limit must sit far enough above the upload limit that multipart "
+        "framing cannot push a legal upload over it"
+    )
+
+
+async def test_an_upload_declares_its_size_even_with_no_content_length(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Which of the two upload caps actually fires, asserted rather than assumed.
+
+    ``MAX_UPLOAD_BYTES`` was documented as "enforced by ``_read_capped`` while
+    the body is consumed, not only against a declared ``Content-Length``", and
+    ``_read_capped`` was documented as the control that holds when the client
+    withholds that header. Both were backwards. Starlette's multipart parser
+    increments ``UploadFile.size`` on every write, so the handler knows the exact
+    size before it reads a byte -- even for a chunked upload that declared no
+    length -- and the pre-check refuses first every time. ``_read_capped``'s own
+    test builds an ``UploadFile`` with ``size=None`` and so never exercises the
+    route's path.
+
+    Nothing here loosens either control; it pins which one is load-bearing, so
+    the next person to delete "the redundant one" finds out from a test rather
+    than from a 2 GB resident set.
+    """
+    from secure_context_pipeline.api import app as app_module
+
+    observed: list[int | None] = []
+    real = app_module._read_capped
+
+    async def spy(upload: UploadFile) -> bytes:
+        observed.append(upload.size)
+        return await real(upload)
+
+    monkeypatch.setattr(app_module, "_read_capped", spy)
+
+    pulled = [0]
+
+    async def body() -> AsyncIterator[bytes]:
+        yield (
+            b'--B\r\nContent-Disposition: form-data; name="user_id"\r\n\r\n'
+            + OWNER.encode()
+            + b'\r\n--B\r\nContent-Disposition: form-data; name="file"; '
+            b'filename="ok.txt"\r\nContent-Type: text/plain\r\n\r\n'
+        )
+        async for chunk in _streamed(512 * 1024, pulled):
+            yield chunk
+        yield b"\r\n--B--\r\n"
+
+    # No content-length: httpx streams this chunked.
+    response = await client.post(
+        "/documents",
+        content=body(),
+        headers={"content-type": "multipart/form-data; boundary=B"},
+    )
+    assert response.status_code == 200, response.text
+    assert observed == [512 * 1024], (
+        "UploadFile.size must be populated for a chunked multipart upload -- the "
+        "route's pre-check depends on it"
+    )
+
+
+async def test_lifespan_unwinds_in_reverse_order_and_on_cancellation(
+    api_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two claims ``_build_services`` makes that nothing was checking.
+
+    Its handler is written ``await _close_quietly(reversed(opened))`` inside
+    ``except BaseException``, and both halves of that line were free: the suite
+    stayed green with the unwinding done in *forward* order, and stayed green
+    with ``BaseException`` narrowed to ``Exception``. The second is the one that
+    matters -- ``asyncio.CancelledError`` is a ``BaseException``, a startup
+    cancelled by a shutdown signal or a failing readiness probe is the ordinary
+    case rather than the exotic one, and an unwind that skips it leaves aiosqlite
+    worker threads running. Those threads are not daemons, so the interpreter
+    cannot exit: the process hangs instead of reporting why it failed to start.
+    (Measured: with the unwinding removed entirely, this file's own pytest
+    process never exited and had to be killed.)
+
+    Reverse order is asserted because it is documented, and because LIFO is the
+    only teardown order that stays correct if a later resource ever comes to
+    depend on an earlier one.
+    """
+    from secure_context_pipeline.api import app as app_module
+
+    for failure in (OSError("data directory is read-only"), asyncio.CancelledError()):
+        closed: list[str] = []
+        real_audit_close = app_module.AuditLogger.close
+        real_store_close = app_module.EncryptedDocumentStore.close
+
+        async def audit_close(
+            self: Any, _real: Any = real_audit_close, _log: list[str] = closed
+        ) -> None:
+            _log.append("audit")
+            await _real(self)
+
+        async def store_close(
+            self: Any, _real: Any = real_store_close, _log: list[str] = closed
+        ) -> None:
+            _log.append("store")
+            await _real(self)
+
+        async def vault_open(_path: Any, _registry: Any, _exc: BaseException = failure) -> Any:
+            raise _exc
+
+        monkeypatch.setattr(app_module.AuditLogger, "close", audit_close)
+        monkeypatch.setattr(app_module.EncryptedDocumentStore, "close", store_close)
+        monkeypatch.setattr(app_module.SessionVault, "open", vault_open)
+
+        failing_app = create_app(api_settings)
+        with pytest.raises(type(failure)):
+            async with failing_app.router.lifespan_context(failing_app):
+                pass  # pragma: no cover -- the lifespan raises before the body runs
+
+        assert closed == ["store", "audit"], (
+            f"{type(failure).__name__}: everything opened must be closed, newest "
+            f"first -- got {closed}"
+        )
+        monkeypatch.undo()
+
+
+async def test_identifier_comparison_is_constant_time_over_bytes() -> None:
+    """``_same_id`` guards two ownership checks and both compare a secret-ish
+    string against an attacker-supplied one.
+
+    Rewriting it as ``claimed == actual`` keeps every other test in this file
+    green, which is the whole reason this one exists: ``==`` on ``str`` exits at
+    the first differing character, so the owner's ``user_id`` can be recovered
+    one character at a time by an attacker who can time the reply -- and the
+    reply is a ``401`` or an empty audit page that anyone may request, without
+    limit. There is no behavioural difference to assert, so the assertion is that
+    the comparison is routed through :func:`secrets.compare_digest`, and over
+    ``bytes`` rather than ``str``: the ``str`` form raises ``TypeError`` on any
+    non-ASCII input, which was itself an unauthenticated 500.
+    """
+    from secure_context_pipeline.api import app as app_module
+
+    seen: list[tuple[type, type]] = []
+    real = secrets.compare_digest
+
+    def spy(left: Any, right: Any) -> bool:
+        seen.append((type(left), type(right)))
+        return bool(real(left, right))
+
+    with mock.patch.object(app_module.secrets, "compare_digest", spy):
+        assert app_module._same_id("alice", "alice") is True
+        assert app_module._same_id("alice", "mallory") is False
+        # Non-ASCII on either side must still reach compare_digest, not raise.
+        assert app_module._same_id("josé", "josé") is True
+        assert app_module._same_id("josé", "alice") is False
+
+    assert len(seen) == 4, "every comparison must go through compare_digest"
+    assert all(pair == (bytes, bytes) for pair in seen), seen
+
+
+# ---------------------------------------------------------------------------
+# 15. Ceilings and policies pinned by value, not only by mechanism
+#
+# Every test below exists because a mutation to a documented control left the
+# rest of this file green. The pattern in all of them is the same: the control
+# was asserted *relative to the constant that expresses it*, so changing the
+# constant changed the control and the assertion together and nothing could see
+# it. Each one therefore pins an absolute, externally meaningful value -- a byte
+# count, a row count, a directive -- observed over HTTP wherever that is possible.
+# ---------------------------------------------------------------------------
+def _csp_directives(policy: str) -> dict[str, tuple[str, ...]]:
+    """A CSP string parsed into ``{directive: (source, ...)}``."""
+    parsed: dict[str, tuple[str, ...]] = {}
+    for directive in policy.split(";"):
+        parts = directive.split()
+        if parts:
+            parsed[parts[0].lower()] = tuple(parts[1:])
+    return parsed
+
+
+async def test_the_content_security_policy_is_restrictive_in_every_directive(
+    client: AsyncClient,
+) -> None:
+    """``CONTENT_SECURITY_POLICY`` appeared in no assertion in this file at all.
+
+    ``test_security_headers_are_sent_on_every_response`` checks that the header
+    is *present* and names ``frame-ancestors 'none'`` and ``default-src 'none'``;
+    it says nothing about the other six directives. So the policy could be
+    rewritten to ``script-src https:`` -- which permits a script from any host on
+    the internet, on a page whose entire premise is that nothing about a document
+    reaches a third party -- or to ``base-uri 'self'`` and ``form-action 'self'``,
+    and the suite stayed at 39 passed. Both mutations were run; both were green.
+
+    Every directive is pinned to a value, and the values are pinned by a *rule*
+    rather than a snapshot: no source may name a host, a scheme or a wildcard, so
+    only ``'none'`` and ``'self'`` are admissible spellings at all.
+
+    The last assertion is the one that keeps the two copies of the policy honest.
+    ``ui/index.html`` carries the same policy in a ``<meta http-equiv>``, because
+    a meta policy is what governs the document itself; the header exists because
+    a meta policy governs *only* that document (never ``app.js``, never a JSON
+    body) and because ``frame-ancestors`` is ignored in meta by specification.
+    Two copies of one policy is two things that can drift apart -- and widening
+    only the meta copy was also green -- so they are required to agree exactly,
+    modulo the one directive that cannot be expressed in meta.
+    """
+    response = await client.get("/")
+    assert response.status_code == 200, response.text
+    header = _csp_directives(response.headers["content-security-policy"])
+
+    # 'none' is a *deny*: default-src is the fallback for every fetch directive
+    # not named; base-uri stops a <base> tag from re-pointing every relative URL
+    # on the page; form-action stops a form POST to anywhere; frame-ancestors is
+    # the clickjacking control, and "Destroy session" is one click from an
+    # irreversible cryptographic erasure.
+    for directive in ("default-src", "base-uri", "form-action", "frame-ancestors"):
+        assert header.get(directive) == ("'none'",), (directive, header.get(directive))
+    # 'self' is same-origin only: the page's own script, style, XHR and images.
+    for directive in ("script-src", "style-src", "connect-src", "img-src"):
+        assert header.get(directive) == ("'self'",), (directive, header.get(directive))
+
+    assert set(header) == {
+        "default-src",
+        "base-uri",
+        "form-action",
+        "frame-ancestors",
+        "script-src",
+        "style-src",
+        "connect-src",
+        "img-src",
+    }, sorted(header)
+
+    for directive, sources in header.items():
+        for source in sources:
+            assert source in ("'none'", "'self'"), (
+                f"{directive} {source!r} names a host, scheme or wildcard; the "
+                f"container needs no network and the page must reach nothing"
+            )
+
+    meta_attribute = response.text.split('http-equiv="Content-Security-Policy"', 1)[1]
+    meta = _csp_directives(meta_attribute.split('content="', 1)[1].split('"', 1)[0])
+    assert meta == {
+        directive: sources
+        for directive, sources in header.items()
+        if directive != "frame-ancestors"
+    }, (meta, header)
+
+
+async def test_the_audit_page_ceiling_is_an_absolute_number_of_rows(
+    client: AsyncClient,
+) -> None:
+    """``MAX_AUDIT_PAGE`` also appeared in no assertion in this file.
+
+    ``limit`` is declared ``Query(ge=1, le=MAX_AUDIT_PAGE)``, and both halves of
+    that were free: deleting ``le=MAX_AUDIT_PAGE`` was green, and so was raising
+    the constant to 1_000_000_000 -- measured, ``limit=1000000000`` went from
+    ``422`` to ``200``. The log is append-only and unbounded, and this route is
+    anonymous, so an unbounded page size is a request that decides how many rows
+    the process materialises and serialises.
+
+    The probes are absolute numbers, deliberately not written in terms of
+    ``MAX_AUDIT_PAGE``: an assertion phrased relative to the constant is exactly
+    what the constant's mutation satisfies.
+    """
+    session_id = await _create_session(client)
+    scope = {"session_id": session_id, "user_id": OWNER}
+
+    at_the_ceiling = await client.get("/audit", params={**scope, "limit": MAX_AUDIT_PAGE})
+    assert at_the_ceiling.status_code == 200, at_the_ceiling.text
+
+    for limit in (MAX_AUDIT_PAGE + 1, 10_001, 100_000, 1_000_000_000):
+        refused = await client.get("/audit", params={**scope, "limit": limit})
+        assert refused.status_code == 422, (limit, refused.status_code, refused.text)
+        assert refused.json()["code"] == "VALIDATION_ERROR", (limit, refused.text)
+
+    assert 1 <= DEFAULT_AUDIT_PAGE <= MAX_AUDIT_PAGE <= 10_000, (
+        DEFAULT_AUDIT_PAGE,
+        MAX_AUDIT_PAGE,
+    )
+
+
+async def test_an_audit_scope_with_no_recorded_owner_reads_as_empty(
+    client: AsyncClient, services: Services
+) -> None:
+    """``_audit_scope_owner`` returns ``None`` for a scope whose owner it cannot
+    prove, and its docstring says callers "must treat that identically to a wrong
+    owner: fail closed". Nothing checked the ``None`` half.
+
+    The existing ownership tests all exercise the *wrong-owner* branch -- a real
+    session created through ``POST /sessions``, queried by a stranger. Inverting
+    ``if owner is None or not _same_id(...)`` to ``if owner is not None and
+    not _same_id(...)`` leaves every one of them green, because for those scopes
+    ``owner`` is never ``None``. What that inversion actually does is make every
+    scope with *no* ``SESSION_CREATE`` row world-readable: rows written by
+    machinery that did not come through the API, by a previous process, or by any
+    path that emits before the session row lands. Measured with the inversion
+    applied: this test's ``DETECT`` row came back to ``user_id=anyone-at-all``,
+    ``doc_id`` and all, and ``/audit/verify`` went from ``length: 0`` to
+    ``length: 1`` -- the existence oracle the uniform empty answer exists to deny.
+
+    The row is proved to *be* in the log first. Without that, an empty answer is
+    equally consistent with "the emit silently did nothing", and the test would
+    pass for the wrong reason.
+    """
+    orphan_session = uuid.uuid4().hex
+    orphan_run = uuid.uuid4().hex
+    secret_doc = f"doc-{uuid.uuid4().hex}"
+    await services.audit.emit(
+        AuditEvent(
+            ts=time.time(),
+            session_id=orphan_session,
+            run_id=orphan_run,
+            event_type=DETECT,
+            detail={"count": 3, "doc_id": secret_doc},
+        )
+    )
+    written = await services.audit.query(session_id=orphan_session, limit=10)
+    assert written, "the row must really be in the log, or an empty page proves nothing"
+    assert written[0].detail["doc_id"] == secret_doc
+
+    for params in (
+        {"session_id": orphan_session, "user_id": OWNER},
+        {"session_id": orphan_session, "user_id": INTRUDER},
+        {"run_id": orphan_run, "user_id": OWNER},
+        {"run_id": orphan_run, "user_id": INTRUDER},
+    ):
+        response = await client.get("/audit", params=params)
+        assert response.status_code == 200, (params, response.text)
+        assert response.json()["events"] == [], (params, response.text)
+        assert secret_doc not in response.text, params
+        assert orphan_session not in response.text, params
+        assert orphan_run not in response.text, params
+
+    verify = await client.get(
+        "/audit/verify", params={"session_id": orphan_session, "user_id": OWNER}
+    )
+    assert verify.status_code == 200, verify.text
+    assert verify.json()["length"] == 0, (
+        "an unprovable scope must be indistinguishable from one that never existed"
+    )
+    assert verify.json()["valid"] is True, verify.text
+
+
+async def test_an_oversize_upload_is_refused_before_a_byte_of_it_is_read(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Which control answers, and what it costs, both observable on the wire.
+
+    Removing the ``file.size`` pre-check from ``upload_document`` was reported as
+    the one fix with no behavioural difference to test, on the grounds that
+    ``_read_capped`` produces the same ``413 UPLOAD_TOO_LARGE`` with the same
+    detail keys. It does not: ``_read_capped`` stops one chunk past the ceiling,
+    so ``detail.bytes`` becomes the read total -- ``16842752``, which is
+    ``MAX_UPLOAD_BYTES`` rounded up to a whole ``UPLOAD_CHUNK_BYTES`` -- instead
+    of the file's real size, a different number on the wire for the same request.
+    And the handler buffers 16 MB to get there rather than refusing at zero cost.
+
+    So this asserts both halves: the reported size is the upload's own, and
+    ``_read_capped`` is never entered. ``_read_capped`` keeps its own test (the
+    ``size is None`` case) and neither control is loosened here -- what is pinned
+    is which of the two fires, and what that costs.
+    """
+    assert MAX_UPLOAD_BYTES <= 16 * 1024 * 1024, (
+        "16 MB is the documented upload ceiling; raising the constant raises "
+        "MAX_BODY_BYTES with it, and this test would then allocate whatever it names"
+    )
+    from secure_context_pipeline.api import app as app_module
+
+    entered: list[int | None] = []
+    real = app_module._read_capped
+
+    async def spy(upload: UploadFile) -> bytes:
+        entered.append(upload.size)
+        return await real(upload)
+
+    monkeypatch.setattr(app_module, "_read_capped", spy)
+
+    oversize = MAX_UPLOAD_BYTES + 500_000
+    assert oversize % UPLOAD_CHUNK_BYTES != 0, (
+        "the size must not land on a chunk boundary, or the two controls would "
+        "report the same number and this test could not tell them apart"
+    )
+    assert oversize + 4096 < MAX_BODY_BYTES, "the body limit must not be what answers here"
+
+    response = await client.post(
+        "/documents",
+        files={"file": ("big.txt", b"A" * oversize, "text/plain")},
+        data={"user_id": OWNER},
+    )
+    assert response.status_code == 413, response.text
+    body = response.json()
+    assert body["code"] == "UPLOAD_TOO_LARGE", body
+    assert body["detail"]["max_bytes"] == MAX_UPLOAD_BYTES, body
+    assert body["detail"]["bytes"] == oversize, (
+        f"the 413 must report the upload's own size; {body['detail']['bytes']} is a "
+        f"partial read total, which means the pre-check no longer fires"
+    )
+    assert entered == [], "an upload past the ceiling must not be read at all"
+
+    # The backstop is still wired in and still names the same ceiling: a legal
+    # upload goes all the way through the helper.
+    ok = await client.post(
+        "/documents",
+        files={"file": ("small.txt", DOC_TEXT.encode("utf-8"), "text/plain")},
+        data={"user_id": OWNER},
+    )
+    assert ok.status_code == 200, ok.text
+    assert entered == [len(DOC_TEXT.encode("utf-8"))], entered
+
+
+async def test_the_request_body_ceiling_is_an_absolute_number_of_bytes(
+    client: AsyncClient,
+) -> None:
+    """The 413 is proved against a byte count that names neither constant.
+
+    ``MAX_BODY_BYTES`` is *defined* as ``MAX_UPLOAD_BYTES + 1 MB``, and the body
+    limit's own test asserts only ``MAX_UPLOAD_BYTES < MAX_BODY_BYTES <= 2 *
+    MAX_UPLOAD_BYTES`` -- which a gigabyte satisfies. So changing one literal,
+    ``MAX_UPLOAD_BYTES = 16 * 1024 * 1024`` to ``1024 * 1024 * 1024``, raised the
+    request-body ceiling to 1 GB with the whole file still green, and measured
+    with that mutation applied the anonymous 256 MB ``POST /sessions`` again
+    returned ``422 VALIDATION_ERROR`` after the process grew by 537 MB. That is
+    the out-of-memory primitive the limit was added to remove, restored by a
+    one-token edit that every relative assertion in the file agrees with.
+
+    A cap is a number of bytes, so the test sends a number of bytes.
+    """
+    assert MAX_UPLOAD_BYTES <= 16 * 1024 * 1024, MAX_UPLOAD_BYTES
+    assert MAX_BODY_BYTES <= 24 * 1024 * 1024, MAX_BODY_BYTES
+
+    sent = 24 * 1024 * 1024
+    assert MAX_BODY_BYTES < sent
+    pulled = [0]
+    response = await client.post(
+        "/sessions",
+        content=_streamed(sent, pulled),
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413, (
+        f"a {sent}-byte anonymous body must be refused outright, not parsed and "
+        f"then rejected: got {response.status_code} {response.text[:200]}"
+    )
+    assert response.json()["code"] == "REQUEST_TOO_LARGE", response.text
+    assert pulled[0] < sent, "the whole body was read before it was refused"
+
+
+async def test_caller_supplied_identifiers_are_bounded_at_the_boundary(
+    client: AsyncClient,
+) -> None:
+    """``user_id`` at 64 characters is claimed in the module docstring; nothing
+    checked it on a query parameter or a header.
+
+    Deleting ``max_length=MAX_ID_LEN`` from ``UserIdQuery``, from ``DocIdPath``,
+    from ``OptionalIdQuery`` and from the ``X-Session-Id`` header declaration were
+    all green. None is cosmetic: these strings are compared in constant time
+    against a recorded owner, echoed into structured error detail, and written
+    into the audit log, and neither a query string, a path segment nor a header
+    is covered by ``_BodyLimit`` -- they are bounded by the ASGI server's header
+    ceiling, which is far larger.
+
+    The three declarations are asserted separately because they are separate
+    declarations: dropping the cap on ``DocIdPath`` alone left every other probe
+    here answering 422 while ``GET /documents/<5000 characters>/text`` went from
+    ``422 VALIDATION_ERROR`` to ``404`` and ``DELETE /sessions/<5000 characters>``
+    to ``204`` -- measured. Nothing crashes at that length *today*, but only
+    because ``StoreAuthError`` truncates its own detail; the module docstring's
+    reason for the ceiling is that an over-long identifier must never reach
+    ``PipelineError``'s constructor, and "another component happens to truncate
+    it" is precisely the kind of guarantee this codebase does not accept.
+
+    The last two assertions pin ``_clamp``, which is the reason an over-long
+    identifier could never reach ``PipelineError``'s own 64-character check and
+    raise a ``ValueError`` from inside the error constructor -- i.e. turn a
+    handled 401 into an unhandled 500. Making ``_clamp`` the identity function is
+    invisible over HTTP *today*, and only because ``MAX_ID_LEN`` happens to equal
+    ``MAX_DETAIL_VALUE_LEN``; that coincidence is asserted rather than assumed,
+    because it is what makes the whole route safe.
+    """
+    from secure_context_pipeline.api import app as app_module
+
+    over = "z" * (MAX_ID_LEN + 1)
+    probes = [
+        # UserIdQuery
+        await client.get("/audit", params={"session_id": "s", "user_id": over}),
+        await client.get(f"/documents/{uuid.uuid4().hex}/text", params={"user_id": over}),
+        await client.delete(f"/sessions/{uuid.uuid4().hex}", params={"user_id": over}),
+        # OptionalIdQuery
+        await client.get("/audit", params={"session_id": over, "user_id": OWNER}),
+        await client.get("/audit", params={"run_id": over, "user_id": OWNER}),
+        await client.get("/audit/verify", params={"session_id": over, "user_id": OWNER}),
+        # DocIdPath -- the path segment, not the query string
+        await client.get(f"/documents/{over}/text", params={"user_id": OWNER}),
+        await client.delete(f"/sessions/{over}", params={"user_id": OWNER}),
+        # the X-Session-Id header
+        await client.post(
+            "/pipeline/run",
+            json={"user_id": OWNER, "doc_id": uuid.uuid4().hex, "prompt": PROMPT},
+            headers={"X-Session-Id": over},
+        ),
+    ]
+    for response in probes:
+        assert response.status_code == 422, (
+            response.request.url,
+            response.request.headers.get("x-session-id", ""),
+            response.status_code,
+            response.text,
+        )
+        assert response.json()["code"] == "VALIDATION_ERROR", response.text
+        # And the rejection does not echo the offending value back.
+        assert over not in response.text
+
+    # The *floor* is load-bearing too, and for a reason that is easy to lose.
+    # ``_audit_scope_owner`` answers ``None`` for a scope whose owner it cannot
+    # prove, and both callers reject that before comparing. Returning ``""``
+    # there instead of ``None`` -- an ordinary-looking fail-open edit -- is
+    # byte-identical over HTTP on every route, but *only* because an empty
+    # ``user_id`` is unsendable: ``min_length=1`` rejects it on ``GET /audit``
+    # and the ``user_id_required_with_session_id`` guard rejects it on
+    # ``/audit/verify``. Those two are what make the empty string unreachable, so
+    # they are asserted rather than relied on.
+    blank = await client.get("/audit", params={"session_id": "s", "user_id": ""})
+    assert blank.status_code == 422, blank.text
+    blank_verify = await client.get("/audit/verify", params={"session_id": "s", "user_id": ""})
+    assert blank_verify.status_code == 400, blank_verify.text
+    assert blank_verify.json()["code"] == "AUDIT_SCOPE_REQUIRED", blank_verify.text
+
+    assert MAX_ID_LEN <= MAX_DETAIL_VALUE_LEN, (
+        "an identifier the schema admits must fit in a structured error detail, or "
+        "PipelineError raises ValueError from inside an exception handler"
+    )
+    assert app_module._clamp("y" * 500) == "y" * MAX_DETAIL_VALUE_LEN
+    assert len(app_module._clamp("y" * 500)) == MAX_DETAIL_VALUE_LEN

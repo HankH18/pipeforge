@@ -14,6 +14,8 @@ and independent of spaCy model availability.
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -47,6 +49,7 @@ from secure_context_pipeline.obfuscation.strategies.base import (
 from secure_context_pipeline.obfuscation.strategies.pseudonymization import (
     MAX_FAKE_ATTEMPTS,
     PseudonymizationStrategy,
+    _structural_fake,
 )
 from secure_context_pipeline.pipeline import egress_gate
 from secure_context_pipeline.surrogates import (
@@ -310,6 +313,63 @@ async def test_pseudonym_format_preservation_needs_no_per_entity_table(env: Env)
     assert re.findall(r"\d+", fake) != re.findall(r"\d+", "Case No. 1:23-cv-45678")
     assert "1:23-cv-45678" not in result.obfuscated_text
     assert result.obfuscated_text == f"Filed under {fake} last term."
+
+
+class _LowestChoice(random.Random):
+    """A ``Random`` whose ``choice`` is not random: always the pool's first member.
+
+    ``_structural_fake`` takes its randomness as an argument, so handing it this
+    removes the ambiguity that a real draw leaves behind. Every position the mask
+    *replaces* becomes ``'0'`` (digits), ``'A'`` (upper) or ``'a'`` (lower), and
+    every position it *copies* keeps the source character -- so the output is a
+    total statement about which is which, with no coincidences to argue about.
+    """
+
+    def choice(self, seq):  # type: ignore[no-untyped-def, override]
+        return seq[0]
+
+
+def test_the_structural_mask_replaces_every_identifying_character() -> None:
+    """Which characters the mask rewrites, pinned exactly rather than by shape.
+
+    The two format tests above assert a *shape* plus "the fake is not the source",
+    and a mask that rewrote only the **first** digit run satisfies both:
+    ``123-45-6789`` becomes ``987-45-6789``, which still matches
+    ``\\d{3}-\\d{2}-\\d{4}``, is still unequal to the source, and still carries
+    eight of the eleven real characters into the payload. The egress gate cannot
+    object either, because the whole original never appears -- the same shape as
+    every leak this file has had to grow a test for. Measured: both that mutation
+    and "leave the last character alone" pass the entire suite without this test.
+
+    A per-character check under a real draw would be flaky (a redrawn digit
+    coincides one time in ten), which is why the randomness is stubbed out
+    instead of sampled.
+    """
+    fixed = _LowestChoice()
+
+    # Every digit is identifying, wherever it sits.
+    assert _structural_fake("123-45-6789", fixed).text == "000-00-0000"
+    assert _structural_fake("12-3456789", fixed).text == "00-0000000"
+    assert _structural_fake("(415) 555-0123", fixed).text == "(000) 000-0000"
+
+    # A detached label word is scaffolding and is copied verbatim; the digits are
+    # not. Both halves matter -- rejecting the label would burn the retry budget
+    # on every labelled entity, keeping the digits would leak the identifier.
+    assert _structural_fake("MRN: 4471902", fixed).text == "MRN: 0000000"
+    assert _structural_fake("Case No. 1:23-cv-45678", fixed).text == "Case No. 0:00-cv-00000"
+
+    # Letters GLUED to a digit are part of the identifier, and case is preserved
+    # per character so the shape survives.
+    assert _structural_fake("BCBS123456789", fixed).text == "AAAA000000000"
+    assert _structural_fake("ab12Cd", fixed).text == "aa00Aa"
+
+    # ...and a run with no digit anywhere near it is left completely alone.
+    assert _structural_fake("Attorney Work Product", fixed).text == "Attorney Work Product"
+
+    # The invented set names exactly the runs that were rewritten -- this is what
+    # the collision guard reads, so it is pinned here rather than inferred.
+    assert _structural_fake("MRN: 4471902", fixed).invented == {"0000000"}
+    assert _structural_fake("Attorney Work Product", fixed).invented == frozenset()
 
 
 async def test_pseudonym_email_is_never_a_deliverable_address(env: Env) -> None:
@@ -588,6 +648,55 @@ async def test_name_passthrough_keeps_titles_and_replaces_only_the_name(env: Env
     assert "Maria Garcia" not in result.obfuscated_text
 
 
+async def test_a_fake_carries_the_source_shape_it_is_standing_in_for(env: Env) -> None:
+    """Casing, initials and street-vs-city: shape rules with no other test.
+
+    Each of these is a one-line branch that the whole file survives losing --
+    measured, by deleting each in turn: ``_match_case`` (an ALL-CAPS header
+    becomes a mixed-case name), the trailing-dot arm (``"J. Smith"`` comes back
+    as ``"S Barnes"``), and the digit tell in the place generator (a street line
+    collapses to a bare city). None of them is a leak, which is exactly why they
+    went unwatched -- but a surrogate that does not sit in the source's shape is
+    a surrogate the model can spot, and spotting it is what invites the model to
+    reason about the mask instead of the content.
+
+    Swept across keys rather than pinned, because none of these is a coincidence
+    of one draw: they are properties of the mapping.
+    """
+    for index in range(12):
+        strategy = build_strategy(
+            "pseudonymization",
+            StrategyContext(
+                registry=env.registry,
+                session_key=(index + 1).to_bytes(32, "big"),
+                settings=env.settings,
+            ),
+        )
+        assert isinstance(strategy, PseudonymizationStrategy)
+        mixed = strategy._generate("NAME", "John Smith", 0).text
+        upper = strategy._generate("NAME", "JOHN SMITH", 0).text
+        lower = strategy._generate("NAME", "john smith", 0).text
+        initial = strategy._generate("NAME", "J. Smith", 0).text
+
+        # Case is carried, and it is carried onto the SAME fake -- so a header in
+        # caps and prose in title case stay one person, not two.
+        assert upper == mixed.upper(), (upper, mixed)
+        assert lower == mixed.lower(), (lower, mixed)
+
+        # An initial stays an initial: one letter and its dot, not a whole given
+        # name and not a bare letter. Its surname still links to the full form.
+        given, surname = initial.split()
+        assert re.fullmatch(r"[A-Z]\.", given), initial
+        assert surname == mixed.split()[-1], (initial, mixed)
+
+        # ADDRESS rides Presidio's LOCATION recognizer, so the span is a street
+        # line or a city and a digit is the only reliable tell.
+        street = strategy._generate("ADDRESS", "742 Evergreen Terrace", 0).text
+        city = strategy._generate("ADDRESS", "Larkspur Valley", 0).text
+        assert any(char.isdigit() for char in street), street
+        assert not any(char.isdigit() for char in city), city
+
+
 async def test_name_and_client_identity_pseudonymize_to_the_same_person(env: Env) -> None:
     """One human, two registry types (legal docs remap PERSON), one pseudonym."""
     strategy = build_strategy("pseudonymization", env.context())
@@ -698,6 +807,248 @@ async def test_a_fake_name_never_keeps_the_real_surname_it_replaces(env: Env) ->
     assert surrogate.split()[-1].casefold() != "williams", surrogate
     assert "Williams" not in surrogate
     assert "Anna" not in surrogate
+
+
+async def test_the_guard_forbids_its_own_value_with_no_help_from_the_caller(
+    env: Env,
+) -> None:
+    """The one original the vault cannot know about is the one being replaced.
+
+    A value reaches the vault only *after* its surrogate exists, so while
+    ``_fake_identifier`` runs, "John Smith" is in neither
+    ``originals_for_session`` nor -- unless a caller happened to seed it --
+    ``reserved_originals``. Every other person test in this file seeds it, and
+    the engine seeds it too, which is precisely why none of them can see this:
+    dropping the guard's own-words term leaves the whole file green while
+    ``"John Smith"`` pseudonymizes to ``"John Briggs"`` (measured on this key),
+    shipping the real given name inside our own surrogate. The egress gate cannot
+    object, because the *whole* original never appears in the payload.
+
+    So the premise is asserted first -- nothing seeded, vault empty, and the
+    unguarded generator really does reproduce the given name -- and only then the
+    outcome. Without those, a pass here would be indistinguishable from a lucky
+    draw.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=COMPONENT_RETRY_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+
+    assert strategy.reserved_originals == frozenset(), "the caller must give no help"
+    assert env.vault.originals_for_session(session_id) == frozenset()
+    unguarded = strategy._generate("NAME", "John Smith", 0).text
+    assert "john" in {word.casefold() for word in unguarded.split()}, (
+        f"{unguarded!r} no longer reproduces the given name on this key, so a pass "
+        f"below would prove nothing"
+    )
+
+    surrogate = await strategy.make_surrogate(
+        Detection(
+            entity_type="NAME", category=EntityCategory.PII, start=0, end=10,
+            text="John Smith", score=0.9,
+        ),
+        "aaaaaaaa",
+        env.vault,
+        session_id=session_id,
+    )
+
+    assert not STRICT_TOKEN_RE.fullmatch(surrogate), (
+        "the guard must regenerate, not give up on faking"
+    )
+    assert len(surrogate.split()) == 2, surrogate
+    assert not set(normalize(surrogate).split()) & {"john", "smith"}, surrogate
+
+
+#: A session key on which the fake city for ``"Lake Larkspur"`` is
+#: ``"Lake Patricia"`` -- an invented word that is a word of the value being
+#: replaced. Also the key on which two surnames collide, below.
+OWN_WORD_PLACE_KEY = (1).to_bytes(32, "big")
+
+
+async def test_the_guard_forbids_its_own_value_on_the_non_person_paths_too(
+    env: Env,
+) -> None:
+    """Same property as above, but reaching it through the other of two terms.
+
+    ``own_words`` is spent twice, and the two spends protect different generators.
+    Persons get it through ``forbidden``, which the per-component search consumes
+    -- that is what the test above exercises. ``ADDRESS``, ``EMAIL`` and the
+    structural mask ignore ``forbidden`` entirely (Faker builds the whole string
+    in one call, so there is no component to advance), which leaves
+    ``_invents_a_real_word``'s ``also`` argument as the only thing standing
+    between a real word of the source and the payload.
+
+    Because the two terms are independent, so are their failures: dropping only
+    the ``_invents_a_real_word`` one keeps every person test green -- measured --
+    while ``"Lake Larkspur"`` pseudonymizes to ``"Lake Patricia"``.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=OWN_WORD_PLACE_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+    source = "Lake Larkspur"
+
+    assert strategy.reserved_originals == frozenset(), "the caller must give no help"
+    assert env.vault.originals_for_session(session_id) == frozenset()
+    unguarded = strategy._generate("ADDRESS", source, 0)
+    shared = {word for word in unguarded.invented if len(word) >= 3} & set(
+        normalize(source).split()
+    )
+    assert shared, (
+        f"{unguarded.text!r} no longer shares a word with {source!r} on this key, "
+        f"so a pass below would prove nothing"
+    )
+    # The premise is a WORD collision, not a whole-string one -- otherwise this
+    # would be re-testing the layer two tests down.
+    assert normalize(unguarded.text) != normalize(source)
+
+    surrogate = await strategy.make_surrogate(
+        Detection(
+            entity_type="ADDRESS", category=EntityCategory.PII, start=0,
+            end=len(source), text=source, score=0.9,
+        ),
+        "aaaaaaaa",
+        env.vault,
+        session_id=session_id,
+    )
+
+    assert not STRICT_TOKEN_RE.fullmatch(surrogate), "regenerate, do not give up"
+    assert not set(normalize(surrogate).split()) & set(normalize(source).split()), (
+        f"{surrogate!r} kept a word of the value it replaces"
+    )
+
+
+#: A session key on which Faker's ``NAME:last:wilson`` and ``NAME:last:thompson``
+#: draws both land on "Cummings" -- two distinct originals, one fake surname.
+SURROGATE_CLASH_KEY = (1).to_bytes(32, "big")
+
+
+async def test_two_originals_are_never_issued_the_same_surrogate(env: Env) -> None:
+    """A shared surrogate is a silent mis-restore, not a cosmetic clash.
+
+    ``get_by_surrogate`` maps a string to exactly one record, so two values
+    issued the same fake would restore both mentions to whichever the vault
+    holds -- one person's data returned under the other's name, with no error
+    anywhere. Nothing else in this file makes the generator collide, so deleting
+    the ``_surrogate_taken`` check leaves every other test green; the collision is
+    constructed here from a pinned key instead.
+
+    A person fake is deliberately *not* regenerable -- ``_fake_person`` ignores
+    the whole-candidate counter, which is what keeps name-component linking
+    stable across mentions -- so the second value spends its budget and degrades
+    to a plain token. That is the documented trade: a fluency loss, never a
+    duplicate.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=SURROGATE_CLASH_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+
+    # Premise: unguarded, these two really do generate the same string.
+    clash = strategy._generate("NAME", "Wilson", 0).text
+    assert strategy._generate("NAME", "Thompson", 0).text == clash, (
+        "this key no longer collides, so the guard is never asked anything"
+    )
+
+    def person(text: str) -> Detection:
+        return Detection(
+            entity_type="NAME", category=EntityCategory.PII, start=0, end=len(text),
+            text=text, score=0.9,
+        )
+
+    first = await strategy.make_surrogate(
+        person("Wilson"), "d0d0d0d0", env.vault, session_id=session_id
+    )
+    assert first == clash
+    await env.vault.put(
+        session_id,
+        TokenRecord(
+            session_id=session_id,
+            token_id="d0d0d0d0",
+            entity_type="NAME",
+            category=EntityCategory.PII,
+            surrogate=first,
+            created_at=time.time(),
+        ),
+        "Wilson",
+    )
+
+    second = await strategy.make_surrogate(
+        person("Thompson"), "d1d1d1d1", env.vault, session_id=session_id
+    )
+
+    assert second != first, "two entities were issued one surrogate"
+    # Identity, not inequality: "not equal" is also satisfied by a second fake
+    # surname, and this path cannot produce one -- the fallback is the token.
+    assert second == "[PII_NAME_d1d1d1d1]"
+    # ...and the first mapping is still the one the vault will resolve.
+    assert await env.vault.get_by_surrogate(session_id, first) == "Wilson"
+
+
+#: A session key on which the two-digit mask over ``"MRN: 71"`` redraws ``71`` --
+#: the generated fake is byte-identical to the value it is replacing.
+SELF_EQUAL_MASK_KEY = (11).to_bytes(32, "big")
+
+
+async def test_a_fake_equal_to_the_value_it_replaces_is_regenerated(env: Env) -> None:
+    """The whole-string self-check is its own layer, and nothing else covers it.
+
+    A short labelled identifier invents only a two-character word, which is below
+    ``_MIN_COLLIDING_WORD``, so the word guard looks straight past it; and the
+    value being replaced is not in the vault yet, so the originals-set check
+    cannot see it either unless a caller seeded ``reserved_originals``. Strip the
+    ``candidate == original`` test and the whole file stays green while
+    ``"MRN: 71"`` is emitted as its own surrogate -- the original, verbatim, in
+    the payload, with a vault row claiming it is a fake.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=SELF_EQUAL_MASK_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+    source = "MRN: 71"
+
+    # Premise, in three parts: the caller gives no help, the vault is empty, and
+    # the generator's first draw really is the source string.
+    assert strategy.reserved_originals == frozenset()
+    assert env.vault.originals_for_session(session_id) == frozenset()
+    unguarded = strategy._generate("MRN", source, 0)
+    assert unguarded.text == source, (
+        f"this key no longer redraws its own value ({unguarded.text!r}); nothing is proved"
+    )
+    assert all(len(word) < 3 for word in unguarded.invented), (
+        "the invented word is long enough for the word guard to catch, so this "
+        "would be testing that layer instead"
+    )
+
+    surrogate = await strategy.make_surrogate(
+        Detection(
+            entity_type="MRN", category=EntityCategory.PHI, start=0, end=len(source),
+            text=source, score=0.9,
+        ),
+        "aaaaaaaa",
+        env.vault,
+        session_id=session_id,
+    )
+
+    assert surrogate != source
+    assert not STRICT_TOKEN_RE.fullmatch(surrogate), "regenerate, do not give up"
+    assert re.fullmatch(r"MRN: \d{2}", surrogate), surrogate
 
 
 @pytest.mark.parametrize("entity_type", ["NAME", "CLIENT_IDENTITY"])
@@ -997,6 +1348,138 @@ async def test_a_shifted_date_landing_on_another_real_date_degrades_to_a_token(
     )
     assert STRICT_TOKEN_RE.fullmatch(degraded), degraded
     assert degraded == "[PHI_DATE_aaaaaaaa]"
+
+
+#: A session key whose date shift is exactly ``+30`` days -- the smallest the
+#: derivation can produce. A ``Month YYYY`` span parses to the first of the month,
+#: so +30 out of a 31-day month lands *inside the same month* and re-renders the
+#: source string byte for byte.
+SELF_SHIFT_KEY = (117).to_bytes(32, "big")
+
+
+async def test_a_shifted_date_that_re_renders_as_its_own_source_degrades(env: Env) -> None:
+    """Tier 2's other collision: the date shifts onto **itself**.
+
+    The test above covers a shifted date landing on a *different* real date, and
+    the originals set catches that one. This one it cannot: the value being
+    shifted is written to the vault only after its surrogate exists, so it is in
+    the originals set only while a caller happens to seed ``reserved_originals``.
+    That made the check correct by accident -- the engine does seed it, so the
+    engine was safe, but the guarantee belonged to the caller rather than to this
+    method. Driven directly, ``"January 2024"`` came back as ``"January 2024"``:
+    the original, verbatim, recorded in the vault as its own surrogate.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=SELF_SHIFT_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+
+    # Premise, computed here rather than read out of the module: this key's shift
+    # really does leave a 31-day month's first day inside that same month.
+    assert strategy.shift_days == 30, "the pinned key no longer yields the +30 shift"
+    landed = datetime(2024, 1, 1).date() + timedelta(days=strategy.shift_days)
+    assert (landed.year, landed.month) == (2024, 1)
+    assert strategy.reserved_originals == frozenset(), "the caller must give no help"
+    assert env.vault.originals_for_session(session_id) == frozenset()
+
+    def date_span(text: str) -> Detection:
+        return Detection(
+            entity_type="DATE", category=EntityCategory.PHI, start=0, end=len(text),
+            text=text, score=0.9,
+        )
+
+    surrogate = await strategy.make_surrogate(
+        date_span("January 2024"), "aaaaaaaa", env.vault, session_id=session_id
+    )
+    assert surrogate != "January 2024"
+    assert surrogate == "[PHI_DATE_aaaaaaaa]"
+
+    # ...and the fallback stays the exception. A month the shift really does move
+    # is still shifted, so this did not simply disable Tier 2.
+    assert await strategy.make_surrogate(
+        date_span("April 2024"), "bbbbbbbb", env.vault, session_id=session_id
+    ) == "May 2024"
+
+
+async def test_a_shifted_date_that_renders_another_original_degrades(env: Env) -> None:
+    """Tier 2's third collision, and the only one a whole-string test cannot see.
+
+    The two tests above ask whether the shifted date **equals** a real value. That
+    is the wrong question. A shifted date is a *rendered string*, and it can carry
+    a real original by **containing** it: ``April 2024`` is vaulted from one
+    document, and a later document's ``17 March 2024`` shifts to ``29 April 2024``.
+    ``'29 april 2024' != 'april 2024'``, so equality passes it straight through --
+    and the residual sweep cannot catch it either, because the sweep runs on the
+    ORIGINAL text before splicing and so never inspects a surrogate it spliced in.
+    The result is a vaulted original on the wire as a word-bounded unit, which the
+    egress gate blocks with ``reason='vault_original'``: the pipeline rejecting its
+    own output, the exact unprocessable-document failure the sweep exists to
+    prevent.
+
+    Everything below runs through the real engine over two documents in one
+    session, because that is the shape the defect has, and the leak assertion is a
+    plain ``in`` on the payload -- not the boundary predicate the guard itself
+    uses, which would share the guard's blind spot by construction.
+
+    The month is computed from *this* session's shift rather than pinned, so the
+    test exercises whatever shift the key produces instead of one lucky constant.
+    """
+    strategy = build_strategy("pseudonymization", env.context())
+    assert isinstance(strategy, PseudonymizationStrategy)
+
+    source_text = "17 March 2024"
+    landed = datetime(2024, 3, 17).date() + timedelta(days=strategy.shift_days)
+    month_year = landed.strftime("%B %Y")
+
+    # Premise, computed rather than asserted from the module: the shift really does
+    # render a string that CONTAINS "<Month> YYYY" without being equal to it. If
+    # this ever stops holding the test below would pass for the wrong reason.
+    would_render = f"{landed.day} {month_year}"
+    assert month_year in would_render
+    assert would_render != month_year, "equality would have caught it; containment is the point"
+    assert normalize(would_render) != normalize(month_year)
+
+    first = f"Coverage began {month_year} for this member."
+    await env.engine.obfuscate(
+        env.session_id, first, [span(first, month_year, "DOB")], strategy="pseudonymization"
+    )
+    assert month_year in env.vault.originals_for_session(env.session_id), (
+        "premise: the month-year really is a vaulted original of this session"
+    )
+
+    second = f"Follow-up visit on {source_text}."
+    result = await env.engine.obfuscate(
+        env.session_id, second, [span(second, source_text, "DOB")], strategy="pseudonymization"
+    )
+
+    assert month_year not in result.obfuscated_text, (
+        "a vaulted original went out inside the shifted date"
+    )
+    assert len(result.tokens) == 1
+    assert result.obfuscated_text == f"Follow-up visit on {result.tokens[0].surrogate}."
+    assert STRICT_TOKEN_RE.fullmatch(result.tokens[0].surrogate), result.tokens[0].surrogate
+
+    # And the degradation stays the exception rather than a disabled tier: the same
+    # date in a session that never vaulted that month is still shifted, not tokenized.
+    clean_id, _expires = await env.sessions.create("test-user")
+    clean_strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry,
+            session_key=await env.sessions.key(clean_id),
+            settings=env.settings,
+        ),
+    )
+    assert isinstance(clean_strategy, PseudonymizationStrategy)
+    clean_landed = datetime(2024, 3, 17).date() + timedelta(days=clean_strategy.shift_days)
+    clean_result = await env.engine.obfuscate(
+        clean_id, second, [span(second, source_text, "DOB")], strategy="pseudonymization"
+    )
+    assert clean_result.tokens[0].surrogate == f"{clean_landed.day} {clean_landed:%B %Y}"
 
 
 async def test_token_id_collision_is_re_derived_and_both_values_resolve(
@@ -1515,6 +1998,46 @@ async def test_a_prior_value_is_not_swept_inside_a_longer_word(env: Env) -> None
     assert len(result.spans) == 1
 
 
+@pytest.mark.parametrize("strategy", BOTH_MODES)
+async def test_a_prior_value_is_swept_when_only_its_case_differs(
+    env: Env, strategy: str
+) -> None:
+    """The cross-call *probe* must be as case-blind as the sweep it feeds.
+
+    Reaching a value vaulted on an earlier call takes two steps, and only the
+    second is covered elsewhere: a cheap "does this original occur here at all?"
+    scan decides whether the value becomes a sweep surface, and the sweep then
+    matches case-insensitively. Making only the probe case-sensitive leaves the
+    whole file green -- the multi-document test above puts "John Smith" in the
+    second document in its vaulted casing, so the probe succeeds there whatever
+    rule it uses, and the ``JOHN SMITH`` variant is only ever reached *after*.
+
+    Here the vaulted surface appears in the second document in **no** other
+    casing, so a case-sensitive probe never offers it and the original rides out
+    in the clear.
+    """
+    first = "Patient John Smith was admitted."
+    await env.engine.obfuscate(
+        env.session_id, first, [span(first, "John Smith", "NAME")], strategy=strategy
+    )
+    record = await env.vault.get_by_original(env.session_id, "NAME", "john smith")
+    assert record is not None
+
+    second = "DISCHARGE SUMMARY FOR JOHN SMITH, SIGNED TODAY."
+    result = await env.engine.obfuscate(env.session_id, second, [], strategy=strategy)
+
+    assert "JOHN SMITH" not in result.obfuscated_text
+    assert result.obfuscated_text == (
+        f"DISCHARGE SUMMARY FOR {record.surrogate}, SIGNED TODAY."
+    )
+    assert len(result.spans) == 1
+    assert second[result.spans[0].start : result.spans[0].end] == "JOHN SMITH"
+    assert result.spans[0].surrogate == record.surrogate
+    # No second row, and the payload declares the surrogate it actually carries.
+    assert await env.vault.row_count(env.session_id) == 1
+    assert [item.token_id for item in result.tokens] == [record.token_id]
+
+
 async def test_the_sweep_claims_a_residual_with_its_longest_surface(env: Env) -> None:
     """A full name must outrank the bare surname it contains.
 
@@ -1548,6 +2071,57 @@ async def test_the_sweep_claims_a_residual_with_its_longest_surface(env: Env) ->
     assert result.obfuscated_text == f"Follow-up scheduled for {full.surrogate} next week."
     assert "John" not in result.obfuscated_text, "the shorter surface left a fragment behind"
     assert "Smith" not in result.obfuscated_text
+
+
+async def test_the_sweep_prefers_length_over_alphabetical_order(env: Env) -> None:
+    """The same rule, on the one pair shape that can actually tell it apart.
+
+    The sweep's order is ``(-len(surface), surface)``, and the test above is meant
+    to pin the ``-len`` half. It cannot: with "Smith" and "John Smith" the longer
+    surface *also* sorts first alphabetically, so deleting ``-len`` entirely leaves
+    that test -- and the whole file -- green while the sweep silently changes
+    behaviour. The data happened to sort correctly under the very rule it was
+    supposed to be excluding.
+
+    A **prefix** pair inverts the two orders, and that is the ordinary shape of the
+    problem: a given name is vaulted on its own and again inside the full name.
+    Alphabetically "Anna" comes first; by length "Anna Wilson" does. If the short
+    surface wins, the sweep splices the *given name's* surrogate over four
+    characters and leaves the real surname standing in the clear -- a partial mask
+    that reads as protected and restores to the wrong entity.
+    """
+    short, full = "Anna", "Anna Wilson"
+    # Premise, stated as executable fact: this pair separates the two orderings and
+    # the pair used above does not.
+    assert full.startswith(short)
+    assert sorted([short, full])[0] == short, "alphabetically the SHORT surface wins"
+    assert sorted(["Smith", "John Smith"])[0] == "John Smith", (
+        "and in the test above the LONG one does -- which is why it cannot see this"
+    )
+
+    first = f"{short} arrived. Later {full} signed."
+    await env.engine.obfuscate(
+        env.session_id,
+        first,
+        [span(first, short, "NAME", occurrence=0), span(first, full, "NAME")],
+        strategy="tokenization",
+    )
+    full_record = await env.vault.get_by_original(env.session_id, "NAME", "anna wilson")
+    given_record = await env.vault.get_by_original(env.session_id, "NAME", "anna")
+    assert full_record is not None and given_record is not None
+    assert full_record.surrogate != given_record.surrogate
+
+    # Second document, same session, detector silent: every surface is a prior one.
+    second = f"Follow-up scheduled for {full} next week."
+    result = await env.engine.obfuscate(env.session_id, second, [], strategy="tokenization")
+
+    assert len(result.spans) == 1, [second[i.start : i.end] for i in result.spans]
+    swept = result.spans[0]
+    assert second[swept.start : swept.end] == full, "the longest surface must win"
+    assert swept.surrogate == full_record.surrogate
+    assert result.obfuscated_text == f"Follow-up scheduled for {full_record.surrogate} next week."
+    assert "Wilson" not in result.obfuscated_text, "the surname was left standing in the clear"
+    assert short not in result.obfuscated_text
 
 
 async def test_the_sweep_lands_in_the_same_place_however_a_surface_arrived(
@@ -1654,6 +2228,173 @@ async def test_second_call_in_one_session_reuses_the_first_mapping(
     ]
     for original in ("John Smith", "123-45-6789"):
         assert original not in second.obfuscated_text
+
+
+async def test_a_value_the_session_already_mapped_is_never_re_derived(
+    env: Env, caplog: pytest.LogCaptureFixture, strategy_registry_guard: None
+) -> None:
+    """Reuse is a *decision*, not a coincidence of the vault being idempotent.
+
+    ``_resolve_groups`` short-circuits on a value the session already holds. Delete
+    that branch and the payload does not move one byte -- ``SessionVault.put`` is
+    idempotent per ``(entity_type, normalize(original))``, so the second write is a
+    no-op and the read-back hands back the first record. The test above stays green,
+    and so does every other assertion about output. That is precisely why this one
+    exists: it asks the two questions the payload cannot answer.
+
+    First, the operational one. Re-deriving an already-mapped value is *guaranteed*
+    to look like a collision, because the value collides with **itself**: its token
+    ID is taken (by its own row), every fake the guard draws is either the vaulted
+    surrogate or a value already in the originals set, and the vault then reports a
+    re-derivation. A repeat mention -- the most ordinary thing a document does --
+    would emit a burst of collision warnings on every call, which is not a cosmetic
+    complaint: it makes a *genuine* 32-bit token collision, the one failure that
+    can restore two entities to one value, unfindable in the noise.
+
+    Second, the interface one. Nothing in :class:`ObfuscationStrategy` promises that
+    generating a surrogate is cheap, pure, or even repeatable, and the engine is
+    what makes "one value, one mapping, forever" true regardless. Asking twice also
+    burns the whole ``MAX_FAKE_ATTEMPTS`` budget to arrive back where it started.
+    """
+    text = "Patient John Smith, MRN 4429183, seen today."
+    detections = [span(text, "John Smith", "NAME"), span(text, "4429183", "MRN")]
+    first = await env.engine.obfuscate(
+        env.session_id, text, detections, strategy="pseudonymization"
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="secure_context_pipeline.obfuscation"):
+        second = await env.engine.obfuscate(
+            env.session_id, text, detections, strategy="pseudonymization"
+        )
+    complaints = [
+        f"{record.name}: {record.getMessage()}"
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+        and record.name.startswith("secure_context_pipeline.obfuscation")
+    ]
+
+    # Control: the call really did happen and really did reuse the mapping, so an
+    # empty warning list below is silence about work done, not silence about
+    # nothing happening.
+    assert second.obfuscated_text == first.obfuscated_text
+    assert [record.token_id for record in second.tokens] == [
+        record.token_id for record in first.tokens
+    ]
+    assert len(second.tokens) == 2
+    assert await env.vault.row_count(env.session_id) == 2
+    assert complaints == [], "a repeat mention was reported as a collision"
+
+    # And the strategy itself is asked once per distinct value, not once per call.
+    @register_strategy
+    class CountingStrategy(ObfuscationStrategy):
+        """Records every value it is asked to generate a surrogate for."""
+
+        name = "counting-once"
+        asked: ClassVar[list[str]] = []
+
+        async def make_surrogate(
+            self,
+            detection: Detection,
+            token_id: str,
+            vault: SessionVault,
+            *,
+            session_id: str,
+        ) -> str:
+            CountingStrategy.asked.append(normalize(detection.text))
+            return f"<<{token_id}>>"
+
+    other = "Contact Ann Lee about 123-45-6789."
+    spans = [span(other, "Ann Lee", "NAME"), span(other, "123-45-6789", "SSN")]
+    once = await env.engine.obfuscate(env.session_id, other, spans, strategy="counting-once")
+    twice = await env.engine.obfuscate(env.session_id, other, spans, strategy="counting-once")
+
+    assert CountingStrategy.asked == ["ann lee", "123-45-6789"], CountingStrategy.asked
+    assert twice.obfuscated_text == once.obfuscated_text
+    assert await env.vault.row_count(env.session_id) == 4
+
+
+#: A surrogate the strategy below returns but never writes to the vault. If this
+#: string ever reaches a payload, that payload carries a token nothing can restore.
+NEVER_VAULTED = "<<surrogate-that-was-never-vaulted>>"
+
+
+async def test_the_payload_carries_the_surrogate_the_vault_actually_holds(
+    env: Env, strategy_registry_guard: None
+) -> None:
+    """The vault -- not the strategy's return value -- decides what goes on the wire.
+
+    ``_resolve_groups`` renders a surrogate, writes it, and then **reads the row
+    back**, splicing whatever the vault says it holds. On the ordinary path the two
+    are the same string and the read-back looks like ceremony, which is why
+    replacing it with the record the engine just built passes every other test in
+    this file. It is not ceremony: ``SessionVault.put`` is idempotent per
+    ``(entity_type, normalize(original))``, so if anything else vaulted this value
+    first, our write is a **no-op** and the row the session actually holds is
+    someone else's. Splicing our own discarded string then puts a surrogate in the
+    payload that ``get_by_surrogate`` cannot resolve -- the caller reads a fake as
+    though it were the answer, and restoration silently returns nothing.
+
+    In production the other writer is a second ``obfuscate`` coroutine on the same
+    session. Racing two calls here would make the test a coin flip on scheduling,
+    so the strategy below *is* the other writer: it stores the row itself, then
+    returns a different string. Deterministic, same collision, same question --
+    which of the two strings reached the payload.
+    """
+
+    @register_strategy
+    class RaceLoserStrategy(ObfuscationStrategy):
+        """Vaults the value itself before returning a surrogate it never stored."""
+
+        name = "race-loser"
+        vaulted: ClassVar[str] = ""
+
+        async def make_surrogate(
+            self,
+            detection: Detection,
+            token_id: str,
+            vault: SessionVault,
+            *,
+            session_id: str,
+        ) -> str:
+            RaceLoserStrategy.vaulted = f"[PII_NAME_{token_id}]"
+            await vault.put(
+                session_id,
+                TokenRecord(
+                    session_id=session_id,
+                    token_id=token_id,
+                    entity_type=detection.entity_type,
+                    category=detection.category,
+                    surrogate=RaceLoserStrategy.vaulted,
+                    created_at=time.time(),
+                ),
+                detection.text,
+            )
+            return NEVER_VAULTED
+
+    text = "Patient John Smith is stable."
+    result = await env.engine.obfuscate(
+        env.session_id, text, [span(text, "John Smith", "NAME")], strategy="race-loser"
+    )
+
+    winner = RaceLoserStrategy.vaulted
+    # Premise: the two strings really are different, and exactly one row exists --
+    # the engine's own put found the value already there and did nothing.
+    assert winner and winner != NEVER_VAULTED
+    assert await env.vault.row_count(env.session_id) == 1
+
+    assert NEVER_VAULTED not in result.obfuscated_text, (
+        "the payload carries a surrogate no vault row holds; it can never be restored"
+    )
+    assert result.obfuscated_text == f"Patient {winner} is stable."
+    assert [record.surrogate for record in result.tokens] == [winner]
+    assert [entry.surrogate for entry in result.spans] == [winner]
+    # The decisive property, asked of the vault rather than of the engine: every
+    # surrogate the payload declares resolves back to the original it stands for.
+    for record in result.tokens:
+        assert await env.vault.get_by_surrogate(env.session_id, record.surrogate) == "John Smith"
+    with pytest.raises(VaultMissError):
+        await env.vault.get_by_surrogate(env.session_id, NEVER_VAULTED)
 
 
 # ---------------------------------------------------------------------------
@@ -1862,6 +2603,14 @@ async def test_per_entity_strategy_override_is_config_only(env: Env) -> None:
     fakes = surrogates_by_type(result.tokens)
     assert STRICT_TOKEN_RE.fullmatch(fakes["SSN"]), fakes["SSN"]
     assert not STRICT_TOKEN_RE.fullmatch(fakes["NAME"]), "NAME still pseudonymized"
+    # Re-routing an entity must not stop protecting it: the surrogate shape is
+    # only half the claim, and "which mode" is worthless if the value stayed put.
+    ssn_record = next(item for item in result.tokens if item.entity_type == "SSN")
+    assert fakes["SSN"] == f"[PII_SSN_{ssn_record.token_id}]"
+    assert result.obfuscated_text == f"{fakes['NAME']}, SSN {fakes['SSN']}."
+    for original in ("John Smith", "123-45-6789"):
+        assert original not in result.obfuscated_text
+    assert await env.vault.get_by_surrogate(env.session_id, fakes["SSN"]) == "123-45-6789"
 
 
 # ---------------------------------------------------------------------------
@@ -2260,6 +3009,72 @@ async def test_spans_below_the_sweep_floor_are_never_vaulted(env: Env, strategy:
     assert await env.vault.row_count(env.session_id) == 1
 
 
+class SilentDetector:
+    """Minimal ``DetectorLike``. The gate's pass-1 originals scan never calls it."""
+
+    async def detect(
+        self, text: str, doc_category: str | None = None
+    ) -> list[Detection]:  # pragma: no cover -- present to satisfy the protocol
+        return []
+
+
+@pytest.mark.parametrize("strategy", BOTH_MODES)
+async def test_the_sweep_floor_is_measured_after_normalization(env: Env, strategy: str) -> None:
+    """The floor is a property of the *normalized* value, not of the raw span.
+
+    The test above uses "MD", "RN" and "Ann" -- and every one of them has the same
+    length raw as normalized, so none of them can tell the two apart. Measuring the
+    raw span instead would reopen the very hole the floor exists to close: a
+    detector that hands back ``"MD "`` with the trailing space gives a raw length of
+    3, at the floor, while the value actually stored and actually compared is
+    ``"md"``, below it. It would be vaulted, and the gate -- which drops an original
+    on ``len(original.strip()) < MIN_ORIGINAL_LEN`` -- would never once scan for it.
+    "Zero originals in transit" would quietly become "zero originals, except the
+    ones too short to check", which is exactly what the floor is for.
+
+    So rather than restate the gate's rule here, the gate's own ``_scan_originals``
+    is asked directly, and asked a control question in the same breath so a zero
+    cannot come from a broken probe.
+    """
+    text = "Reviewed by MD  on the ward."
+    start = text.index("MD")
+    padded = Detection(
+        entity_type="NAME",
+        category=EntityCategory.PII,
+        start=start,
+        end=start + 3,
+        text=text[start : start + 3],
+        score=0.9,
+    )
+    # Premise: raw length is exactly AT the floor; normalized length is BELOW it.
+    assert padded.text == "MD "
+    assert len(padded.text) == engine_module.MIN_SWEEP_LEN
+    assert len(normalize(padded.text)) < engine_module.MIN_SWEEP_LEN
+
+    # The consequence, from the gate itself: were this vaulted, no form of it would
+    # ever be counted -- even in a payload that carries it verbatim.
+    gate = egress_gate.EgressGate(
+        vault=env.vault,  # type: ignore[arg-type]
+        detector=SilentDetector(),  # type: ignore[arg-type]
+        settings=env.settings,
+    )
+    carrying = f"Reviewed by {padded.text} on the ward."
+    assert padded.text in carrying and normalize(padded.text) in normalize(carrying)
+    assert gate._scan_originals(carrying, frozenset({padded.text})) == 0
+    assert gate._scan_originals(carrying, frozenset({normalize(padded.text)})) == 0
+    assert gate._scan_originals(carrying, frozenset({"Reviewed"})) == 1, (
+        "control: the probe does count an original above the floor"
+    )
+
+    result = await env.engine.obfuscate(env.session_id, text, [padded], strategy=strategy)
+
+    assert result.obfuscated_text == text
+    assert result.tokens == []
+    assert result.spans == []
+    assert await env.vault.row_count(env.session_id) == 0
+    assert env.vault.originals_for_session(env.session_id) == frozenset()
+
+
 async def test_document_category_scoping_drops_out_of_scope_entities(env: Env) -> None:
     """``only_in_doc_categories`` is registry policy; the engine just asks."""
     text = "Wire of $250,000 cleared today."
@@ -2355,7 +3170,14 @@ async def test_no_audit_logger_is_a_supported_configuration(
         )
         text = "Patient John Smith."
         result = await engine.obfuscate(session_id, text, [span(text, "John Smith", "NAME")])
+        # "The name is gone" is also satisfied by an engine that dropped the span
+        # on the floor when it found no audit logger, so pin the whole outcome:
+        # the surrogate was issued, spliced, vaulted and is restorable.
+        assert len(result.tokens) == 1
+        record = result.tokens[0]
+        assert result.obfuscated_text == f"Patient {record.surrogate}."
         assert "John Smith" not in result.obfuscated_text
+        assert await vault.get_by_surrogate(session_id, record.surrogate) == "John Smith"
     finally:
         await vault.close()
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from typing import Any
 import pytest
 
 from secure_context_pipeline.config import Settings
+from secure_context_pipeline.crypto.aead import decrypt, doc_aad, encrypt
 from secure_context_pipeline.crypto.keys import build_key_provider
 from secure_context_pipeline.errors import PipelineError, StoreAuthError
 from secure_context_pipeline.store import document_store, extraction
@@ -277,6 +279,55 @@ async def test_the_two_blobs_of_one_document_share_one_aad(
     # either half, whichever way round they are on disk.
     with pytest.raises(StoreAuthError):
         await store.get_raw(USER_B, doc_id)
+
+
+async def test_get_text_fails_closed_on_an_authentic_blob_that_is_not_utf8(
+    store: EncryptedDocumentStore, settings: Settings
+) -> None:
+    """A text blob that authenticates but is not utf-8 must raise, never decode lossily.
+
+    ``get_text``'s ``UnicodeDecodeError`` handler is documented as unreachable
+    via ``put``, and that is true -- GCM has authenticated the very bytes ``put``
+    encoded as utf-8. It does not follow that the handler is untestable, and
+    "unreachable, therefore no test" is how a fail-closed branch quietly becomes
+    a fail-open one: replacing ``plaintext.decode("utf-8")`` with
+    ``decode("utf-8", errors="replace")`` -- returning U+FFFD-riddled text out of
+    a corrupt store instead of ``NOT_FOUND`` -- changed nothing any assertion
+    could observe.
+
+    What AES-GCM prevents is an *attacker* forging such a blob. A test holds the
+    key, so it can forge one, and so could a future edit to ``put`` that wrote
+    raw bytes where it means to write encoded text. The forgery is done with the
+    store's own key and its own AAD so that the blob is authentic in every
+    respect except its encoding.
+
+    The middle assertion is the one that stops this test from passing for the
+    wrong reason: it proves the blob really does decrypt, so the refusal has to
+    be coming from the decode step rather than from the ``CryptoAuthError`` path
+    that every other tampering test in this file exercises.
+    """
+    doc_id = await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+    text_path = blob_dir(settings) / f"{doc_id}{TEXT_SUFFIX}"
+
+    key = store._keys.doc_key(USER_A)
+    aad = doc_aad(USER_A, doc_id)
+    # A lone continuation byte and a bare 0x80: invalid utf-8 in any position.
+    not_utf8 = b"\xff\xfe\x80 encounter note \x80\xff"
+    text_path.write_bytes(encrypt(key, not_utf8, aad))
+
+    assert decrypt(key, text_path.read_bytes(), aad, scope="document_text") == not_utf8, (
+        "the forged blob must authenticate, or this test proves nothing about the decode"
+    )
+
+    with pytest.raises(StoreAuthError) as err:
+        await store.get_text(USER_A, doc_id)
+    assert err.value.code == "NOT_FOUND"
+    # Same response an absent document produces: a corrupt store is not a
+    # distinguishable one.
+    assert "�" not in str(err.value)
+
+    # Scoped to the damaged blob: the raw half is untouched and still readable.
+    assert await store.get_raw(USER_A, doc_id) == SYNTHETIC_BYTES
 
 
 # --- 4. no existence oracle -------------------------------------------------
@@ -570,6 +621,414 @@ async def test_close_is_idempotent(settings: Settings) -> None:
     # And it reopens on demand rather than failing.
     assert await opened.list_docs(USER_A) == []
     await opened.close()
+
+
+async def test_concurrent_connection_opens_exactly_one_connection(settings: Settings) -> None:
+    """Racing ``_connection`` must not leak an aiosqlite thread.
+
+    ``aiosqlite`` backs every connection with a **non-daemon** thread, so a
+    connection that is opened, overwritten by a racing opener and never closed
+    keeps the interpreter alive at shutdown: the process hangs instead of
+    exiting. The vault has exactly this test; the store has the same
+    double-check under the same kind of lock and had no test at all, so deleting
+    it kept the whole suite green. It opens six connections for six callers and
+    strands five of them -- measured, not inferred.
+    """
+    store = EncryptedDocumentStore(settings)
+    # ``aiosqlite.Connection`` *is* the thread, so these objects are exactly the
+    # threads that would be stranded.
+    connections: list[Any] = []
+    real_connect = document_store.aiosqlite.connect
+
+    def counting_connect(*args: Any, **kwargs: Any) -> Any:
+        connection = real_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(document_store.aiosqlite, "connect", counting_connect)
+        await asyncio.gather(*(store._connection() for _ in range(6)))
+
+    assert len(connections) == 1, f"{len(connections)} connections opened, expected 1"
+
+    # The one connection is the one the store actually uses.
+    doc_id = await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+    assert await store.get_raw(USER_A, doc_id) == SYNTHETIC_BYTES
+    await store.close()
+
+    deadline = time.monotonic() + 5.0
+    while any(connection.is_alive() for connection in connections):
+        assert time.monotonic() < deadline, "an aiosqlite thread outlived close()"
+        await asyncio.sleep(0.01)
+
+
+async def test_a_close_landing_mid_upload_does_not_strand_the_write(
+    settings: Settings,
+) -> None:
+    """A shutdown between the blob writes and the metadata INSERT must not break the put.
+
+    ``put`` used to resolve its connection *before* two real awaits and use it
+    after them, so an ordinary ``close`` landing in that window -- a shutdown
+    while an upload is in flight -- made the INSERT raise a bare
+    ``ValueError: no active connection``: an unstructured 500 out of a method
+    documented to raise ``PipelineError`` and nothing else. No existing test
+    could see it, because every other test closes the store only once its puts
+    have finished.
+
+    The handle is now resolved inside ``_write_lock`` and ``close`` takes that
+    same lock, so the two serialise. The upload finishes against a reopened
+    connection, which is the behaviour ``test_close_is_idempotent`` already
+    documents for every other accessor.
+    """
+    store = await EncryptedDocumentStore.open(settings)
+    real_write = store._write_blob
+    parked = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def park_after_the_first_write(path: Path, blob: bytes) -> None:
+        await real_write(path, blob)
+        if not parked.is_set():
+            parked.set()
+            await resume.wait()
+
+    store._write_blob = park_after_the_first_write  # type: ignore[method-assign]
+    upload = asyncio.create_task(store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical"))
+    await parked.wait()
+    assert not upload.done(), "the upload was supposed to park between its two blob writes"
+
+    await store.close()
+    resume.set()
+    doc_id = await upload
+
+    assert await store.get_text(USER_A, doc_id) == SYNTHETIC_TEXT
+    assert await store.get_raw(USER_A, doc_id) == SYNTHETIC_BYTES
+    assert [meta.doc_id for meta in await store.list_docs(USER_A)] == [doc_id]
+    await store.close()
+
+
+async def test_connection_never_hands_out_the_connection_close_is_closing(
+    settings: Settings,
+) -> None:
+    """``close`` must detach ``self._db`` *before* it awaits the connection closed.
+
+    ``_connection``'s fast path reads ``self._db`` with no lock held at all --
+    the docstring's "resolved while ``_open_lock`` is still held" argument covers
+    only the slow path below it. While ``close`` cleared the attribute *after*
+    ``await self._db.close()``, that unlocked read returned the very connection
+    being closed, and the caller's next statement raised
+    ``ValueError: no active connection``. Detaching first makes the fast path
+    structurally unable to observe a half-closed connection.
+    """
+    store = await EncryptedDocumentStore.open(settings)
+    original = store._db
+    assert original is not None
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_close = original.close
+
+    async def parked_close() -> None:
+        entered.set()
+        await release.wait()
+        await real_close()
+
+    original.close = parked_close  # type: ignore[method-assign]
+    closer = asyncio.create_task(store.close())
+    await entered.wait()
+
+    handed_out = await store._connection()
+    assert handed_out is not original, "the store handed out the connection it was closing"
+
+    release.set()
+    await closer
+    # The replacement is a working connection, not a husk.
+    doc_id = await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+    assert await store.get_raw(USER_A, doc_id) == SYNTHETIC_BYTES
+    await store.close()
+
+    deadline = time.monotonic() + 5.0
+    while original.is_alive() or handed_out.is_alive():
+        assert time.monotonic() < deadline, "an aiosqlite thread outlived close()"
+        await asyncio.sleep(0.01)
+
+
+async def test_close_waits_for_an_in_flight_metadata_write(settings: Settings) -> None:
+    """``close`` takes ``_write_lock``, so it cannot detach mid-INSERT.
+
+    ``put`` yields between its ``execute`` and its ``commit``. A ``close`` that
+    only took ``_open_lock`` could land there, close the connection, and leave
+    the commit to fail on a dead handle -- a shutdown turning a nearly-complete
+    upload into an unstructured error. Taking ``_write_lock`` makes the shutdown
+    *wait* for the write it interrupted instead of racing it.
+
+    What this test does **not** prove is the acquisition *order*. An earlier
+    version of this docstring claimed "this test would hang rather than fail if
+    that order were inverted", and that is false: swapping ``close`` to take
+    ``_open_lock`` outside ``_write_lock`` leaves all of this file green,
+    including this test, because ``put`` only reaches for ``_open_lock`` when
+    ``self._db`` is ``None`` and nothing here opens a connection concurrently
+    with a close. Removing ``_write_lock`` from ``close`` altogether is what this
+    test catches -- a removal, not an inversion. The order is pinned separately,
+    by ``test_close_and_a_first_upload_do_not_deadlock_on_the_two_locks``.
+    """
+    store = await EncryptedDocumentStore.open(settings)
+    db = await store._connection()
+    real_commit = db.commit
+    at_commit = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def parked_commit() -> None:
+        at_commit.set()
+        await proceed.wait()
+        await real_commit()
+
+    db.commit = parked_commit  # type: ignore[method-assign]
+    try:
+        upload = asyncio.create_task(store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical"))
+        await at_commit.wait()
+
+        closer = asyncio.create_task(store.close())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not closer.done(), (
+            "close() detached the connection out from under an in-flight INSERT"
+        )
+
+        proceed.set()
+        doc_id = await upload
+        await closer
+    finally:
+        db.commit = real_commit  # type: ignore[method-assign]
+
+    async with EncryptedDocumentStore(settings) as reopened:
+        assert [meta.doc_id for meta in await reopened.list_docs(USER_A)] == [doc_id]
+        assert await reopened.get_raw(USER_A, doc_id) == SYNTHETIC_BYTES
+
+
+def lock_waiters(lock: asyncio.Lock) -> int:
+    """How many coroutines are parked on ``lock``.
+
+    ``asyncio.Lock`` publishes no waiter count, and the two lock-ordering tests
+    below need one: both have to place a coroutine on a specific queue before
+    releasing the next, and "it has not finished yet" is not the same statement.
+    """
+    waiters = getattr(lock, "_waiters", None) or ()
+    return sum(1 for waiter in waiters if not waiter.cancelled())
+
+
+async def park_on_lock(lock: asyncio.Lock, expected: int, *, what: str) -> None:
+    """Run the event loop until ``expected`` coroutines are queued on ``lock``.
+
+    Bounded, and every caller must unpark its coroutines and close its store in a
+    ``finally``. Both tests below park a real upload on an ``asyncio.Event`` and
+    hold a live aiosqlite connection while they do it; raising from here without
+    that cleanup leaves a non-daemon thread alive and the *process* hangs at
+    exit, turning a red test into the CI job timeout ``pyproject.toml`` says a
+    security suite cannot afford. Measured: it hangs, it does not report.
+    """
+    for _ in range(2_000):
+        if lock_waiters(lock) >= expected:
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"{what}: {lock_waiters(lock)} queued on the lock, expected {expected}")
+
+
+async def test_close_and_a_first_upload_do_not_deadlock_on_the_two_locks(
+    settings: Settings,
+) -> None:
+    """``close`` must take ``_write_lock`` **outside** ``_open_lock``, not inside.
+
+    This is the half of the ordering claim that
+    ``test_close_waits_for_an_in_flight_metadata_write`` does not establish.
+    ``put`` holds ``_write_lock`` and then asks ``_connection`` for
+    ``_open_lock``; ``close`` wants both. Acquire them in the opposite order and
+    the two are a textbook AB-BA: whichever holds ``_open_lock`` waits forever
+    for ``_write_lock``, and vice versa.
+
+    Nothing in this file used to build that interleaving, so the inversion was
+    invisible -- 61 green -- even though the deadlock is real and reachable: a
+    shutdown arriving while the *first* upload of the process is still resolving
+    its connection. The store is therefore constructed rather than ``open``ed, so
+    ``self._db`` is ``None`` and ``put`` must take the slow path that needs
+    ``_open_lock``; the upload is parked in the gap between the two acquires; and
+    the close is queued while it sits there.
+
+    A deadlock cannot be asserted by waiting forever, so the tasks are given a
+    bounded window and the test fails on what is still pending. Under the shipped
+    order both finish in milliseconds.
+    """
+    store = EncryptedDocumentStore(settings)
+    assert store._db is None, "the deadlock needs put to open the connection itself"
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_connection = store._connection
+
+    async def parked_connection() -> Any:
+        # Parks *after* put has taken _write_lock and *before* _open_lock.
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await real_connection()
+
+    store._connection = parked_connection  # type: ignore[method-assign]
+
+    upload = asyncio.create_task(store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical"))
+    closer: asyncio.Task[None] | None = None
+    try:
+        await entered.wait()
+        assert store._write_lock.locked(), "put should be holding _write_lock here"
+        assert not store._open_lock.locked(), "put has not asked for _open_lock yet"
+
+        closer = asyncio.create_task(store.close())
+        await park_on_lock(store._write_lock, 1, what="close never queued on _write_lock")
+        assert not store._open_lock.locked(), (
+            "close is holding _open_lock while it waits for _write_lock -- that is the AB-BA"
+        )
+
+        release.set()
+        _done, pending = await asyncio.wait({upload, closer}, timeout=5.0)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        assert not pending, (
+            "close() and the first put() deadlocked on _write_lock/_open_lock: "
+            f"{len(pending)} of 2 tasks never completed"
+        )
+
+        doc_id = upload.result()
+        closer.result()
+        assert await store.get_raw(USER_A, doc_id) == SYNTHETIC_BYTES
+    finally:
+        # Unconditional, and covering the assertions above as well as the wait:
+        # a failure that leaves the upload parked on ``release`` strands an
+        # aiosqlite thread, and the process then hangs at exit instead of
+        # reporting the failure. Unpark first, then drain, then close.
+        release.set()
+        for task in (upload, closer):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (upload, closer) if task is not None), return_exceptions=True
+        )
+        store._connection = real_connection  # type: ignore[method-assign]
+        await store.close()
+
+
+async def test_a_second_upload_never_uses_a_handle_a_queued_close_will_detach(
+    settings: Settings,
+) -> None:
+    """``put`` must resolve its connection *inside* ``_write_lock``, not merely after the blobs.
+
+    ``test_a_close_landing_mid_upload_does_not_strand_the_write`` moved the
+    resolution after the two blob writes, which closes the window it was written
+    for. It does not close this one, and hoisting the resolution just *outside*
+    the ``async with self._write_lock`` -- one line, still after the blobs --
+    keeps the entire repository green while restoring the original bug.
+
+    The interleaving that shows it needs three participants, which is why no
+    single-upload test can see it: upload #1 holds ``_write_lock`` at its commit,
+    a ``close`` queues behind it, and upload #2 queues behind the close. When the
+    close finally runs it detaches the connection, so any handle upload #2
+    resolved *before* joining that queue is already dead by the time it reaches
+    the front. Resolving under the lock means upload #2 asks after the close has
+    finished and simply reopens -- the documented "a closed store reopens on next
+    use" behaviour.
+
+    Measured on the hoisted version, the failure is
+    ``ValueError: no active connection`` -- a bare, unstructured error out of a
+    method whose contract is ``PipelineError`` and nothing else, which is exactly
+    what ``put``'s comment says this ordering prevents.
+    """
+    store = await EncryptedDocumentStore.open(settings)
+    db = await store._connection()
+
+    at_commit = asyncio.Event()
+    proceed = asyncio.Event()
+    real_commit = db.commit
+
+    async def parked_commit() -> None:
+        if not at_commit.is_set():
+            at_commit.set()
+            await proceed.wait()
+        await real_commit()
+
+    db.commit = parked_commit  # type: ignore[method-assign]
+
+    first = asyncio.create_task(store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical"))
+    tasks: list[asyncio.Task[Any]] = [first]
+    try:
+        await at_commit.wait()
+        assert store._write_lock.locked(), "upload #1 should be holding _write_lock at its commit"
+
+        closer = asyncio.create_task(store.close())
+        tasks.append(closer)
+        await park_on_lock(store._write_lock, 1, what="close never queued on _write_lock")
+
+        second = asyncio.create_task(store.put(USER_B, "second.txt", SYNTHETIC_BYTES, "legal"))
+        tasks.append(second)
+        await park_on_lock(store._write_lock, 2, what="upload #2 never queued behind the close")
+
+        proceed.set()
+        doc_one = await first
+        await closer
+        # The assertion: not "it raised the right error" but "it did not raise".
+        doc_two = await second
+    finally:
+        # Upload #2 *reopens* the store after the close detaches it, so a second
+        # aiosqlite connection -- and therefore a second non-daemon thread -- is
+        # live here on the success path, and upload #1 may still be parked on
+        # ``proceed`` on a failure path. Neither shows up as a failed assertion:
+        # both hang the interpreter at exit, which is the failure mode
+        # ``test_concurrent_connection_opens_exactly_one_connection`` exists for.
+        proceed.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await store.close()
+
+    async with EncryptedDocumentStore(settings) as reopened:
+        assert await reopened.get_raw(USER_A, doc_one) == SYNTHETIC_BYTES
+        assert await reopened.get_raw(USER_B, doc_two) == SYNTHETIC_BYTES
+        assert [meta.doc_id for meta in await reopened.list_docs(USER_A)] == [doc_one]
+        assert [meta.doc_id for meta in await reopened.list_docs(USER_B)] == [doc_two]
+
+
+async def test_get_category_refuses_a_malformed_doc_id_before_the_database(
+    store: EncryptedDocumentStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``get_category``'s own guard must refuse, not the empty result set.
+
+    The query is parameterised, so a hostile ``doc_id`` can never reach query
+    construction, and every case below already answers ``NOT_FOUND`` from a row
+    that does not exist. Deleting the guard therefore changed nothing any
+    existing assertion could observe -- which is precisely why it needs one that
+    watches the *mechanism*: an unvalidated, caller-supplied string must not
+    reach the metadata query at all. ``test_malformed_doc_id_never_reaches_the_filesystem``
+    makes the same argument for the blob path.
+    """
+    doc_id = await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "legal")
+    assert await store.get_category(USER_A, doc_id) == "legal"
+
+    connection = await store._connection()
+    reached: list[str] = []
+    real_execute = connection.execute
+
+    async def recording_execute(sql: str, *args: Any, **kwargs: Any) -> Any:
+        if "FROM documents" in sql:
+            reached.append(sql)
+        return await real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(connection, "execute", recording_execute)
+    for hostile in ("../../etc/passwd", "..%2Fescape", "", "NOT-HEX", "a" * 400, "x" * 31):
+        with pytest.raises(StoreAuthError) as err:
+            await store.get_category(USER_A, hostile)
+        assert err.value.code == "NOT_FOUND"
+        detail = err.value.detail["doc_id"]
+        assert isinstance(detail, str)
+        assert len(detail) <= 64
+    assert reached == [], f"a rejected doc_id reached the metadata query: {reached}"
 
 
 async def test_wal_mode_is_enabled(store: EncryptedDocumentStore, settings: Settings) -> None:

@@ -17,7 +17,7 @@ Everything below is measured on this repository, not aspirational.
 | You want | Go to |
 |---|---|
 | Does it run? | §1 — two commands, and the numbers the suite prints |
-| Is the zero-egress claim real? | §1 *Leakage harness* — including the three shapes the harness itself was blind to, and how they were found |
+| Is the zero-egress claim real? | §1 *Leakage harness* — including the shapes the harness itself was blind to, the four boundaries it does **not** claim, and how each was found |
 | What does it **not** defend? | §3 — **start with "The weakest point in this design"**: `user_id` is an asserted claim and there is no authn at this tier |
 | The six live-review questions | §5 — each answered in its first sentence |
 | Where it breaks at scale | §5 Q1 — the bottleneck is not the one you would guess, and the obvious fix was measured and **rejected** |
@@ -58,8 +58,20 @@ decrypts every document in the store. Replacing it with an explicit `COPY` allow
 forgets; an allow-list cannot. You can check the result in one command:
 
 ```bash
+# 1. No secret reached a build instruction (ENV / ARG / RUN):
 docker history --no-trunc secure-context-pipeline:1.0.0 | grep -cE 'SCP_MASTER_KEY=|ANTHROPIC_API_KEY='   # -> 0
+
+# 2. And -- the check that actually catches THIS bug -- no secret reached a layer's *contents*:
+docker run --rm --entrypoint sh secure-context-pipeline:1.0.0 -c \
+  'ls -a /app; find / -xdev \( -name ".env" -o -name "*.key" -o -name "id_rsa" \) 2>/dev/null'
+# -> /app holds only the allow-listed files; the find prints nothing.
 ```
+
+Command 1 alone would **not** have caught the leak it is printed under. The offending instruction
+was `COPY . .`, and that is all `docker history` records — the layer's *contents* are where
+`.env` was, and history never shows them. Command 2 is the one that fails when the file ships.
+(Measured on the current image: `/app` holds only the allow-listed files, and the only `.pem`
+files anywhere are the CA trust stores that ship with `python:3.11-slim`.)
 
 The container runs as a non-root user. Readiness costs a few seconds after start:
 the spaCy pipeline is loaded once in the FastAPI lifespan, never per request, so that cost is
@@ -94,8 +106,8 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1123 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
-                             #   113 leakage - 5 bench - rest unit + integration
+1217 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+                             #   115 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 39 source files
 ruff check .                 # clean, whole repo
 ```
@@ -104,7 +116,7 @@ ruff check .                 # clean, whole repo
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2840 originals vaulted and scanned, 2405 surrogates round-tripped)
+          (2840 originals vaulted and scanned, 2410 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result and it does not move. The two tallies
@@ -112,15 +124,18 @@ beside it behave differently from each other, and the difference is worth statin
 rather than describing both as "reproducible":
 
 - **2,840 originals** is stable for a given commit. Document seeds are fixed, so the same 100
-  documents carry the same values, and this number only moves when detection changes.
-- **The surrogate round-trip count** is *not* stable, and drifts across a band of roughly
-  2,400–2,420 between runs of the same commit (2,415 / 2,418 / 2,416 on three consecutive runs
-  of the current build). That is expected, and is a property of the design rather than noise in
-  the measurement: session keys are
-  `secrets.token_bytes(32)`, pseudonyms are seeded from `HMAC(session_key, …)`, so every
-  pseudonymization run draws different fakes, and which lines the mock provider chooses to echo
-  shifts with them. The count is of surrogates *the model happened to mention*. A stable number
-  here would actually be evidence of a bug — it would mean session keys were not random.
+  documents carry the same values, and this number only moves when detection changes. Observed
+  identical on every run of the current build.
+- **The surrogate round-trip count is not stable and is not a fingerprint of the build.** Two
+  independent things move it. Within one commit it drifts by a few counts because session keys
+  are `secrets.token_bytes(32)` and pseudonyms are seeded from `HMAC(session_key, …)`, so every
+  pseudonymization run draws different fakes and which lines the mock provider echoes shifts
+  with them — the count is of surrogates *the model happened to mention*. A stable number here
+  would actually be evidence of a bug: it would mean session keys were not random. Across
+  commits it moves much further, because any change to obfuscation or restoration changes what
+  there is to mention; it was observed at **2,717** during one such change and back at **2,408**
+  after it. Do not treat any single reading as a regression signal — `ledger.leaks == 0` is the
+  assertion, and the tally is context.
 
 Read them as scale, not as a fingerprint.
 
@@ -186,8 +201,9 @@ not move under the stronger instrument** — 100/100, zero leaks, on three conse
 is the only reason it is worth more than it was before: the same result now survives a scan that
 sees strictly more.
 
-**Two boundaries are stated rather than closed**, because closing them would manufacture false
-reds indistinguishable from real ones:
+**Four boundaries are stated rather than closed**, because closing them would manufacture false
+reds indistinguishable from real ones. Each is pinned by a test, so closing one later is a red
+rather than a silent widening of the claim:
 
 - **Partial disclosure.** If a splice bug leaves *one component* of a multi-word original behind
   — the surname of a vaulted full name — neither the harness nor the gate reports it. Both ask
@@ -196,8 +212,40 @@ reds indistinguishable from real ones:
   are ordinary English words (`Brown`, `Rich`). So the honest form of the guarantee is *no whole
   vaulted value* reaches the payload, the audit log or the process log, and
   `test_a_partial_value_leak_is_outside_what_this_harness_claims` pins that boundary.
+- **A value glued into a longer word.** `xJohn Smithx` carries the original byte for byte and is
+  reported by neither. The occurrence rule asserts a word boundary on each side whose adjacent
+  needle character is alphanumeric — which is precisely what stops `Brown` matching inside
+  `Browning`. Relaxing it only for multi-word originals does not rescue it: `chronic low back
+  pains` contains `chronic low back pain`. What keeps the residual risk small is that the
+  pipeline cannot emit this shape — every surrogate and redaction marker ends in `]`, so a
+  splice that leaves an original beside our own output has a non-alphanumeric character between
+  them and *is* caught. Pinned by
+  `test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`.
+- **A combining mark spliced into a value.** `normalize` is NFKC, which *composes* — so a
+  decomposed rendering of `José` is caught, and that half is now asserted. What no
+  normalisation form can do is remove a mark that was never in the vaulted value: `J` + U+0301 +
+  `ohn Smith` is simply a different string. Folding marks out would make `José` and `Jose` the
+  same value, which the gate's `_INVISIBLE_RE` deliberately refuses in a comment naming that
+  exact trade. Pinned by
+  `test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`.
 - **Homoglyphs.** Cyrillic `о` for Latin `o` needs a confusables table, not another
   normalisation form. Out of scope in the gate for the same reason.
+
+**The last three are blind spots the harness and the gate share**, because both resolve to the
+same occurrence rule — so for those shapes there is no second opinion. Confirmed rather than
+reasoned about: with the gate **live**, a real vaulted original spliced into a real payload with
+one combining acute inserted, or glued to a letter, completed the run and reached the provider.
+Where the gate is a second opinion that is survivable; on the audit database and the process log,
+where nothing else looks, it is not — which is why these are recorded as claims the harness does
+not make rather than as cases it happens not to have hit.
+
+**How the other shapes were confirmed.** The list above is what survived an attack, not what was
+left over after reading the code. A copy of the pipeline was sabotaged — a real vaulted original
+re-spliced into the outbound payload in twelve shapes, with the gate's original-value pass
+blinded — and the harness was required to go red on each. It caught the verbatim value, markdown
+emphasis (`_John Smith_`, `**John Smith**`), both punctuation-edged shapes (`tel(415) 555-0123`,
+`USD$1,234.56`), a value inside a token's `|hint` tail, a value split across a line break, a
+case-only difference, and a value followed by a full stop. It missed exactly the three above.
 
 Getting here took four fixes to the pipeline itself (Deviations 11–14) and eight to the
 instrument; two of the pipeline fixes were found by this harness and by nothing else.
@@ -205,13 +253,58 @@ instrument; two of the pipeline fixes were found by this harness and by nothing 
 **Benchmarks** (`pytest -m bench`, budgets from the build specification). Measured on an
 M-series laptop that was **not idle** — several other test suites were running concurrently:
 
-| Measurement | Result | Budget | Headroom | Scoring |
+| Measurement | Worst of a 7-run sample | Budget | Headroom at that worst | Scoring |
 |---|---|---|---|---|
-| Obfuscate 2,000 words (tokenization) | **0.364 s** | 2 s | 5.5× | best of 3 |
-| Obfuscate 2,000 words (pseudonymization) | **0.382 s** | 2 s | 5.2× | best of 3 |
-| Vault lookup p99 (1,000 cached reads) | **0.001 ms** | 5 ms | ~4,600× | single shot |
-| Restore a 500-token response | **4.71 ms** | 500 ms | 106× | single shot |
-| Full pipeline, 12k-word brief (mock provider) | **6.69 s** | 15 s | 2.2× | best of 3 |
+| Obfuscate 2,000 words (tokenization) | 0.388 s | 2 s | 5.2× | best of 3 |
+| Obfuscate 2,000 words (pseudonymization) | 0.389 s | 2 s | 5.1× | best of 3 |
+| Vault lookup p99 (1,000 cached reads) | 0.001 ms | 5 ms | 3,636× | single shot |
+| Restore a 500-token response | 4.774 ms | 500 ms | 104.7× | single shot |
+| Full pipeline, 12k-word brief (mock provider) | 7.248 s | 15 s | 2.07× | best of 3 |
+
+**The budget column is the claim. Every other column is one sample of seven.** That framing is
+the third correction this table has needed, and the sequence is worth more than the numbers.
+
+It first carried single point values. Those were replaced with ranges, because a wall-clock
+figure quoted to three significant figures invites exactly the check it cannot survive. The
+ranges were then replaced with *floors* — "≥ 2.2×", "≥ 3,600×" — on the reasoning that a floor
+only gets safer with more measurements. **Then more measurements broke one of the floors and
+came within 1% of another.** The seven runs behind the table above put the full pipeline at
+7.248 s — 2.07× headroom, under the "≥ 2.2×" the table itself asserted — on two of seven runs,
+and put the vault at 3,636× against a stated floor of 3,600×.
+
+A floor computed from seven samples is not a bound. It is an *estimate of a tail from seven
+draws*, which is the same category of error as the point value it replaced — one level up, and
+harder to see because it is wearing the costume of caution. So the columns now say what they
+are, and the only number this page asserts is the budget, because the budget is the only one a
+test enforces. All five budgets passed on all seven runs.
+
+If your own run lands outside these readings, that is expected and is not a regression. If it
+lands outside the *budget*, that is a real failure and `pytest -m bench` will say so.
+
+**The retraction, kept because it is more useful than the claim was.** This paragraph used to
+say that the two original point values (`6.69 s` and `~4,600×`) "did not reproduce on **any**"
+of the runs behind the table, and that `~4,600×` "overstated the headroom actually observed".
+
+Both statements are false, and the seven runs above refute both. `~4,600×` reproduced twice
+(4,616.8× and 4,612.5×), so it never overstated anything. `6.69 s` was exceeded twice (7.203 s
+and 7.248 s). Two independent re-runs of this build, seven invocations each, reported the same
+thing. The original point values were reproducible; the *criticism* of them was the
+unsupportable claim, because "did not reproduce on any" is a universal statement and it was made
+from a sample far too small to carry the word **any**.
+
+Which is the lesson of this whole page turning up where it was least expected: the paragraph
+written to explain why an unreproducible number is dangerous was itself an unreproducible
+number, and it survived review precisely because it read like the *cautious* option. Being the
+one who points out an overclaim is not evidence of being right — a negative universal needs
+more sampling than the positive claim it attacks, not less.
+
+The table moved off point values for the good reason and not this one: a reviewer who re-runs
+`pytest -m bench` and sees a different number has been handed a reason to doubt everything else
+on the page. Re-measure with:
+
+```bash
+pytest -m bench -q -s     # prints the table above, with per-stage breakdowns
+```
 
 **Why two of these are best-of-3, and why that is not the same as widening the budget.** A
 wall-clock assertion measures the machine as much as the code, and these two run at the least
@@ -226,7 +319,11 @@ It still catches a real regression, and that is checked rather than argued: a de
 regression injected into `PipelineOrchestrator.run` fails the full-pipeline budget at 17.16 s,
 because a genuine slowdown affects every iteration and therefore moves the minimum. (A +6 s
 regression passes — correctly, since 12.7 s is genuinely inside a 15 s budget.) The two
-high-headroom rows are single-shot: no realistic contention reaches 4,600×.
+high-headroom rows are single-shot because contention cannot plausibly consume the margin
+between a sub-microsecond lookup and a 5 ms budget, or between a 4.8 ms restore and a 500 ms
+one — and note that this is an argument about those *budgets*, not about the sampled headroom
+figures. The vault figure moved by 27% across seven runs (3,636× to 4,617×), which is exactly
+the kind of number this section has now been wrong about twice.
 
 That last row used to live only in `demo.py --real`, where it needed an API key and a network
 and therefore never ran in CI. It is now a `bench` test on the mock provider, so it covers
@@ -544,6 +641,40 @@ rather than rounded away.
 fixes it drove, so it measures **the shapes it knew to look for**, and it does not transfer to
 production as a recall estimate. A corpus written by the person fixing the detector is a
 regression harness, not an evaluation.
+
+##### The held-out number, which is the one to believe
+
+Rather than leave that caveat as an argument, it was measured. `HELD_OUT_CORPUS` is a control of
+**53 documents in registers that appear nowhere in the tuning corpus** — radiology, pathology,
+pharmacy prior-auth, EOB, trial adverse-event, immunization, telehealth chat, portal message,
+hospice plan — annotated *before* being run and never used to change a pattern.
+
+| Over 366 values, none of which anything was tuned against | Tuned corpus | **Held-out** |
+|---|---|---|
+| Values **covered** by a detected span | 99% | **88.5%** |
+| Values covered **and correctly typed** | 99% | **87.4%** |
+| `MRN` covered | ~100% | **27% (4 of 15)** |
+| `MRN` correctly typed | ~100% | **13% (2 of 15)** |
+
+Reproduce with `pytest tests/test_detection.py -k held_out -s`; the floors are asserted, not
+commented, so a regression fails the build.
+
+**Read the gap, not the average.** The 10.5-point drop is the ordinary cost of unseen shapes.
+`MRN` is not ordinary: it collapses because the registry recognises the field *labels* it was
+shown (`MRN:`, `Medical Record No.`) and unseen documents write `Rec #`, `Chart:`, or put the
+number in a table cell with no label at all. Two of the fifteen are absorbed by `DATE`, which is
+worse than a miss — a seven-digit record number is date-shifted and looks handled.
+
+**This is the honest bottom line of the whole submission.** Detection recall is the binding
+constraint (§7), and an entity the detector misses is not merely unblocked: it never enters the
+vault, so egress-gate pass 1 does not scan for it, pass 2 re-scans with the *same* detector and
+shares the miss exactly, and the 100-run leakage harness cannot see it either — the instrument
+that measures leaks is blind to precisely the leaks that matter most. `100/100 clean` is
+therefore a statement about values the detector found, not about all PII in the document. The
+architectural answer is that the gate is fail-closed over the vault (a defence in depth that
+does not depend on recall), and the engineering answer is a clinical NER model rather than a
+gazetteer plus label patterns. Neither answer makes 27% acceptable, and it is stated here rather
+than left for a reviewer to find.
 
 What makes the fixes more credible than the number is that five of the six came from a
 **property** rather than a corpus row — Public Suffix List validation dropping internal
@@ -925,13 +1056,62 @@ the shared store never holds anything usable on its own.
   correctly-hashed row at a new `seq`; **forging a new genesis row** and shifting the rest up;
   deleting the newest rows (truncation); deleting every row of one session; and deleting every
   row in the log. A tampered row that makes the walk itself *unreadable* — a non-numeric `ts`, a
-  corrupt page — now returns `False` rather than raising, so the verifier cannot be crashed using
+  corrupt page — returns `False` rather than raising, so the verifier cannot be crashed using
   the tamper it is looking for.
 
-  Two of those are worth naming because a naive chain misses them. A truncated tail leaves the
+  **That last sentence was an overclaim until recently, and how it was caught is worth the
+  space.** It was true of the chain walk and of nothing else, because the test behind it drove a
+  *monkeypatched cursor* and its docstring argued a real corrupted file was impossible to test:
+  "a file mangled badly enough to fail the walk also fails `AuditLogger.open`". That was wrong,
+  and being wrong in a docstring is how the test never got written. Zeroing one 4 KiB page of a
+  120-row audit database leaves `open` perfectly happy — the file length still matches the
+  header's page count, so nothing reads the dead page until the walk does — and truncation is not
+  the wall either: a 5-row database cut to 90% opens *and* verifies `True`, because the bytes
+  removed were unused tail. Writing the file-level test
+  (`test_verify_chain_reports_a_physically_corrupted_file_that_open_accepts`) then found three
+  defects the mock could not reach:
+
+  - `query()` and `length()` crashed on the same file `verify_chain()` handled — raw
+    `sqlite3.DatabaseError`, and in the truncated case a bare `TypeError` from `float(row["ts"])`
+    where a lost page returned `NULL`. `GET /audit` and `GET /audit/verify` therefore still
+    returned 500s on a corrupt log; only one of the three readers had been hardened. All three
+    now share one `_UNREADABLE` rule, pinned by
+    `test_every_audit_reader_shares_one_unreadable_rule` so they cannot drift apart again.
+  - `verify_chain()` **raised** on a blanked high-water mark. `sqlite_sequence` is an ordinary
+    writable table, so `UPDATE sqlite_sequence SET seq = NULL` is accepted, and `int(row["seq"])`
+    ran *outside* the walk's error handling. An attacker deleting the newest rows has every
+    reason to make that exact edit, since the high-water mark is the only thing that notices — so
+    the verifier could be crashed by the second half of the very attack it exists to catch. It
+    reports `False` now (`test_verify_chain_survives_a_tampered_high_water_mark`), not "no
+    opinion", because a sentinel that exists but holds garbage is evidence rather than absence.
+  - `AuditLogger.open()` **leaked its connection thread** whenever setup failed.
+    `aiosqlite.connect` starts a non-daemon worker and returns before any statement touches the
+    file, so `PRAGMA journal_mode=WAL` was the first thing to fail — escaping with `self._conn`
+    still `None`, leaving the caller no handle and the thread alive. A process that opened a
+    damaged audit DB could not exit, with no error message. Found because a probe script hung and
+    had to be killed.
+
+  The pattern is the recurring one in this codebase, in its quietest form yet: not a checker that
+  shared a bug with the thing it checked, but a *docstring that explained why a test was
+  impossible*, believed for as long as nobody measured it.
+
+  Three of those are worth naming because a naive chain misses them. A truncated tail leaves the
   survivors internally perfect, so it is caught by SQLite's `sqlite_sequence` high-water mark,
   which `AUTOINCREMENT` maintains and `DELETE` does not roll back. And a wholly-erased session
   used to read back as *clean*, which is the worst possible answer to a compliance query.
+
+  The third is the competent version of a middle deletion and it is the one to attack in the
+  review. Having deleted the row, **re-link**: walk the survivors and recompute `prev_hash` and
+  `entry_hash` for every one of them with the published formula. The digests are unkeyed, so
+  this costs nothing. Every row now recomputes, every link matches, and the high-water mark is
+  untouched because the `seq` values were left alone — so the *only* surviving witness is that
+  `seq` skips a number. Compact the numbering to hide that and the high-water mark catches it
+  instead. Both halves are asserted in
+  `test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught`, which also asserts the
+  attacker's own success first, so it cannot pass by failing to build the attack. That test was
+  added because the `seq`-continuity comparison was the one check in `verify_chain` no test
+  isolated: deleting it in a scratch copy left all 100 audit tests green while this exact attack
+  flipped from detected to undetected.
 
   **The exact edge of the high-water defence, since it is easy to overstate.**
   `sqlite_sequence` is an ordinary table in the same file, so an attacker who can run the
@@ -1332,11 +1512,11 @@ marked as such rather than quietly asserted.
 | **Core 4** — vault encrypted, deterministic in-session, purged on expiry/logout | `vault/session_vault.py`, `vault/session_registry.py` | `test_vault.py::test_within_session_determinism`, `::test_destroy_makes_tokens_unreadable`, `::test_destroy_surviving_row_is_undecryptable`, `::test_surviving_row_cannot_repopulate_a_destroyed_cache`; `integration/test_pipeline.py::test_expired_session` |
 | **Core 5** — context injector, chunking, pre-send check | `pipeline/context_injector.py`, `pipeline/egress_gate.py`, `detection/detector.py::chunk_text` | `test_context_injector.py::test_serialized_is_exactly_what_the_gate_scans`; `test_egress_gate.py::test_the_gate_runs_before_the_provider_on_the_happy_path`, `::test_the_provider_is_never_reached_when_the_gate_blocks`; `test_detection.py::test_entity_straddling_a_chunk_boundary_is_detected_whole` |
 | **Core 6** — restore, including mangled/paraphrased token forms | `deobfuscation/restorer.py`, `surrogates.py::TOKEN_RE` | `test_deobfuscation.py::test_mangled_token_forms_restore`, `::test_hint_is_ignored_for_lookup`, `::test_post_restore_assertion_fires_on_residual_token`; `integration/test_pipeline.py::test_vault_miss_on_deobfuscation` |
-| **Core 7** — audit: ts, session, type, token, action; queryable; zero originals | `audit/logger.py`, `models.py::AuditEvent` | `test_audit.py::test_persisted_rows_carry_no_free_text_columns`, `::test_detail_rejects_long_string_values`, `::test_truncating_the_tail_breaks_the_chain`, `::test_erasing_a_whole_session_is_not_reported_as_that_session_being_clean`; leakage assertion 2 |
+| **Core 7** — audit: ts, session, type, token, action; queryable; zero originals | `audit/logger.py`, `models.py::AuditEvent` | `test_audit.py::test_persisted_rows_carry_no_free_text_columns`, `::test_detail_rejects_long_string_values`, `::test_truncating_the_tail_breaks_the_chain`, `::test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught`, `::test_erasing_a_whole_session_is_not_reported_as_that_session_being_clean`; leakage assertion 2 |
 | **Critical constraint** — reversible in-session, irreversible across | `crypto/keys.py::derive_token_id` (HMAC under an ephemeral key), key destruction | `test_crypto.py::test_token_id_deterministic_within_session`, `::test_token_id_non_deterministic_across_sessions`, `::test_token_id_is_irreversible_without_the_key`; `integration/test_pipeline.py::test_restoration_is_impossible_after_the_session_is_destroyed` |
 | **NFR** — config-only entity add | `entities.yaml`; `entity_type` opaque downstream | `test_extensibility.py::test_package_source_never_mentions_passport` (the grep **is** the proof), plus the three end-to-end cases beside it |
 | **NFR** — strategy swappable via config | strategy registry dict, `Settings.strategy` | `test_obfuscation.py::test_dummy_strategy_plugs_in_with_zero_engine_changes`, `::test_per_entity_strategy_override_is_config_only`; `test_llm.py::test_new_provider_name_is_selectable_with_zero_other_changes` |
-| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, two passes) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; `demo.py --dump-wire` for the literal HTTP body |
+| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, two passes) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the four stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims`, `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`, `::test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`; `demo.py --dump-wire` for the literal HTTP body |
 | **NFR** — vault isolation is cryptographic, cross-session | per-session HKDF vault keys, AAD `session_id:token_id` | `test_vault.py::test_aad_binding_across_sessions`, `::test_aad_binding_across_token_ids`; `integration/test_pipeline.py::test_concurrent_session_isolation` (50 interleaved ops) |
 | **NFR** — graceful degradation (never pass through raw) | engine threshold policy, `action: redact` | `test_obfuscation.py::test_mid_confidence_span_is_redacted_without_a_vault_entry`, `::test_case_strategy_is_force_redacted_in_both_modes`; `test_detection.py::test_below_floor_span_is_dropped` |
 | **NFR** — async pipeline, spaCy off the event loop | `detector.detect` (`asyncio.to_thread` behind `Semaphore(4)`), `aiosqlite`, `aiofiles` | `integration/test_pipeline.py::test_the_pipeline_never_blocks_the_event_loop`; `test_extraction.py::test_extraction_runs_off_the_event_loop_thread` |
@@ -1381,7 +1561,14 @@ git clone <repo-url> /tmp/scp-verify && cd /tmp/scp-verify
 show the example file only.
 
 ```bash
-git log --all -p | grep -nE 'SCP_MASTER_KEY=.+|ANTHROPIC_API_KEY=.+|sk-ant-'   # expect: no output
+git log --all -p \
+  | grep -nE 'SCP_MASTER_KEY=[A-Za-z0-9+/]{20,}|ANTHROPIC_API_KEY=[A-Za-z0-9_+/-]{20,}|sk-ant-[A-Za-z0-9]{24,}'
+# expect: no output. The value shapes are matched, not the variable names: a real master key is
+# 32 random bytes base64 (44 chars) and a real API key carries a long unbroken alphanumeric run.
+# Grepping the bare names instead reports 9 hits on a clean tree -- this README's own three
+# commands match themselves, `demo.py` prints `export ANTHROPIC_API_KEY=sk-ant-...` in its help,
+# and the tests use a literal `sk-ant-not-a-real-key`. A check that cries wolf on a clean repo
+# is one a reviewer learns to wave through, which is the failure mode worth avoiding here.
 git log --all --name-only --pretty=format: | sort -u | grep -x '.env'          # expect: no output
 ls -a | grep -E '^\.env'                                                        # expect: .env.example
 ```

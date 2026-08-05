@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -36,6 +37,8 @@ from secure_context_pipeline.detection.detector import (
     warm_up,
 )
 from secure_context_pipeline.detection.recognizers import (
+    GAZETTEER_SCORE,
+    PATTERN_SCORE,
     class_hint_for,
     gazetteer_terms,
     load_gazetteer,
@@ -1085,28 +1088,84 @@ OVERALL_COVERAGE_FLOOR = 0.98
 OVERALL_TYPED_FLOOR = 0.98
 
 
-async def measure_recall(detector: Detector) -> tuple[dict[str, list[int]], list[str]]:
-    """``{entity_type: [covered, typed, total]}`` plus a line per residual miss."""
+class Residual(NamedTuple):
+    """One annotated value the detector did not fully and correctly claim.
+
+    ``covered`` distinguishes the two shortfalls, which are not equally serious.
+    ``covered=False`` means the value went out in the clear -- a leak. ``True``
+    with a non-matching label means the value *was* masked but under the wrong
+    entity type, so only the pseudonymization tier is wrong.
+    """
+
+    doc_id: str
+    entity_type: str
+    value: str
+    covered: bool
+    labels: tuple[str, ...]
+
+    def describe(self) -> str:
+        if not self.covered:
+            return f"{self.doc_id}: {self.entity_type} {self.value!r} not covered"
+        return (
+            f"{self.doc_id}: {self.entity_type} {self.value!r} labelled {list(self.labels)}"
+        )
+
+
+async def measure_coverage(
+    detector: Detector,
+    corpus: list[tuple[str, str | None, str]],
+    in_scope: Callable[[str, str | None], bool] | None = None,
+) -> tuple[dict[str, list[int]], list[Residual], list[int]]:
+    """``{entity_type: [covered, typed, total]}``, one ``Residual`` per shortfall, and
+    the same ``[covered, typed, total]`` restricted to values ``in_scope`` accepts.
+
+    One counting rule, applied to both the tuned corpus and the held-out one, so
+    the two figures are comparable rather than merely adjacent. A separate
+    implementation per corpus would be the same shape of mistake as a checker that
+    shares a bug with the thing it checks: the comparison that carries the whole
+    argument would rest on two rules nothing forces to agree.
+
+    The scoped subtotal is accumulated in this loop rather than reconstructed
+    afterwards from the residual list. Reconstruction has to key on something, and
+    every available key -- ``(doc_id, entity_type, value)`` included -- repeats:
+    ``ho_immunization`` annotates the same name and the same chart number on two
+    consecutive rows. Both are missed today, so a set-based reconstruction would
+    agree with this one and be wrong the moment one of them started matching.
+    """
     tally: dict[str, list[int]] = {}
-    misses: list[str] = []
-    for doc_id, doc_category, annotated in RECALL_CORPUS:
+    residual: list[Residual] = []
+    scoped = [0, 0, 0]
+    for doc_id, doc_category, annotated in corpus:
         text, truth = parse_annotated(annotated)
         found = await detector.detect(text, doc_category)
         for entity_type, start, end, value in truth:
             row = tally.setdefault(entity_type, [0, 0, 0])
             row[2] += 1
+            counted = in_scope is not None and in_scope(entity_type, doc_category)
+            if counted:
+                scoped[2] += 1
             covering = [d for d in found if d.start <= start and end <= d.end]
             if not covering:
-                misses.append(f"{doc_id}: {entity_type} {value!r} not covered")
+                residual.append(Residual(doc_id, entity_type, value, False, ()))
                 continue
             row[0] += 1
+            if counted:
+                scoped[0] += 1
             accepted = LABEL_ALIASES.get(entity_type, frozenset({entity_type}))
             if any(d.entity_type in accepted for d in covering):
                 row[1] += 1
+                if counted:
+                    scoped[1] += 1
             else:
-                labels = sorted({d.entity_type for d in covering})
-                misses.append(f"{doc_id}: {entity_type} {value!r} labelled {labels}")
-    return tally, misses
+                labels = tuple(sorted({d.entity_type for d in covering}))
+                residual.append(Residual(doc_id, entity_type, value, True, labels))
+    return tally, residual, scoped
+
+
+async def measure_recall(detector: Detector) -> tuple[dict[str, list[int]], list[str]]:
+    """``{entity_type: [covered, typed, total]}`` plus a line per residual miss."""
+    tally, residual, _scoped = await measure_coverage(detector, RECALL_CORPUS)
+    return tally, [item.describe() for item in residual]
 
 
 def format_recall_table(tally: dict[str, list[int]]) -> str:
@@ -1218,6 +1277,1207 @@ async def test_over_detection_on_realistic_prose_stays_bounded(detector: Detecto
                 extra.append(f"{doc_id}: {found.entity_type} {found.text!r}")
     print("\n".join(["", "unannotated spans:", *extra]))
     assert len(extra) <= MAX_UNANNOTATED_SPANS, "\n".join(["over-detection grew:", *extra])
+
+
+# ---------------------------------------------------------------------------
+# 1d. Held-out recall -- the same measurement on shapes nothing was tuned against
+# ---------------------------------------------------------------------------
+# RECALL_CORPUS above was written by the same process that tuned the patterns, so
+# its 99% measures how well the detector handles the shapes we already knew about.
+# That number is not wrong, but on its own it is not evidence about an unseen
+# document, and it is the first thing a reviewer should distrust.
+#
+# HELD_OUT_CORPUS is the control. 53 documents in registers that appear nowhere
+# above -- radiology dictation, surgical pathology, pharmacy prior-auth, EOB,
+# clinical-trial adverse event, immunization export, physical therapy, telehealth
+# transcript, patient-portal message, hospice plan, dental recall, EMS run sheet,
+# arbitration award, subpoena, court transcript, docketing notice, retainer
+# invoice, cease-and-desist, will, closing statement, parenting plan, expert
+# invoice, commercial invoice, collections notice, mortgage payoff and servicing
+# transfer, brokerage confirmation, payroll register and adjustment, tax notice
+# and transmittal, card dispute, adjuster file note, dunning statement, chat log,
+# voicemail transcription, CSV and JSON exports, CV, visa letter, university
+# record, HR investigation, Slack thread, conference registration, veterinary
+# summary, alumni note, IT escalation, survey free text, incident narrative --
+# and in spellings the fixtures above never use: dotted and international phone
+# numbers, space-separated SSNs, "Patient ID" and "Chart No." for a chart number,
+# space-grouped account digits, day-month-year and two-digit-year dates, names
+# with particles, hyphens and non-Latin transliteration, plus-addressed e-mail.
+#
+# The corpus was written before it was measured and NOTHING was changed in
+# response to the result. That is the whole point: tuning the registry until this
+# number rises would recreate exactly the bias it exists to detect, and would
+# leave the project with two home-turf corpora and no control. If a future change
+# closes one of the documented gaps below, it must be driven by the property (a
+# pattern that is wrong about the world), not by a row in this table.
+#
+# MEASURED, on the shipped registry:
+#
+#     RECALL_CORPUS (tuned)      99.1% covered 99.1% typed over 320 values
+#     HELD_OUT_CORPUS (unseen)   88.5% covered 87.4% typed over 366 values
+#     ... of which in-policy      91.3% covered 90.1% typed over 355 values
+#
+# An eleven-point drop on unseen shapes is the honest figure and the one the
+# README's caveat is about. The residual is not spread evenly -- it concentrates
+# in four places, all of them already-known properties rather than surprises, and
+# HELD_OUT_MISS_SHAPES below names each one.
+#
+# "In-policy" excludes annotated values whose entity type is not `allowed_in`
+# that document's category -- an AMOUNT in a legal invoice, a service DATE in a
+# financial statement. Those are values the detector was never asked to look for,
+# because `only_in_doc_categories` scopes AMOUNT to financial documents and DATE
+# to medical ones. They are counted in the headline number anyway (a value in the
+# clear is in the clear, whatever the reason) and reported separately so the two
+# causes are not confused.
+#
+# Reproduce with:  pytest tests/test_detection.py -k held_out -s
+
+HELD_OUT_CORPUS: list[tuple[str, str | None, str]] = [
+# ---------------------------------------------------------------- medical
+("ho_radiology", "medical", """
+RADIOLOGY REPORT — CT ABDOMEN/PELVIS WITH CONTRAST
+
+Patient ID <<MRN|8814027>>        Accession 2024-CT-88140
+Patient: <<NAME|Halvard Nystrom>>
+Birth date <<DOB|21-Aug-1958>>
+Ordering clinician: Dr. <<NAME|Priti Raval>>
+
+FINDINGS: There is a 3.1 cm hypodense lesion in segment VI of the liver.
+No free fluid. Known <<DIAGNOSIS|cirrhosis>> is again noted with a nodular contour.
+
+IMPRESSION: Indeterminate hepatic lesion; recommend MRI. Renal function adequate,
+<<LAB_RESULT|creatinine 1.0>>. Results phoned to the ordering clinician at
+<<PHONE|312.555.0164>>.
+"""),
+("ho_pathology", "medical", """
+SURGICAL PATHOLOGY REPORT
+
+Chart No. <<MRN|2207731>>. Specimen received from <<NAME|Ingeborg Vasquez-Lund>>,
+date of birth <<DOB|9 Feb 1949>>.
+
+Microscopic description: sections show invasive ductal carcinoma, grade 2.
+Final diagnosis: <<DIAGNOSIS|breast cancer>>, ER positive.
+
+The patient also carries a diagnosis of <<DIAGNOSIS|osteoporosis>> and takes
+<<MEDICATION|alendronate>> weekly. Please direct queries to the laboratory,
+<<EMAIL|histology@path.regionalhealth.internal>>, or <<PHONE|+44 20 7946 0958>>.
+"""),
+("ho_pharmacy_pa", "medical", """
+PHARMACY PRIOR AUTHORIZATION REQUEST — FAX COVER
+
+Member <<NAME|Terrance O'Loughlin>>          Member ID <<INSURANCE_ID|AETNA4412093>>
+DOB <<DOB|03-07-1972>>                        Chart <<MRN|9014482>>
+
+Requested drug: <<MEDICATION|insulin glargine>>. Prior therapy with
+<<MEDICATION|metformin>> and <<MEDICATION|glipizide>> was inadequate; most recent
+<<LAB_RESULT|HbA1c of 9.6>> supports escalation. Indication is
+<<DIAGNOSIS|type 2 diabetes>>.
+
+Prescriber fax <<PHONE|(415) 555-0193>>; prescriber e-mail
+<<EMAIL|rx.desk@clinic-network.corp>>.
+"""),
+("ho_eob", "medical", """
+EXPLANATION OF BENEFITS — THIS IS NOT A BILL
+
+Subscriber: <<NAME|Rosalind Achterberg>>
+Policy member number <<INSURANCE_ID|UHG88213047>>
+Service date <<DATE|02-14-2024>>
+
+Charge submitted <<AMOUNT|$1,842.00>>. Plan allowance $912.30. You may owe $184.20.
+Claim questions: <<PHONE|1 (800) 555-0122>>, or write to
+<<EMAIL|member.services@payerco.example>>.
+"""),
+("ho_trial_ae", "medical", """
+CLINICAL TRIAL — SERIOUS ADVERSE EVENT NARRATIVE
+
+Subject initials H.T.  Subject record <<MRN|4402198>>.
+Subject full name on the consent form: <<NAME|Hiroko Takahashi>>. Born
+<<DOB|1966-11-30>>.
+
+On study day 42 the subject was hospitalised with <<DIAGNOSIS|pulmonary embolism>>.
+Study drug was withheld. Concomitant medication at the time included
+<<MEDICATION|apixaban>> and <<MEDICATION|prednisone>>. Baseline
+<<LAB_RESULT|WBC of 12.4>> on admission.
+
+Investigator contact <<PHONE|617-555-0128>> / <<EMAIL|pi.office@trialsite.local>>.
+"""),
+("ho_pt_progress", "medical", """
+PHYSICAL THERAPY PROGRESS NOTE
+
+Pt: <<NAME|Anneliese van der Berg>> | mrn# <<MRN|7712340>> | dob <<DOB|12/4/1981>>
+
+Subjective: reports improved tolerance. History of <<DIAGNOSIS|rheumatoid arthritis>>.
+Objective: knee flexion 118 degrees. Continues <<MEDICATION|naproxen>> as needed.
+Plan: two visits weekly for four weeks.
+
+Home number on file: <<PHONE|206 555 0175>>.
+"""),
+("ho_immunization", "medical", """
+IMMUNIZATION RECORD EXPORT
+
+name,dob,mrn,vaccine,date
+<<NAME|Chidi Okonjo>>,<<DOB|07/23/2011>>,<<MRN|3318802>>,MMR,<<DATE|09/15/2016>>
+<<NAME|Chidi Okonjo>>,<<DOB|07/23/2011>>,<<MRN|3318802>>,Tdap,<<DATE|09/15/2022>>
+
+Guardian e-mail: <<EMAIL|okonjo.family+records@mailhost.example>>
+Guardian phone: <<PHONE|(773) 555-0119>>
+"""),
+("ho_pt_visit", "medical", """
+Physical therapy -- visit 4 of 12
+
+Client <<NAME|Dorothy Vaneck>> arrived on time and reports her
+<<DIAGNOSIS|chronic low back pain>> is now 4/10, down from 7/10 at evaluation. She
+continues <<MEDICATION|meloxicam>> 15 mg each morning and denies new numbness.
+
+Objective: lumbar flexion improved to within functional limits. No red flags today.
+Plan: continue twice weekly for four more weeks, then reassess.
+
+Billing reference: chart <<MRN|5518044>>. Insurance on file is member
+<<INSURANCE_ID|AET88120334>>. Patient was born <<DOB|09.14.1958>>.
+"""),
+("ho_prior_auth_appeal", "medical", """
+Re: Adverse determination -- request for reconsideration
+
+To whom it may concern,
+
+I am writing on behalf of my patient, <<NAME|Angela Whitmore>>, whose date of birth is
+<<DOB|1966-11-30>>, to appeal the denial issued against member ID
+<<INSURANCE_ID|CIG4471290>>. Her <<DIAGNOSIS|rheumatoid arthritis>> has failed two prior
+agents, and continued <<MEDICATION|methotrexate>> monotherapy is inadequate.
+
+Her most recent renal function, <<LAB_RESULT|creatinine 0.8>>, does not contraindicate
+escalation, and her chart number is <<MRN|4419307>>.
+
+I can be reached directly at <<EMAIL|k.morrisey@grovehealth.example>> should you require
+additional records before the appeal deadline.
+"""),
+("ho_ems_run", "medical", """
+EMS RUN SHEET -- UNIT 12
+
+DISP 0347. ARR 0356. PT: <<NAME|Rudolph Steinmetz>>, M, DOB <<DOB|3/9/62>>.
+HX: <<DIAGNOSIS|copd>>, <<DIAGNOSIS|atrial fibrillation>>.
+MEDS: <<MEDICATION|tiotropium>>, <<MEDICATION|apixaban>>.
+CC: increasing <<DIAGNOSIS|shortness of breath>> since the evening meal.
+TX: oxygen via non-rebreather, <<MEDICATION|albuterol>> nebuliser en route.
+Receiving facility chart MRN <<MRN|7702914>>. Spouse notified at <<PHONE|619-555-0128>>.
+"""),
+("ho_telehealth_chat", "medical", """
+Telehealth session transcript
+
+[10:02] Clinician: Good morning, am I speaking with <<NAME|Beatrice Solano>>?
+[10:02] Patient: Yes, that's me.
+[10:03] Clinician: Thanks. Can you confirm your date of birth for me?
+[10:03] Patient: Sure, it's <<DOB|July 4, 1988>>.
+[10:04] Clinician: Perfect. Does the portal show your record as <<MRN|4419305>>?
+[10:04] Patient: It does.
+[10:05] Clinician: You mentioned the <<DIAGNOSIS|migraine>> is back. Are you still taking
+        the <<MEDICATION|sumatriptan>> we prescribed?
+[10:05] Patient: Yes, but it isn't helping much this week.
+[10:07] Clinician: Understood. Is <<PHONE|(801) 555-0169>> still the best number for you?
+[10:07] Patient: That's right.
+"""),
+("ho_portal_message", "medical", """
+Secure message -- from your care team
+
+Hello <<NAME|Terrence Boudreaux>>,
+
+Your recent bloodwork is back. Your <<LAB_RESULT|LDL was 148>> and your
+<<LAB_RESULT|A1C is 6.1>>, which puts you in the range we call
+<<DIAGNOSIS|prediabetes>>. We would like you to start <<MEDICATION|metformin>> at a low
+dose and recheck in three months.
+
+If anything looks wrong on your chart -- it should list record <<MRN|3308871>> and a
+birth date of <<DOB|02-28-1974>> -- please tell the front desk when you next visit.
+
+Reply here or write to <<EMAIL|carecoordination@stmarks.internal>>.
+"""),
+("ho_hospice_plan", "medical", """
+Hospice plan of care -- interdisciplinary team review
+
+* Patient: <<NAME|Grace Okorie>>, record <<MRN|6612977>>
+* Born <<DOB|12 March 1939>>
+* Primary terminal diagnosis: <<DIAGNOSIS|end-stage renal disease>>
+* Secondary conditions: <<DIAGNOSIS|dementia>>, <<DIAGNOSIS|anemia>>
+* Comfort medications: <<MEDICATION|morphine>> concentrate, <<MEDICATION|lorazepam>>
+* Primary caregiver: her daughter, <<NAME|Charlotte Okorie>>, cell <<PHONE|443-555-0192>>
+* Caregiver email for the visit calendar: <<EMAIL|c.okorie@familymail.example>>
+"""),
+("ho_dental_note", "medical", """
+Dental chart entry.
+
+Patient <<NAME|Steven Halvorsen>> presented for recall prophylaxis. Health history was
+updated; he reports <<DIAGNOSIS|type 2 diabetes>> controlled on <<MEDICATION|metformin>>
+and also takes <<MEDICATION|lisinopril>> daily. Blood pressure taken in the chair.
+
+Radiographs: four bitewings. No new caries. Periodontal charting stable.
+Chart number <<MRN|2214880>>. Patient's mobile is <<PHONE|(505) 555-0175>>.
+"""),
+# ------------------------------------------------------------------ legal
+("ho_arbitration_award", "legal", """
+FINAL AWARD OF THE ARBITRATOR
+
+In the matter of <<CLIENT_IDENTITY|Rowan Delacroix-Meyer>> and Sundial Freight LLC,
+AAA case <<CASE_ID|23-AAA-00641>>, consolidated with <<CASE_ID|3:22-cv-01145>>.
+
+Having considered the evidence, the arbitrator awards claimant
+<<SETTLEMENT_TERM|damages in the sum of $612,500>>, payable within thirty days.
+
+<<PRIVILEGED_MARKER|Attorney Work Product>> — the panel's deliberation notes are
+not part of this award.
+"""),
+("ho_subpoena", "legal", """
+SUBPOENA DUCES TECUM
+
+To: Custodian of Records
+Re: <<CLIENT_IDENTITY|Beatriz Sanabria>>, born <<DOB|30 June 1988>>, social security
+number <<SSN|418 22 9037>>.
+
+You are commanded to produce all documents in <<CASE_ID|1:25-cv-00318>> concerning
+the above individual on or before <<DATE|03/28/2025>>.
+
+Service copy to <<EMAIL|records@courtservices.example>> and by telephone
+confirmation to <<PHONE|202-555-0146>>.
+"""),
+("ho_transcript", "legal", """
+EXCERPT OF PROCEEDINGS — VOLUME II
+
+THE COURT: We are on the record in <<CASE_ID|2:24-cv-09931>>.
+MR. ABERNATHY: Appearing for the plaintiff, your honour.
+THE COURT: And your client is present?
+MR. ABERNATHY: <<CLIENT_IDENTITY|Yusuf Abdi-Rahman>> is seated at counsel table.
+THE COURT: Very well. <<CASE_STRATEGY|We intend to move to bifurcate liability
+from damages before the pretrial conference>>, counsel indicated in the joint report.
+"""),
+("ho_retainer_invoice", "legal", """
+STATEMENT OF ACCOUNT — LEGAL SERVICES
+
+Bill to: <<CLIENT_IDENTITY|Margarethe Solheim>>
+Matter: <<CASE_ID|4:23-cv-00219>>
+Invoice 2024-1187
+
+Professional fees this period <<AMOUNT|$18,750.00>>. Trust balance applied
+<<AMOUNT|$5,000.00>>. Remit to our operating account, a/c
+<<ACCOUNT_NUMBER|7710294883>>, or contact accounts at
+<<EMAIL|billing@solheimlaw.internal>>.
+
+Taxpayer identification number for our firm is <<TAX_ID|27-4419283>>.
+"""),
+("ho_cease_desist", "legal", """
+<<PRIVILEGED_MARKER|PRIVILEGED & CONFIDENTIAL>>
+
+Dear Sir or Madam,
+
+This firm represents <<CLIENT_IDENTITY|Sunniva Bjørnstad>>. Your continued use of the
+mark is actionable. <<CASE_STRATEGY|We are inclined to seek preliminary injunctive
+relief in the Northern District if we do not receive written assurances by the end
+of the month>>.
+
+Related proceeding: <<CASE_ID|24-CIV-00771>>. Please respond to
+<<EMAIL|litigation@brandcounsel.example>> or <<PHONE|(628) 555-0187>>.
+"""),
+("ho_docketing_notice", "legal", """
+DOCKETING NOTICE
+
+The clerk has assigned <<CASE_ID|5:25-cr-00042>> to Judge Alvarez.
+Counsel of record for the defendant is <<CLIENT_IDENTITY|Nnamdi Eze>>, whose date of
+birth appears in the sealed exhibit as <<DOB|1990/02/09>>.
+A settlement conference is set. <<SETTLEMENT_TERM|A settlement of $75,000 was
+discussed off the record>>.
+"""),
+("ho_will", "legal", """
+LAST WILL AND TESTAMENT
+
+I, <<CLIENT_IDENTITY|Cornelius Ashby>>, being of sound mind, do hereby revoke all former
+wills heretofore made by me.
+
+FIRST: I direct that my just debts and funeral expenses be paid.
+
+SECOND: I give and bequeath the residue of my estate to my niece,
+<<CLIENT_IDENTITY|Prudence Ashby>>, presently residing in <<ADDRESS|Charleston>>.
+
+THIRD: I nominate as executor the attorney whose office maintains the file bearing
+number <<CASE_ID|2:24-pr-00318>>, and whose taxpayer identification number is
+<<TAX_ID|58-2210947>>.
+
+Executed this day in the presence of the witnesses named below.
+Witness contact: <<PHONE|(843) 555-0181>>.
+"""),
+("ho_closing_statement", "legal", """
+SETTLEMENT STATEMENT -- REAL PROPERTY CLOSING
+
+Buyer: <<CLIENT_IDENTITY|Margaret Lindholm>>
+Seller: <<CLIENT_IDENTITY|Hollis Trueblood>>
+Companion litigation matter <<CASE_ID|3:24-cv-01177>>
+
+Purchase price and adjustments were reconciled against the escrow
+account no. <<ACCOUNT_NUMBER|6640118293>>. Seller proceeds were wired the same afternoon
+and the file has been closed.
+
+Buyer's counsel may be reached at <<EMAIL|mlindholm@harborcounsel.example>> or on
+<<PHONE|(360) 555-0154>>. The buyer's date of birth, taken for title purposes, is
+<<DOB|1979/05/02>>.
+"""),
+("ho_parenting_plan", "legal", """
+PARENTING PLAN AND PARENTING TIME SCHEDULE
+
+The parties, <<CLIENT_IDENTITY|Delphine Marchetti>> and <<CLIENT_IDENTITY|Stefan Reyes>>,
+agree as follows.
+
+1. The children shall reside primarily with the mother in <<ADDRESS|Missoula>>.
+2. Exchanges occur at the midpoint of the drive. Each parent shall keep a working
+   telephone number on file; the father's is <<PHONE|406-555-0136>>.
+3. Neither parent shall disparage the other in the presence of the children.
+
+Case number <<CASE_ID|4:23-dr-00250>>. The mediator's email is
+<<EMAIL|mediation@bitterrootadr.example>>.
+"""),
+("ho_expert_invoice", "legal", """
+INVOICE FOR EXPERT SERVICES
+
+Bill to: counsel of record, matter <<CASE_ID|5:22-cv-04471>>.
+Expert: <<CLIENT_IDENTITY|Raymond Ballinger>>
+Federal employer identification number <<TAX_ID|77-3049182>>
+
+Services rendered: record review, 6.5 hours; deposition preparation, 3.0 hours.
+
+Remit by ACH to account number <<ACCOUNT_NUMBER|1102938475>>. Questions to
+<<EMAIL|billing@ballingerconsulting.example>> or <<PHONE|(650) 555-0119>>.
+"""),
+# -------------------------------------------------------------- financial
+("ho_invoice", "financial", """
+COMMERCIAL INVOICE 88-2044
+
+Bill to: <<NAME|Ferdinand Oyelaran>>
+Remit payment to account no <<ACCOUNT_NUMBER|4471029384>> at Meridian Bank.
+Supplier EIN: <<TAX_ID|81-2947160>>
+
+Subtotal <<AMOUNT|$34,200.00>>. Freight <<AMOUNT|$1,150.00>>. Total due
+<<AMOUNT|$35,350.00>> net 30.
+
+Accounts payable questions: <<EMAIL|ap@oyelaran-imports.corp>>,
+<<PHONE|+1-312-555-0138>>.
+"""),
+("ho_collections", "financial", """
+NOTICE OF DELINQUENCY
+
+<<NAME|Consuelo Ibarra-Nunez>>
+Account number <<ACCOUNT_NUMBER|9902831746>>
+
+Your balance of <<AMOUNT|$2,884.19>> is now 90 days past due. A payment of
+<<AMOUNT|$500.00>> today will stop further collection activity. We hold your
+social security number as <<SSN|530 41 8827>> and your date of birth as
+<<DOB|18-Mar-1979>> for identification purposes.
+
+Call <<PHONE|888.555.0154>> or e-mail <<EMAIL|collections@recoverypartners.example>>.
+"""),
+("ho_mortgage_payoff", "financial", """
+MORTGAGE PAYOFF STATEMENT
+
+Borrower: <<NAME|Bartholomew Achterberg>>
+Loan/acct # <<ACCOUNT_NUMBER|30012948756>>
+Property address in <<ADDRESS|Tulsa>>, Oklahoma
+
+Principal balance <<AMOUNT|$214,880.42>>. Per diem interest $23.14. Good through
+<<DATE|06/30/2025>>. Wire instructions will be released only after telephone
+verification at <<PHONE|(918) 555-0102>>.
+
+Borrower taxpayer id <<TAX_ID|44-8827193>>.
+"""),
+("ho_brokerage_confirm", "financial", """
+TRADE CONFIRMATION
+
+Registered owner <<NAME|Xiulan Zhao>>
+Brokerage a/c <<ACCOUNT_NUMBER|660112938475>>
+
+Bought 400 shares at a principal amount of <<AMOUNT|$18,004.00>>; commission
+<<AMOUNT|$4.95>>. Settlement date <<DATE|05/22/2025>>.
+
+Statements are delivered to <<EMAIL|x.zhao@investormail.local>>. Service line
+<<PHONE|(646) 555-0173>>.
+"""),
+("ho_payroll_register", "financial", """
+PAYROLL REGISTER — PERIOD ENDING <<DATE|03/15/2025>>
+
+Employee                 SSN               Net pay      Direct deposit
+<<NAME|Aurelio Santangelo>>      <<SSN|602 33 1194>>       <<AMOUNT|$3,412.77>>    acct <<ACCOUNT_NUMBER|551029384712>>
+<<NAME|Dilnoza Yusupova>>        <<SSN|714 08 2265>>       <<AMOUNT|$2,988.10>>    acct <<ACCOUNT_NUMBER|551029477310>>
+
+Employer identification number <<TAX_ID|59-1102847>>. Payroll questions to
+<<EMAIL|payroll@company-hq.internal>>.
+"""),
+("ho_tax_notice", "financial", """
+NOTICE OF PROPOSED ASSESSMENT
+
+Taxpayer: <<NAME|Grigore Enescu>>
+Taxpayer identification number <<TAX_ID|72-3391085>>
+Tax period ending <<DATE|12/31/2023>>
+
+Our records show an underpayment of <<AMOUNT|$7,412.00>> plus interest. Payment may
+be made from your bank account <<ACCOUNT_NUMBER|880194728310>>.
+
+If you disagree, write to <<EMAIL|appeals@revenueoffice.example>> or telephone
+<<PHONE|1-877-555-0161>>.
+"""),
+("ho_card_dispute", "financial", """
+CARDHOLDER DISPUTE FORM
+
+Cardholder <<NAME|Marguerite N'Diaye>>, date of birth <<DOB|4 Oct 1993>>, resides in
+<<ADDRESS|Providence>>, Rhode Island.
+
+Disputed transaction of <<AMOUNT|$1,204.55>> posted to account
+<<ACCOUNT_NUMBER|4400 8829 1374>> on <<DATE|01/09/2025>>. Cardholder states the
+transaction was not authorised.
+
+Callback <<PHONE|401-555-0130>>; e-mail <<EMAIL|m.ndiaye@personalbox.example>>.
+"""),
+("ho_collections_letter", "financial", """
+NOTICE OF DELINQUENCY
+
+Dear <<NAME|Marisol Cabrera>>,
+
+Our records show the balance on Account Number: <<ACCOUNT_NUMBER|9930118274>> remains
+unpaid. The amount now due is <<AMOUNT|$3,412.09>>, which includes late fees assessed
+against the account since the last payment was received.
+
+We hold your social security number as <<SSN|318-46-2207>> and your date of birth as
+<<DOB|10/22/1981>> for identification purposes only.
+
+To arrange payment, call <<PHONE|(844) 555-0193>> or write to
+<<EMAIL|resolutions@pinnaclerecovery.example>>.
+"""),
+("ho_tax_cover", "financial", """
+Transmittal letter -- individual return
+
+Enclosed please find the completed return for <<NAME|Ingrid Haugland>>, prepared from the
+documents you provided. Your taxpayer identification number as shown on the return is
+<<TAX_ID|26-4471902>> and your date of birth is <<DOB|Feb 11, 1969>>.
+
+The refund of <<AMOUNT|$2,206.44>> will be deposited directly to the checking
+a/c <<ACCOUNT_NUMBER|8801927364>> you designated on the signature page.
+
+Please sign where indicated and return by email to <<EMAIL|returns@meridiantax.example>>.
+Our office line is <<PHONE|(612) 555-0102>>.
+"""),
+("ho_mortgage_servicing", "financial", """
+IMPORTANT NOTICE ABOUT YOUR LOAN
+
+The servicing of your mortgage is transferring to a new servicer.
+
+Borrower of record: <<NAME|Charlotte Fitzgerald>>
+Loan account: <<ACCOUNT_NUMBER|acct # 44029183756>>
+Current escrow balance: <<AMOUNT|$4,118.62>>
+
+Nothing else about your loan changes. Your payment, currently <<AMOUNT|$1,942.18>> each
+month, stays exactly the same, and no action is required from you.
+
+Questions? Call <<PHONE|1-877-555-0112>> or email <<EMAIL|transfers@atlasloan.internal>>.
+"""),
+("ho_adjuster_note", "financial", """
+Claim file note -- adjuster entry.
+
+Insured <<NAME|Bartholomew Reed>>. DOB <<DOB|05/07/1977>>. SSN on file
+<<SSN|466-92-1130>>. Spoke with insured regarding the loss and confirmed policy member
+<<INSURANCE_ID|GEI7719042>>.
+
+Estimate written for <<AMOUNT|$8,940.55>>. Payment to be issued to the mortgagee and the
+insured jointly, deposited to account no. <<ACCOUNT_NUMBER|2200194837>>.
+
+Insured cell <<PHONE|(210) 555-0187>>. Email on file <<EMAIL|b.reed@webmail.example>>.
+"""),
+("ho_payroll_dispute", "financial", """
+Payroll adjustment request
+
+Employee: <<NAME|Susan Torkelsen>>
+Employee SSN: <<SSN|529-07-3341>>
+Direct deposit account <<ACCOUNT_NUMBER|3391028475>>
+
+The employee reports that the deduction of <<AMOUNT|$412.77>> taken from the last cycle
+was applied in error. Payroll confirms the transaction was a duplicate withdrawal and has
+been reversed.
+
+Corrected net pay of <<AMOUNT|$2,884.31>> will be released on the next cycle.
+Employee contact: <<PHONE|503-555-0141>>, <<EMAIL|s.torkelsen@company.internal>>.
+Employer identification number <<TAX_ID|93-1102847>>.
+"""),
+("ho_dunning_invoice", "financial", """
+STATEMENT OF ACCOUNT -- 60 DAYS PAST DUE
+
+Customer <<NAME|Prosper Adeyinka>> owes a balance of <<AMOUNT|$27,510.00>> against
+account no <<ACCOUNT_NUMBER|770291384562>>.
+
+Invoice 8841 was issued against a deposit of <<AMOUNT|$9,170.00>>, of which nothing has
+been received. A payment plan is available on request.
+
+Our tax identification number for your records is <<TAX_ID|41-9928374>>.
+Accounts receivable: <<EMAIL|ar@northgateindustrial.example>>, <<PHONE|(414) 555-0125>>.
+"""),
+# ---------------------------------------------------------------- general
+("ho_chat_log", None, """
+#support-escalations
+
+09:14  <<NAME|Priyanka Raghunathan>>: customer can't log in, verified last 4 of ssn
+09:15  <<NAME|Tomas Bergqvist>>: what's the full number, i'll check the record
+09:15  <<NAME|Priyanka Raghunathan>>: <<SSN|385-22-9014>>, dob <<DOB|11/06/1987>>
+09:16  <<NAME|Tomas Bergqvist>>: found them, mail is <<EMAIL|k.svensson@clientdomain.lan>>
+09:17  <<NAME|Priyanka Raghunathan>>: phone on file <<PHONE|(415) 555-0109>>, calling now
+"""),
+("ho_voicemail_ext", None, """
+VOICEMAIL TRANSCRIPTION — EXTENSION 4402
+
+"Hi, this is <<NAME|Eamonn Fitzgerald>> returning your call. You can reach me back on
+<<PHONE|503 555 0141>> any time today. My date of birth is <<DOB|Feb 3, 1975>> if you
+need to verify, and my e-mail is <<EMAIL|e.fitzgerald@homedomain.internal>>.
+Thanks, bye."
+"""),
+("ho_csv_export", None, """
+customer_id,full_name,email,phone,ssn,dob
+44120,<<NAME|Solveig Haraldsen>>,<<EMAIL|s.haraldsen@nordicmail.example>>,<<PHONE|+47 21 08 44 12>>,<<SSN|221-55-0084>>,<<DOB|1994-07-19>>
+44121,<<NAME|Rajesh Ramachandran>>,<<EMAIL|r.ramachandran@corp.intranet>>,<<PHONE|(972) 555-0166>>,<<SSN|609-14-3372>>,<<DOB|1982-01-05>>
+"""),
+("ho_json_payload", None, """
+{
+  "applicant": {
+    "name": "<<NAME|Zainab Al-Mansouri>>",
+    "email": "<<EMAIL|z.almansouri@applicants.internal>>",
+    "phone": "<<PHONE|+971 4 555 0177>>",
+    "ssn": "<<SSN|477-90-2216>>",
+    "date_of_birth": "<<DOB|1996-05-28>>"
+  },
+  "reference_case": "<<CASE_ID|1:24-cv-03310>>"
+}
+"""),
+("ho_cv", None, """
+CURRICULUM VITAE
+
+<<NAME|Oluwadamilare Adebayo-Fischer>>
+<<EMAIL|o.adebayo@jobseeker.example>> · <<PHONE|(212) 555-0184>> · <<ADDRESS|Newark>>, New Jersey
+
+PROFILE
+Fifteen years in supply-chain analytics. Authorised to work without sponsorship.
+
+PERSONAL
+Date of birth: <<DOB|29 September 1979>>. Reference number for the background check
+was <<CASE_ID|1:22-cv-00551>>.
+"""),
+("ho_visa_letter", None, """
+LETTER OF EMPLOYMENT VERIFICATION FOR VISA PURPOSES
+
+To whom it may concern,
+
+This letter confirms that <<NAME|Nguyen Thi Minh Chau>>, born <<DOB|14/08/1990>>, is
+employed by this company. Her annual salary is <<AMOUNT|$96,000>>.
+
+Her social security number on our records is <<SSN|315-77-2048>> and she can be
+contacted at <<EMAIL|minh.chau@employer.corp>> or <<PHONE|+84 28 3555 0128>>.
+
+Human resources: <<PHONE|(206) 555-0117>>.
+"""),
+("ho_university_record", None, """
+OFFICE OF THE REGISTRAR — ENROLMENT VERIFICATION
+
+Student: <<NAME|Cathal Ó Briain>>
+Student e-mail <<EMAIL|c.obriain@students.university.edu>>
+Date of birth: <<DOB|22-11-2003>>
+
+The above named is enrolled full time for the current term. The student's social
+security number, <<SSN|498-31-7720>>, is retained on the financial-aid file, and a
+guardian may be reached at <<PHONE|614.555.0198>>.
+"""),
+("ho_hr_investigation", None, """
+CONFIDENTIAL HR INVESTIGATION MEMORANDUM
+
+Complainant: <<NAME|Ravindra Balasubramanian>>
+Respondent: <<NAME|Britt-Marie Lindgren>>
+
+The complainant reported the incident on <<DATE|10/02/2024>>. The complainant's
+personal contact details are <<EMAIL|r.bala@personal.lan>> and
+<<PHONE|(650) 555-0111>>. Occupational health noted a pre-existing diagnosis of
+<<DIAGNOSIS|migraine>> which the complainant says was aggravated.
+
+No further identifying information is recorded in this memorandum.
+"""),
+("ho_slack_thread", None, """
+#ops-escalations
+
+<<NAME|Tobias Wrenfield>>  9:14 AM
+anyone around? customer says they cannot log in at all
+
+<<NAME|Patricia Ranganathan>>  9:15 AM
+what is their account email
+
+<<NAME|Tobias Wrenfield>>  9:15 AM
+<<EMAIL|p.hollander@vertexbuild.internal>> -- they also left a callback number of
+<<PHONE|(971) 555-0166>>
+
+<<NAME|Patricia Ranganathan>>  9:17 AM
+found them, the legacy record id is <<MRN|4471023>> which is odd for this tenant
+
+<<NAME|Tobias Wrenfield>>  9:18 AM
+ok escalating now
+"""),
+("ho_conference_reg", None, """
+Registration confirmation -- Annual Symposium
+
+Attendee: <<NAME|Laura Bertolucci>>
+Email used for registration: <<EMAIL|l.bertolucci@institute.example>>
+Mobile for on-site alerts: <<PHONE|+39 06 5555 0170>>
+
+Your registration has been received and a receipt has been sent to the address above.
+
+If your badge shows the wrong name, please reply before the cutoff date. Accessibility
+requests may mention a relevant condition; this attendee disclosed
+<<DIAGNOSIS|multiple sclerosis>> and asked for seating near an exit.
+"""),
+("ho_vet_record", None, """
+Veterinary visit summary
+
+Owner: <<NAME|Fiona Shaughnessy>>
+Owner phone: <<PHONE|(617) 555-0189>>
+Owner email: <<EMAIL|fiona.shaughnessy@petmail.example>>
+
+Patient "Biscuit", a nine-year-old retriever, presented for lethargy. The owner mentioned
+that she herself manages <<DIAGNOSIS|hypothyroidism>> and wondered whether the dog could
+have the same condition.
+
+Bloodwork was sent to the outside laboratory. The balance was settled on the card held
+against account <<ACCOUNT_NUMBER|5580291837>>.
+"""),
+("ho_alumni_note", None, """
+Class notes
+
+<<NAME|Gwendolyn Pryce>> writes in from abroad to say she has finally retired after
+thirty years in the same practice. She would love to hear from classmates and can be
+reached at <<EMAIL|gwen.pryce@alumnimail.example>>.
+
+Meanwhile <<NAME|Howard Park>>, born <<DOB|November 2, 1961>>, has taken up long distance
+cycling and reports covering three thousand miles this year. His new number is
+<<PHONE|(608) 555-0198>>.
+"""),
+("ho_it_escalation", None, """
+Priority 1 escalation -- identity verification service
+
+Impact: password resets are failing for a subset of tenants.
+
+Reported by <<NAME|Aurelio Santangelo>> (<<EMAIL|a.santangelo@corp.internal>>), on call
+at <<PHONE|(415) 555-0177>>.
+
+During triage an engineer pasted a production record into the ticket, which included a
+customer social security number, <<SSN|657-21-9948>>, and that customer's date of birth
+<<DOB|1990-04-15>>. The ticket has since been restricted.
+
+Vendor case reference <<CASE_ID|24-SUP-00931>>.
+"""),
+("ho_survey_freetext", None, """
+Patient experience survey -- free text responses
+
+"The nurse who saw me, <<NAME|Kenneth Osei>>, was excellent. I have
+<<DIAGNOSIS|generalized anxiety disorder>> and he was patient with me throughout."
+
+"Nobody told me my <<LAB_RESULT|eGFR 52>> result for two weeks. Please telephone me on
+<<PHONE|(704) 555-0132>> next time instead of writing."
+
+"Billing sent my statement to the wrong address. My email is
+<<EMAIL|d.osullivan@homemail.example>> and it has been for years."
+"""),
+("ho_incident_narrative", None, """
+INCIDENT NARRATIVE
+
+On the date in question the reporting party, <<NAME|Katherine Volkonsky>>, stated that
+she returned home and discovered the rear door had been forced. She provided a date of
+birth of <<DOB|24-Sep-1986>> and a contact number of <<PHONE|(619) 555-0150>>.
+
+Taken from the residence were documents including a card statement bearing
+account <<ACCOUNT_NUMBER|acct. 6690118273>> and a tax notice showing employer
+identification number <<TAX_ID|82-1937465>>.
+
+The reporting party's email for follow up is <<EMAIL|k.volkonsky@mailbox.example>>.
+A related civil matter, <<CASE_ID|3:25-cv-00218>>, is already on file.
+"""),
+("ho_voicemail_callback", None, """
+Voicemail transcription (automated, low confidence)
+
+"Hi, um, this is <<NAME|Rosalind Kavanagh>> calling back about the paperwork. Uh, you
+asked for my social, it is <<SSN|205-63-8814>>, and I was born <<DOB|8/16/1993>>. You can
+get me at <<PHONE|(937) 555-0158>> most days, or on my email which is
+<<EMAIL|r.kavanagh@personalmail.example>>. Thanks, bye."
+"""),
+]
+
+# Held-out entity-free prose in the same new registers: ground truth is "return nothing".
+HELD_OUT_CLEAN_CORPUS: list[tuple[str, str | None, str]] = [
+("hoc_rad_protocol", "medical", """
+Contrast protocol standard. Screening for renal impairment is performed before every
+contrast-enhanced study. Where screening is not possible the study proceeds without
+contrast unless the clinical question requires otherwise. Scanner calibration is
+verified at the start of each working day.
+"""),
+("hoc_lab_qc", "medical", """
+Laboratory quality control summary. Control material is run at the start of every
+shift and after any instrument maintenance. Out-of-range controls require repeat
+testing before patient samples are released. Reagent lots are recorded in the
+instrument log rather than on paper.
+"""),
+("hoc_pt_gym", "medical", """
+Gym safety notice for the therapy suite. Wipe down equipment between users. Report any
+frayed resistance band to the lead therapist so that it can be replaced. Do not leave
+weights on the floor between sessions. The emergency pull cord is tested weekly.
+"""),
+("hoc_bereavement", "medical", """
+Bereavement support is offered to families for thirteen months following a death. Groups
+meet twice monthly and are open to anyone who has been served by the agency. Attendance is
+voluntary and there is no charge. Individual counselling can be arranged where a group is
+not the right fit.
+"""),
+("hoc_arb_rules", "legal", """
+Arbitration rules, article twelve. The tribunal shall determine the procedure subject
+to the parties agreeing otherwise in writing. Hearings are private unless the parties
+agree to admit observers. The tribunal may proceed in the absence of a party that
+fails to appear without showing sufficient cause.
+"""),
+("hoc_court_notice", "legal", """
+General notice to the bar. Filings submitted after four in the afternoon are entered
+on the following business day. Paper courtesy copies are no longer accepted for
+routine motions. Counsel should consult the standing orders before noticing any
+hearing.
+"""),
+("hoc_third_party_requests", "legal", """
+Guidance for responding to third party requests. Route every request to the records team
+on the day it arrives. Do not produce anything before the response date has been
+calendared and the scope confirmed. Where a request appears overbroad, prepare objections
+rather than producing first and objecting later.
+"""),
+("hoc_closing_checklist", "legal", """
+Pre closing checklist. Confirm the title commitment has been updated. Confirm the payoff
+figures are current through the anticipated funding date. Confirm the wire instructions
+were verified by telephone using a number obtained independently rather than one supplied
+in an email.
+"""),
+("hoc_ap_policy", "financial", """
+Accounts payable policy. Invoices are matched against a purchase order and a receipt
+before payment is scheduled. Payment runs occur twice a month. Any invoice without a
+matching purchase order is returned to the requesting department rather than held.
+"""),
+("hoc_aml_training", "financial", """
+Anti-money-laundering refresher training. All staff complete the module annually.
+Escalation is through the nominated officer and not through line management. Records
+of training completion are retained for the period required by the regulator.
+"""),
+("hoc_escrow_policy", "financial", """
+Escrow analysis is performed annually. Where a shortage is identified it may be spread
+over the following twelve months or paid as a lump sum at the borrower's election. A
+surplus above the threshold is refunded. Analyses are mailed at least thirty days before
+the new payment takes effect.
+"""),
+("hoc_collections_standards", "financial", """
+Collection call standards. Calls may not be placed before eight in the morning or after
+nine at night in the consumer's own time zone. A consumer who states in writing that they
+refuse to pay must not be contacted further except as the statute permits. Every call is
+recorded and reviewed on a sample basis.
+"""),
+("hoc_it_runbook", None, """
+Certificate rotation runbook. Generate the new key material, stage it alongside the
+existing certificate, then cut over during the maintenance window. Verify the chain
+from an external network before removing the old certificate. Roll back by restoring
+the previous bundle.
+"""),
+("hoc_office_notice", None, """
+Building notice. The lifts in the south tower will be out of service while the
+controllers are replaced. Please use the stairs or the north tower lifts. Deliveries
+should be routed to the loading bay entrance for the duration of the works.
+"""),
+("hoc_voicemail_greeting", None, """
+"You have reached our main line. Our offices are open on weekdays. Please listen carefully
+as our options have changed. To repeat this message, remain on the line. Otherwise, leave
+a message after the tone and someone will return your call on the next business day."
+"""),
+("hoc_slack_standup", None, """
+standup thread -- yesterday: finished the migration dry run and wrote up the rollback
+steps. today: pairing on the flaky integration test, then reviewing the deploy checklist.
+blockers: none, though the staging environment was slow again this morning.
+"""),
+("hoc_conference_cfp", None, """
+Call for proposals. Submissions should describe work that has not been presented
+elsewhere. Sessions run forty minutes including questions. Reviewers score on relevance,
+originality and clarity. Notification is sent to every submitter whether or not the
+proposal is accepted.
+"""),
+]
+
+# Measured on the held-out corpus, not on the tuned one, and not adjusted afterwards.
+# Where a floor sits far below 1.0 the gap is real and named in HELD_OUT_MISS_SHAPES;
+# lowering a floor here without moving the corresponding entry there is how a
+# regression would get through.
+HELD_OUT_COVERAGE_FLOORS: dict[str, float] = {
+    "ACCOUNT_NUMBER": 0.94,
+    "ADDRESS": 1.0,
+    "AMOUNT": 0.84,
+    "CASE_ID": 1.0,
+    "CASE_STRATEGY": 1.0,
+    "CLIENT_IDENTITY": 0.92,
+    "DATE": 0.30,
+    "DIAGNOSIS": 1.0,
+    "DOB": 0.87,
+    "EMAIL": 1.0,
+    "INSURANCE_ID": 0.80,
+    "LAB_RESULT": 1.0,
+    "MEDICATION": 1.0,
+    "MRN": 0.26,
+    "NAME": 0.81,
+    "PHONE": 1.0,
+    "PRIVILEGED_MARKER": 1.0,
+    "SETTLEMENT_TERM": 0.0,
+    "SSN": 1.0,
+    "TAX_ID": 1.0,
+}
+
+# Measured: 324/366 covered, 320/366 typed; in-policy 324/355.
+HELD_OUT_COVERAGE_FLOOR = 0.88
+HELD_OUT_TYPED_FLOOR = 0.87
+HELD_OUT_IN_POLICY_COVERAGE_FLOOR = 0.91
+
+# entity type -> (how many of its held-out values fall short, and why).
+#
+# This is the inventory the aggregate floors would otherwise hide. Each ceiling is
+# the count measured today and the assertion is ``<=``, so closing a gap passes while
+# a NEW kind of shortfall -- an entity type absent from this table, or an existing one
+# getting worse -- fails. An aggregate floor alone cannot do that: MRN could fall to
+# zero and NAME rise to compensate without the headline number moving at all.
+HELD_OUT_MISS_SHAPES: dict[str, tuple[int, str]] = {
+    "MRN": (
+        13,
+        "the field label is not literally 'MRN', 'medical record number' or 'MR #' "
+        "-- 'Patient ID 8814027', 'Chart No. 2207731', 'chart number is 4419307', "
+        "'record 6612977'. entities.yaml documents this gap in the comment above MRN; "
+        "the held-out corpus is what puts a number on it, and the number is bad: 4/15 "
+        "covered, 2/15 typed. Eleven of the thirteen shortfalls go to the provider in "
+        "the clear -- 'the legacy record id is 4471023' among them. The other two are "
+        "masked only incidentally, both by a DATE detection over the bare digit run "
+        "('Chart No. 2207731', 'Billing reference: chart 5518044'), which is luck "
+        "rather than design and gives the value the wrong pseudonymization tier. See "
+        "HELD_OUT_INCIDENTAL_MASKS: those two are the only MRN masks of that kind and "
+        "no PERSON/NAME detection covers any held-out MRN.",
+    ),
+    "NAME": (
+        12,
+        "spaCy's PERSON recall, which no registry edit can raise: hyphenated and "
+        "multi-particle names ('Oluwadamilare Adebayo-Fischer', 'Ingeborg "
+        "Vasquez-Lund'), and names in a CSV or column-aligned row with no sentence "
+        "around them ('Chidi Okonjo' twice, 'Solveig Haraldsen', 'Rajesh "
+        "Ramachandran', 'Dilnoza Yusupova'). Structure alone does not predict the "
+        "miss, so 'no grammatical context' is not the whole story: the JSON payload's "
+        "quoted 'Zainab Al-Mansouri' IS detected, while 'Customer Prosper Adeyinka "
+        "owes a balance' sits in an ordinary sentence and is not. One of the twelve, "
+        "'Priyanka Raghunathan' in the chat log, is masked incidentally by a DOB span "
+        "that swallowed the '09:15' timestamp ahead of it -- masked, wrongly tiered.",
+    ),
+    "DATE": (
+        7,
+        "out of policy rather than missed: DATE is scoped to medical documents by "
+        "only_in_doc_categories, so a settlement date on a brokerage confirmation or a "
+        "tax period on an assessment notice is never looked for. Section 9.2 makes "
+        "that choice deliberately -- HIPAA treats individual-related dates as "
+        "identifiers, ordinary business dates are not -- and the held-out corpus "
+        "annotates them anyway so the cost of the choice stays visible.",
+    ),
+    "DOB": (
+        5,
+        "three are an ISO date in a structured column, where the only birth context is "
+        "a header several fields away and outside the 60-character leading window; one "
+        "is '4 Oct 1993', where Presidio returns 'Oct 1993' and leaves the day "
+        "uncovered. The fifth, '09.14.1958', is not a miss at all -- a dot-separated "
+        "date is claimed by PHONE, so it is masked under the wrong type rather than "
+        "left in the clear (HELD_OUT_INCIDENTAL_MASKS).",
+    ),
+    "AMOUNT": (
+        4,
+        "out of policy: AMOUNT is scoped to financial documents, so a fee line on a "
+        "legal retainer invoice and a salary in a visa letter are not looked for.",
+    ),
+    "SETTLEMENT_TERM": (
+        2,
+        "both patterns need a literal 'settle...' inside the bounded gap. An award of "
+        "'damages in the sum of $612,500' has none, and AMOUNT is out of scope in a "
+        "legal document, so that figure goes to the provider in the clear -- a plain "
+        "gap rather than a known limit, as is ACCOUNT_NUMBER's below. The second "
+        "shortfall is not of that kind: 'A settlement of $75,000 was\\ndiscussed off "
+        "the record' does match, but the span returned is 'settlement of $75,000', so "
+        "the money is masked and only the surrounding words are uncovered.",
+    ),
+    "INSURANCE_ID": (
+        1,
+        "'AETNA4412093' has a five-letter payer prefix and the pattern allows "
+        "[A-Z]{2,4}. Widening to {2,5} would also match any five-letter word followed "
+        "by seven digits, so this is a real trade rather than an oversight -- but it "
+        "is a trade nothing in the tuned corpus exposed.",
+    ),
+    "CLIENT_IDENTITY": (
+        1,
+        "spaCy PERSON again: only the surname of 'Margarethe Solheim' is returned, so "
+        "the forename is left uncovered. The surname is still masked.",
+    ),
+    "ACCOUNT_NUMBER": (
+        1,
+        "'4400 8829 1374' is space-grouped, and the pattern's specificity comes from "
+        "an unbroken 8-17 digit run. Card-style grouping is common; this is a real gap.",
+    ),
+}
+
+# Every held-out value that IS masked, but by a detection carrying the wrong label:
+# (entity_type, doc_id, value, labels that cover it). These are the shortfalls that
+# leak nothing and mis-tier everything, and the ones the notes above are most likely
+# to describe from memory.
+#
+# It is a table rather than a sentence because a sentence is exactly how this went
+# wrong. The MRN note used to read "three of the shortfalls are masked anyway because
+# spaCy happens to type a bare digit run as DATE_TIME or PERSON". Measured, it is two,
+# both DATE, and no PERSON/NAME detection covers any held-out MRN at all -- the whole
+# "or PERSON" branch describes something that never happens. Nothing in the file
+# asserted any of it, so the number and the mechanism could both be wrong while the
+# suite stayed green: the same shared silence as a docstring nobody can falsify.
+#
+# Asserted with ``==`` on purpose. ``<=`` on the count would have let the old sentence
+# through (2 <= 3), and a subset check on the labels would have let "or PERSON"
+# through as well. A documented mask that stops happening is a stale note, which is
+# the defect being fixed here, so it has to fail too.
+HELD_OUT_INCIDENTAL_MASKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    # A dot-separated birth date reads as a phone number: PHONE '09.14.1958' @ 0.40.
+    ("DOB", "ho_pt_visit", "09.14.1958", ("PHONE",)),
+    # Bare 7-digit chart numbers, claimed by DATE @ 0.85. Never by PERSON.
+    ("MRN", "ho_pathology", "2207731", ("DATE",)),
+    ("MRN", "ho_pt_visit", "5518044", ("DATE",)),
+    # DOB's span here is '09:15  Priyanka Raghunathan' -- a chat timestamp that ran on
+    # into the speaker's name, so the name is masked as a birth date.
+    ("NAME", "ho_chat_log", "Priyanka Raghunathan", ("DOB",)),
+)
+
+
+async def measure_held_out(
+    detector: Detector, registry: EntityRegistry
+) -> tuple[dict[str, list[int]], list[Residual], list[int]]:
+    """Held-out tally and residual, plus the subtotal for values policy asks for.
+
+    "In policy" means the annotated entity type is ``allowed_in`` that document's
+    category. Everything else was never looked for, so counting it as a detection
+    failure blames the detector for a deliberate scoping decision -- and dropping it
+    silently would hide a value that really is in the clear. Both numbers are
+    reported and the headline one is the conservative one.
+    """
+    return await measure_coverage(
+        detector,
+        HELD_OUT_CORPUS,
+        in_scope=lambda entity_type, doc_category: registry.spec(entity_type).allowed_in(
+            doc_category
+        ),
+    )
+
+
+async def test_held_out_recall_meets_its_measured_floor(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """The number a reviewer should actually ask for: recall on unseen shapes.
+
+    RECALL_CORPUS reports 99%, and that figure is honest about what it measures --
+    the shapes this detector was built to handle. It is not evidence about a
+    document nobody has seen, and quoting it as though it were is the most
+    misleading thing this project could do.
+
+    Measured here, on 53 documents in registers that appear nowhere above:
+    88.5% covered and 87.4% typed, against 99%/99% on home turf. Restricted to the
+    values the registry's document-category scoping actually asks for, 91.3%/90.1%.
+
+    The eleven-point drop is the result, not a defect to be tuned away. Editing
+    patterns until this table improves would destroy the only control the project
+    has and leave two home-turf corpora behind it. Every gap it exposes is a
+    property of a pattern or of spaCy rather than a corpus artefact, and each is
+    named in HELD_OUT_MISS_SHAPES.
+    """
+    tally, residual, in_policy = await measure_held_out(detector, registry)
+    covered_in_policy, typed_in_policy, total_in_policy = in_policy
+    print("\nHELD-OUT (shapes nothing was tuned against)")
+    print(format_recall_table(tally))
+    print(
+        f"{'IN-POLICY ONLY':<20}{total_in_policy:>5}"
+        f"{covered_in_policy / total_in_policy:>8.0%}"
+        f"{typed_in_policy / total_in_policy:>8.0%}"
+    )
+    print("\n".join(["", "held-out residual:", *(item.describe() for item in residual)]))
+
+    assert set(tally) == set(HELD_OUT_COVERAGE_FLOORS), "corpus and floor table disagree"
+    for entity_type, (covered, _typed, total) in sorted(tally.items()):
+        assert covered / total >= HELD_OUT_COVERAGE_FLOORS[entity_type], (
+            f"{entity_type} held-out coverage fell to {covered}/{total}"
+        )
+
+    total = sum(row[2] for row in tally.values())
+    assert sum(row[0] for row in tally.values()) / total >= HELD_OUT_COVERAGE_FLOOR
+    assert sum(row[1] for row in tally.values()) / total >= HELD_OUT_TYPED_FLOOR
+    assert covered_in_policy / total_in_policy >= HELD_OUT_IN_POLICY_COVERAGE_FLOOR
+
+
+async def test_held_out_residual_stays_inside_the_documented_shapes(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """Every held-out shortfall must be a failure that has already been named.
+
+    An aggregate floor cannot see a change of shape: MRN could collapse while NAME
+    improved and 88% would not move. This asserts the per-type inventory instead,
+    with ``<=`` so that closing a gap passes and opening a new one -- an entity type
+    that is not in the table at all, or one that gets worse -- fails.
+    """
+    _tally, residual, _in_policy = await measure_held_out(detector, registry)
+    counts: dict[str, int] = {}
+    for item in residual:
+        counts[item.entity_type] = counts.get(item.entity_type, 0) + 1
+
+    undocumented = sorted(set(counts) - set(HELD_OUT_MISS_SHAPES))
+    assert undocumented == [], "\n".join(
+        [
+            f"held-out shortfalls in entity types with no documented cause: {undocumented}",
+            *(item.describe() for item in residual if item.entity_type in undocumented),
+        ]
+    )
+    for entity_type, count in sorted(counts.items()):
+        ceiling, why = HELD_OUT_MISS_SHAPES[entity_type]
+        assert count <= ceiling, f"{entity_type} shortfalls grew to {count} (was {ceiling}): {why}"
+
+
+async def test_held_out_incidental_masks_are_exactly_the_documented_ones(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """The notes above say which shortfalls are masked by the wrong recognizer. Check it.
+
+    The ceilings test one above counts shortfalls and cannot tell the two kinds
+    apart: a value in the clear and a value masked under the wrong entity type both
+    add one. The difference is the whole severity question -- ``Residual.covered``
+    exists to record it -- and it is the part the prose kept getting wrong, because
+    prose was all it was. The MRN note claimed three such masks "DATE_TIME or
+    PERSON"; there are two, both DATE, and nothing in this corpus has ever produced
+    a PERSON detection over an MRN.
+
+    So the claim is a table now, and this is what makes it cost something to be
+    wrong about. Equality in both directions: an undocumented new mask fails
+    (something started masking that the notes do not explain), and a documented mask
+    that stops happening fails too (the note has gone stale). The second half is not
+    a test punishing an improvement -- it is the assertion that would have caught the
+    sentence this replaces, and closing a gap here means editing HELD_OUT_MISS_SHAPES
+    and this table in the same commit, which is the point. Re-measure and rewrite;
+    never relax this to ``<=`` or to a subset check.
+
+    Measurement comes from ``measure_held_out``, the same pass the ceilings and the
+    printed table use, so the notes describe the run a reviewer sees rather than a
+    second opinion computed alongside it.
+    """
+    _tally, residual, _in_policy = await measure_held_out(detector, registry)
+    measured = tuple(
+        sorted(
+            (item.entity_type, item.doc_id, item.value, item.labels)
+            for item in residual
+            if item.covered
+        )
+    )
+    assert measured == HELD_OUT_INCIDENTAL_MASKS, (
+        "HELD_OUT_INCIDENTAL_MASKS no longer matches what the detector does.\n"
+        f"measured: {measured}\ndocumented: {HELD_OUT_INCIDENTAL_MASKS}\n"
+        "Re-measure and update the table AND the prose in HELD_OUT_MISS_SHAPES that "
+        "describes it. Do not weaken this assertion."
+    )
+
+    mrn_labels = sorted(
+        {
+            label
+            for entity_type, _doc, _value, labels in measured
+            if entity_type == "MRN"
+            for label in labels
+        }
+    )
+    assert "PERSON" not in mrn_labels and "NAME" not in mrn_labels, (
+        f"an MRN is now masked by a person detection: {mrn_labels}. The MRN note says "
+        "this has never happened; if it now does, the note is wrong."
+    )
+
+
+async def test_held_out_clean_documents_produce_no_detections(detector: Detector) -> None:
+    """Precision on unseen prose, where ground truth needs no adjudication.
+
+    The recall drop above would be worthless as a finding if the detector had
+    quietly become trigger-happy on unfamiliar registers -- a pattern that fires on
+    everything scores well on coverage. It has not: zero spans over 17 entity-free
+    documents in the same new registers.
+    """
+    spurious: list[str] = []
+    words = 0
+    for doc_id, doc_category, text in HELD_OUT_CLEAN_CORPUS:
+        words += len(text.split())
+        for found in await detector.detect(text, doc_category):
+            spurious.append(f"{doc_id}: {found.entity_type} {found.text!r}")
+    print(f"\nheld-out clean corpus: {len(HELD_OUT_CLEAN_CORPUS)} documents, {words} words")
+    assert spurious == [], "\n".join(["false positives on unseen entity-free prose:", *spurious])
+
+
+# DIAGNOSIS and MEDICATION are exempt from the disjointness rule below: both are
+# matched from a closed, curated gazetteer of real clinical vocabulary, so the two
+# corpora necessarily draw on the same few hundred terms. Requiring disjoint drug
+# names would only push the held-out corpus towards rarer drugs, which measures the
+# gazetteer's length rather than the detector's behaviour on unfamiliar shapes.
+SHARED_VOCABULARY_TYPES = frozenset({"DIAGNOSIS", "MEDICATION"})
+
+
+def test_held_out_corpus_shares_no_identifier_with_the_tuned_corpus() -> None:
+    """"Held out" has to be structurally true, not merely intended.
+
+    The comparison the section above rests on is worth nothing if the two corpora
+    overlap, and overlap is exactly what happens when a later author "refreshes" the
+    held-out set by copying rows across, or reuses a memorable identifier from
+    upstairs. One value had in fact been carried over -- an AAA docket number -- and
+    this assertion is what found it.
+    """
+
+    def annotated_values(corpus: list[tuple[str, str | None, str]]) -> set[tuple[str, str]]:
+        return {
+            (entity_type, value)
+            for _doc_id, _category, annotated in corpus
+            for entity_type, _start, _end, value in parse_annotated(annotated)[1]
+            if entity_type not in SHARED_VOCABULARY_TYPES
+        }
+
+    shared = sorted(annotated_values(RECALL_CORPUS) & annotated_values(HELD_OUT_CORPUS))
+    assert shared == [], f"the held-out corpus reuses tuned-corpus values: {shared}"
+
+    tuned_ids = {doc_id for doc_id, _c, _a in RECALL_CORPUS} | {
+        doc_id for doc_id, _c, _t in CLEAN_CORPUS
+    }
+    held_ids = {doc_id for doc_id, _c, _a in HELD_OUT_CORPUS} | {
+        doc_id for doc_id, _c, _t in HELD_OUT_CLEAN_CORPUS
+    }
+    assert not tuned_ids & held_ids, "a document id appears in both corpora"
+    assert len(held_ids) == len(HELD_OUT_CORPUS) + len(HELD_OUT_CLEAN_CORPUS), (
+        "duplicate document id inside the held-out corpus"
+    )
+
+
+def test_held_out_corpus_exercises_every_spec_mandated_entity() -> None:
+    """The unseen-shape figure has to cover the nine types section 2 mandates.
+
+    A held-out corpus that happened to omit MRN would report a much better number
+    while saying nothing at all about the type that turns out to fail hardest.
+    """
+    mandated = {
+        "NAME",
+        "SSN",
+        "DOB",
+        "EMAIL",
+        "PHONE",
+        "MRN",
+        "DIAGNOSIS",
+        "ACCOUNT_NUMBER",
+        "CASE_ID",
+    }
+    counts: dict[str, int] = {}
+    for _doc_id, _category, annotated in HELD_OUT_CORPUS:
+        for entity_type, _start, _end, _value in parse_annotated(annotated)[1]:
+            counts[entity_type] = counts.get(entity_type, 0) + 1
+    thin = sorted(entity_type for entity_type in mandated if counts.get(entity_type, 0) < 5)
+    assert thin == [], f"the held-out corpus needs at least 5 instances of each of {thin}"
 
 
 # ---------------------------------------------------------------------------
@@ -1508,6 +2768,56 @@ def test_chunk_overlap_exceeds_the_longest_registry_span(registry: EntityRegistr
     assert 0 < widest < CHUNK_OVERLAP_CHARS, f"widest registry span {widest} needs a wider overlap"
 
 
+# The overlap widens each chunk's analysis window, so the analyser sees more than the
+# document. ``detect`` caps it at one chunk -- ``min(CHUNK_OVERLAP_CHARS,
+# chunk_max_chars)`` -- which bounds that at twice the document however small the
+# chunk size is configured. Measured with the cap in place: 2.05x. With it removed
+# and ``chunk_max_chars`` at 64: 8.86x. 3.0 separates the two with room on each side.
+ANALYSIS_BUDGET_RATIO = 3.0
+
+
+async def test_the_analysis_window_never_scans_the_document_more_than_twice_over(
+    registry: EntityRegistry, settings: Settings
+) -> None:
+    """``chunk_max_chars`` below ``CHUNK_OVERLAP_CHARS`` must not multiply the work.
+
+    Every chunk is analysed over a window running ``overlap`` characters into the
+    next one, so the total text handed to spaCy is the document plus one overlap per
+    chunk. With a small ``chunk_max_chars`` there are many chunks, and without the
+    cap each still drags a full 512-character tail: at 64 the analyser processes the
+    document nearly nine times over, which is a self-inflicted denial of service on
+    the one code path that is CPU-bound and configurable.
+
+    Nothing tested this. ``chunk_max_chars`` is 8,000 by default and the cap only
+    binds below 512, so deleting ``min(...)`` left all 277 tests green -- the fix was
+    real, load-bearing under a supported configuration, and completely unproven.
+    Asserted as a ratio to the document length rather than as a time, so it measures
+    the work done rather than how busy the machine is.
+    """
+    text = ("Operational notes continue with routine scheduling details. " * 60) + (
+        "Chart note: MRN: 4471902 filed by the records desk."
+    )
+    scoped = settings.model_copy(update={"chunk_max_chars": 64})
+    assert scoped.chunk_max_chars < CHUNK_OVERLAP_CHARS, "fixture must make the cap bind"
+    detector = Detector(registry, scoped)
+
+    analysed: list[int] = []
+    unpatched = detector._analyze_sync
+
+    def spy(body: str, entities: tuple[str, ...]) -> list[object]:
+        analysed.append(len(body))
+        return unpatched(body, entities)
+
+    detector._analyze_sync = spy  # type: ignore[method-assign]
+    hits = await detector.detect(text, "medical")
+
+    assert "MRN" in types_of(hits), "the fixture must still detect across the tiny chunks"
+    assert sum(analysed) <= ANALYSIS_BUDGET_RATIO * len(text), (
+        f"analysed {sum(analysed)} characters of a {len(text)}-character document "
+        f"({sum(analysed) / len(text):.2f}x) across {len(analysed)} chunks"
+    )
+
+
 async def test_entity_past_a_paragraph_boundary_keeps_absolute_offsets(
     detector: Detector, settings: Settings
 ) -> None:
@@ -1597,14 +2907,21 @@ async def test_tied_claimants_resolve_in_registry_declaration_order(
     ``_resolve_builtin`` scores claimants on context and document scoping and
     breaks the remaining tie on declaration order. The shipped registry never
     reaches that tie -- ``DOB``/``DATE`` and ``NAME``/``CLIENT_IDENTITY`` are
-    always separated by one of the two scores -- so replacing the tie-break with a
-    constant left the suite green. It is reachable the moment someone adds a
-    second claimant by config, which is exactly what section 10.4 invites, and a
-    label that depends on dict iteration order would make the pseudonymization
-    tier non-deterministic across runs.
+    always separated by one of the two scores -- so it is reachable only once
+    someone adds a second claimant by config, which is exactly what section 10.4
+    invites, and a label that depended on dict iteration order would make the
+    pseudonymization tier non-deterministic across runs.
 
     Parametrized on both declaration orders so the assertion cannot be satisfied
     by alphabetical order or by whichever name happens to hash first.
+
+    What this test does **not** establish is that ``_declaration_order`` is the
+    mechanism producing the answer. It is not: ``presidio_aliases`` already returns
+    claimants in declaration order and the comparison is a strict ``<``, so the
+    first claimant iterated wins any tie whether or not the key mentions
+    declaration order at all. Replacing that key with a constant leaves this test
+    green -- measured, not supposed. The test below removes that agreement and is
+    the one that makes the key load-bearing.
     """
     first, second = order
     path = tmp_path / "entities.yaml"
@@ -1616,6 +2933,50 @@ async def test_tied_claimants_resolve_in_registry_declaration_order(
     )
     hits = await Detector(load_registry(path), settings).detect("Jane Doe signed today.")
     assert types_of(hits) == {first}, f"{second} took a hit declared second"
+
+
+@pytest.mark.parametrize("order", [("ALPHA_NAME", "BETA_NAME"), ("BETA_NAME", "ALPHA_NAME")])
+async def test_declaration_order_wins_even_when_claimants_arrive_reversed(
+    tmp_path: Path, settings: Settings, order: tuple[str, str]
+) -> None:
+    """The tie-break must come from the registry, not from iteration order.
+
+    Two independent things currently give the same answer, and the test above
+    cannot tell them apart: ``_resolve_builtin``'s ``(-score, declaration_order)``
+    key, and the plain fact that ``presidio_aliases`` hands back claimants in the
+    order the YAML declared them. So the explicit key looked proven and was not --
+    swapping ``self._declaration_order[name]`` for the constant ``0`` leaves every
+    other test in this file passing.
+
+    That is the "correct only by accident" shape: the guard is real, the agreement
+    that hides its absence is incidental, and the day something reorders that
+    tuple -- a registry accessor that sorts, a refactor that routes through a set,
+    a caller that builds aliases itself -- the label silently starts depending on
+    whatever order fell out. Reversing the alias tuple here removes the accidental
+    agreement, so declaration order is the only thing left that can produce the
+    answer, and the constant tie-break fails.
+    """
+    first, second = order
+    path = tmp_path / "entities.yaml"
+    path.write_text(
+        "categories: [PII]\nentities:\n"
+        f"  {first}: {{category: PII, presidio: PERSON}}\n"
+        f"  {second}: {{category: PII, presidio: PERSON}}\n",
+        encoding="utf-8",
+    )
+    detector = Detector(load_registry(path), settings)
+    assert detector._aliases["PERSON"] == (first, second), (
+        "fixture assumes aliases start in declaration order"
+    )
+    detector._aliases = {
+        builtin: tuple(reversed(claimants))
+        for builtin, claimants in detector._aliases.items()
+    }
+
+    hits = await detector.detect("Jane Doe signed today.")
+    assert types_of(hits) == {first}, (
+        f"{second} took the hit: the winner followed claimant order, not declaration order"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1903,6 +3264,49 @@ def test_every_recognizer_pattern_is_compiled_before_any_request(
         if getattr(pattern, "compiled_regex", None) is None
     ]
     assert uncompiled == [], f"patterns left to compile mid-request: {uncompiled}"
+
+
+async def test_a_bare_gazetteer_hit_is_still_strong_enough_to_tokenize(
+    detector: Detector, settings: Settings
+) -> None:
+    """``GAZETTEER_SCORE`` decides tokenize-vs-redact, and nothing pinned its value.
+
+    The pattern side of this has a guard --
+    ``test_context_words_boost_a_pattern_hit`` ends by asserting a bare pattern hit
+    still clears ``threshold_obfuscate`` -- and the gazetteer side, which starts
+    from a *different* constant, had none. That asymmetry is the whole bug: the two
+    constants were silently assumed to move together and only one of them was
+    watched.
+
+    What the missing half costs, measured: dropping ``GAZETTEER_SCORE`` from 0.80 to
+    0.45 leaves all 285 tests green, and 0.45 lands between ``threshold_redact``
+    (0.30) and ``threshold_obfuscate`` (0.50). Every diagnosis and medication
+    mentioned without a nearby context word would stop being a reversible Tier-3
+    token and become an irreversible ``[REDACTED_DIAGNOSIS]`` with no vault row --
+    the class-annotated token that section 9.3 exists for, gone, with nothing red.
+
+    The fixture deliberately carries no DIAGNOSIS context word ("diagnosis", "dx",
+    "condition", "present"), so the score observed here is the bare constant rather
+    than a context-enhanced 1.00 that would pass whatever the constant became.
+    """
+    hits = await detector.detect("The problem list records pneumonia.", "medical")
+    diagnosis = [d for d in hits if d.entity_type == "DIAGNOSIS"]
+    assert len(diagnosis) == 1, "fixture should produce exactly one gazetteer hit"
+    assert diagnosis[0].score == pytest.approx(GAZETTEER_SCORE), (
+        "fixture picked up a context boost, so it no longer measures the bare score"
+    )
+    assert diagnosis[0].score >= settings.threshold_obfuscate, (
+        "a curated-term hit must be tokenized, not silently downgraded to a redaction"
+    )
+
+    # An exact match against a curated clinical list is stronger evidence than a
+    # shape-based regex, and score is what breaks the tie once the two categorical
+    # dimensions in _resolve_overlaps agree -- which they do for any two custom
+    # recognizers. Asserted as a relationship rather than behaviourally because no
+    # document in either corpus overlaps a gazetteer hit with a pattern hit, so
+    # there is nothing honest to measure it on; the ordering is a design invariant
+    # and this is what stops the two constants drifting past each other unnoticed.
+    assert GAZETTEER_SCORE > PATTERN_SCORE
 
 
 def test_gazetteers_are_parsed_once_and_skip_comments() -> None:

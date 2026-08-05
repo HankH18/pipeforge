@@ -39,8 +39,9 @@ Four assertions per run (build doc section 10.5):
    is a broken answer, and a surviving pseudonym is a silently wrong one.
 
 **What this harness measures, and what it does not.** The claim is about *whole
-vaulted values*, per channel, per session. Three boundaries are deliberate, and are
-stated here rather than left to be discovered:
+vaulted values*, per channel, per session. Five boundaries are deliberate, and are
+stated here rather than left to be discovered. Each is pinned by a test, so a change
+that closes one is a red rather than a silent widening of the headline claim:
 
 * **Partial disclosure is out of scope.** If a splice bug leaves one component of a
   multi-word original behind -- the surname of a vaulted full name -- neither this
@@ -50,6 +51,19 @@ stated here rather than left to be discovered:
   manufacture reds indistinguishable from the real thing. See
   :func:`test_a_partial_value_leak_is_outside_what_this_harness_claims`, which pins
   the boundary so it cannot be forgotten.
+* **A value glued into a longer word is out of scope.** ``xJohn Smithx`` carries the
+  original byte for byte and is not reported, because :func:`_occurs_as_a_unit`
+  asserts a word boundary on each side whose adjacent needle character is
+  alphanumeric. Removing that assertion is what makes ``Brown`` match inside
+  ``Browning``; restricting the relaxation to multi-word originals does not help
+  either, because ``chronic low back pains`` contains ``chronic low back pain``.
+  See :func:`test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`.
+* **A combining mark spliced into a value is out of scope.** ``normalize`` is NFKC,
+  which composes -- so a *decomposed* rendering of an accented original is caught,
+  but a mark that was never in the vaulted value is not removable by any
+  normalisation form. Folding marks out would make ``José`` and ``Jose`` the same
+  value, which the gate's ``_INVISIBLE_RE`` deliberately refuses. See
+  :func:`test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`.
 * **Cross-session leakage is out of scope here.** Each run scans only its own
   session's originals. Cross-session isolation is a cryptographic property, proven
   in ``test_vault.py::test_aad_binding_across_sessions`` and
@@ -58,6 +72,13 @@ stated here rather than left to be discovered:
 * **Homoglyph substitution is out of scope**, for the same reason it is out of scope
   in the gate: catching Cyrillic U+043E for Latin ``o`` needs a confusables table,
   not another normalisation form.
+
+The last three share one cause and it is worth naming: they are the shapes for which
+the harness and the gate are blind **together**, because both resolve to the same
+occurrence rule. Where the gate is a second opinion that failure is survivable; on
+the audit database and the process log, where nothing else looks, it is not -- which
+is why they are recorded here as claims the harness does not make rather than as
+cases it happens not to have hit.
 
 Then one adversarial run that removes detection from the argument entirely: a
 value of a shape **no recogniser in the registry matches** is planted in the
@@ -77,6 +98,7 @@ import json
 import logging
 import re
 import secrets
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -841,6 +863,110 @@ def test_a_partial_value_leak_is_outside_what_this_harness_claims() -> None:
     assert find_in_text(
         frozenset({original}), f"The client {original} signed the release."
     ) == [original]
+
+
+def test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims() -> None:
+    """The second stated boundary: adjacency to a letter on either side suppresses the match.
+
+    ``xJohn Smithx`` carries the original **byte for byte**, and neither this
+    harness nor the gate reports it -- both resolve to :func:`_occurs_as_a_unit`,
+    which applies a word-boundary assertion on each side whose adjacent needle
+    character is alphanumeric. Found by sabotage, not by reading: a real vaulted
+    original was spliced into a real payload in this shape with the gate's pass 1
+    blinded, and all six runs read clean; with the gate live the value reached the
+    provider.
+
+    It is a boundary rather than a bug because the alternative is worse in a way
+    this file has already paid for. Dropping the assertion makes ``Brown`` match
+    inside ``Browning`` -- a red that is indistinguishable from a real leak until
+    somebody spends an hour on it, and one that appears and vanishes between runs
+    because pseudonyms derive from a random per-session key. Restricting the
+    relaxation to multi-word originals does not rescue it either: fixture originals
+    include ordinary clinical phrases, and ``chronic low back pains`` contains
+    ``chronic low back pain`` verbatim, so the plural alone would manufacture a red.
+
+    What makes the residual risk small is that the shapes the *pipeline* can
+    actually emit do not land here. Every surrogate ends in ``]`` and every
+    redaction marker does too, so a splice that leaves an original adjacent to our
+    own output has a non-alphanumeric character between them and is caught -- which
+    :func:`test_the_scan_sees_markdown_and_punctuation_wrapped_originals` pins from
+    the other direction. This test exists so the boundary is a decision on the
+    record rather than a surprise in a live review.
+    """
+    original = "John Smith"
+
+    for haystack in (
+        f"Reference: x{original}x confirmed.",
+        f"Reference: x{original} confirmed.",
+        f"Reference: {original}x confirmed.",
+    ):
+        assert original in haystack, "premise: the original really is present verbatim"
+        assert not find_in_text(frozenset({original}), haystack), (
+            f"if this now fires, the occurrence rule has gained glued-word detection "
+            f"for {haystack!r} -- good, but the README's stated boundary must change "
+            "with it, and the Brown/Browning false positive must be re-checked"
+        )
+
+    # The false positive the rule exists to prevent, and the plural form that rules
+    # out the obvious "relax it for multi-word needles" fix.
+    assert not find_in_text(frozenset({"Brown"}), "Counsel Browning filed the motion.")
+    assert not find_in_text(
+        frozenset({"chronic low back pain"}), "notes chronic low back pains today"
+    )
+
+    # Separated by anything non-alphanumeric -- including our own output's ``]`` --
+    # it is caught, which is the case the pipeline can actually produce.
+    assert find_in_text(
+        frozenset({original}), f"[PII_NAME_1a2b3c4d]{original} confirmed."
+    ) == [original]
+
+
+def test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims() -> None:
+    """The third stated boundary: a combining mark spliced into a value defeats the scan.
+
+    ``normalize`` is NFKC, which *composes* -- so a value written in decomposed form
+    is caught (asserted below, because that half is a real capability and nothing
+    else pins it). What NFKC cannot do is remove a mark that was never in the
+    vaulted value: ``J`` + U+0301 + ``ohn Smith`` normalises to ``J́ohn Smith``,
+    which is simply a different string from ``john smith``.
+
+    This is deliberate upstream and not an oversight here. ``_INVISIBLE_RE`` in the
+    egress gate folds 145 format codepoints and names its own limit in as many
+    words -- *"no letter, digit, space or combining diacritic is in here, so
+    ``José`` and ``Jose`` remain different values"*. Folding marks out would collapse
+    two genuinely distinct originals into one and manufacture reds on any document
+    carrying both spellings of a name, which is ordinary in the documents this
+    system protects.
+
+    So it belongs with homoglyph substitution rather than with the zero-width
+    bypass: catching it needs a confusables/skeleton table, not another
+    normalisation form. Verified by sabotage rather than reasoned about -- a real
+    vaulted original was spliced into a real payload with one combining acute
+    inserted, and with the gate **live** the run completed and the value reached the
+    provider, so this is a property of the pipeline and not only of the instrument.
+    """
+    original = "John Smith"
+    mark = unicodedata.lookup("COMBINING ACUTE ACCENT")
+    mutated = f"Reference: {original[0]}{mark}{original[1:]} confirmed."
+
+    assert original not in mutated, "premise: the raw value is genuinely not present"
+    assert not find_in_text(frozenset({original}), mutated), (
+        "if this now fires, the scan has gained combining-mark folding -- good, but "
+        "the README's stated boundary must change with it, and `José` vs `Jose` must "
+        "be re-checked, because that is what the fold would also collapse"
+    )
+    # The gate agrees. The two must not disagree about what an occurrence is, and a
+    # boundary only counts as *stated* if it is the same boundary on both sides.
+    assert not _occurs_as_a_unit(
+        _strip_invisible(normalize(original)), _strip_invisible(normalize(mutated))
+    ), "the gate now sees this and the harness does not -- the checker is weaker again"
+
+    # The half that DOES hold: NFKC composes, so a decomposed rendering of an
+    # accented original is still caught. Nothing else in this module asserted it.
+    accented = "José Ruiz"
+    decomposed = unicodedata.normalize("NFD", accented)
+    assert accented not in f"client {decomposed} signed", "premise: NFD is a distinct string"
+    assert find_in_text(frozenset({accented}), f"client {decomposed} signed") == [accented]
 
 
 def test_a_short_surrogate_inside_a_longer_word_has_not_survived() -> None:

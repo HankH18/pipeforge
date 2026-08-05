@@ -11,7 +11,10 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import re
 import sqlite3
+import subprocess
+import sys
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -20,6 +23,7 @@ import aiosqlite
 import pytest
 from pydantic import ValidationError
 
+import secure_context_pipeline.audit.logger as logger_module
 from secure_context_pipeline.audit.logger import (
     DEOBFUSCATE,
     DETECT,
@@ -927,6 +931,118 @@ async def test_forging_a_new_genesis_row_breaks_the_chain(
     assert await audit.verify_chain() is False
 
 
+async def test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """The attack that defeats every check in :meth:`verify_chain` except one.
+
+    A naive middle deletion leaves the successor's ``prev_hash`` pointing at a row
+    that is gone, which ``test_deleted_row_breaks_the_chain`` already covers. The
+    competent version does not stop there: having deleted the row, the attacker
+    **re-links** -- walks the survivors in order and recomputes ``prev_hash`` and
+    ``entry_hash`` for every one of them with the shipped formula. The digests are
+    unkeyed, so this costs nothing and nothing prevents it.
+
+    What is left is a chain in which every row's hash recomputes correctly from its
+    own columns and every link matches its predecessor. The content check passes.
+    The link check passes. The high-water check passes too, because ``seq`` values
+    were left as they were, so the tail is still the highest ``seq`` SQLite ever
+    handed out. **The one surviving witness is that ``seq`` now skips a number**, and
+    the ``seq != expected_seq`` comparison is the only line in the method that looks.
+
+    That is why this test exists as its own case rather than as a variation of the
+    others. Every previously existing chain test breaks *at least two* checks at
+    once, so removing the ``seq`` continuity comparison entirely left all 100 audit
+    tests green -- measured, by deleting it in a scratch copy -- while this exact
+    attack went from ``valid=False`` to ``valid=True``. A check that no test isolates
+    is a check that can be removed by accident, which is the same shape of silence
+    that left ``prev_hash`` and ``entry_hash`` uncapped.
+
+    The renumbering variant (re-link *and* compact ``seq`` to 1..n) is a different
+    attack caught by a different witness -- the ``sqlite_sequence`` high-water mark --
+    and is asserted below so the two are not confused for one another.
+    """
+    for i in range(6):
+        await audit.emit(make_event(ts=9400.0 + i, detail={"count": i}))
+    assert await audit.verify_chain() is True
+
+    async def relink(*, renumber: bool) -> None:
+        """Rebuild a perfectly self-consistent chain over the surviving rows."""
+        async with aiosqlite.connect(tmp_path / "audit.db") as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT * FROM audit_events ORDER BY seq ASC"
+            ) as cursor:
+                survivors = [dict(row) for row in await cursor.fetchall()]
+            await conn.execute("DELETE FROM audit_events")
+            prev = GENESIS_HASH
+            for position, row in enumerate(survivors, start=1):
+                seq = position if renumber else int(row["seq"])
+                entry_hash = compute_entry_hash(
+                    prev,
+                    chain_payload(
+                        seq=seq,
+                        ts=float(row["ts"]),
+                        session_id=str(row["session_id"]),
+                        run_id=row["run_id"],
+                        event_type=str(row["event_type"]),
+                        entity_type=row["entity_type"],
+                        token_id=row["token_id"],
+                        detail=json.loads(row["detail"]),
+                    ),
+                )
+                await conn.execute(
+                    "INSERT INTO audit_events (seq, ts, session_id, run_id, event_type,"
+                    " entity_type, token_id, detail, prev_hash, entry_hash)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (seq, row["ts"], row["session_id"], row["run_id"], row["event_type"],
+                     row["entity_type"], row["token_id"], row["detail"], prev, entry_hash),
+                )
+                prev = entry_hash
+            await conn.commit()
+
+    async with aiosqlite.connect(tmp_path / "audit.db") as conn:
+        await conn.execute("DELETE FROM audit_events WHERE seq = 3")
+        await conn.commit()
+    await relink(renumber=False)
+
+    # Premise: the attacker's work really did succeed on its own terms -- every row
+    # now recomputes, and every link matches. If this premise ever fails the test
+    # below stops proving what it claims, so it is asserted rather than assumed.
+    async with aiosqlite.connect(tmp_path / "audit.db") as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM audit_events ORDER BY seq ASC") as cursor:
+            rows = [dict(row) for row in await cursor.fetchall()]
+    expected_prev = GENESIS_HASH
+    for row in rows:
+        assert row["prev_hash"] == expected_prev, "premise: the re-link left the links intact"
+        recomputed = compute_entry_hash(
+            expected_prev,
+            chain_payload(
+                seq=int(row["seq"]), ts=float(row["ts"]), session_id=str(row["session_id"]),
+                run_id=row["run_id"], event_type=str(row["event_type"]),
+                entity_type=row["entity_type"], token_id=row["token_id"],
+                detail=json.loads(row["detail"]),
+            ),
+        )
+        assert recomputed == row["entry_hash"], "premise: every row's own hash recomputes"
+        expected_prev = row["entry_hash"]
+    assert [int(row["seq"]) for row in rows] == [1, 2, 4, 5, 6], "premise: seq skips the hole"
+
+    # ... and it is still caught, by the seq continuity check and nothing else.
+    assert await audit.verify_chain() is False
+
+    # The compacting variant renumbers the hole away, so seq is continuous again --
+    # and is caught instead by the high-water mark, which DELETE never rolls back.
+    await relink(renumber=True)
+    async with aiosqlite.connect(tmp_path / "audit.db") as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT seq FROM audit_events ORDER BY seq ASC") as cursor:
+            seqs = [int(row["seq"]) for row in await cursor.fetchall()]
+    assert seqs == [1, 2, 3, 4, 5], "premise: seq is now continuous, so that witness is gone"
+    assert await audit.verify_chain() is False
+
+
 async def test_deleting_every_row_is_not_reported_as_a_clean_log(
     audit: AuditLogger, tmp_path: Path
 ) -> None:
@@ -998,10 +1114,26 @@ async def test_verify_chain_reports_an_unreadable_database_rather_than_raising(
     to report on. ``_high_water_seq`` already degraded to "no opinion" on
     ``sqlite3.Error``; the main walk did not, and that asymmetry was the bug.
 
-    Driven through a patched cursor rather than a corrupted file on purpose: a file
-    mangled badly enough to fail the walk also fails ``AuditLogger.open`` (which
-    runs ``PRAGMA journal_mode`` and the schema script), so a file-level test would
-    prove something about ``open`` instead of about this method.
+    Driven through a patched cursor because that is the *cheap and deterministic*
+    way to reach the handler, and for no other reason.
+
+    This docstring used to justify the patched cursor by claiming a file-level test
+    was impossible -- "a file mangled badly enough to fail the walk also fails
+    ``AuditLogger.open``, so a file-level test would prove something about ``open``
+    instead of about this method". **That was false, and it was the kind of false
+    that stops a test from being written.** Measured: zeroing one 4 KiB page of a
+    120-row audit database leaves ``open`` perfectly happy -- the file length still
+    matches the header's page count, so nothing reads the damaged page until the
+    walk does -- and ``verify_chain`` then returns ``False`` off a genuinely
+    corrupted file. Truncation, the shape the old claim was written from, is also
+    not the wall it describes: a 5-row database truncated to 90% opens *and*
+    verifies ``True``, because the bytes removed were unused tail.
+
+    The real file-level test is
+    :func:`test_verify_chain_reports_a_physically_corrupted_file_that_open_accepts`,
+    and it found three defects this patched-cursor test could not see: ``query``
+    and ``length`` crashing on the same input, and ``AuditLogger.open`` leaking its
+    connection thread on the input that *does* make it fail.
     """
     for i in range(4):
         await audit.emit(make_event(ts=9500.0 + i))
@@ -1017,6 +1149,356 @@ async def test_verify_chain_reports_an_unreadable_database_rather_than_raising(
 
     monkeypatch.setattr(conn, "execute", failing)
     assert await audit.verify_chain() is False
+
+
+#: Repo root, for the out-of-process leak probe below.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+async def _build_log(path: Path, rows: int) -> None:
+    """Write ``rows`` events to a fresh log at ``path`` and close it cleanly."""
+    log = await AuditLogger.open(path)
+    try:
+        for i in range(rows):
+            await log.emit(make_event(ts=9700.0 + i))
+    finally:
+        await log.close()
+
+
+def _zero_one_page(path: Path, *, page_from_end: int = 1) -> None:
+    """Overwrite one 4 KiB page with zeros, leaving the file's length untouched.
+
+    Length matters: SQLite's header records the database size in pages, so a file
+    that is *short* is rejected at open, while a file of the right length holding a
+    dead page is accepted and only fails when something reads that page. That is
+    what makes this the deterministic way to corrupt a database at the file level
+    and still get past ``open`` -- confirmed on 60-, 120- and 200-row logs at four
+    different page offsets each, 12 of 12 accepted by ``open`` and reported ``False``
+    by ``verify_chain``.
+    """
+    data = bytearray(path.read_bytes())
+    page = 4096
+    start = len(data) - page_from_end * page
+    assert start >= page, "database is too small for this corruption to be meaningful"
+    data[start : start + page] = b"\x00" * page
+    path.write_bytes(bytes(data))
+
+
+async def test_verify_chain_reports_a_physically_corrupted_file_that_open_accepts(
+    tmp_path: Path,
+) -> None:
+    """The file-level corruption test a docstring above once argued was impossible.
+
+    No patched cursor, no monkeypatched connection: a real audit database on disk
+    with one of its 4 KiB pages zeroed, opened by the real ``AuditLogger.open``.
+
+    Three separate contracts are asserted, because the value of this test is that
+    it reaches *every* reader with one input rather than one reader with a mock:
+
+    * ``open`` accepts the file -- the premise the old docstring denied.
+    * ``verify_chain`` returns ``False`` and does not raise. This is the contract
+      ``GET /audit/verify`` depends on to answer ``{"valid": false}`` instead of
+      returning a 500 on exactly the tampering it exists to report.
+    * ``query`` and ``length`` fail *typed*. Both used to escape with a raw
+      ``sqlite3.DatabaseError``, and ``query`` could also escape with a bare
+      ``TypeError`` from ``float(row["ts"])`` when a lost page returned ``NULL``
+      -- an unhandled crash from the middle of a row loop, on the same file
+      ``verify_chain`` was carefully hardened for.
+
+    ``query`` deliberately does not return the rows it read before the failure: a
+    short list with a 200 on it is indistinguishable from a complete one, and
+    truncation is the attack the chain verifier exists to catch.
+    """
+    db = tmp_path / "corrupt.db"
+    await _build_log(db, rows=120)
+    intact_bytes = db.stat().st_size
+    _zero_one_page(db)
+    assert db.stat().st_size == intact_bytes, "corruption must not change the length"
+
+    log = await AuditLogger.open(db)  # the premise: this does NOT raise
+    try:
+        assert await log.verify_chain() is False, (
+            "a physically corrupted file must read as invalid, not as clean and not "
+            "as an exception"
+        )
+        with pytest.raises(PipelineError) as query_err:
+            await log.query(limit=10_000)
+        assert query_err.value.detail["reason"] == "audit_log_unreadable"
+
+        with pytest.raises(PipelineError) as length_err:
+            await log.length()
+        assert length_err.value.detail["reason"] == "audit_log_unreadable"
+    finally:
+        await log.close()
+
+
+async def test_a_truncated_file_either_verifies_honestly_or_refuses_to_open(
+    tmp_path: Path,
+) -> None:
+    """Truncation is size-dependent, so the property is asserted, not one outcome.
+
+    Lopping bytes off the end is the obvious physical attack, and the tempting
+    assertion -- "a truncated database fails" -- is simply untrue: a 5-row log cut
+    to 90% opens and verifies ``True``, because the bytes removed were unused tail
+    and nothing was lost. Asserting the failure would therefore have been asserting
+    a falsehood, and asserting nothing was how the false docstring survived.
+
+    The property that *is* always true, and is the one worth having: whenever the
+    verifier is willing to call a truncated file valid, the file must still hold
+    every row it held before, byte-identically. ``True`` is never allowed to mean
+    "I could not tell". Any outcome that is not clean must be either a refusal to
+    open or a ``False`` -- never a crash out of ``verify_chain``.
+    """
+    src = tmp_path / "src.db"
+    await _build_log(src, rows=5)
+    intact = src.read_bytes()
+
+    reference = await AuditLogger.open(src)
+    try:
+        expected = await reference.query(limit=10_000)
+    finally:
+        await reference.close()
+    assert len(expected) == 5
+
+    saw_valid = False
+    saw_refusal = False
+    for pct in (99, 97, 95, 93, 90, 85, 50, 10):
+        target = tmp_path / f"cut_{pct}.db"
+        target.write_bytes(intact[: len(intact) * pct // 100])
+        try:
+            log = await AuditLogger.open(target)
+        except sqlite3.DatabaseError:
+            saw_refusal = True
+            continue
+        try:
+            # Never a crash: this is the contract the endpoint reports as data.
+            valid = await log.verify_chain()
+            if valid:
+                saw_valid = True
+                rows = await log.query(limit=10_000)
+                assert rows == expected, (
+                    f"truncating to {pct}% was called VALID while the log no longer "
+                    f"holds what it held ({len(rows)} of {len(expected)} rows) -- "
+                    "verify_chain must never let loss read as cleanliness"
+                )
+        finally:
+            await log.close()
+
+    assert saw_refusal, "no truncation ratio was rejected at open; sweep is not biting"
+    assert saw_valid, (
+        "no truncation ratio was accepted as valid -- if this now fails, truncation "
+        "detection got strictly stronger and the docstring above should be revisited"
+    )
+
+
+#: Counts ``aiosqlite.Connection`` threads specifically, not "threads that appeared".
+#: ``_connect`` also runs ``asyncio.to_thread(parent.mkdir)``, which starts the
+#: default executor's worker on first use; that thread is benign -- the executor
+#: registers an atexit join, so it never blocks shutdown -- and counting it made an
+#: earlier version of this test fail against correct code. ``aiosqlite.Connection``
+#: subclasses ``Thread``, so the leaked object is directly identifiable and there is
+#: no need to infer it from a population difference.
+_LEAK_PROBE = '''
+import asyncio, sqlite3, sys, threading
+from pathlib import Path
+sys.path.insert(0, {repo!r})
+import aiosqlite
+from secure_context_pipeline.audit.logger import AuditLogger
+
+def live_connections():
+    return [t for t in threading.enumerate()
+            if isinstance(t, aiosqlite.Connection) and t.is_alive()]
+
+async def main():
+    bad = Path({bad!r})
+    for _ in range(10):
+        try:
+            await AuditLogger.open(bad)
+        except sqlite3.DatabaseError:
+            pass
+        else:
+            print("NO_RAISE"); return
+    for _ in range(50):
+        if not live_connections():
+            break
+        await asyncio.sleep(0.02)
+    print("LEAKED=%d" % len(live_connections()), flush=True)
+
+asyncio.run(main())
+'''
+
+
+async def test_a_failed_open_does_not_leak_the_connection_thread(tmp_path: Path) -> None:
+    """A refused ``open`` must not leave a live connection nobody can close.
+
+    ``aiosqlite.connect`` starts a **non-daemon** worker thread and returns before
+    any setup statement has touched the file, so the first statement that reads a
+    page -- ``PRAGMA journal_mode=WAL`` -- is the first that can fail. When that
+    raised, it escaped ``open`` with ``self._conn`` still ``None``: the caller got
+    an exception and no handle, the thread stayed alive, and because it is not a
+    daemon the interpreter could never exit. Every retry leaked another one.
+
+    Not a hypothetical tidiness point. It was found by a probe script that hung
+    forever after opening a corrupt database and had to be killed, and the same
+    shape hangs an API process during startup on a damaged audit file -- a failure
+    with no error message, which is the worst kind to ship.
+
+    **Run in a subprocess, which is the whole point rather than an inconvenience.**
+    The harm *is* "the interpreter cannot exit", so the assertion has to be about a
+    process actually exiting; a thread count in this process would describe the
+    symptom and not the damage. It also keeps the failure clean: asserting in-process
+    was tried first and made pytest itself unable to shut down, so the regression
+    signal was a hung CI job rather than a red test -- the leak would have suppressed
+    the report of its own detection.
+
+    Ten failed opens rather than one, so a single thread reaped by chance elsewhere
+    cannot satisfy it.
+    """
+    src = tmp_path / "src.db"
+    await _build_log(src, rows=5)
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(src.read_bytes()[: src.stat().st_size // 2])
+
+    script = tmp_path / "leak_probe.py"
+    script.write_text(
+        _LEAK_PROBE.format(repo=str(REPO_ROOT), bad=str(bad)), encoding="utf-8"
+    )
+
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = (exc.stdout or b"").decode(errors="replace") if exc.stdout else ""
+        pytest.fail(
+            "a process that made 10 failed AuditLogger.open() calls could not exit "
+            f"within 60s -- the connection thread is leaking and it is not a daemon "
+            f"(probe stdout: {out.strip()!r})"
+        )
+
+    assert proc.stdout.strip() == "LEAKED=0", (
+        f"failed opens left connection threads alive: {proc.stdout.strip()!r} "
+        f"(stderr: {proc.stderr.strip()[:400]!r})"
+    )
+    assert proc.returncode == 0, f"probe exited {proc.returncode}: {proc.stderr[:400]}"
+
+
+async def test_verify_chain_survives_a_tampered_high_water_mark(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """The tail-truncation sentinel itself is attacker-writable, and was a crash.
+
+    ``sqlite_sequence`` is an ordinary table. ``test_tail_truncation_is_only_caught
+    _while_sqlite_sequence_is_intact`` already pins what happens when an attacker
+    rewrites it to a *plausible* number. This pins the other move -- blanking it --
+    which is strictly easier, since it needs no knowledge of how many rows survived.
+
+    Both ``NULL`` and a non-numeric string were accepted by SQLite and reached
+    ``int(row["seq"])`` inside ``_high_water_seq``, which runs *after*
+    ``verify_chain``'s try block. So the verifier raised ``TypeError`` /
+    ``ValueError`` instead of returning ``False``: ``GET /audit/verify`` answered a
+    500, and the answer to "has this log been tampered with" became an error page,
+    on an input that is itself the tampering.
+
+    Note this is the same bug shape as ``test_verify_chain_survives_a_non_numeric
+    _tampered_timestamp`` one table over. That test enumerated the columns of
+    ``audit_events`` and stopped there; the bookkeeping table the truncation
+    defence actually depends on was never in the enumeration.
+
+    ``False``, not ``True``: a sentinel that exists but holds garbage is evidence,
+    not absence, and must not degrade to the "no opinion" that a *missing* row
+    correctly gets -- otherwise erasure reads as cleanliness.
+    """
+    for i in range(5):
+        await audit.emit(make_event(ts=9800.0 + i))
+    assert await audit.verify_chain() is True
+
+    for tampered in ("NULL", "'not-a-number'"):
+        async with aiosqlite.connect(tmp_path / "audit.db") as conn:
+            await conn.execute(
+                f"UPDATE sqlite_sequence SET seq = {tampered} WHERE name = 'audit_events'"
+            )
+            await conn.commit()
+        assert await audit.verify_chain() is False, (
+            f"sqlite_sequence.seq = {tampered} must read as tampered, not raise "
+            "and not pass"
+        )
+
+
+def test_every_audit_reader_shares_one_unreadable_rule() -> None:
+    """The three readers must not drift apart on what "unreadable" means.
+
+    This codebase's recurring defect is a rule written out twice and fixed once:
+    ``_high_water_seq`` degraded on ``sqlite3.Error`` while the chain walk did not,
+    and later ``verify_chain`` was hardened while ``query`` and ``length`` -- which
+    read the same rows out of the same file -- were left raising.
+
+    So the tuple is defined once, and this asserts the shape of that definition
+    rather than trusting three ``except`` clauses to stay in step. It fails if a
+    reader is added that catches its own hand-written tuple, and it fails if the
+    shared tuple loses a member: ``ValueError`` and ``TypeError`` are load-bearing,
+    not defensive padding -- a tampered ``ts`` reaches ``float()`` as the first and
+    a lost page reaches it as the second.
+    """
+    source = Path(logger_module.__file__).read_text(encoding="utf-8")
+
+    assert set(logger_module._UNREADABLE) == {sqlite3.Error, ValueError, TypeError}
+
+    handlers = re.findall(r"except\s+([^\n:]+?)\s+as\s+\w+:", source)
+    tuple_handlers = [h for h in handlers if h.startswith("(") or "," in h]
+    assert not tuple_handlers, (
+        f"a reader is catching its own hand-written tuple {tuple_handlers} instead of "
+        "_UNREADABLE; that is exactly how the last two versions of this rule drifted"
+    )
+    assert source.count("except _UNREADABLE") == 4, (
+        "expected the shared rule at all four read sites (chain walk, high-water "
+        "call, query, length); a changed count means a reader was added or removed "
+        "without this test being considered"
+    )
+
+
+def test_the_audit_emit_budget_has_a_magnitude_and_not_just_a_mechanism() -> None:
+    """``AUDIT_EMIT_TIMEOUT_S`` is a *budget*, and nothing pinned how big it was.
+
+    Both tests that exercise the gate's block-path audit write monkeypatch this
+    constant to ``0.05`` so they can finish quickly. That pins the ``asyncio.timeout``
+    wiring -- that a hung audit writer is interrupted at all -- and pins nothing
+    about the shipped number. Raising it to ``1e9`` left the whole suite green while
+    deleting the guarantee: a wedged audit writer would once again hold a request
+    open forever with the block already decided, which is the exact failure the
+    constant was introduced to close.
+
+    Asserted as a *relationship* rather than a magic ceiling, because a magic
+    ceiling is another unpinned number. ``AUDIT_EMIT_TIMEOUT_S`` bounds a write that
+    happens after ``check()`` has already decided to block, and it is only a bound
+    on anything if it is shorter than the budget of the request it is delaying --
+    otherwise the caller has blown ``DEFAULT_TIMEOUT_S`` before this timer is even
+    consulted, and the guarantee is vacuous.
+
+    It is a constant assertion and not a wall-clock one on purpose: proving the
+    magnitude behaviourally means stalling a sink and waiting out the entire real
+    budget, which buys a slow test for a property two existing tests already cover
+    the mechanism of. The gap was the number, so the number is what is pinned.
+
+    (Lives here rather than beside the gate tests because those files belong to
+    another agent in this pass. The constant is an audit-write budget, so this is
+    not an unnatural home, but it is a placement to revisit.)
+    """
+    from secure_context_pipeline.pipeline.egress_gate import (
+        AUDIT_EMIT_TIMEOUT_S,
+        DEFAULT_TIMEOUT_S,
+    )
+
+    assert AUDIT_EMIT_TIMEOUT_S > 0, "a non-positive budget would fire instantly"
+    assert AUDIT_EMIT_TIMEOUT_S < DEFAULT_TIMEOUT_S, (
+        f"the block-path audit write may wait {AUDIT_EMIT_TIMEOUT_S}s, which is not "
+        f"shorter than the request budget it delays ({DEFAULT_TIMEOUT_S}s) -- so it "
+        "bounds nothing a caller can observe"
+    )
 
 
 async def test_verify_chain_survives_a_non_numeric_tampered_timestamp(

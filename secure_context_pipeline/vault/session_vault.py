@@ -290,19 +290,30 @@ class SessionVault:
         Raises :class:`SessionExpiredError` if the session is gone.
         """
         index = (record.entity_type, normalize(original))
-        conn = self._require_conn()
 
-        # Liveness check, collision check, encryption and insert are one
-        # critical section. Two coroutines racing on the same token ID must not
-        # both take it -- and the session must be *checked* live under the same
-        # lock that ``destroy`` takes, not merely have been live when this
-        # coroutine started. Reading the key outside the lock happened to be
-        # safe only because there was no ``await`` between the read and the
-        # acquire; anything added there (an audit emit, a metric, a thread hop)
-        # would have let a write land after logout and rebuild the plaintext
-        # cache for a destroyed session. ``SessionRegistry`` never calls back
-        # into the vault, so taking its lock from inside ours cannot deadlock.
+        # Connection handle, liveness check, collision check, encryption and
+        # insert are one critical section. Two coroutines racing on the same
+        # token ID must not both take it -- and the session must be *checked*
+        # live under the same lock that ``destroy`` takes, not merely have been
+        # live when this coroutine started. Reading the key outside the lock
+        # happened to be safe only because there was no ``await`` between the
+        # read and the acquire; anything added there (an audit emit, a metric, a
+        # thread hop) would have let a write land after logout and rebuild the
+        # plaintext cache for a destroyed session. ``SessionRegistry`` never
+        # calls back into the vault, so taking its lock from inside ours cannot
+        # deadlock.
+        #
+        # ``_require_conn`` is called *here*, not before the acquire, for the
+        # same class of reason -- and that one was not merely fragile, it was
+        # reachable with no edit at all. ``close`` takes this lock, so a ``close``
+        # already queued on it runs first: a handle resolved before the acquire
+        # was live when it was read and dead by the time it was used, and the
+        # INSERT raised a bare ``sqlite3.ProgrammingError`` out of a method whose
+        # whole contract is ``PipelineError(reason="vault_closed")``. Resolving
+        # it under the lock makes "the connection I use is the connection that
+        # was open while I held the lock" a property of the code.
         async with self._lock:
+            conn = self._require_conn()
             session_key = await self._registry.key(session_id)
             if session_id in self._destroyed:
                 # A write that lost the race with logout. See destroy().
@@ -540,10 +551,11 @@ class SessionVault:
         naive query.
         """
         known = frozenset(known_session_ids)
-        conn = self._require_conn()
         deleted = 0
         orphan_count = 0
+        # Resolved under the lock, not before it: see the note in :meth:`put`.
         async with self._lock:
+            conn = self._require_conn()
             cursor = await conn.execute(_DISTINCT_SESSIONS_SQL)
             rows = await cursor.fetchall()
             await cursor.close()
@@ -576,8 +588,9 @@ class SessionVault:
     # -- internals ---------------------------------------------------------
 
     async def _fetch_one(self, sql: str, params: tuple[object, ...]) -> aiosqlite.Row | None:
-        conn = self._require_conn()
+        # Resolved under the lock, not before it: see the note in :meth:`put`.
         async with self._lock:
+            conn = self._require_conn()
             cursor = await conn.execute(sql, params)
             row = await cursor.fetchone()
             await cursor.close()

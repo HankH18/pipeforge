@@ -63,6 +63,7 @@ from secure_context_pipeline.audit.logger import (
     DEFAULT_DB_FILENAME as AUDIT_DB_FILENAME,
 )
 from secure_context_pipeline.audit.logger import (
+    EGRESS_BLOCK,
     EGRESS_PASS,
     LLM_CALL,
     VAULT_DESTROY,
@@ -73,16 +74,26 @@ from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.deobfuscation.restorer import Restorer
 from secure_context_pipeline.detection.detector import Detector, warm_up
 from secure_context_pipeline.detection.registry import load_registry
-from secure_context_pipeline.errors import ConfigError, PipelineError
+from secure_context_pipeline.errors import ConfigError, EgressBlockedError, PipelineError
 from secure_context_pipeline.llm.anthropic_provider import AnthropicProvider
 from secure_context_pipeline.llm.base import DetailedLLMProvider, build_provider
-from secure_context_pipeline.models import AuditEvent, PipelineResult
+from secure_context_pipeline.models import (
+    AuditEvent,
+    EntityCategory,
+    PipelineResult,
+    TokenRecord,
+)
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import MIN_ORIGINAL_LEN, EgressGate
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import DOC_CATEGORIES, EncryptedDocumentStore
-from secure_context_pipeline.surrogates import REDACTION_RE, TOKEN_RE, extract_token_ids
+from secure_context_pipeline.surrogates import (
+    REDACTION_RE,
+    TOKEN_RE,
+    extract_token_ids,
+    format_surrogate,
+)
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import (
     DEFAULT_DB_FILENAME as VAULT_DB_FILENAME,
@@ -113,6 +124,26 @@ DEFAULT_PROMPT: Final = (
     "important figures. Answer in short bullet points."
 )
 WIRE_DUMP_PATH: Final = REPO_ROOT / "wire_dump.txt"
+
+#: The stand-in for an entity the detector missed, used by
+#: :func:`demonstrate_fail_closed`. Deliberately something the shipped registry
+#: classifies as nothing -- verified against ``entities.yaml`` in every category
+#: -- because the whole demonstration rests on obfuscation leaving it alone. If a
+#: future registry rule starts matching it, the fail-closed check goes red rather
+#: than quietly passing for the wrong reason, and the fix is a new sentinel.
+LEAK_SENTINEL: Final = "8QX-DELTA-4471"
+#: 8 hex characters, the shape ``format_surrogate`` requires. Not a secret: a
+#: token ID is a public label that names a vault row, never a key.
+LEAK_TOKEN_ID: Final = "5e17a0c3"  # noqa: S105 -- a surrogate label, not a credential
+LEAK_DOC: Final = (
+    "OPERATIONS MEMO\n\n"
+    "This file is an internal working note. It records one item only.\n\n"
+    f"Ledger tag {LEAK_SENTINEL} is cited on every page of the reconciliation.\n\n"
+    "Nothing further is recorded here.\n"
+)
+#: Page size for the demo's own audit reads. The log is append-only and shared
+#: across runs, so a fixed ceiling keeps the scan bounded on a well-used data dir.
+MAX_AUDIT_SCAN: Final = 1000
 #: Build doc section 12: the full-pipeline budget, checked under ``--real``.
 REAL_BUDGET_S: Final = 15.0
 
@@ -800,6 +831,121 @@ def _sha256_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+async def demonstrate_fail_closed(
+    harness: Harness, checks: CheckList, *, session_id: str, prompt: str
+) -> None:
+    """Make the egress gate refuse, and show what refusal costs.
+
+    Runs A and B show the gate *passing*, which is the uninteresting half: a
+    payload with nothing wrong in it is released by a gate that does nothing at
+    all. The claim this system is built on is the other half -- that a payload
+    with an original still in it is **not** released -- and that half was, until
+    this section existed, asserted in a docstring and demonstrated nowhere.
+
+    The failure is injected where it actually happens. The gate's first pass
+    scans the outbound payload for every original the session's vault holds, so
+    the way to stage "the detector missed one" is to put a value in the vault
+    that the detector does not flag: the engine leaves it in the payload
+    verbatim, exactly as it would leave a real entity it failed to recognise.
+    :data:`LEAK_SENTINEL` is chosen for that -- it is checked against the shipped
+    registry and detected as nothing, in any category.
+
+    Three things are then true and all three are checked, because the first alone
+    is not the property:
+
+    * the run raises ``EGRESS_BLOCKED`` instead of returning an answer;
+    * **no ``LLM_CALL`` event exists for that run**, against runs A and B which
+      both have one -- the refusal happened *before* the provider, not after;
+    * the error a caller receives names a reason and a count and never the value
+      that would have leaked. A block that leaked the blocked value in its own
+      error message would be a worse hole than the one it closed.
+    """
+    print(dim("  runs A and B show the gate passing. That is the easy half: a gate"))
+    print(dim("  that always passes looks identical. Here it must refuse."))
+
+    doc_id = await harness.store.put(USER_ID, "leak_probe.txt", LEAK_DOC.encode("utf-8"), "general")
+    kv("file", f"leak_probe.txt  (synthetic, {len(LEAK_DOC)} bytes, category=general)")
+    kv("doc_id", doc_id)
+    wrapped(
+        "  premise       ",
+        "one value in this document is in the session vault but is not something "
+        "the detector recognises, so obfuscation leaves it in the payload -- which "
+        "is what a missed entity looks like from the gate's side. The value itself "
+        "is not printed here, or anywhere.",
+        style=dim,
+    )
+
+    # The vault entry a real detection would have written. `put` is the same call
+    # the obfuscation engine makes; nothing here reaches around the vault's API.
+    await harness.vault.put(
+        session_id,
+        TokenRecord(
+            session_id=session_id,
+            token_id=LEAK_TOKEN_ID,
+            entity_type="ACCOUNT_REF",
+            category=EntityCategory.FIN,
+            surrogate=format_surrogate("FIN", "ACCOUNT_REF", LEAK_TOKEN_ID),
+            created_at=time.time(),
+        ),
+        LEAK_SENTINEL,
+    )
+
+    blocked: EgressBlockedError | None = None
+    try:
+        await harness.orchestrator.run(session_id, USER_ID, doc_id, prompt, "tokenization")
+    except EgressBlockedError as exc:
+        blocked = exc
+
+    print()
+    checks.record(
+        "EGRESS GATE BLOCKS a payload that still carries an original",
+        blocked is not None,
+        f"EgressBlockedError(reason={blocked.detail.get('reason')!r}, "
+        f"hit_count={blocked.detail.get('hit_count')})" if blocked else
+        "the run completed -- the gate released a payload containing a vault original",
+    )
+
+    # Scoped to *this* run, read out of the log rather than out of the exception:
+    # the evidence is the audit trail a reviewer can query for themselves, and a
+    # whole-log scan would pick up blocks from earlier demo runs sharing ./data.
+    run_id = blocked.detail.get("run_id") if blocked else None
+    events = (
+        await harness.audit.query(run_id=run_id, limit=MAX_AUDIT_SCAN)
+        if isinstance(run_id, str)
+        else []
+    )
+    kinds = [e.event_type for e in events]
+    checks.record(
+        "the provider was NEVER called for the blocked run",
+        EGRESS_BLOCK in kinds and LLM_CALL not in kinds,
+        f"run {run_id} emitted {len(events)} event(s): "
+        f"{EGRESS_BLOCK} present, {LLM_CALL} absent",
+    )
+
+    # Non-vacuity. "No LLM_CALL for that run" is also what a broken provider
+    # wiring would produce, so the same session's *passing* runs have to show
+    # the event this one is missing.
+    passing = await harness.audit.query(
+        session_id=session_id, event_type=LLM_CALL, limit=MAX_AUDIT_SCAN
+    )
+    checks.record(
+        "control: the same session's passing runs DO reach the provider",
+        bool(passing) and all(e.run_id != run_id for e in passing),
+        f"{len(passing)} {LLM_CALL} event(s) for this session, none of them this run",
+    )
+
+    surfaced = repr(blocked) + str(dict(blocked.detail)) if blocked else ""
+    checks.record(
+        "the block itself leaks nothing -- the refused value is not in the error",
+        blocked is not None and LEAK_SENTINEL not in surfaced,
+        f"{len(surfaced)} chars of error detail scanned; keys "
+        f"{sorted(blocked.detail) if blocked else []}",
+    )
+    if blocked is not None:
+        print()
+        wrapped("  caller receives: ", f"422 {blocked.code} {dict(blocked.detail)}", style=yellow)
+
+
 @dataclass(slots=True)
 class DestroyProbe:
     """The exact restoration that must succeed before destruction and fail after.
@@ -1108,6 +1254,11 @@ async def run_demo(args: argparse.Namespace) -> int:
             prompt=args.prompt,
             panes=True,
             nonvacuity_fatal=True,
+        )
+
+        section("6c. fail-closed: the egress gate refuses")
+        await demonstrate_fail_closed(
+            harness, checks, session_id=session_id, prompt=args.prompt
         )
 
         originals_before_destroy = harness.vault.originals_for_session(session_id)

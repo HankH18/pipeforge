@@ -36,6 +36,8 @@ from secure_context_pipeline.audit.logger import (
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.deobfuscation.restorer import RestoreResult
+from secure_context_pipeline.detection.detector import Detector
+from secure_context_pipeline.detection.registry import load_registry
 from secure_context_pipeline.errors import EgressBlockedError, PipelineError
 from secure_context_pipeline.llm.base import LLMResponse
 from secure_context_pipeline.models import (
@@ -48,11 +50,22 @@ from secure_context_pipeline.models import (
 )
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import (
+    AUDIT_EMIT_TIMEOUT_S,
+    DEFAULT_TIMEOUT_S,
+    HIGH_SEVERITY_TYPES,
     MIN_ORIGINAL_LEN,
     EgressGate,
+    _occurs_as_a_unit,
     _strip_invisible,
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
+from secure_context_pipeline.surrogates import (
+    REDACTION_RE,
+    STRICT_TOKEN_RE,
+    format_redaction,
+    format_surrogate,
+)
+from tests.conftest import REGISTRY_PATH
 
 SESSION = "sess-egress"
 
@@ -241,6 +254,106 @@ async def test_normalised_original_blocks(tmp_path: Path, payload: str) -> None:
         await gate.check(payload, SESSION)
     assert exc.value.detail["reason"] == "vault_original"
     await audit.close()
+
+
+async def test_the_normalised_form_is_the_only_thing_that_sees_some_leaks(
+    tmp_path: Path,
+) -> None:
+    """Pass 1 ORs three comparison forms, so each one has to be pinned ALONE.
+
+    ``test_normalised_original_blocks`` above cannot see the normalised form
+    disappear. Every payload in it is *also* caught by the folded form -- folding is
+    normalisation plus a strip, so on text containing no invisible characters the
+    two forms are the same needle against the same haystack. Deleting
+    ``(normalized, payload_norm)`` from ``_scan_originals`` therefore left this
+    entire file green while a vaulted original went to the provider byte-for-byte.
+    That is the audit's own lesson (a checker blind in the way the thing it checks is
+    blind) reappearing as three checks that only ever disagree on inputs nothing
+    tested.
+
+    This payload is the shape only the middle form can see:
+
+    * **raw** misses on case -- the payload shouts the name;
+    * **folded** misses on boundaries -- removing the two zero-width spaces glues
+      ``ref`` onto the front of the name and ``filed`` onto the back, so the needle
+      sits inside a longer alphanumeric run, which :func:`_occurs_as_a_unit`
+      deliberately does not treat as an occurrence;
+    * **normalised** casefolds but keeps the zero-width spaces, which are not
+      alphanumeric, so both boundary assertions hold and the value is found.
+
+    Every byte of it discloses ``John Smith`` to a human reader and to the model.
+    """
+    # Escapes, never literals: a literal zero-width character here would be
+    # invisible to the next reader of the very case it is testing.
+    payload = "Ref\u200bJOHN SMITH\u200bfiled."
+    assert "John Smith" not in payload, "the raw form would catch this"
+    assert _occurs_as_a_unit(normalize("John Smith"), normalize(payload))
+    assert not _occurs_as_a_unit(
+        _strip_invisible(normalize("John Smith")), _strip_invisible(normalize(payload))
+    ), "the folded form would catch this, so it would not pin the normalised one"
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({"John Smith"}))
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] == "vault_original"
+    await audit.close()
+
+
+async def test_the_raw_form_is_the_only_thing_that_sees_some_leaks(tmp_path: Path) -> None:
+    """The other end of the same property -- and what it demands of the pre-filter.
+
+    ``Dr Smith℠`` carries the original verbatim, and *only* the raw comparison can
+    see it. U+2120 (SERVICE MARK) expands to ``SM`` under NFKC, so the normalised
+    and folded payloads both read ``dr smithsm``: there the right-hand neighbour is
+    alphanumeric and both derived forms correctly decline to match. The raw payload
+    still has a symbol there, which is a boundary, so the raw form matches.
+
+    The consequence is that the exact-substring pre-filter in
+    :func:`_occurs_as_a_unit` is load-bearing rather than merely fast. It is sound
+    only because it is *exact* -- every match needs the literal needle, so ``needle
+    in haystack`` can reject only what the regex would also reject. Weaken it to an
+    approximation (casefold one side, strip a character) and it starts rejecting
+    values that are present, in the one form that has no second chance. Making it
+    ``needle.casefold() not in haystack`` leaves this file green and lets this
+    payload out.
+    """
+    payload = "Dr Smith℠ filed the report."
+    assert "Smith" in payload
+    assert not _occurs_as_a_unit(normalize("Smith"), normalize(payload)), (
+        "a derived form catches this too, so it would not pin the raw one"
+    )
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({"Smith"}))
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] == "vault_original"
+    await audit.close()
+
+
+@pytest.mark.parametrize(
+    ("needle", "haystack"),
+    [
+        ("Smith", "Dr Smith filed the report."),
+        ("JOHN SMITH", "Patient JOHN SMITH is stable."),
+        ("(415) 555-0123", "Reachable at tel(415) 555-0123 during clinic hours."),
+        ("$1,234.56", "Balance of USD$1,234.56 remains outstanding."),
+        ("O'Brien", "Attending Dr O'Brien signed off."),
+    ],
+)
+def test_the_substring_pre_filter_rejects_only_values_that_are_absent(
+    needle: str, haystack: str
+) -> None:
+    """The pre-filter's soundness on its own, with no payload plumbing in the way.
+
+    ``_occurs_as_a_unit`` returns ``False`` before it builds a regex whenever
+    ``needle not in haystack``. That shortcut is a pure optimisation *only* while it
+    is exact; the moment it answers a slightly different question than the matcher
+    behind it, it becomes a silent filter on what the gate is allowed to see. Every
+    case here puts the needle in the haystack verbatim and as a standalone unit, so
+    every one must survive the pre-filter and match.
+    """
+    assert needle in haystack
+    assert _occurs_as_a_unit(needle, haystack)
 
 
 async def test_block_is_audited_and_carries_no_original(tmp_path: Path) -> None:
@@ -434,6 +547,52 @@ def test_every_unicode_format_character_is_folded() -> None:
     )
 
 
+#: ``Default_Ignorable_Code_Point`` from the Unicode standard's
+#: ``DerivedCoreProperties.txt``, transcribed as (first, last) pairs.
+#:
+#: Roughly a fifth of these are *not* general category ``Cf``, so
+#: ``test_every_unicode_format_character_is_folded`` -- which walks
+#: :mod:`unicodedata` for ``Cf`` -- cannot see them: the variation selectors are
+#: ``Mn``, the Hangul and Khmer fillers are ``Lo``, and ``U+FFF0``\\ ..\\ ``U+FFF8``
+#: are unassigned. The module docstring claims the fold covers *every*
+#: default-ignorable, and until this list existed that claim was checked by nothing
+#: at all -- the sixteen hand-picked cases below it happened to name, and no more.
+#: Transcribed from the standard rather than derived from
+#: :data:`~secure_context_pipeline.pipeline.egress_gate._INVISIBLE_RE`, because a
+#: list copied out of the implementation would agree with the implementation by
+#: construction and could never fail.
+_DEFAULT_IGNORABLE_RANGES = [
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
+    (0x17B4, 0x17B5), (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
+    (0x2060, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+]
+
+
+def test_every_default_ignorable_code_point_is_folded() -> None:
+    """The half of the fold's claim that ``unicodedata`` cannot check for us.
+
+    Python ships no ``Default_Ignorable_Code_Point`` query, so the Cf sweep above is
+    blind to every default-ignorable that is not a format character -- and those are
+    exactly the ones a hand-picked list forgets, because they do not look like
+    controls: ``U+3164`` is classed as a *letter*.
+
+    A miss here is the same one-character complete bypass of pass 1 that the tag
+    characters were, and it is reachable from an uploaded document.
+    """
+    missed = [
+        cp
+        for first, last in _DEFAULT_IGNORABLE_RANGES
+        for cp in range(first, last + 1)
+        if _strip_invisible(chr(cp)) != ""
+    ]
+    assert not missed, (
+        "default-ignorable codepoints not folded -- each is a one-character bypass "
+        "of pass 1: " + " ".join(f"U+{cp:04X}" for cp in missed[:20])
+    )
+
+
 @pytest.mark.parametrize(
     "visible",
     [
@@ -562,12 +721,76 @@ async def test_a_fake_containing_an_original_as_a_longer_word_does_not_block(
     await audit.close()
 
 
+@pytest.mark.parametrize(
+    ("original", "payload"),
+    [
+        # Raw: "Brown" is present byte-for-byte, as the TAIL of "McBrown".
+        ("Brown", "Report by Dr McBrown, attending physician."),
+        # Normalised only: "Ford" is not in "Bradford" (case), but "ford" is in the
+        # casefolded payload -- so on this one the left assertion is the only thing
+        # between a legitimate fake and a block.
+        ("Ford", "Attending Dr Bradford reviewed the chart."),
+    ],
+)
+async def test_a_fake_that_ends_with_an_original_does_not_block_either(
+    tmp_path: Path, original: str, payload: str
+) -> None:
+    """The suffix direction of the same rule, which nothing above was testing.
+
+    ``_occurs_as_a_unit`` applies its boundary assertion **per side**, and the two
+    sides are separate statements in the source. The sibling test above uses
+    ``Browning`` and ``Smithsonian``: both put the original at the *start* of the
+    longer word, so both are decided entirely by the RIGHT assertion. Deleting the
+    LEFT assertion outright therefore left this whole file green -- while the gate
+    began false-blocking on ``Dr McBrown``, which is exactly the false-positive class
+    the per-side rule exists to prevent and the one that makes pseudonymization
+    unusable (a run that blocks on its own well-formed output ships nothing).
+
+    Both probes are legitimate: neither payload contains the original as a unit, so
+    neither is a leak, so neither may block.
+    """
+    gate, audit = await _gate(tmp_path, vault=FakeVault({original}))
+    report = await gate.check(payload, SESSION)
+    assert report.originals_scanned == 1
+    await audit.close()
+
+
 async def test_very_short_originals_are_not_scanned(tmp_path: Path) -> None:
     """A 1-2 char 'original' would match almost any payload and block everything."""
     short = "a" * (MIN_ORIGINAL_LEN - 1)
     gate, audit = await _gate(tmp_path, vault=FakeVault({short}))
     report = await gate.check("a perfectly ordinary sentence", SESSION)
     assert report.payload_chars > 0
+    await audit.close()
+
+
+async def test_a_short_original_padded_with_whitespace_is_not_scanned_either(
+    tmp_path: Path,
+) -> None:
+    """``MIN_ORIGINAL_LEN`` is measured on the STRIPPED vaulted value, and that matters.
+
+    The length floor is checked in two places, and the test above can only see one of
+    them. ``"aa"`` is rejected by the per-form check inside the loop
+    (``len(needle) >= MIN_ORIGINAL_LEN``), so deleting the check on the *vaulted*
+    value changed nothing there and left the file green.
+
+    ``" ab "`` is the shape that separates them. It is four characters raw -- past
+    the per-form floor -- and two characters of actual signal. Normalisation trims it
+    back to ``"ab"``, so the normalised and folded forms are skipped, but the raw form
+    is compared against the raw payload with **no boundary assertion on either side**,
+    because both of its own ends are spaces. One such vault entry then blocks every
+    payload containing a two-letter word: a denial of service of the whole pipeline,
+    reachable from an uploaded document, which makes it a security bug rather than a
+    tidiness one.
+    """
+    original = " ab "
+    assert len(original) >= MIN_ORIGINAL_LEN, "the per-form floor would reject this on its own"
+    assert len(original.strip()) < MIN_ORIGINAL_LEN
+    assert original in "The lab ab test is done."
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({original}))
+    report = await gate.check("The lab ab test is done.", SESSION)
+    assert report.originals_scanned == 1
     await audit.close()
 
 
@@ -611,6 +834,78 @@ async def test_token_spans_are_skipped(tmp_path: Path) -> None:
     detector = FakeDetector([("SSN", token, 0.99)])
     gate, audit = await _gate(tmp_path, detector=detector)
     report = await gate.check(f"Patient {token} is stable.", SESSION)
+    assert report.rescan_warnings == 0
+    await audit.close()
+
+
+async def test_an_empty_surrogate_protects_nothing(tmp_path: Path) -> None:
+    """A protected span is a hole in pass 2, so the empty string must open none.
+
+    ``str.find("")`` succeeds at *every* offset, so one empty member of the surrogate
+    set walks the payload and appends a zero-width span per character. Those look
+    inert -- they cover nothing -- but :func:`_overlaps` asks ``start < s_end and end
+    > s_start``, and any zero-width span strictly inside a detection satisfies both.
+    A 36-character payload produced 36 of them and switched pass 2 off completely.
+
+    ``format_surrogate`` cannot return ``""`` today, so the guard that skips it is
+    defensive -- which is exactly why nothing was checking it. Deleting the guard left
+    this file green while a 0.99-confidence SSN went unexamined, and "unreachable
+    today" is a property of code somebody else owns.
+    """
+    payload = "Maria Torres filed SSN 412-33-7891."
+    fake = "Maria Torres"
+
+    # Stated as three spans rather than one equality, so "the skip-list returns
+    # nothing at all" cannot satisfy it: the empty string must contribute nothing
+    # *while a real surrogate in the same set still contributes its own span*.
+    assert EgressGate._protected_spans(payload, frozenset()) == []
+    assert EgressGate._protected_spans(payload, frozenset({""})) == []
+    assert EgressGate._protected_spans(payload, frozenset({"", fake})) == [(0, len(fake))]
+
+    detector = FakeDetector([("SSN", "412-33-7891", 0.99)])
+    gate, audit = await _gate(tmp_path, detector=detector)
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION, surrogates=frozenset({"", fake}))
+    assert exc.value.detail["reason"] == "detector_rescan"
+    assert exc.value.detail["entity_types"] == "SSN"
+    await audit.close()
+
+
+async def test_a_surrogate_the_strict_grammar_rejects_is_still_protected(
+    tmp_path: Path,
+) -> None:
+    """What actually stops the narrowed grammar false-blocking: string equality.
+
+    The tempting argument for matching with ``STRICT_TOKEN_RE`` is that
+    ``format_surrogate`` validates category, entity type, token id and hint, so its
+    output is a strict match *by construction*. That argument is false, and believing
+    it is how the skip-list would quietly become the only protection. The three
+    validators anchor with ``$``, which in Python matches at end-of-string **or just
+    before a trailing newline**, while ``STRICT_TOKEN_RE`` demands a literal ``]``
+    right after the hash. So an entity type, token id or hint carrying a trailing
+    newline is accepted by the emitter and rejected by the matcher. (Those validators
+    live in ``surrogates.py`` and should anchor with ``\\Z``; that is not this file's
+    fix to make, and it is reported rather than papered over here.)
+
+    The leg that does hold is the other one: the orchestrator hands ``check()`` the
+    exact strings this run emitted and ``_protected_spans`` protects those by string
+    equality, which no grammar can drift away from. This pins that leg on a token the
+    strict matcher does not recognise -- protected when the run declares it, and
+    re-scanned like any other prose when it does not, which is the safe direction.
+    """
+    token = "[PII_NAME\n_deadbeef]"
+    assert STRICT_TOKEN_RE.fullmatch(token) is None, "pick a shape the grammar really rejects"
+    payload = f"Patient {token} was seen."
+    assert EgressGate._protected_spans(payload, frozenset()) == [], (
+        "the grammar, not string equality, is protecting this -- the probe is stale"
+    )
+    assert EgressGate._protected_spans(payload, frozenset({token})) == [
+        (payload.index(token), payload.index(token) + len(token))
+    ]
+
+    detector = FakeDetector([("SSN", token, 0.99)])
+    gate, audit = await _gate(tmp_path, detector=detector)
+    report = await gate.check(payload, SESSION, surrogates=frozenset({token}))
     assert report.rescan_warnings == 0
     await audit.close()
 
@@ -905,6 +1200,110 @@ async def test_a_hanging_audit_writer_still_leaves_a_pass_blocked(
     await audit.close()
 
 
+#: The longest this pipeline may leave a request unanswered while it decides, or
+#: after it has already decided. Stated here rather than derived from the gate's own
+#: constants on purpose: anchoring one unpinned number to another unpinned number is
+#: how both end up at an hour. A caller that waits longer than this cannot tell a
+#: blocked request from a dead worker, and neither can the operator looking at the
+#: two of them.
+_ANSWER_CEILING_S = 60.0
+
+
+async def test_the_block_path_audit_budget_is_short_enough_to_be_a_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two tests above prove the wrapper EXISTS. Nothing proved its value.
+
+    Both of them monkeypatch ``AUDIT_EMIT_TIMEOUT_S`` to 0.05 so they finish quickly,
+    and they are the only references to the constant in the suite. The shipped number
+    was therefore pinned by nothing at all: raising it to 3600.0 left this whole file
+    green, and an hour is not a budget -- it is the unbounded wait the wrapper exists
+    to remove. Removing the wrapper is caught; neutering it was not. That is the same
+    shared-silence shape as an untested salt.
+
+    So this reads the budget the block path *actually installs* -- by recording what
+    ``asyncio.timeout`` is asked for while a real ``gate_exception`` block runs -- and
+    holds it to a ceiling stated in this file rather than copied from the module. It
+    also pins which budget is which: the whole-check budget first, the block-path
+    write second, with nothing else wrapped in between.
+    """
+    real_timeout = asyncio.timeout
+    delays: list[float] = []
+
+    def _spy(delay: float | None) -> asyncio.Timeout:
+        delays.append(-1.0 if delay is None else delay)
+        return real_timeout(delay)
+
+    audit = await _open_audit(tmp_path / "audit.db")
+    gate = EgressGate(
+        vault=FakeVault(),  # type: ignore[arg-type]
+        detector=ExplodingDetector(),  # type: ignore[arg-type]
+        settings=_settings(tmp_path),
+        audit=audit,
+        timeout_s=12.5,
+    )
+    monkeypatch.setattr(asyncio, "timeout", _spy)
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check("anything", SESSION, run_id="run-budget")
+    monkeypatch.undo()
+
+    assert exc.value.detail["reason"] == "gate_exception"
+    assert delays == [12.5, AUDIT_EMIT_TIMEOUT_S], (
+        "the block path no longer installs AUDIT_EMIT_TIMEOUT_S after the whole-check "
+        f"budget: {delays}"
+    )
+    assert AUDIT_EMIT_TIMEOUT_S <= _ANSWER_CEILING_S, (
+        f"the block-path audit write may hold an already-decided request for "
+        f"{AUDIT_EMIT_TIMEOUT_S}s, which is not a budget"
+    )
+    await audit.close()
+
+
+async def test_the_default_whole_check_budget_is_short_enough_to_be_a_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same silence, one constant over: nothing pinned ``DEFAULT_TIMEOUT_S``.
+
+    ``test_a_hanging_detector_blocks_instead_of_hanging_forever`` and its siblings all
+    construct the gate with an explicit ``timeout_s`` so they finish in milliseconds,
+    which means the value an *unparameterised* gate installs -- the one every caller
+    in ``api/app.py`` and ``demo.py`` actually gets -- was checked by nothing. Raising
+    it to 3600.0 left this file green while the gate's answer to "a detector that
+    never returns" became an hour-long hang.
+
+    A wedged scan is the case the budget exists for, and it is the case where
+    "blocked" and "never answered" diverge: the second one is not a security control,
+    it is a worker that never comes back. So this reads the budget a default gate
+    installs and holds it to the same ceiling as the block path.
+    """
+    real_timeout = asyncio.timeout
+    delays: list[float] = []
+
+    def _spy(delay: float | None) -> asyncio.Timeout:
+        delays.append(-1.0 if delay is None else delay)
+        return real_timeout(delay)
+
+    audit = await _open_audit(tmp_path / "audit.db")
+    gate = EgressGate(
+        vault=FakeVault(),  # type: ignore[arg-type]
+        detector=FakeDetector(),  # type: ignore[arg-type]
+        settings=_settings(tmp_path),
+        audit=audit,
+    )
+    monkeypatch.setattr(asyncio, "timeout", _spy)
+    await gate.check("nothing sensitive at all", SESSION, run_id="run-default-budget")
+    monkeypatch.undo()
+
+    assert delays == [DEFAULT_TIMEOUT_S], (
+        f"a default gate no longer wraps its passes in DEFAULT_TIMEOUT_S: {delays}"
+    )
+    assert DEFAULT_TIMEOUT_S <= _ANSWER_CEILING_S, (
+        f"a wedged scan may hold a request for {DEFAULT_TIMEOUT_S}s before the gate "
+        "answers, which is not a budget"
+    )
+    await audit.close()
+
+
 async def test_the_token_contract_example_is_outside_the_grammar_and_that_is_inert(
     tmp_path: Path,
 ) -> None:
@@ -915,9 +1314,10 @@ async def test_the_token_contract_example_is_outside_the_grammar_and_that_is_ine
     verbatim prompt is what ships. This pins the three consequences that make that
     choice safe, so a later "tidy-up" to eight hex has to argue with a red test:
 
-    * the literal is not matched by ``TOKEN_RE``, so it is not protected by the
-      gate's skip-list -- it is re-scanned like any other prose, which is *more*
-      scrutiny than a real token's core gets, not less;
+    * the literal is matched by neither grammar -- not the tolerant ``TOKEN_RE`` the
+      restorer uses, and not the ``STRICT_TOKEN_RE`` the gate's skip-list now uses --
+      so it is re-scanned like any other prose, which is *more* scrutiny than a real
+      token's core gets, not less;
     * the 8-hex example in the same prompt *is* protected, so the skip-list is
       working and the 4-hex miss is a property of the literal, not a broken regex;
     * a payload carrying the whole contract still passes, because nothing in it is
@@ -931,14 +1331,21 @@ async def test_the_token_contract_example_is_outside_the_grammar_and_that_is_ine
     example = "[PHI_MEDICATION_2f4a|oral-antidiabetic]"
     assert example in TOKENIZATION_SYSTEM_PROMPT
     assert TOKEN_RE.search(example) is None, "the 4-hex example became grammar-visible"
+    assert STRICT_TOKEN_RE.search(example) is None
 
     spans = EgressGate._protected_spans(TOKENIZATION_SYSTEM_PROMPT, frozenset())
     start = TOKENIZATION_SYSTEM_PROMPT.index(example)
     end = start + len(example)
     assert not any(start < s_end and end > s_start for s_start, s_end in spans)
     # The 8-hex sibling in the same prompt is protected -- so this is the literal's
-    # doing, not a skip-list that stopped working.
-    assert spans, "TOKEN_RE stopped protecting the 8-hex example too"
+    # doing, not a skip-list that stopped working. Named exactly rather than checked
+    # as "spans is non-empty", which any surviving match would have satisfied.
+    sibling = "[PHI_NAME_1a2b3c4d]"
+    assert sibling in TOKENIZATION_SYSTEM_PROMPT
+    sibling_start = TOKENIZATION_SYSTEM_PROMPT.index(sibling)
+    assert (sibling_start, sibling_start + len(sibling) - 1) in spans, (
+        "the skip-list stopped protecting the 8-hex example in the same prompt"
+    )
 
     gate, audit = await _gate(tmp_path, vault=FakeVault({"John Smith"}))
     report = await gate.check(TOKENIZATION_SYSTEM_PROMPT, SESSION)
@@ -1131,6 +1538,139 @@ async def test_the_provider_is_never_reached_when_the_gate_blocks(tmp_path: Path
     assert exc.value.detail["reason"] == "vault_original"
     assert trace == ["gate"], "the provider was called despite a blocked egress check"
     assert LLM_CALL not in {e.event_type for e in await audit.query()}
+    await audit.close()
+
+
+async def test_the_gate_is_handed_the_session_that_produced_the_payload(
+    tmp_path: Path,
+) -> None:
+    """Pass 1 is only worth anything against the *right* session's originals.
+
+    Every other gate test here uses a vault that ignores ``session_id`` and answers
+    with the same set whatever it is asked -- which is what makes them readable, and
+    also what makes them all pass unchanged if ``run()`` hands the gate a different
+    identifier from the one the engine vaulted under. Swap ``session_id`` for
+    ``user_id`` in the ``self._gate.check(...)`` call and pass 1 scans an empty set:
+    the whole first pass silently becomes a no-op, and nothing in this file notices.
+
+    So the vault here answers *only* for the session the run was started with. The
+    document carries a vaulted original, so a gate given the right session blocks and
+    a gate given anything else lets it through to the provider.
+    """
+    trace: list[str] = []
+
+    class SessionScopedVault:
+        """Answers for one session and returns nothing for any other."""
+
+        def originals_for_session(self, session_id: str) -> frozenset[str]:
+            return frozenset({"John Smith"}) if session_id == SESSION else frozenset()
+
+    audit = await _open_audit(tmp_path / "audit.db")
+    settings = _settings(tmp_path)
+    gate = RecordingGate(
+        trace,
+        vault=SessionScopedVault(),
+        detector=FakeDetector(),
+        settings=settings,
+        audit=audit,
+    )
+    orchestrator = PipelineOrchestrator(
+        store=StubStore("Patient John Smith is stable."),  # type: ignore[arg-type]
+        detector=FakeDetector(),  # type: ignore[arg-type]
+        engine=StubEngine(),  # type: ignore[arg-type]
+        injector=ContextInjector(),
+        gate=gate,
+        provider=RecordingProvider(trace),  # type: ignore[arg-type]
+        restorer=StubRestorer(),  # type: ignore[arg-type]
+        vault=FakeVault(set()),  # type: ignore[arg-type]
+        settings=settings,
+        audit=audit,
+    )
+    with pytest.raises(EgressBlockedError) as exc:
+        await orchestrator.run(SESSION, "user-1", "doc-1", "Summarise this.")
+
+    assert exc.value.detail["reason"] == "vault_original"
+    assert trace == ["gate"], "the gate was handed the wrong session and pass 1 saw nothing"
+    await audit.close()
+
+
+async def test_the_gate_is_handed_the_surrogates_this_run_actually_emitted(
+    tmp_path: Path,
+) -> None:
+    """The skip-list's load-bearing leg, checked at the seam that feeds it.
+
+    ``_protected_spans`` protects two kinds of thing: text matching
+    ``STRICT_TOKEN_RE``, and the exact strings in the ``surrogates`` argument. The
+    second is the stronger of the two and the one the gate's own docstring leans on --
+    a grammar can drift away from the emitter (``format_surrogate`` anchors its
+    validators with ``$``, which also matches before a trailing newline, so it can
+    emit a token the strict pattern rejects), while string equality cannot.
+
+    But that argument is only worth something if the orchestrator actually *passes*
+    the set, and nothing was checking that it does. Replacing
+    ``frozenset(t.surrogate for t in obf.tokens)`` with ``frozenset()`` left the whole
+    gate suite green -- every gate test hands ``check()`` its surrogates directly --
+    while every pseudonymization run began false-blocking on its own output. That is
+    the loop-3 shape again: a property held only by a line no test can see.
+
+    So the probe is behavioural, not a recorded-argument assertion. The engine emits a
+    pseudonym; the gate's detector calls that pseudonym a 0.99 ``SSN``, which is
+    high-severity and therefore blocks unless it is explained. The run must complete.
+    And the second half proves the probe is not vacuous: the same gate, handed the
+    same payload with an empty surrogate set, must block -- so a skip-list that
+    protected everything would fail here rather than pass twice.
+    """
+    fake = "Marion Delacroix"
+    trace: list[str] = []
+
+    class PseudonymEngine(StubEngine):
+        async def obfuscate(
+            self, session_id: str, text: str, detections: object, **kwargs: object
+        ) -> ObfuscationResult:
+            return ObfuscationResult(
+                obfuscated_text=text.replace("John Smith", fake),
+                tokens=[
+                    TokenRecord(
+                        session_id=session_id,
+                        token_id="1a2b3c4d",
+                        entity_type="NAME",
+                        category=EntityCategory.PII,
+                        surrogate=fake,
+                        created_at=0.0,
+                    )
+                ],
+            )
+
+    audit = await _open_audit(tmp_path / "audit.db")
+    settings = _settings(tmp_path)
+    gate = RecordingGate(
+        trace,
+        vault=FakeVault(set()),
+        detector=FakeDetector([("SSN", fake, 0.99)]),
+        settings=settings,
+        audit=audit,
+    )
+    orchestrator = PipelineOrchestrator(
+        store=StubStore("Patient John Smith is stable."),  # type: ignore[arg-type]
+        detector=FakeDetector(),  # type: ignore[arg-type]
+        engine=PseudonymEngine(),  # type: ignore[arg-type]
+        injector=ContextInjector(),
+        gate=gate,
+        provider=RecordingProvider(trace),  # type: ignore[arg-type]
+        restorer=StubRestorer(),  # type: ignore[arg-type]
+        vault=FakeVault(set()),  # type: ignore[arg-type]
+        settings=settings,
+        audit=audit,
+    )
+    result = await orchestrator.run(SESSION, "user-1", "doc-1", "Summarise this.")
+    assert trace == ["gate", "provider"], "the run did not reach the provider"
+    assert fake in result.obfuscated_payload
+
+    # ...and the same payload with no surrogate set blocks, so the pass above is
+    # evidence that the set arrived rather than evidence that nothing can block.
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(result.obfuscated_payload, SESSION, surrogates=frozenset())
+    assert exc.value.detail["reason"] == "detector_rescan"
     await audit.close()
 
 
@@ -1502,3 +2042,260 @@ async def test_planted_original_blocks_even_though_detector_is_blind(tmp_path: P
     events = await audit.query(run_id="adv")
     assert [e.event_type for e in events] == [EGRESS_BLOCK]
     await audit.close()
+
+
+# ---------------------------------------------------------------------------
+# The skip-list against the REAL detector and the REAL registry
+#
+# Everything above this line hands the gate a canned ``FakeDetector``, which means
+# the *skip-list* is checked against detections the test itself decided existed.
+# That is fine for "is this span skipped?" and useless for "can a real identifier
+# hide in a span we are willing to skip?" -- the question the loop-1 ``|hint``
+# bypass was, and the question the section below asks with the shipped recognizers
+# and the shipped ``entities.yaml`` supplying the answer.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def real_settings(tmp_path_factory: pytest.TempPathFactory) -> Settings:
+    """Settings pointed at the shipped registry -- the real recognizers, real thresholds."""
+    return Settings(
+        master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        data_dir=tmp_path_factory.mktemp("real-gate"),
+        registry_path=REGISTRY_PATH,
+        llm_provider="mock",
+    )
+
+
+@pytest.fixture(scope="module")
+def real_detector(real_settings: Settings) -> Detector:
+    """The shipped detector. Module-scoped: the spaCy pipeline is expensive to build."""
+    return Detector(load_registry(REGISTRY_PATH), real_settings)
+
+
+def _real_gate(detector: Detector, settings: Settings, originals: set[str]) -> EgressGate:
+    return EgressGate(
+        vault=FakeVault(originals),  # type: ignore[arg-type]
+        detector=detector,
+        settings=settings,
+        audit=None,
+    )
+
+
+#: Shapes the *tolerant* ``TOKEN_RE`` accepts and ``format_surrogate`` never emits.
+#: Each hides ``ACCOUNT12345678`` -- a 1.00-confidence ``ACCOUNT_NUMBER`` to the
+#: shipped detector -- inside what used to be a protected span.
+_TOLERATED_BUT_NEVER_EMITTED = [
+    pytest.param("Ref PII-ACCOUNT12345678-deadbeef filed.", id="hyphen-separators"),
+    pytest.param("Ref [PII-ACCOUNT12345678-deadbeef] filed.", id="hyphen-in-brackets"),
+    pytest.param("Ref {PII-ACCOUNT12345678-deadbeef} filed.", id="brace-brackets"),
+    pytest.param("Ref (PII-ACCOUNT12345678-DEADBEEF) filed.", id="paren-and-upper-hex"),
+    pytest.param("Ref PII-ACCOUNT12345678-DEADBEEF filed.", id="bare-upper-hex"),
+]
+
+
+@pytest.mark.parametrize("payload", _TOLERATED_BUT_NEVER_EMITTED)
+async def test_an_identifier_inside_a_token_shape_we_never_emit_is_still_rescanned(
+    real_detector: Detector, real_settings: Settings, payload: str
+) -> None:
+    """The loop-1 ``|hint`` bypass again, one field to the left -- in the token CORE.
+
+    Narrowing the protected span to the core closed the *tail*. It did not close the
+    core, because the core was still being matched with ``TOKEN_RE``, which is
+    deliberately tolerant of things ``format_surrogate`` never produces -- and one of
+    them is writing the separator as ``-`` instead of ``_``. That single character is
+    the entire exploit: ``_`` is a regex word character and ``-`` is not, so ``-``
+    manufactures the ``\\b`` that ``ACCOUNT_NUMBER``'s pattern needs::
+
+        Ref PII-ACCOUNT12345678-deadbeef filed.
+
+    The shipped detector calls that a 1.00-confidence ``ACCOUNT_NUMBER``; the tolerant
+    matcher called it one token and the gate skipped every character of it. The
+    payload is assembled from an uploaded document, so the string is reachable by a
+    file, and pass 1 cannot cover for it -- a value the detector missed at detect time
+    was never vaulted, so nothing at all was looking at it.
+
+    Note what is *not* asserted: this does not check ``_protected_spans``. It asks the
+    real detector what is in the payload and then asks the gate what it did, so a
+    change that widens the skip-list back out cannot make the expectation agree with
+    it.
+    """
+    hits = [
+        det
+        for det in await real_detector.detect(payload, None)
+        if det.entity_type in HIGH_SEVERITY_TYPES
+        and det.score >= real_settings.threshold_obfuscate
+    ]
+    assert hits, "the probe no longer plants a high-severity identifier"
+
+    gate = _real_gate(real_detector, real_settings, set())
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] == "detector_rescan"
+    assert exc.value.detail["entity_types"] == "ACCOUNT_NUMBER"
+
+
+async def test_the_canonical_emitted_token_is_still_skipped(
+    real_detector: Detector, real_settings: Settings
+) -> None:
+    """The other half: narrowing the grammar must not have cost the skip-list its job.
+
+    ``[PHI_MRN_deadbeef|oral-antidiabetic]`` is exactly what ``format_surrogate``
+    emits, and our own placeholders are PII-shaped on purpose. Every tokenized run
+    would false-positive on its own output if this stopped being skipped, and a gate
+    that blocks every call protects nothing.
+    """
+    surrogate = format_surrogate("PHI", "MRN", "deadbeef", "oral-antidiabetic")
+    payload = f"Record {surrogate} filed for review."
+    report = await _real_gate(real_detector, real_settings, set()).check(payload, SESSION)
+    assert report.rescan_warnings == 0
+
+
+def test_every_protected_span_is_a_string_this_pipeline_can_emit() -> None:
+    """The invariant behind the narrowing, checked through the *emitter*.
+
+    A protected span is a hole in pass 2, so the property that has to hold is "we
+    wrote this". The expectation here is therefore re-derived by feeding the parsed
+    fields back through :func:`format_surrogate` / :func:`format_redaction` and
+    demanding the round trip reproduce the covered text -- not by re-applying the
+    same regex the gate applied, which would only prove the matcher agrees with
+    itself.
+
+    The payload deliberately mixes genuine surrogates with document text shaped to
+    look like one, including the hyphen form that used to be absorbed.
+    """
+    genuine = format_surrogate("PHI", "NAME", "1a2b3c4d")
+    hinted = format_surrogate("PHI", "MEDICATION", "2f4a1b3c", "oral-antidiabetic")
+    redaction = format_redaction("CASE_STRATEGY")
+    payload = (
+        f"Patient {genuine} started {hinted}. Strategy: {redaction}.\n"
+        "Uploaded text follows: PII-ACCOUNT12345678-deadbeef, "
+        "[FIN-TAX_ID-DEADBEEF|12-3456789], PHI_MRN_deadbeef, "
+        "[PHI_NAME_deadbeef|412-33-7891]\n"
+    )
+    spans = EgressGate._protected_spans(payload, frozenset())
+    assert spans, "the skip-list stopped recognising our own output entirely"
+
+    for start, end in spans:
+        covered = payload[start:end]
+        token = STRICT_TOKEN_RE.fullmatch(f"{covered}]")
+        marker = REDACTION_RE.fullmatch(covered)
+        assert token or marker, f"protected span {covered!r} is not a shape we emit"
+        if token:
+            # The core plus its closing bracket must be *exactly* what the emitter
+            # produces for those fields. A hint is dropped on purpose: the tail is
+            # never protected, so the plain form is the whole protected string.
+            assert f"{covered}]" == format_surrogate(token[1], token[2], token[3])
+        else:
+            assert marker is not None
+            assert covered == format_redaction(marker[1])
+
+    # And the negative half: the tolerated-but-never-emitted shapes in the payload
+    # above contribute nothing, so the identifiers inside them stay in the re-scan.
+    covered_text = {payload[s:e] for s, e in spans}
+    for never_emitted in ("PII-ACCOUNT12345678-deadbeef", "FIN-TAX_ID-DEADBEEF"):
+        assert never_emitted in payload
+        assert not any(never_emitted in text for text in covered_text)
+
+
+async def test_a_high_severity_hit_outside_our_own_output_always_blocks(
+    real_detector: Detector, real_settings: Settings
+) -> None:
+    """The whole of pass 2 as one property, with the real detector as ground truth.
+
+    For every probe below the verdict is *computed* rather than written down: run the
+    shipped detector, drop anything below the obfuscation threshold, drop anything
+    lying wholly inside a string this run actually emitted (exact occurrences of the
+    surrogate set -- not ``_protected_spans``), and whatever high-severity findings
+    remain are unexplained. Unexplained findings must block; none must not.
+
+    This is the check that does not share the gate's blind spot. It never consults
+    the skip-list, so a skip-list that swallows too much shows up here as a probe the
+    gate passed and this test says it should have blocked -- which is precisely how
+    the token-core bypass presented before it was closed.
+
+    The probes cover the boundary cases the span arithmetic is most likely to get
+    wrong: identifiers adjacent to a token, straddling the end of one, sitting in the
+    hint tail, and inside a pseudonym's neighbourhood.
+    """
+    emitted = frozenset(
+        {
+            format_surrogate("PHI", "NAME", "1a2b3c4d"),
+            format_surrogate("PHI", "MEDICATION", "2f4a1b3c", "oral-antidiabetic"),
+            "Rachel Medina",
+        }
+    )
+    probes = [
+        "The subject SSN is 412-33-7891 on file.",
+        "Patient [PHI_NAME_1a2b3c4d] SSN 412-33-7891.",
+        "Patient [PHI_NAME_1a2b3c4d]412-33-7891 follows.",
+        "Patient [PHI_NAME_deadbeef|412-33-7891] was seen.",
+        "Ref PII-ACCOUNT12345678-deadbeef filed.",
+        "Ref [PII_ACCOUNT12345678_deadbeef] filed.",
+        "Ref [REDACTED_ACCOUNT12345678] filed.",
+        "Dr Rachel Medina noted acct 12345678901 on the chart.",
+        "Dr Rachel Medina reviewed [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic].",
+        "Nothing sensitive at all in this sentence.",
+        f"{format_surrogate('PHI', 'NAME', '1a2b3c4d')} EIN 12-3456789 attached.",
+    ]
+
+    for payload in probes:
+        ours = _occurrence_spans(payload, emitted)
+        unexplained = sorted(
+            {
+                det.entity_type
+                for det in await real_detector.detect(payload, None)
+                if det.entity_type in HIGH_SEVERITY_TYPES
+                and det.score >= real_settings.threshold_obfuscate
+                and not any(s <= det.start and det.end <= e for s, e in ours)
+            }
+        )
+        gate = _real_gate(real_detector, real_settings, set())
+        if unexplained:
+            with pytest.raises(EgressBlockedError) as exc:
+                await gate.check(payload, SESSION, surrogates=emitted)
+            assert exc.value.detail["reason"] == "detector_rescan", payload
+            assert exc.value.detail["entity_types"] == ",".join(unexplained), payload
+        else:
+            await gate.check(payload, SESSION, surrogates=emitted)
+
+
+def _occurrence_spans(payload: str, emitted: frozenset[str]) -> list[tuple[int, int]]:
+    """Every occurrence of a string we emitted. Ground truth, computed from the set."""
+    spans: list[tuple[int, int]] = []
+    for value in emitted:
+        idx = payload.find(value)
+        while idx != -1:
+            spans.append((idx, idx + len(value)))
+            idx = payload.find(value, idx + 1)
+    return spans
+
+
+def test_no_high_severity_entity_is_scoped_out_of_the_rescan() -> None:
+    """Pass 2 asks for the category-unscoped entity set, and that must stay free.
+
+    ``_rescan`` passes ``doc_category=None``, so any entity declaring
+    ``only_in_doc_categories`` is simply not looked for. The docstring says that costs
+    no *blocking* decision because none of those entities is high-severity -- a claim
+    about ``entities.yaml`` made in ``egress_gate.py``, i.e. exactly the shape that
+    goes stale the moment somebody edits the other file.
+
+    Both sides are re-read from the shipped artefacts here rather than restated, so
+    adding ``only_in_doc_categories`` to ``SSN`` (or adding a category-scoped entity
+    to :data:`HIGH_SEVERITY_TYPES`) turns this red instead of turning pass 2 silently
+    blind.
+    """
+    registry = load_registry(REGISTRY_PATH)
+    scoped = {
+        name for name, spec in registry.entities.items() if spec.only_in_doc_categories
+    }
+    assert scoped, "no entity is category-scoped any more -- this test guards nothing"
+    blind_spot = sorted(scoped & HIGH_SEVERITY_TYPES)
+    assert not blind_spot, (
+        "these entities block on a re-scan hit but are never re-scanned, because "
+        f"_rescan passes doc_category=None: {blind_spot}"
+    )
+    # And every blocking type must actually exist in the registry, or the gate is
+    # promising to block on a name nothing can ever produce.
+    unknown = sorted(HIGH_SEVERITY_TYPES - set(registry.entities))
+    assert not unknown, f"HIGH_SEVERITY_TYPES names entities the registry has no: {unknown}"

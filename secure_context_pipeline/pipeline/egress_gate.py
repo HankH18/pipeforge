@@ -39,6 +39,40 @@ second one is the guarantee. Holding the second is the caller's job, and
 is where this pipeline does it -- by re-deriving the digest from the exact
 arguments it hands the provider and refusing to send on a mismatch.
 
+**Every path by which a byte can reach the provider**, enumerated, because "the
+gate covers the normal path" is not the claim -- one unmediated path and the
+headline guarantee is gone. There are eight, and the first is the only one that
+carries payload bytes:
+
+1. *The call itself.* ``PipelineOrchestrator.run`` step 7 is the sole invocation of
+   a provider anywhere in this package; ``llm/`` is also the only subtree that
+   imports a network library at all. It is preceded, in that order, by ``check()``
+   and by ``_verify_release``.
+2. *Retries.* ``AnthropicProvider`` builds ``system`` and ``messages`` once, before
+   the attempt loop, and re-sends the same objects. A retry is the same cleared
+   bytes again, never new ones, and every attempt is downstream of one gate pass.
+3. *Streaming.* There is none. The non-streaming Messages API is used, and the
+   absence of ``stream`` from the request body is asserted on the wire in
+   ``tests/test_llm.py``. There is no chunk boundary for a value to straddle.
+4. *Timeout and cancellation.* Both abort an in-flight request; neither composes a
+   new one. Inside ``check()`` a cancelled scan is an unfinished scan -- see below.
+5. *Exceptions.* ``LLMTransportError``/``LLMRefusalError``/``LLMResponseError``
+   carry a model name, a machine reason, an attempt count and an HTTP status.
+   ``EgressBlockedError`` and the audit rows this module writes carry counts,
+   digests and reason codes. No exception, log line or audit detail in this
+   module or the orchestrator interpolates payload, original or surrogate text.
+6. *Third-party logging.* The SDK logs the whole serialized request body at DEBUG;
+   importing ``llm/anthropic_provider.py`` installs a filter that drops it, so a
+   host application's ``basicConfig(level=DEBUG)`` cannot turn a log into an egress
+   path.
+7. *Provider-side transformation after the check.* The only one is the SDK's JSON
+   serialization, which is lossless and reversible: it encodes the exact strings the
+   gate cleared, and ``tests/test_llm.py`` parses the request body back out of an
+   ``httpx.MockTransport`` and compares. It can neither conceal a value the gate saw
+   nor introduce one it did not.
+8. *The wire dump.* ``demo.py --dump-wire`` captures ``request.content`` and scans
+   the literal bytes against the vault's originals before writing them anywhere.
+
 **What pass 1 does and does not promise**, stated as residual risk rather than
 implied by omission. It blocks whenever a vaulted original appears in the payload
 as a standalone run of text, in any of the three compared forms -- including next
@@ -88,7 +122,7 @@ from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.errors import MAX_DETAIL_VALUE_LEN, EgressBlockedError
 from secure_context_pipeline.models import AuditEvent, Detection, EgressReport
-from secure_context_pipeline.surrogates import REDACTION_RE, TOKEN_RE
+from secure_context_pipeline.surrogates import REDACTION_RE, STRICT_TOKEN_RE
 
 __all__ = [
     "AUDIT_EMIT_TIMEOUT_S",
@@ -109,6 +143,13 @@ HIGH_SEVERITY_TYPES = frozenset({"SSN", "MRN", "ACCOUNT_NUMBER", "TAX_ID"})
 # Originals shorter than this are not scanned for. A one- or two-character value
 # carries no re-identification signal on its own and would match inside almost any
 # payload, blocking every call. Stated as a known limitation in the README.
+#
+# Applied TWICE in _scan_originals, and the two are different questions. On the
+# vaulted value it is measured after ``.strip()``, because " ab " is four characters
+# of which two are signal and neither of its own ends is alphanumeric -- so no
+# boundary assertion applies and it matches inside "The lab ab test", blocking every
+# such payload. On each derived form it is measured raw, because normalising and
+# folding both shrink a needle and can drop it below the floor after the fact.
 MIN_ORIGINAL_LEN = 3
 
 #: Wall-clock budget for one whole ``check()``. Exceeding it blocks, because a
@@ -126,6 +167,14 @@ DEFAULT_TIMEOUT_S: Final = 30.0
 #: stalled fsync -- held the request open forever *after* the decision to block had
 #: already been made. Nothing leaks in that state, but "blocked" and "never
 #: answered" are different outcomes and only one of them is a security control.
+#:
+#: The *number* is part of the control, not decoration. The two tests that exercise
+#: the wrapper monkeypatch this to 0.05 so they finish quickly, which for a while
+#: left the shipped value pinned by nothing at all: raising it to an hour kept the
+#: whole gate suite green while restoring exactly the unbounded wait the wrapper was
+#: added to remove. ``test_the_block_path_audit_budget_is_short_enough_to_be_a_budget``
+#: now reads back the budget the block path actually installs and holds it to a
+#: ceiling stated in the test file.
 AUDIT_EMIT_TIMEOUT_S: Final = 5.0
 
 
@@ -309,6 +358,18 @@ class EgressGate:
            discloses exactly what ``John Smith`` discloses. Without this form, one
            zero-width space is a complete bypass of pass 1.
 
+        The three are **not** redundant, and assuming they were is how the middle one
+        nearly disappeared unnoticed: on text with no invisible characters, folded and
+        normalised are the same needle against the same haystack, so a suite whose
+        probes all satisfy two forms at once cannot see the third leave. Each now has
+        a payload only it can catch, named in a test of its own -- raw:
+        ``test_the_raw_form_is_the_only_thing_that_sees_some_leaks`` (``Dr Smith℠``,
+        where NFKC expands the symbol and glues an alphanumeric onto the needle in
+        both derived forms); normalised:
+        ``test_the_normalised_form_is_the_only_thing_that_sees_some_leaks`` (case
+        changed, zero-width spaces on both sides, so folding glues the neighbours on);
+        folded: the zero-width and default-ignorable parametrizations.
+
         O(payload x entities), with a C-level substring pre-filter in
         :func:`_occurs_as_a_unit` doing the rejecting; the scale answer is an
         Aho-Corasick automaton built incrementally per session (README Q1).
@@ -353,10 +414,10 @@ class EgressGate:
         another, so it is a different scan, not a cheaper one. It is also worth
         little: protected spans cover 16-26% of a payload (not the ~95% previously
         claimed) and excision saves 5-6% of this pass, ~2% of end-to-end wall time.
-        Finally, the protected-span set is partly derived from ``TOKEN_RE`` over the
-        *uploaded document*, so letting it decide what the detector ever sees would
-        hand an uploader a lever on the gate's input -- a strictly larger version of
-        the token-hint bypass :meth:`_protected_spans` exists to close.
+        Finally, the protected-span set is partly derived by matching a grammar over
+        the *uploaded document*, so letting it decide what the detector ever sees
+        would hand an uploader a lever on the gate's input -- a strictly larger
+        version of the two bypasses :meth:`_protected_spans` exists to close.
 
         **The re-scan asks for the category-unscoped entity set** (``doc_category``
         is ``None``): the payload is not a document and carries no category, and
@@ -364,10 +425,22 @@ class EgressGate:
         ``only_in_doc_categories`` are not re-detected here -- today ``DATE``,
         ``AMOUNT``, ``CLIENT_IDENTITY`` and ``CASE_STRATEGY``. None of them is in
         :data:`HIGH_SEVERITY_TYPES`, so no *blocking* decision is affected, and pass 1
-        still covers every one of them that was vaulted. It does mean a future
-        category-scoped high-severity entity would be invisible to this pass, which
-        is a property of the registry rather than of this code, and is why the
-        blocking set is documented as a tuning table.
+        still covers every one of them that was vaulted. That last sentence is a claim
+        about a *config file* made in a *source file*, which is exactly the shape that
+        goes quietly stale, so ``test_no_high_severity_entity_is_scoped_out_of_the_rescan``
+        re-derives both sets from the shipped registry and this constant and fails the
+        day someone gives a high-severity entity an ``only_in_doc_categories``.
+
+        **A detection is skipped on any overlap with a protected span, not only on
+        containment**, and the lenient direction is the deliberate one. The detector
+        legitimately returns spans a shade wider than ours -- it claims the whole
+        ``[PII_NAME_1a2b3c4d]`` including the closing bracket, while the protected
+        core stops at the hash -- so demanding containment would false-block every
+        tokenized run on its own placeholders, and a gate that blocks everything
+        protects nothing. What makes the leniency affordable is that a protected span
+        is now bounded on both sides by characters we chose: it is ``[`` plus one
+        unbroken word run, so a value straddling its edge would have to be one the
+        detector reads *through* our bracket or our category literal.
         """
         protected = self._protected_spans(payload, surrogates)
         detections = await self._detector.detect(payload, None)
@@ -393,31 +466,85 @@ class EgressGate:
         """Spans that are our own output: tokens, redaction markers, and surrogates.
 
         A protected span is a hole in pass 2 -- whatever it covers is never
-        re-examined -- so it must cover our output and *only* our output.
+        re-examined -- so it must cover our output and *only* our output. Two
+        independent narrowings are needed to keep that true, because the outbound
+        payload is assembled from an *uploaded document* and anything token-shaped in
+        that document lands here too.
 
-        For :data:`TOKEN_RE` matches that means the **core**, ``[CATEGORY_TYPE_hash``,
-        and never the ``|hint`` tail. The distinction is not cosmetic. ``TOKEN_RE`` is
-        deliberately tolerant so it can recognise a token an LLM mangled, and it runs
-        over text this pipeline did not write: the outbound payload is assembled from
-        an *uploaded document*, so anything token-shaped in that document matches too.
-        The hint alphabet is ``[a-z0-9-]``, which spells an SSN, an EIN and a phone
-        number, so a crafted upload containing::
+        **1. The grammar is the one we emit, not the one we tolerate.** The matcher
+        is :data:`~secure_context_pipeline.surrogates.STRICT_TOKEN_RE` -- the exact
+        shape :func:`~secure_context_pipeline.surrogates.format_surrogate` produces --
+        and *not* the tolerant ``TOKEN_RE``. ``TOKEN_RE`` accepts wrong brackets, stray
+        whitespace, uppercase hex and ``-`` where we write ``_``, and it accepts them
+        for one reason: the restorer reads text an LLM mangled. Nothing on this path
+        has been near an LLM. Every token in the payload was written by
+        ``format_surrogate`` milliseconds earlier, so here the tolerance buys nothing
+        and costs a hole -- one that was open and is worth naming exactly, because it
+        is the same shape as the ``|hint`` bypass below, one field to the left. The
+        hyphen is the whole mechanism: ``_`` is a regex word character and ``-`` is
+        not, so writing the separator as ``-`` manufactures the ``\\b`` that
+        ``ACCOUNT_NUMBER``'s pattern needs. An uploaded document containing::
+
+            PII-ACCOUNT12345678-deadbeef
+
+        is a 1.00-confidence ``ACCOUNT_NUMBER`` to the shipped detector, and the
+        tolerant matcher excused all of it. Under the strict grammar a protected core
+        is ``[`` followed by one unbroken run of word characters beginning with a
+        category literal, so it contains no *interior* word boundary at all -- and
+        every high-severity recogniser in play, the three registry patterns and
+        Presidio's ``US_SSN``, anchors on ``\\b``. That last sentence is a claim about
+        a config file and a third-party library, so it is not left as prose:
+        ``test_a_high_severity_hit_outside_our_own_output_always_blocks`` runs the
+        shipped detector over these shapes and demands the gate's verdict match what
+        the detector actually found, which goes red if either side changes.
+
+        **2. The span is the core, never the ``|hint`` tail.** The hint alphabet is
+        ``[a-z0-9-]``, which spells an SSN, an EIN and a phone number, so a crafted
+        upload containing::
 
             [PHI_NAME_deadbeef|123-45-6789]
 
         used to be absorbed as one token match and excluded from the re-scan
         wholesale -- and pass 1 is blind to it too whenever the detector missed that
         value in that odd context, so nothing was left looking at it. Bounding the
-        hint to 24 characters shrinks the window; refusing to protect it closes the
-        shape, regardless of what the grammar is later relaxed to permit.
+        hint to 24 characters shrinks the window; refusing to protect it removes it.
 
         Re-scanning our own hints costs nothing: a hint is a gazetteer class label we
         chose (``oral-antidiabetic``), not a value, so a detector hit on one is a
         finding worth having rather than a false positive worth suppressing.
 
-        Surrogates are protected in full, and that is not the same trade: those
-        strings are matched by exact equality against what the engine actually
-        emitted this run, so the span cannot absorb text we did not write.
+        Neither narrowing can cost us a false block on a real token -- and it is worth
+        being exact about *why*, because the tempting argument is wrong and an audit
+        found it wrong. The tempting argument is that
+        :func:`~secure_context_pipeline.surrogates.format_surrogate` validates
+        category, entity type, token id and hint, so its output is a
+        ``STRICT_TOKEN_RE`` match *by construction*. It is not: those three validators
+        anchor with ``$``, which in Python matches at end-of-string **or just before a
+        trailing newline**, while this pattern demands a literal ``]`` immediately
+        after the hash. A field carrying a trailing newline is therefore accepted by
+        the emitter and rejected by this matcher, and ``load_registry`` accepts an
+        entity named ``"NAME\\n"``, so a config file can reach it. (The fix belongs in
+        ``surrogates.py`` -- ``\\Z`` or ``fullmatch`` rather than ``$`` -- and is
+        reported rather than papered over here.)
+
+        What the property actually rests on is the other leg: the orchestrator hands
+        ``check()`` the exact surrogate strings this run emitted, and those are
+        protected in full below by **string equality** -- a stronger claim than any
+        regex, since the span then cannot absorb text we did not write, and one no
+        grammar drift can weaken.
+        ``test_a_surrogate_the_strict_grammar_rejects_is_still_protected`` pins that
+        leg on a token this pattern does not recognise, so the mechanism is checked
+        rather than asserted.
+
+        The strict matcher is the belt to that pair of braces, and it is what protects
+        the token printed in the tokenization system prompt, which belongs to no run.
+        One thing it protects with no backstop at all is the **redaction marker**:
+        markers are not in the surrogate set, so :data:`REDACTION_RE` is the only
+        thing standing behind ``[REDACTED_<TYPE>]``. An entity name that grammar
+        rejects leaves our own marker in the re-scan -- more scrutiny rather than
+        less, and inert unless the name itself reads as a high-severity identifier --
+        but it is a grammar-only guarantee, and the point of writing this down is that
+        the token half is not.
 
         The list is unordered, and deliberately so: :func:`_overlaps` scans it in
         full for every detection, so a sort would cost O(n log n) per call and buy
@@ -425,7 +552,7 @@ class EgressGate:
         by a search, which is the change that should introduce the sort.
         """
         spans: list[tuple[int, int]] = [
-            (m.start(), m.end(3)) for m in TOKEN_RE.finditer(payload)
+            (m.start(), m.end(3)) for m in STRICT_TOKEN_RE.finditer(payload)
         ]
         spans.extend(m.span() for m in REDACTION_RE.finditer(payload))
         for surrogate in surrogates:
@@ -573,6 +700,13 @@ _ALNUM_RE = re.compile(_ALNUM)
 #: notices. ``test_every_unicode_format_character_is_folded`` re-derives the ``Cf``
 #: set from :mod:`unicodedata` and fails on anything this class still misses -- the
 #: expectation comes from the Unicode database, not from a copy of this literal.
+#:
+#: That sweep can only see the ``Cf`` half, because Python ships no
+#: ``Default_Ignorable_Code_Point`` query, and the other half is where a hand-picked
+#: list actually goes wrong: a variation selector is ``Mn`` and ``U+3164`` is
+#: classed as a *letter*, so neither looks like a control to anyone reading this.
+#: ``test_every_default_ignorable_code_point_is_folded`` covers them from a
+#: transcription of the standard's own ``DerivedCoreProperties`` ranges.
 #:
 #: Written as escapes on purpose: a literal zero-width character in this source file
 #: would be invisible to the next reader of the very guard that removes it.
