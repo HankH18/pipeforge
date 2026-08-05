@@ -14,9 +14,9 @@ in a lookup, which is exactly why a dropped or mangled hint still restores.
 Pseudonyms have no embedded key, so their matcher needs the same tolerance from a
 different direction: a fake is an ordinary word and the only question is whether
 an occurrence is *this* word rather than part of a longer one. That question is
-answered by the rule the EgressGate defines and this module imports -- see
-:func:`_compile_surrogate_pattern`, which also explains why a home-grown ``\\b``
-here left ``_Maria Torres_`` un-restored and silent.
+answered by :mod:`secure_context_pipeline.textrules`, the one place the rule lives
+-- see :func:`_compile_surrogate_pattern`, which also explains why a home-grown
+``\\b`` here left ``_Maria Torres_`` un-restored and silent.
 
 **Fail-loud on residue.** After restoration this module re-scans its own output
 and raises :class:`~secure_context_pipeline.errors.PipelineError` if any token
@@ -115,8 +115,13 @@ from secure_context_pipeline.audit.logger import DEOBFUSCATE, VAULT_MISS, AuditL
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.errors import PipelineError, VaultMissError
 from secure_context_pipeline.models import MASK, AuditEvent
-from secure_context_pipeline.pipeline.egress_gate import _ALNUM, _ALNUM_RE
 from secure_context_pipeline.surrogates import TOKEN_RE
+from secure_context_pipeline.textrules import (
+    LEFT_GUARD,
+    RIGHT_GUARD,
+    guards_left,
+    guards_right,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1298,17 +1303,23 @@ def _compile_surrogate_pattern(
     guarded: list[str] = []
     unguarded: list[str] = []
     for surrogate in ordered:
-        bare = f"(?!{_ALNUM})" if _ALNUM_RE.match(surrogate[-1]) else ""
-        suffix = f"(?:{apostrophe}s(?!{_ALNUM})|{apostrophe}|{bare})"
+        # The right-hand assertion is decided by the shared rule, then woven into a
+        # possessive-aware alternation that is this module's own concern: a surrogate
+        # may be followed by "'s", by a bare apostrophe, or by nothing.
+        bare = RIGHT_GUARD if guards_right(surrogate) else ""
+        suffix = f"(?:{apostrophe}s{RIGHT_GUARD}|{apostrophe}|{bare})"
         branch = f"{_escape_ws_flexible(surrogate)}{suffix}"
-        if _ALNUM_RE.match(surrogate[0]):
+        # Grouped by whether the LEFT guard applies so one assertion can front the
+        # whole alternation, which is why this uses the predicate rather than
+        # `word_bounded_pattern`: the guards are needed apart, not assembled.
+        if guards_left(surrogate):
             guarded.append(branch)
         else:
             unguarded.append(branch)
 
     groups: list[str] = []
     if guarded:
-        groups.append(f"(?<!{_ALNUM})(?:{'|'.join(guarded)})")
+        groups.append(f"{LEFT_GUARD}(?:{'|'.join(guarded)})")
     if unguarded:
         groups.append(f"(?:{'|'.join(unguarded)})")
     return re.compile("|".join(groups), re.IGNORECASE if fold else 0)

@@ -134,7 +134,7 @@ from secure_context_pipeline.obfuscation.strategies.base import (
     StrategyContext,
     register_strategy,
 )
-from secure_context_pipeline.pipeline.egress_gate import _occurs_as_a_unit
+from secure_context_pipeline.textrules import occurs_as_a_unit as _occurs_as_a_unit
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle avoidance / typing only
     from random import Random
@@ -877,8 +877,8 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         word-versus-whole-string reasoning :meth:`_fake_identifier` applies through
         :meth:`_invents_a_real_word`; Tier 2 needs it too.
 
-        The containment test calls the egress gate's own
-        :func:`~secure_context_pipeline.pipeline.egress_gate._occurs_as_a_unit`
+        The containment test calls the one shared rule,
+        :func:`~secure_context_pipeline.textrules.occurs_as_a_unit`,
         rather than re-deriving a boundary rule here. Re-deriving it is how five
         separate copies of ``(?<!\\w)...(?!\\w)`` came to share one blind spot; a
         guard whose job is "do not emit what the gate will block" should be asking

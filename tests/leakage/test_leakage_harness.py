@@ -191,12 +191,14 @@ from secure_context_pipeline.pipeline.egress_gate import (
     EgressGate,
     _deaccent,
     _identifier_needles,
-    _occurs_as_a_unit,
     _strip_invisible,
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
 from secure_context_pipeline.surrogates import TOKEN_RE, extract_token_ids
+from secure_context_pipeline.textrules import (
+    occurs_as_a_unit as _textrules_occurs_as_a_unit,
+)
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
 
@@ -592,10 +594,16 @@ def mask(value: str) -> str:
 #: Importing is therefore not a tidiness preference. A renamed or re-scoped helper
 #: is now an ImportError instead of a silent divergence, and there is exactly one
 #: definition of what "this value appears in this text" means across the gate, the
-#: engine and this harness. :func:`test_the_occurrence_rule_has_no_fourth_copy`
-#: below checks that single definition against an independently written reference,
-#: so the shared rule is still verified rather than merely shared.
-occurs_as_a_unit = _occurs_as_a_unit
+#: engine, the restorer and this harness -- :mod:`secure_context_pipeline.textrules`,
+#: a leaf module every consumer depends on *downward*. It was previously the gate's
+#: own private copy, which fixed the divergence but inverted the layering and shared
+#: only the alphabet: the engine and the restorer imported ``_ALNUM`` and then
+#: reassembled the assertions by hand, so a rename raised ImportError while an edit
+#: to the rule still had to be made in three places.
+#: :func:`test_the_occurrence_rule_has_no_fourth_copy` checks that single definition
+#: against an independently written reference, so the shared rule is still verified
+#: rather than merely shared.
+occurs_as_a_unit = _textrules_occurs_as_a_unit
 
 
 def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
@@ -1401,7 +1409,7 @@ def test_the_scan_sees_an_invisible_character_bypass() -> None:
     # The gate agrees, which is the property that was broken: harness and gate must
     # not disagree about whether this is an occurrence.
     zero_width = "The client Marguerite​ Vandenberg signed."
-    assert _occurs_as_a_unit(
+    assert occurs_as_a_unit(
         _strip_invisible(normalize(name)), _strip_invisible(normalize(zero_width))
     ), "the gate's folded comparison must see this too, or the two have diverged again"
 
@@ -2086,6 +2094,54 @@ def test_the_occurrence_rule_has_no_fourth_copy() -> None:
     )
     assert 0 < positives < pairs, (
         f"the differential corpus is degenerate: {positives}/{pairs} positive"
+    )
+
+
+#: Every package module allowed to name a raw boundary assertion. Only the module that
+#: *defines* the rule may write one; everywhere else it must arrive by import.
+_BOUNDARY_RULE_OWNER = "textrules.py"
+
+#: The two assertions, written as they appear in source. Matched as text on purpose:
+#: the property being protected is "nobody re-derives this", and a re-derivation is a
+#: textual act. An AST check would miss an f-string, which is exactly how the previous
+#: three copies were spelled.
+_RAW_GUARD_SNIPPETS = ("(?<!", "(?!")
+
+
+def test_no_module_reassembles_the_boundary_guards_by_hand() -> None:
+    """The rule must arrive by import everywhere, not be rebuilt from the alphabet.
+
+    This is the check the previous arrangement could not express. When the consumers
+    imported ``_ALNUM`` from the gate, the *alphabet* was shared but the *decision*
+    was not: ``engine.py`` and ``restorer.py`` each wrote
+
+        left = f"(?<!{_ALNUM})" if _ALNUM_RE.match(value[0]) else ""
+
+    themselves. A rename raised ImportError as advertised, and an edit to the rule
+    silently had to be made in three places -- which is the failure this whole
+    apparatus exists to prevent, surviving inside the fix for it.
+
+    So: no package module except the owner may contain a lookaround built next to an
+    alphabet reference. ``textrules`` may, because it is the definition; the restorer
+    composes ``LEFT_GUARD``/``RIGHT_GUARD`` around a possessive, which is its own
+    concern and reads as a *use* of the shared decision rather than a restatement of
+    it -- so the constants are permitted, the raw assertions are not.
+    """
+    package = Path(__file__).resolve().parents[2] / "secure_context_pipeline"
+    offenders: list[tuple[str, int, str]] = []
+    for path in sorted(package.rglob("*.py")):
+        if path.name == _BOUNDARY_RULE_OWNER:
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if "ALNUM" not in code:
+                continue
+            if any(snippet in code for snippet in _RAW_GUARD_SNIPPETS):
+                offenders.append((str(path.relative_to(package)), number, line.strip()))
+
+    assert not offenders, (
+        "a boundary assertion is being rebuilt from the alphabet outside "
+        f"{_BOUNDARY_RULE_OWNER}; import the rule instead: {offenders}"
     )
 
 

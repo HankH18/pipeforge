@@ -1996,9 +1996,10 @@ def test_the_sweep_and_the_gate_agree_on_what_counts_as_an_occurrence() -> None:
        lockstep still fails;
     2. the sweep against :func:`occurs_as_a_unit_oracle`, which shares no code with
        it; and
-    3. the sweep against the gate, which is the drift alarm the engine's import of
-       ``_ALNUM`` cannot raise on its own (the per-side assembly is written out in
-       both modules).
+    3. the sweep against the gate. Both now resolve to ``textrules``, so this leg
+       can no longer catch a *divergence* -- there is nothing left to diverge. It
+       is kept because it still catches the case that matters more: the shared
+       rule being wrong, which is what every previous instance actually was.
     """
     # 1. Ground truth first: this is the part that does not care what any
     #    implementation currently believes.

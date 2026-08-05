@@ -164,6 +164,7 @@ from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.errors import MAX_DETAIL_VALUE_LEN, EgressBlockedError
 from secure_context_pipeline.models import AuditEvent, Detection, EgressReport
 from secure_context_pipeline.surrogates import REDACTION_RE, STRICT_TOKEN_RE
+from secure_context_pipeline.textrules import occurs_as_a_unit
 
 __all__ = [
     "AUDIT_EMIT_TIMEOUT_S",
@@ -854,14 +855,6 @@ def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     return any(start < s_end and end > s_start for s_start, s_end in spans)
 
 
-#: A word character for boundary purposes, **excluding underscore**. Regex ``\w``
-#: counts ``_`` as a word character, which hands markdown a free bypass: the emphasis
-#: form ``_John Smith_`` puts the original on the wire byte-for-byte while
-#: ``(?<!\w)John Smith(?!\w)`` refuses to match it. Underscore is punctuation in prose,
-#: so it is a boundary here.
-_ALNUM = r"[^\W_]"
-_ALNUM_RE = re.compile(_ALNUM)
-
 #: Characters that render as nothing, so a value carrying one discloses exactly what
 #: the clean value discloses -- ``John`` and ``Joh<U+200B>n`` are the same disclosure
 #: to any reader and to the model. Stripping them before the folded comparison closes
@@ -1134,50 +1127,19 @@ def _independent_hits(payload: str, protected: list[tuple[int, int]]) -> list[st
     return hits
 
 
-def _occurs_as_a_unit(needle: str, haystack: str) -> bool:
-    """Whether ``needle`` appears in ``haystack`` as a unit rather than inside a word.
-
-    Raw substring matching produces false blocks that look exactly like leaks. The
-    surname ``Brown`` is a real original; a generated fake surname ``Browning``
-    contains it, and a naive ``"brown" in payload`` reports a leak that is not one.
-    The 100-run harness surfaced this and it cost real time to tell apart from the
-    genuine substring leak it resembles.
-
-    The boundary assertions are therefore applied **per side, and only where they
-    mean something** -- a ``\\b``-style guard is only about telling one word from a
-    longer word:
-
-    * a side whose adjacent needle character is alphanumeric gets the assertion, so
-      ``Brown`` still does not match inside ``Browning``;
-    * a side whose adjacent needle character is *not* alphanumeric gets none. The
-      earlier unconditional ``(?<!\\w)...(?!\\w)`` asked whether the character before
-      ``(`` in ``(415) 555-0123`` was a word character, which has nothing to do with
-      word boundaries: it silently passed ``tel(415) 555-0123``, ``USD$1,234.56`` and
-      ``Ph.D.degree`` -- each of which carries the original verbatim.
-
-    Underscore counts as a boundary (see :data:`_ALNUM`), which is what makes the
-    markdown form ``_John Smith_`` block.
-
-    **This is no longer the only occurrence test pass 1 applies**, and the difference
-    matters to anyone reading this function as the definition of a leak. It is the
-    right rule for a name and the wrong one for an identifier, because the
-    false-positive argument above is a word-list argument: ``Browning`` is a real
-    word containing ``Brown``, while ``batch47-1234567Alpha`` is not a real anything
-    containing a taxpayer ID. :func:`_identifier_needles` scans digit-carrying values
-    without this rule for that reason; the engine's residual sweep still applies it,
-    so the two now disagree on purpose -- the gate blocks a shape the sweep leaves
-    behind, which is the safe direction for them to differ in.
-
-    Because every match requires the literal needle to be present, ``needle in
-    haystack`` is an exact pre-filter, not an approximation. It is roughly 40x
-    faster than the regex on the overwhelmingly common miss, which is what keeps a
-    large per-session originals set off the critical path (20k originals against a
-    54 KB payload: ~31 s before, ~1 s after).
-    """
-    if not needle or needle not in haystack:
-        return False
-    left = f"(?<!{_ALNUM})" if _ALNUM_RE.match(needle[0]) else ""
-    right = f"(?!{_ALNUM})" if _ALNUM_RE.match(needle[-1]) else ""
-    if not left and not right:
-        return True
-    return re.search(left + re.escape(needle) + right, haystack) is not None
+#: The word-boundary occurrence test, owned by
+#: :mod:`secure_context_pipeline.textrules` and re-exported here under the name pass 1
+#: has always called it. The rule itself -- why the assertions are per-side, why
+#: underscore is a boundary, why the ``in`` pre-filter is exact -- is documented at the
+#: definition; this module is one of four consumers and deliberately not the owner.
+#:
+#: **This is not the only occurrence test pass 1 applies**, and the difference matters
+#: to anyone reading it as *the* definition of a leak. It is the right rule for a name
+#: and the wrong one for an identifier, because the false-positive argument behind it
+#: is a word-list argument: ``Browning`` is a real word containing ``Brown``, while
+#: ``batch47-1234567Alpha`` is not a real anything containing a taxpayer ID.
+#: :func:`_identifier_needles` scans digit-carrying values without this rule for that
+#: reason; the engine's residual sweep still applies it, so the two disagree on purpose
+#: -- the gate blocks a shape the sweep leaves behind, which is the safe direction for
+#: them to differ in.
+_occurs_as_a_unit = occurs_as_a_unit

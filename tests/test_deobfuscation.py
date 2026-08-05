@@ -1308,11 +1308,12 @@ async def test_the_residue_assertion_is_not_blind_where_the_matcher_was(
 def test_the_restorer_and_the_gate_agree_on_what_counts_as_an_occurrence() -> None:
     """Differential test: a fourth copy of the boundary rule must not drift.
 
-    The restorer imports the gate's ``_ALNUM`` but assembles the assertions
-    itself (they have to straddle an optional possessive), so the shared constant
-    alone does not keep the two honest. This pins the *behaviour* against
-    ``egress_gate._occurs_as_a_unit`` the way ``tests/test_obfuscation.py`` pins
-    the engine's sweep against it.
+    The restorer takes its guards from ``textrules`` but still composes them
+    itself, because they have to straddle an optional possessive -- so it uses
+    ``guards_left``/``guards_right`` rather than ``word_bounded_pattern``. Sharing
+    the *decision* removes the drift that a shared constant alone allowed, but the
+    composition is still this module's own, so the behaviour is pinned here against
+    ``occurs_as_a_unit`` the way ``tests/test_obfuscation.py`` pins the sweep.
     """
     needles = [
         "John Smith", "Brown", "Ann", "MRN: 4471902", "(415) 555-0123",

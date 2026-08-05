@@ -85,16 +85,17 @@ from secure_context_pipeline.obfuscation.strategies.base import (
     StrategyContext,
     build_strategy,
 )
+from secure_context_pipeline.surrogates import format_redaction
 
 # The occurrence rule is imported, not re-derived. The sweep and the gate have now
 # disagreed twice -- most recently on whether "_" is a word character -- and a
 # disagreement here is the worst kind: the sweep declines to mask a value the gate
 # then blocks on, so the document is unprocessable and no test on either side sees
-# a contradiction. Importing the gate's own definition makes a third divergence a
-# rename error at import time rather than a silent behavioural split. No cycle:
-# ``egress_gate`` imports nothing from ``obfuscation``.
-from secure_context_pipeline.pipeline.egress_gate import _ALNUM, _ALNUM_RE
-from secure_context_pipeline.surrogates import format_redaction
+# a contradiction. `textrules` is a leaf module both this and the gate depend on, so
+# there is one decision rather than two agreeing copies, and it points downward:
+# importing it from `pipeline` (as this did) inverted the layering, since `pipeline`
+# already imports `obfuscation`.
+from secure_context_pipeline.textrules import word_bounded_pattern
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
 
@@ -769,35 +770,18 @@ class ObfuscationEngine:
 # ---------------------------------------------------------------------------
 
 
-def _word_bounded(surface: str) -> str:
-    """``surface`` as a literal pattern that cannot match inside a longer word.
-
-    Character-for-character the rule
-    :func:`~secure_context_pipeline.pipeline.egress_gate._occurs_as_a_unit`
-    applies, built from the same imported :data:`_ALNUM`. Two properties matter,
-    and the sweep got both wrong before:
-
-    * **Underscore is a boundary, not a word character.** Regex ``\\w`` counts
-      ``_``, so ``(?<!\\w)John Smith(?!\\w)`` refuses to match ``_John Smith_`` --
-      ordinary markdown emphasis. The sweep therefore left the original in place,
-      and because the gate held the identical belief, nothing on either side
-      contradicted the other: the value went out byte-for-byte.
-    * **The assertions are per side, and only where they mean something.** A
-      boundary assertion answers "is this one word or part of a longer one?",
-      which is meaningless on a side where the surface itself is punctuation.
-      Asserting unconditionally asked whether the character before ``(`` in
-      ``(415) 555-0123`` was a word character, so ``tel(415) 555-0123``,
-      ``USD$1,234.56`` and ``Ph.D.degree`` all went unswept while carrying the
-      original verbatim.
-
-    An empty surface gets a pattern that never matches; both call sites already
-    filter on :data:`MIN_SWEEP_LEN`, so this is a guard, not a path.
-    """
-    if not surface:
-        return r"(?!)"
-    left = f"(?<!{_ALNUM})" if _ALNUM_RE.match(surface[0]) else ""
-    right = f"(?!{_ALNUM})" if _ALNUM_RE.match(surface[-1]) else ""
-    return left + re.escape(surface) + right
+#: ``surface`` as a literal pattern that cannot match inside a longer word.
+#:
+#: This is :func:`~secure_context_pipeline.textrules.word_bounded_pattern` under the
+#: name the sweep has always used. The sweep previously built the assertions itself
+#: from a shared alphabet, which is how it and the gate came to disagree twice while
+#: both importing the same constant: sharing ``ALNUM`` catches a rename, not an edit
+#: to the rule. Now there is one decision, in one place, and a divergence would be an
+#: ``ImportError`` rather than a silent difference of opinion about what a leak is.
+#:
+#: An empty surface gets a pattern that never matches; both call sites already filter
+#: on :data:`MIN_SWEEP_LEN`, so that is a guard rather than a path.
+_word_bounded = word_bounded_pattern
 
 
 def _group(planned: Sequence[_Planned]) -> dict[tuple[str, str], _Group]:
