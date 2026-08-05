@@ -22,8 +22,9 @@ Four assertions per run (build doc section 10.5):
 
 1. **Outbound payload holds zero originals**, checked against the vault's own
    ``originals_for_session`` in raw, normalised, invisible-character-folded and
-   combining-mark-skeleton form, plus the unbounded identifier needles -- the same
-   **five** comparisons ``EgressGate._scan_originals`` makes, so the harness cannot
+   combining-mark-skeleton form, plus the unbounded identifier needles, plus those
+   four forms again per constituent of a composite original -- the same **six**
+   comparisons ``EgressGate._scan_originals`` makes, so the harness cannot
    pass on a form the gate would catch -- and with no minimum length, so a short
    value the gate skips still fails here. No span is exempt, including the
    pipeline's own output: a pseudonym that reproduces a real value verbatim puts
@@ -63,7 +64,8 @@ from the **haystack** only, which collapses nothing. The harness was therefore w
 than the code it measures, and arguing on the record for a limitation the code no
 longer had. See :func:`test_the_scan_sees_a_combining_mark_spliced_into_a_value`:
 
-* **Partial disclosure is out of scope.** If a splice bug leaves one component of a
+* **Partial disclosure is out of scope**, with one carve-out named below. If a splice
+  bug leaves one component of a
   multi-word original behind -- the surname of a vaulted full name -- neither this
   harness nor the gate reports it, because both ask whether the *value* occurs. A
   word-level scan is not safely assertable: fixture originals include ordinary
@@ -71,6 +73,21 @@ longer had. See :func:`test_the_scan_sees_a_combining_mark_spliced_into_a_value`
   manufacture reds indistinguishable from the real thing. See
   :func:`test_a_partial_value_leak_is_outside_what_this_harness_claims`, which pins
   the boundary so it cannot be forgotten.
+
+  **The carve-out is a *composite* original, and it is a different question from a
+  partial one.** A vault original is whatever the detector called one span, and spaCy
+  returns ``03/11/2024, 09/17/2024`` as a single ``DATE`` -- so the "value" both
+  scanners ask about is a string the document contains but which nobody wrote as a
+  unit, and one of the dates in it is a whole value in its own right rather than a
+  component of one. That distinction is what makes it safely assertable where the
+  surname is not: a constituent qualifies only when the original splits on an English
+  list delimiter (never on whitespace) into pieces that *each* carry seven digits, so
+  no ordinary word can become a needle. Both the gate and :func:`find_in_text` now
+  scan for those constituents (:func:`_composite_needles`). It matters more than a
+  boundary usually does because this pipeline can **manufacture** the fragment: a
+  third date shifted by the session delta renders as a verbatim slice of the
+  composite. Detection also splits such spans upstream now, so the composite should
+  no longer be vaulted at all -- this limb is the second opinion on that.
 * **A NAME glued into a longer word is out of scope -- on the text channels.**
   ``xJohn Smithx`` carries the original byte for byte and is not reported by
   :func:`find_in_text`, because :func:`_occurs_as_a_unit` asserts a word boundary on
@@ -189,6 +206,7 @@ from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import (
     MIN_ORIGINAL_LEN,
     EgressGate,
+    _composite_needles,
     _deaccent,
     _identifier_needles,
     _strip_invisible,
@@ -625,8 +643,16 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
     5. **identifier needles** (:func:`_identifier_needles`) -- a bare substring test
        with **no adjacency requirement at all**, for values carrying a run of at least
        :data:`MIN_IDENTIFIER_DIGITS` digits.
+    6. **composite constituents** (:func:`_composite_needles`) -- forms 1-4 again, per
+       constituent, when the original is itself a *list* of digit-bearing values. A
+       vault original is whatever the detector called one span, and spaCy returns
+       ``03/11/2024, 09/17/2024`` as a single ``DATE``: forms 1-4 then look for a
+       string nobody wrote as a unit, and form 5 contributes nothing at all because
+       the longest contiguous digit run in it is four. Both limbs go quiet on a
+       payload carrying one of the dates, which this pipeline can *manufacture* by
+       shifting a third date onto it.
 
-    **Forms 4 and 5 are the ones this function did not have while the gate did**, and
+    **Forms 4, 5 and 6 are the ones this function did not have while the gate did**, and
     that asymmetry is the single defect this module exists to prevent, in its most
     dangerous direction. On the outbound payload the gate is a second opinion, so a
     leak this function missed would still be blocked. On the **audit database and the
@@ -644,9 +670,9 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
     :func:`test_the_scan_sees_an_identifier_glued_into_a_longer_run` and
     :func:`test_the_scan_sees_a_combining_mark_spliced_into_a_value`.
 
-    Form 5 keeps the gate's own function rather than restating its rule, for exactly
-    the reason form 1-4's occurrence rule is imported: a re-derived copy is a copy
-    that can drift, and this file has already paid for four of those.
+    Forms 5 and 6 keep the gate's own functions rather than restating their rules, for
+    exactly the reason form 1-4's occurrence rule is imported: a re-derived copy is a
+    copy that can drift, and this file has already paid for four of those.
 
     No minimum length on the bounded forms, deliberately: the gate skips originals
     shorter than
@@ -658,16 +684,31 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
     norm_hay = normalize(haystack)
     folded_hay = _strip_invisible(norm_hay)
     skeleton_hay = _deaccent(folded_hay)
-    found: list[str] = []
-    for original in originals:
-        normalised = normalize(original)
+
+    def bounded(value: str) -> bool:
+        """Forms 1-4, for a whole original or for one composite constituent.
+
+        Written once rather than twice for the same reason the gate factors it out:
+        two copies of the four forms are two places to edit the day a fifth is added,
+        and "the harness has every limb the gate has" is the one property this file
+        cannot afford to hold only by habit.
+        """
+        normalised = normalize(value)
         folded = _strip_invisible(normalised)
-        if (
-            occurs_as_a_unit(original, haystack)
+        return (
+            occurs_as_a_unit(value, haystack)
             or occurs_as_a_unit(normalised, norm_hay)
             or occurs_as_a_unit(folded, folded_hay)
             or occurs_as_a_unit(folded, skeleton_hay)
+        )
+
+    found: list[str] = []
+    for original in originals:
+        folded = _strip_invisible(normalize(original))
+        if (
+            bounded(original)
             or any(needle in skeleton_hay for needle in _identifier_needles(folded))
+            or any(bounded(part) for part in _composite_needles(original))
         ):
             found.append(original)
     return sorted(found)
@@ -1768,7 +1809,9 @@ def test_the_scan_sees_an_identifier_glued_into_a_longer_run() -> None:
 #: The sabotage matrix, for the next person who edits :func:`find_in_text`:
 #: raw and normalised are held by the ``(only)`` entries here; folded is held by the
 #: fuzz below (its ``é`` needles are the ones deaccenting breaks); skeleton and
-#: identifier are held by both.
+#: identifier are held by both; **composite is held only by the entry here**, and has
+#: to be, because the fuzz cannot reach it -- a composite needle wants a delimiter and
+#: seven digits on each side of it, and no ``_FUZZ_VALUES`` alphabet carries a comma.
 _GATE_BLOCKING_PAYLOADS: tuple[tuple[str, str, str], ...] = (
     ("raw", "Marguerite Vandenberg", "The client Marguerite Vandenberg signed."),
     # The payload ONLY the raw form catches. NFKC expands U+2120 to ``SM``, which glues
@@ -1792,6 +1835,17 @@ _GATE_BLOCKING_PAYLOADS: tuple[tuple[str, str, str], ...] = (
     ("identifier (bare run elsewhere)", "Account No. 100200300400", "ref 100200300400 posted"),
     ("markdown emphasis", "John Smith", "the memo names _John Smith_ as counsel"),
     ("punctuation-edged needle", "(415) 555-0123", "tel(415) 555-0123 on file"),
+    # The payload ONLY the composite limb catches, and the one the gate can
+    # *manufacture*. spaCy returns two dates as a single DATE span, so the joined
+    # string is one vault original: the four bounded forms look for a string that is
+    # not in the payload, and the identifier limb contributes no run needle at all
+    # because the longest contiguous digit run in it is `2024`. A third date in the
+    # same document, shifted by the session delta, renders as exactly this slice.
+    (
+        "composite constituent (only)",
+        "03/11/2024, 09/17/2024",
+        "re-scheduled from 03/11/2024 at the patient's request",
+    ),
 )
 
 

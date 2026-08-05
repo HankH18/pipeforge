@@ -24,6 +24,8 @@ import pytest
 
 from secure_context_pipeline.audit.logger import AuditLogger
 from secure_context_pipeline.config import Settings
+from secure_context_pipeline.daterules import parse_source_date, split_composite_date
+from secure_context_pipeline.detection import detector as detector_module
 from secure_context_pipeline.detection.detector import (
     CHUNK_OVERLAP_CHARS,
     PRESIDIO_LOGGER_NAME,
@@ -45,6 +47,7 @@ from secure_context_pipeline.detection.recognizers import (
 )
 from secure_context_pipeline.detection.registry import (
     GAZETTEER_DIR,
+    TIER_TEMPORAL,
     EntityRegistry,
     EntitySpec,
     load_registry,
@@ -4289,6 +4292,276 @@ def test_both_invariants_still_fire_with_assertions_disabled() -> None:
     assert completed.returncode == 0, completed.stderr
     assert "offset_drift_raised" in completed.stdout
     assert "chunking_raised" in completed.stdout
+
+
+# ---------------------------------------------------------------------------
+# Composite date spans: one detection per date
+# ---------------------------------------------------------------------------
+# spaCy returns a list of dates as ONE ``DATE`` span. That single fact costs twice:
+# the whole composite string becomes one vault original, so both leak scanners --
+# which ask whether a *whole* vaulted value occurs -- go blind to any fragment of it,
+# and the composite does not parse as a date, so Tier 2 degrades it to a plain token
+# and the intervals it carried are lost. Both are closed by splitting it here.
+
+
+#: Verbatim from ``fixtures/generator.py`` line 598, so the shape under test is the
+#: one an ordinary generated medical record actually produces:
+#:
+#:     Prior ambulatory visits: {prior[0]}, {prior[1]}, and {prior[2]}.
+COMPOSITE_DATE_TEXT = (
+    "ENCOUNTER HISTORY\n"
+    "    Prior ambulatory visits: 03/11/2024, 09/17/2024, and 10/01/2024.\n"
+)
+
+#: The single ``DATE`` span spaCy returns out of that line.
+COMPOSITE_SPAN = "03/11/2024, 09/17/2024"
+
+
+async def test_a_date_span_that_is_a_list_of_dates_becomes_one_detection_per_date(
+    detector: Detector,
+) -> None:
+    """The root-cause half, measured on the real detector and the real registry.
+
+    Without the split, spaCy hands back ``03/11/2024, 09/17/2024`` as a **single**
+    ``DATE`` beside a separate ``10/01/2024``, and that composite -- a string the
+    document contains but which nobody wrote as one value -- is what the engine
+    vaults. Everything downstream then reasons about the composite: the egress gate's
+    pass 1 and the leakage harness both ask whether a *whole* vaulted original occurs,
+    so neither can see one date out of it, and the pipeline can manufacture exactly
+    that fragment by shifting a third date onto it.
+
+    The premise assertions are the load-bearing ones. They establish that this is a
+    genuine composite -- the joined string does not parse as a date, each piece does --
+    so a green here cannot be coming from spaCy having tokenised the line differently
+    on this machine.
+    """
+    assert parse_source_date("03/11/2024, 09/17/2024") is None, (
+        "premise: the composite is not a date, which is why Tier 2 used to degrade it"
+    )
+    for piece in ("03/11/2024", "09/17/2024", "10/01/2024"):
+        assert parse_source_date(piece) is not None, "premise: each constituent is a date"
+
+    detections = await detector.detect(COMPOSITE_DATE_TEXT, "medical")
+    dates = [d for d in detections if d.entity_type == "DATE"]
+
+    assert [d.text for d in dates] == ["03/11/2024", "09/17/2024", "10/01/2024"], (
+        "a DATE detection is one date; a span carrying two of them is a composite "
+        "original that both leak scanners are structurally unable to look inside"
+    )
+    # Offsets, by slicing rather than by trusting the arithmetic that produced them.
+    for detection in dates:
+        assert COMPOSITE_DATE_TEXT[detection.start : detection.end] == detection.text
+
+    # And nothing was uncovered by the split: the only characters between the
+    # constituents are the list punctuation.
+    assert uncovered(COMPOSITE_DATE_TEXT, detections, "03/11/2024, 09/17/2024") == ", "
+
+
+@pytest.mark.parametrize(
+    ("span_text", "expected", "why"),
+    [
+        pytest.param(
+            "03/11/2024, 09/17/2024",
+            ("03/11/2024", "09/17/2024"),
+            "the measured shape: two dates spaCy returns as one span",
+            id="two-dates-comma",
+        ),
+        pytest.param(
+            "03/11/2024, 09/17/2024, and 10/01/2024",
+            ("03/11/2024", "09/17/2024", "10/01/2024"),
+            "three dates; the bare gap between ',' and 'and' is not a constituent",
+            id="three-dates-comma-and",
+        ),
+        pytest.param(
+            "03/11/2024; 09/17/2024",
+            ("03/11/2024", "09/17/2024"),
+            "semicolon",
+            id="two-dates-semicolon",
+        ),
+        pytest.param(
+            "2024-03-11 & 2024-09-17",
+            ("2024-03-11", "2024-09-17"),
+            "ampersand, and a format whose renderer is ISO",
+            id="two-dates-ampersand",
+        ),
+        pytest.param(
+            "5 June 2024 and 9 July 2024",
+            ("5 June 2024", "9 July 2024"),
+            "the word 'and' alone, with no comma anywhere, and constituents that "
+            "carry spaces of their own -- whitespace is not a delimiter",
+            id="two-dates-and",
+        ),
+        pytest.param(
+            "March 3, 2024 & April 5, 2024",
+            (),
+            "ampersand, but 'March 3' and '2024' do not each parse -- a PARTIAL "
+            "split would vault '2024' and leave a rump span, so none is taken",
+            id="refused-partial",
+        ),
+        pytest.param(
+            "Prior visits: 03/11/2024, 09/17/2024",
+            (),
+            "a label rode into the span, so the first constituent is not a date",
+            id="refused-label-in-span",
+        ),
+        pytest.param(
+            "03/11/2024, 09/17/2024 Marguerite Vandenberg",
+            (),
+            "overlap resolution widened the span to swallow a name; the piece "
+            "carrying the name does not parse, so the span is left whole",
+            id="refused-widened-span",
+        ),
+        pytest.param(
+            "March 3, 2024",
+            (),
+            "a single date that merely contains a comma -- it parses, so it is "
+            "not a composite whatever punctuation it carries",
+            id="refused-single-date-with-comma",
+        ),
+        pytest.param(
+            "03/11/2024",
+            (),
+            "one constituent is not a list",
+            id="refused-single-constituent",
+        ),
+        pytest.param(
+            "",
+            (),
+            "the empty span",
+            id="refused-empty",
+        ),
+    ],
+)
+def test_split_composite_date_is_all_or_nothing(
+    span_text: str, expected: tuple[str, ...], why: str
+) -> None:
+    """The rule itself, asked directly, including the cases that must refuse.
+
+    A *partial* split is worse than no split -- it vaults some constituents and
+    leaves the rest in a rump span the pipeline has decided is not an entity -- so
+    every non-trivial constituent has to parse or the whole thing is left alone. The
+    refusing rows are therefore the half that matters; the accepting rows only show
+    the feature exists.
+
+    Offsets are checked by slicing the input, never by comparing to arithmetic done
+    here, because arithmetic done here would be the same arithmetic the
+    implementation does.
+    """
+    parts = split_composite_date(span_text)
+    assert tuple(span_text[start:end] for start, end in parts) == expected, why
+    for start, end in parts:
+        assert 0 <= start < end <= len(span_text)
+
+
+def test_a_composite_that_parses_as_one_date_is_never_split() -> None:
+    """``dateutil`` reads some lists as a single date, and that shape stays untouched.
+
+    ``2024-01-01, 2024-12-31`` is two dates to a reader and one date to
+    ``dateutil.parser`` (it returns the first and ignores the rest). The splitter's
+    first question is "does this already parse?", so this span keeps exactly the
+    behaviour it had -- which is the contract, and is also a *pre-existing* fidelity
+    bug worth naming: Tier 2 renders one shifted date over a span that denoted two.
+    The gate covers the security half of it independently, through
+    ``_composite_needles``; the fidelity half is out of scope here and is recorded
+    rather than quietly fixed under cover of this change.
+    """
+    assert parse_source_date("2024-01-01, 2024-12-31") is not None, "premise"
+    assert split_composite_date("2024-01-01, 2024-12-31") == ()
+
+
+def test_a_non_temporal_entity_type_is_never_split(
+    registry: EntityRegistry, settings: Settings
+) -> None:
+    """Scope is the tier, and the same text proves it in both directions.
+
+    A comma inside a name or an address is part of the value, not a list separator,
+    so the split must not be reachable from any entity type whose values are not
+    dates. Asserted with one string and two entity types, so the only variable is the
+    one being tested.
+    """
+    detector = Detector(registry, settings)
+    text = f"Row: {COMPOSITE_SPAN}."
+
+    def detection_of(entity_type: str) -> Detection:
+        start = text.index(COMPOSITE_SPAN)
+        return Detection(
+            entity_type=entity_type,
+            category=registry.spec(entity_type).category,
+            start=start,
+            end=start + len(COMPOSITE_SPAN),
+            text=COMPOSITE_SPAN,
+            score=0.9,
+        )
+
+    assert registry.spec("DATE").tier == TIER_TEMPORAL, "premise"
+    assert registry.spec("NAME").tier != TIER_TEMPORAL, "premise"
+
+    split = detector._split_composite_dates(text, detection_of("DATE"))
+    assert [d.text for d in split] == ["03/11/2024", "09/17/2024"]
+
+    unsplit = detector._split_composite_dates(text, detection_of("NAME"))
+    assert [d.text for d in unsplit] == [COMPOSITE_SPAN]
+
+
+def test_the_composite_split_scope_and_the_temporal_tier_cannot_drift_apart(
+    registry: EntityRegistry,
+) -> None:
+    """The tier the split keys on must stay the tier whose values are dates.
+
+    ``Detector._split_composite_dates`` asks the registry for ``tier ==
+    TIER_TEMPORAL`` and then hands the span to a *date* parser. That is only sound
+    while the temporal tier means "this value is a date", which is a claim about
+    ``entities.yaml`` made in Python -- exactly the shape that goes quietly stale. So
+    it is re-derived from the shipped registry: every temporal entity must be served
+    by the date recogniser, and there must be at least one, or the rule is scoped to
+    nothing and every test above is vacuous.
+    """
+    temporal = {
+        name for name, spec in registry.entities.items() if spec.tier == TIER_TEMPORAL
+    }
+    assert temporal, "no entity is temporal, so the composite split is scoped to nothing"
+    for name in temporal:
+        assert registry.spec(name).presidio == "DATE_TIME", (
+            f"{name} is tier {TIER_TEMPORAL} but is not date-recognised; the split "
+            "would hand a date parser a value that is not a date"
+        )
+
+
+def test_the_composite_split_refuses_to_emit_a_detection_whose_offsets_have_drifted(
+    registry: EntityRegistry, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The offsets are verified against the document, not trusted from arithmetic.
+
+    ``start``/``end`` are the sum of two independently derived numbers, and the engine
+    *splices* by them while *vaulting* ``detection.text``. If those disagree the vault
+    holds a value that never appeared in the document and de-obfuscation puts the
+    wrong string into the user's answer, silently. So the emitted text is taken by
+    slicing the document and compared against the substring the splitter identified.
+
+    Sabotaged here by making the splitter return bounds one character to the left,
+    which is what an off-by-one in either producer would look like.
+    """
+    detector = Detector(registry, settings)
+    text = f"Row: {COMPOSITE_SPAN}."
+    start = text.index(COMPOSITE_SPAN)
+    detection = Detection(
+        entity_type="DATE",
+        category=registry.spec("DATE").category,
+        start=start,
+        end=start + len(COMPOSITE_SPAN),
+        text=COMPOSITE_SPAN,
+        score=0.9,
+    )
+
+    assert detector._split_composite_dates(text, detection), "premise: it does split"
+
+    monkeypatch.setattr(
+        detector_module, "split_composite_date", lambda _text: ((1, 11), (13, 23))
+    )
+    with pytest.raises(DetectionInvariantError) as raised:
+        detector._split_composite_dates(text, detection)
+    assert raised.value.detail["reason"] == "composite_split_offset_drift"
+    assert COMPOSITE_SPAN not in str(raised.value), "a span is an original value"
 
 
 def test_detection_repr_never_leaks_the_original_value() -> None:

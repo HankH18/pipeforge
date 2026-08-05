@@ -13,10 +13,11 @@ cryptographically irreversible across sessions.
 
 The word doing the work is **whole**, and the four boundaries are stated here rather than 300
 lines down, because each one is a shape that has been *confirmed* to reach the provider with the
-gate live: a partial value (one component of a multi-word original), a value glued inside a
-longer alphanumeric word (**names and other digit-poor values only** — a digit-carrying identifier
-*is* caught, see the two identifier floors below), a combining mark spliced into a value, and a
-homoglyph substitution.
+gate live: a partial value (one component of a multi-word original — the *composite-span* sub-case,
+where detection merged a list of values into one span, is now closed on both sides; see §7 gap 9),
+a value glued inside a longer alphanumeric word (**names and other digit-poor values only** — a
+digit-carrying identifier *is* caught, see the two identifier floors below), a combining mark
+spliced into a value, and a homoglyph substitution.
 Each is pinned by a named test so that closing one later is a red rather than a silent widening
 of the claim; all four are detailed under *Leakage harness* below. A stronger claim was written
 here first, and it was wrong in the way that matters — it promised `never` while the document
@@ -131,7 +132,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1555 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1578 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   127 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 39 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
@@ -1777,12 +1778,45 @@ paralegal is a silent one.
    variable — **27 collisions before, 0 after**. The leakage harness went from 1 failing run in 8
    to 8/8 clean.
 
-   **The residual limitation is the scanners, not that one guard.** Any future path that emits a
-   string containing a fragment of a vaulted value is still invisible to both. Closing it properly
-   means scanning for sub-spans of originals, which trades directly against false positives — the
-   `Brown`/`Browning` problem, one entity type at a time. It is not built, and it is the honest
-   qualifier on the headline claim: *no whole vaulted value reaches the provider* is what is
-   measured, and a composite detector span is what makes "whole" load-bearing.
+   **That fixed the failure. It did not fix the condition, so the condition was fixed too** — on
+   both sides, because a detection-only fix would violate this design's own posture that the gate
+   is a second opinion which does not trust detection.
+
+   - *Upstream:* `Detector._split_composite_dates` emits one detection per date when a Tier-2 span
+     fails to parse as a single date **and** splits on `,` / `;` / `&` / `and` into ≥2
+     constituents that **each** parse. One unparseable piece refuses the whole split — a partial
+     split is worse than none, since it would vault some constituents and leave a rump span
+     holding the rest. Offsets are checked by slicing the document, and drift raises rather than
+     emits. It is also a **utility win**: those dates used to degrade to a plain token, losing the
+     interval property Tier 2 exists for; now each one carries the session shift.
+   - *Downstream:* `EgressGate._composite_needles` derives a needle per constituent of a composite
+     vaulted original, through the same bounded-form comparison the whole value uses. Both sides
+     share one delimiter grammar (`textrules.delimited_parts`), which is what makes "the gate
+     scans for the pieces detection would have split out" mechanically true rather than a comment.
+
+   **What the gate deliberately will not do**, because the gate is fail-closed and a false positive
+   is a denied request that looks exactly like a leak: a constituent below `MIN_IDENTIFIER_DIGITS`
+   contributes nothing, so `April 2024` never makes `April` a needle and `Park Avenue, Springfield`
+   never makes `Park` one; and one sub-floor constituent refuses the whole value, so `Jan 5, 2024`
+   cannot contribute `2024` and deny every document. Measured rather than asserted: across 30
+   freshly generated documents the detector returned 1,345 spans, **211 carrying a list delimiter,
+   0 contributing a composite needle** — on a corpus where detection behaves, this limb fires on
+   nothing. It earns its place on the day detection does not.
+
+   **What genuinely remains.** A bare component of a *non-composite* original — vaulted
+   `John Smith`, payload says `Smith`. Whitespace is deliberately not a delimiter, which is what
+   keeps the rule above away from this case, and closing it needs per-entity component policy
+   rather than one predicate: that is where the `Brown`/`Browning` trade actually bites. Two
+   smaller residuals: `dateutil` parses `2024-01-01, 2024-12-31` as a *single* date and silently
+   drops the rest, so Tier 2 renders one shifted date over a span denoting two (a fidelity loss,
+   not a disclosure — the gate limb still covers its security half, and it is pinned by
+   `test_a_composite_that_parses_as_one_date_is_never_split`); and a two-digit-year composite
+   splits upstream but contributes no gate needles, each part carrying six digits against a floor
+   of seven.
+
+   So the honest qualifier on the headline claim is now narrower than it was: *no whole vaulted
+   value reaches the provider* is what is measured, and it is a **multi-word original**, not a
+   composite detector span, that still makes "whole" load-bearing.
 
 10. **No k-anonymity / generalization pass.** This is the real answer to the inference risk in
    §3, and it is not built.
@@ -1880,6 +1914,7 @@ Recorded per the build doc's instruction. Each one is a deliberate choice with a
 | 45 | **The Faker seed label carries the normalized original value**, not just the entity type: `HMAC(session_key, b"faker:" + f"{entity_type}:{normalize(text)}")`. §9.3 writes `b"faker:" + entity_type`. | Stability per *value* rather than per *type* is what component linking needs — one patient must own both `Sherri Lopez` and `Lopez` across the whole document. `crypto/keys.py` still implements §9.3's signature exactly; only the label passed to it is composite. Not a disclosure: the HMAC is under a secret 32-byte session key, `normalize` cannot introduce NUL, and `_label_bytes` rejects one, so the domain separation argument in `keys.py` still holds. Recorded because original values now flow into a keyed derivation, which is a fact a security reviewer should be told rather than have to find. |
 | 46 | **`CASE_ID` pattern 1 drops §6.2's `(?:Case|Docket)\s+No\.?\s*[:#]?\s*` prefix**, widens `[a-z]{2}` to `[a-z]{2,4}`, and adds `(?i)`. | Real briefs cite bare docket numbers, and requiring the lexical prefix missed them. The cost is that the pattern now claims any `d:dd-xx-ddd` run in **any** document category with no lexical context, which is exactly the broadening Deviation 15 relies on. Deviation 3 covers only the backslash spelling and was previously the only row mentioning `CASE_ID`. Same class, lower stakes: `MEDICATION` drops the spec's `takes` context word (explained in `entities.yaml`, not here until now), and `MRN`/`ACCOUNT_NUMBER` are wholesale rewrites acknowledged only in a §4 parenthetical. |
 | 47 | **`regex` is a hard runtime dependency and is now declared.** | `detection/registry.py` does `import regex`, and it resolved only transitively through `presidio-analyzer`. It is not optional: `MRN` and `ACCOUNT_NUMBER` use PCRE `\K` and possessive quantifiers, which the standard library's `re` **cannot compile at all** (`bad escape \K`), so `entities.yaml` is not portable to `re` and every path that touches the registry — config, detector, engine, strategies — fails at import without it. Deviation 2 enumerated the added dependencies and omitted the one that was undeclared. |
+| 48 | **A Tier-2 span that is a *list* of dates is split into one detection per date** (`Detector._split_composite_dates`), and the egress gate derives a scan needle per constituent of a composite vaulted original (`_composite_needles`). | spaCy returns `03/11/2024, 09/17/2024` as one `DATE` span, so the whole string became a single vault original. A different date shifted onto `03/11/2024` then rendered a **verbatim slice** of that original, and both leak scanners reported clean — correctly, since each asks whether a *whole* vaulted value occurs. The pipeline was manufacturing the partial disclosure that §1's first boundary describes. Splitting is refused unless every constituent parses, because a partial split leaves a rump span with the same defect; the gate limb is duplicated on purpose so the fix does not depend on detection being right. It is also a utility gain — those dates previously degraded to a plain token, losing the interval property Tier 2 exists for. |
 
 ---
 

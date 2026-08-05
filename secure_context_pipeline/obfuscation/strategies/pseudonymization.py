@@ -120,7 +120,14 @@ onto ``03/11/2024`` is then a verbatim slice of it. All three put a real value o
 the wire inside a string we invented, and the third is the one nothing else can
 catch: the first two leave a *whole* vaulted original in the payload, which the
 egress gate blocks, whereas a slice is what both the gate and the leakage harness
-document themselves as blind to. It must also not *duplicate* a surrogate the
+document themselves as blind to. That third shape is now also attacked at its
+source -- the detector splits a span that is a *list* of dates into one detection
+per date (:func:`~secure_context_pipeline.daterules.split_composite_date`), so the
+composite never becomes a vault original in the first place and each date keeps the
+shift instead of the whole span degrading to a plain token. The guard here stays,
+because the split is deliberately all-or-nothing: a list whose pieces do not all
+parse is still one span, and a rendered date can be swallowed by an original of any
+shape rather than only by another date. It must also not *duplicate* a surrogate the
 session already issued: Tier 2 is many-to-one by construction, so ``2024-01-05``
 and ``Friday, January 5, 2024`` shift to the same day and render to the same
 string, and two originals sharing one surrogate is the one collision restoration
@@ -136,18 +143,23 @@ from __future__ import annotations
 import logging
 import re
 import string
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from dateutil import parser as dateutil_parser
 from faker import Faker
 
 from secure_context_pipeline.crypto.keys import (
     derive_date_shift_days,
     derive_faker_seed,
     normalize,
+)
+from secure_context_pipeline.daterules import parse_source_date
+from secure_context_pipeline.detection.registry import (
+    TIER_CONTENT,
+    TIER_IDENTIFIER,
+    TIER_NUMERIC,
+    TIER_TEMPORAL,
 )
 from secure_context_pipeline.errors import VaultMissError
 from secure_context_pipeline.models import Detection
@@ -156,6 +168,7 @@ from secure_context_pipeline.obfuscation.strategies.base import (
     StrategyContext,
     register_strategy,
 )
+from secure_context_pipeline.textrules import match_case as _match_case
 from secure_context_pipeline.textrules import occurs_as_a_unit as _occurs_as_a_unit
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle avoidance / typing only
@@ -165,6 +178,12 @@ if TYPE_CHECKING:  # pragma: no cover -- import cycle avoidance / typing only
 
 logger = logging.getLogger(__name__)
 
+# ``TIER_*`` and ``parse_source_date`` are re-exported, not defined here, and are kept
+# under the names this module's callers and tests already use. Both moved *down* so
+# that ``detection`` could read them without an import cycle -- the Tier-2 date format
+# table into :mod:`secure_context_pipeline.daterules`, the tier numbers into
+# :mod:`secure_context_pipeline.detection.registry`, which owns the ``tier:`` field they
+# are the domain of. See those modules for why.
 __all__ = [
     "FAKER_LOCALE",
     "MAX_FAKE_ATTEMPTS",
@@ -173,13 +192,8 @@ __all__ = [
     "TIER_NUMERIC",
     "TIER_TEMPORAL",
     "PseudonymizationStrategy",
+    "parse_source_date",
 ]
-
-#: Tier numbers, matching ``tier:`` in ``entities.yaml`` (build doc section 9.3).
-TIER_IDENTIFIER = 1
-TIER_TEMPORAL = 2
-TIER_CONTENT = 3
-TIER_NUMERIC = 4
 
 #: Tier used for an entity the registry does not define: plain token, no fake.
 TIER_UNKNOWN = TIER_NUMERIC
@@ -310,218 +324,6 @@ def _structural_fake(text: str, rng: Random) -> _Candidate:
         if any(replaced[run.start() : run.end()]):
             invented |= _words_of(run.group())
     return _Candidate(generated, frozenset(invented))
-
-
-def _match_case(source: str, generated: str) -> str:
-    """Carry the source's ALL-CAPS / all-lower styling onto a generated word."""
-    if source.isupper():
-        return generated.upper()
-    if source.islower():
-        return generated.lower()
-    return generated
-
-
-# ---------------------------------------------------------------------------
-# Tier 2 -- date parsing that remembers the source format
-# ---------------------------------------------------------------------------
-
-_MONTHS_FULL = (
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
-
-_MONTH_INDEX: dict[str, int] = {}
-for _position, _month in enumerate(_MONTHS_FULL, start=1):
-    _MONTH_INDEX[_month.lower()] = _position
-    _MONTH_INDEX[_month[:3].lower()] = _position
-_MONTH_INDEX["sept"] = 9
-
-_ISO_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})$")
-_NUMERIC_RE = re.compile(r"^(\d{1,2})([/.\-])(\d{1,2})\2(\d{2}|\d{4})$")
-_MDY_RE = re.compile(
-    r"^([A-Za-z]{3,9})(\.?)\s+(\d{1,2})(?:st|nd|rd|th)?\s*(,?)\s+(\d{4})$", re.IGNORECASE
-)
-_DMY_RE = re.compile(
-    r"^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})(\.?),?\s+(\d{4})$", re.IGNORECASE
-)
-_MY_RE = re.compile(r"^([A-Za-z]{3,9})(\.?)\s+(\d{4})$", re.IGNORECASE)
-_ORDINAL_RE = re.compile(r"\d{1,2}(st|nd|rd|th)\b", re.IGNORECASE)
-_DIGIT_RUN_RE = re.compile(r"\d+")
-
-#: Anchors the dateutil fallback so a missing component is never filled from
-#: "today" -- a shifted today is a wrong date that looks right.
-_FALLBACK_ANCHOR = datetime(2000, 1, 1)
-
-
-@dataclass(frozen=True, slots=True)
-class _SourceDate:
-    """A parsed date plus a renderer that reproduces the source's formatting."""
-
-    value: date
-    render: Callable[[date], str]
-
-
-def _ordinal_suffix(day: int) -> str:
-    if 11 <= day % 100 <= 13:
-        return "th"
-    return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
-
-
-def _month_word(target_month: int, source_word: str, dotted: str) -> str:
-    """Render ``target_month`` in the source's style (full/abbreviated, case, dot)."""
-    source_index = _MONTH_INDEX[source_word.lower()]
-    abbreviated = len(source_word.rstrip(".")) < len(_MONTHS_FULL[source_index - 1])
-    rendered = _MONTHS_FULL[target_month - 1]
-    if abbreviated:
-        rendered = rendered[:3]
-    return _match_case(source_word, rendered) + dotted
-
-
-def _safe_date(year: int, month: int, day: int) -> date | None:
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
-
-
-def _expand_year(raw: str) -> int:
-    """Two-digit years use the POSIX pivot: 00-68 -> 2000s, 69-99 -> 1900s."""
-    if len(raw) == 4:
-        return int(raw)
-    value = int(raw)
-    return 2000 + value if value < 69 else 1900 + value
-
-
-def _parse_iso(text: str) -> _SourceDate | None:
-    match = _ISO_RE.match(text)
-    if match is None:
-        return None
-    year, month, day = match.group(1), match.group(2), match.group(3)
-    value = _safe_date(int(year), int(month), int(day))
-    if value is None:
-        return None
-    month_width, day_width = len(month), len(day)
-
-    def render(shifted: date) -> str:
-        return (
-            f"{shifted.year:04d}-{shifted.month:0{month_width}d}-{shifted.day:0{day_width}d}"
-        )
-
-    return _SourceDate(value, render)
-
-
-def _parse_numeric(text: str) -> _SourceDate | None:
-    match = _NUMERIC_RE.match(text)
-    if match is None:
-        return None
-    first, separator, second, year_raw = match.groups()
-    # US convention (M/D/Y) unless the leading field cannot be a month.
-    month_first = not (int(first) > 12 and int(second) <= 12)
-    month, day = (int(first), int(second)) if month_first else (int(second), int(first))
-    value = _safe_date(_expand_year(year_raw), month, day)
-    if value is None:
-        return None
-    first_width, second_width, year_width = len(first), len(second), len(year_raw)
-
-    def render(shifted: date) -> str:
-        lead = shifted.month if month_first else shifted.day
-        follow = shifted.day if month_first else shifted.month
-        year = f"{shifted.year % 100:02d}" if year_width == 2 else f"{shifted.year:04d}"
-        return f"{lead:0{first_width}d}{separator}{follow:0{second_width}d}{separator}{year}"
-
-    return _SourceDate(value, render)
-
-
-def _parse_month_day_year(text: str) -> _SourceDate | None:
-    match = _MDY_RE.match(text)
-    if match is None:
-        return None
-    word, dotted, day_raw, comma, year_raw = match.groups()
-    month = _MONTH_INDEX.get(word.lower())
-    if month is None:
-        return None
-    value = _safe_date(int(year_raw), month, int(day_raw))
-    if value is None:
-        return None
-    ordinal = bool(_ORDINAL_RE.search(text))
-
-    def render(shifted: date) -> str:
-        day = f"{shifted.day}{_ordinal_suffix(shifted.day) if ordinal else ''}"
-        return f"{_month_word(shifted.month, word, dotted)} {day}{comma} {shifted.year:04d}"
-
-    return _SourceDate(value, render)
-
-
-def _parse_day_month_year(text: str) -> _SourceDate | None:
-    match = _DMY_RE.match(text)
-    if match is None:
-        return None
-    day_raw, word, dotted, year_raw = match.groups()
-    month = _MONTH_INDEX.get(word.lower())
-    if month is None:
-        return None
-    value = _safe_date(int(year_raw), month, int(day_raw))
-    if value is None:
-        return None
-    ordinal = bool(_ORDINAL_RE.search(text))
-
-    def render(shifted: date) -> str:
-        day = f"{shifted.day}{_ordinal_suffix(shifted.day) if ordinal else ''}"
-        return f"{day} {_month_word(shifted.month, word, dotted)} {shifted.year:04d}"
-
-    return _SourceDate(value, render)
-
-
-def _parse_month_year(text: str) -> _SourceDate | None:
-    match = _MY_RE.match(text)
-    if match is None:
-        return None
-    word, dotted, year_raw = match.groups()
-    month = _MONTH_INDEX.get(word.lower())
-    if month is None:
-        return None
-    value = _safe_date(int(year_raw), month, 1)
-    if value is None:
-        return None
-
-    def render(shifted: date) -> str:
-        return f"{_month_word(shifted.month, word, dotted)} {shifted.year:04d}"
-
-    return _SourceDate(value, render)
-
-
-def _parse_fallback(text: str) -> _SourceDate | None:
-    """``dateutil`` for anything the format table missed; renders ISO.
-
-    Guarded by "at least two digit runs" so a bare year ("2024") is *not*
-    silently promoted to 1 January and shifted into a plausible-looking lie.
-    """
-    if len(_DIGIT_RUN_RE.findall(text)) < 2:
-        return None
-    try:
-        parsed = dateutil_parser.parse(text, default=_FALLBACK_ANCHOR, fuzzy=False)
-    except (ValueError, OverflowError, TypeError):
-        return None
-    return _SourceDate(parsed.date(), lambda shifted: shifted.isoformat())
-
-
-_DATE_PARSERS: tuple[Callable[[str], _SourceDate | None], ...] = (
-    _parse_iso,
-    _parse_numeric,
-    _parse_month_day_year,
-    _parse_day_month_year,
-    _parse_month_year,
-    _parse_fallback,
-)
-
-
-def parse_source_date(text: str) -> _SourceDate | None:
-    """First parser that recognises ``text``, or ``None`` if none does."""
-    for parser in _DATE_PARSERS:
-        parsed = parser(text)
-        if parsed is not None:
-            return parsed
-    return None
 
 
 # ---------------------------------------------------------------------------

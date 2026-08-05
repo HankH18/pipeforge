@@ -1,7 +1,8 @@
-"""The word-boundary rule, defined once, in a leaf module below everything.
+"""Surface-text rules, defined once, in a leaf module below everything.
 
-Four components need to answer one question -- *does this value occur here as a unit,
-or is it part of a longer word?* -- and they must answer it identically:
+The rule this module was built for is the word-boundary one. Four components need to
+answer one question -- *does this value occur here as a unit, or is it part of a
+longer word?* -- and they must answer it identically:
 
 * the egress gate's pass 1, deciding whether a vaulted original is in the payload;
 * the obfuscation engine's residual sweep, deciding whether to replace a surface;
@@ -40,6 +41,23 @@ anything containing a taxpayer ID. The gate scans digit-carrying values with no
 adjacency requirement at all (``_identifier_needles``) for exactly that reason, and the
 two deliberately disagree -- the gate blocks a shape the sweep leaves behind, which is
 the safe direction to differ in.
+
+**Two smaller rules live here for the same reason**, and neither is a boundary
+question:
+
+* :func:`delimited_parts` -- where an ordinary English list separates one value from
+  the next. Detection uses it to split a composite ``DATE`` span into the dates it is
+  actually made of; the egress gate's pass 1 uses it to derive a needle per
+  constituent of a composite vaulted original. The two apply *different* rules to
+  decide which constituents qualify and share nothing else, which is exactly why the
+  split itself has to be shared: "the gate scans for the pieces detection would have
+  split out" is a claim about one delimiter grammar, and it is only true while there
+  is one.
+* :func:`match_case` -- carrying a source word's ALL-CAPS/all-lower styling onto a
+  generated one. The Tier-1 name generator and the Tier-2 date renderer both need it,
+  and since the date format table moved into
+  :mod:`secure_context_pipeline.daterules` they no longer share a module to keep it
+  in.
 """
 
 from __future__ import annotations
@@ -49,11 +67,14 @@ import re
 __all__ = [
     "ALNUM",
     "ALNUM_RE",
+    "DELIMITER_RE",
     "LEFT_GUARD",
     "RIGHT_GUARD",
     "boundary_guards",
+    "delimited_parts",
     "guards_left",
     "guards_right",
+    "match_case",
     "occurs_as_a_unit",
     "word_bounded_pattern",
 ]
@@ -142,3 +163,77 @@ def occurs_as_a_unit(needle: str, haystack: str) -> bool:
     if not left and not right:
         return True
     return re.search(left + re.escape(needle) + right, haystack) is not None
+
+
+#: The delimiters an ordinary English list puts between one value and the next: a
+#: comma, a semicolon, an ampersand, or the word "and".
+#:
+#: **Whitespace is deliberately not one of them.** A space is what separates the
+#: *components* of a single value -- ``John Smith``, ``Park Avenue``, ``chronic low
+#: back pain`` -- so admitting it would turn a rule about composite values into a rule
+#: about partial ones. Those are different problems with very different costs: a
+#: composite constituent is a whole value that a joining word happened to glue to
+#: another whole value, while ``Smith`` out of ``John Smith`` needs per-entity policy
+#: and is what makes a fail-closed gate deny ordinary prose.
+#:
+#: No quantifier here is unbounded and none can backtrack: the alternation is four
+#: literals matched left to right, so ``finditer`` is linear in the input. An earlier
+#: draft absorbed the surrounding whitespace (``\s*(?:,|;|&|\band\b)\s*``), which is
+#: quadratic on a long whitespace run -- the same shape as the ``TOKEN_RE`` denial of
+#: service recorded in :mod:`secure_context_pipeline.surrogates`, reachable from an
+#: ordinary document upload. The whitespace is trimmed off the parts instead.
+DELIMITER_RE = re.compile(r",|;|&|\band\b", re.IGNORECASE)
+
+
+def delimited_parts(value: str) -> tuple[tuple[int, int], ...]:
+    """``(start, end)`` bounds of ``value``'s :data:`DELIMITER_RE`-separated parts.
+
+    Bounds rather than substrings, because the offsets are the part that is easy to
+    get wrong and both callers need them. The detector emits one detection per
+    constituent and those offsets have to address the *document*, so a caller that
+    received strings would have to re-find them -- and re-finding is how an off-by-one
+    becomes a mis-spliced value rather than a failed test. ``value[start:end]`` is the
+    constituent exactly, with surrounding whitespace already trimmed.
+
+    Empty and whitespace-only runs are dropped. They occur for real rather than
+    theoretically: ``"a, b, and c"`` puts a bare space between the second comma and
+    the ``and``, and a trailing comma leaves an empty tail. Neither carries anything,
+    and counting them as constituents would make every ordinary three-item list fail a
+    caller's "every part must qualify" rule.
+
+    A value with no delimiter in it comes back as a 1-tuple covering the whole
+    (trimmed) value, not as ``()``. Deciding that one part is not a composite belongs
+    to the caller -- both of this function's callers require at least two -- and
+    folding that decision in here would hide it in a helper.
+    """
+    bounds: list[tuple[int, int]] = []
+    cursor = 0
+    for match in DELIMITER_RE.finditer(value):
+        bounds.append((cursor, match.start()))
+        cursor = match.end()
+    bounds.append((cursor, len(value)))
+
+    parts: list[tuple[int, int]] = []
+    for start, end in bounds:
+        piece = value[start:end]
+        trimmed = piece.strip()
+        if not trimmed:
+            continue
+        lead = len(piece) - len(piece.lstrip())
+        parts.append((start + lead, start + lead + len(trimmed)))
+    return tuple(parts)
+
+
+def match_case(source: str, generated: str) -> str:
+    """Carry the source's ALL-CAPS / all-lower styling onto a generated word.
+
+    Mixed case is left alone: a source that is neither uniformly upper nor uniformly
+    lower carries no styling decision worth copying, and guessing one (title case,
+    say) would rewrite ``McDonald`` and ``d'Arcy`` into something the source never
+    said.
+    """
+    if source.isupper():
+        return generated.upper()
+    if source.islower():
+        return generated.lower()
+    return generated

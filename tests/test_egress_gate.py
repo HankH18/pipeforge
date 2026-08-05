@@ -61,6 +61,7 @@ from secure_context_pipeline.pipeline.egress_gate import (
     MIN_IDENTIFIER_RUN_DIGITS,
     MIN_ORIGINAL_LEN,
     EgressGate,
+    _composite_needles,
     _deaccent,
     _identifier_needles,
     _occurs_as_a_unit,
@@ -1082,6 +1083,155 @@ def test_the_identifier_forms_are_derived_from_the_value_and_nothing_else() -> N
     assert sum(c.isdigit() for c in at_floor) >= MIN_IDENTIFIER_DIGITS, "premise"
     assert max(len(r) for r in re.findall(r"\d+", at_floor)) < MIN_IDENTIFIER_RUN_DIGITS
     assert _identifier_needles(at_floor) == (at_floor,)
+
+
+# ---------------------------------------------------------------------------
+# Composite originals: a vaulted span that is a LIST of values
+# ---------------------------------------------------------------------------
+
+
+async def test_a_slice_of_a_composite_vaulted_original_is_blocked(tmp_path: Path) -> None:
+    """The disclosure this pipeline could **manufacture**, blocked at the gate.
+
+    A vault original is whatever the detector called one span, and a span is not
+    always one value: spaCy returns ``03/11/2024, 09/17/2024`` as a single ``DATE``,
+    so that composite -- a string the document contains but nobody wrote as a unit --
+    became one original. Every comparison pass 1 makes then asks about the composite:
+
+    * the four bounded forms look for the whole joined string, which is not present;
+    * ``_identifier_needles`` contributes the whole joined string again as its
+      whole-value needle, and **no digit-run needle at all**, because its longest
+      contiguous run is ``2024`` -- four digits, below ``MIN_IDENTIFIER_RUN_DIGITS``.
+
+    Both premises are asserted below rather than described, because a green here that
+    came from one of the older limbs would be measuring nothing.
+
+    And the payload is not hypothetical: the session's date shift can take a *third*
+    date in the same document onto ``03/11/2024`` exactly, so the pipeline puts a
+    real patient date on the wire inside a string it invented, with pass 1 and the
+    leakage harness both reporting clean and both correct by their own definitions.
+    """
+    original = "03/11/2024, 09/17/2024"
+    payload = "System prompt.\n\nRe-scheduled from 03/11/2024 at the patient's request."
+
+    assert not _occurs_as_a_unit(original, payload), "premise: the composite is absent"
+    assert not any(needle in payload for needle in _identifier_needles(original)), (
+        "premise: the unbounded limb cannot see this either -- the longest digit run "
+        "in the composite is four, so it contributes no run needle"
+    )
+    assert "03/11/2024" in payload, "premise: half the vaulted span is there verbatim"
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({original}))
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] == "vault_original"
+    assert exc.value.detail["hit_count"] == 1
+    await audit.close()
+
+
+def test_the_composite_forms_are_derived_from_the_value_and_nothing_else() -> None:
+    """The rule directly, and mostly the half that must contribute **nothing**.
+
+    This gate is fail-closed, so a false positive is a denied request that looks
+    exactly like a leak. Every ``()`` row below is a denial that would otherwise be
+    reachable from an ordinary document, and each is a separate reason the rule is
+    shaped the way it is.
+    """
+    # In scope: two or more constituents, every one of them digit-bearing past the
+    # whole-value identifier floor.
+    assert _composite_needles("03/11/2024, 09/17/2024") == ("03/11/2024", "09/17/2024")
+    assert _composite_needles("03/11/2024, 09/17/2024, and 10/01/2024") == (
+        "03/11/2024",
+        "09/17/2024",
+        "10/01/2024",
+    )
+    assert _composite_needles("(415) 555-0123 & (415) 555-0124") == (
+        "(415) 555-0123",
+        "(415) 555-0124",
+    )
+    # Letters in a constituent are fine -- seven digits is what makes it specific,
+    # not the absence of a label.
+    assert _composite_needles("MRN 5567281; MRN 5567282") == ("MRN 5567281", "MRN 5567282")
+
+    # Out of scope, one reason at a time.
+    #
+    # A common word. `April 2024` must not make `April` a needle and `Park Avenue`
+    # must not make `Park` one: a word-bounded needle on an ordinary English word
+    # denies every payload that uses it.
+    assert _composite_needles("Park Avenue, Springfield") == ()
+    assert _composite_needles("Sanders and Reeves LLP") == ()
+    # Partial qualification: one constituent below the floor refuses the whole value.
+    # Without that, a single date carrying a comma contributes the bare year, and
+    # `2024` as a needle denies essentially every document in the corpus.
+    assert _composite_needles("Jan 5, 2024") == ()
+    assert _composite_needles("March 3, 2024") == ()
+    # An ordinary vaulted AMOUNT, whose thousands separators are not a list.
+    assert _composite_needles("$1,234,567.89") == ()
+    assert _composite_needles("$1,234.56") == ()
+    # A multi-WORD original. Whitespace is deliberately not a delimiter, which is
+    # what keeps this rule away from partial disclosure -- vaulted `John Smith`,
+    # payload carrying `Smith` -- a separate problem needing per-entity policy.
+    assert _composite_needles("John Smith") == ()
+    assert _composite_needles("Marguerite Vandenberg") == ()
+    # Values with no delimiter at all, whatever else they carry.
+    assert _composite_needles("47-1234567") == ()
+    assert _composite_needles("Case No. 3:24-cv-01188") == ()
+
+    # The floor is the constant, not a number retyped here: two constituents that
+    # are one digit short contribute nothing, and the same pair at the floor are
+    # both needles.
+    short = "9" * (MIN_IDENTIFIER_DIGITS - 1)
+    at_floor = "9" * MIN_IDENTIFIER_DIGITS
+    assert _composite_needles(f"{short}, {short}") == ()
+    assert _composite_needles(f"{at_floor}, {at_floor}") == (at_floor,)
+    assert _composite_needles(f"{short}, {at_floor}") == (), "all, or nothing"
+
+
+@pytest.mark.parametrize(
+    ("original", "payload", "why"),
+    [
+        pytest.param(
+            "Jan 5, 2024",
+            "System prompt.\n\nThe 2024 fiscal year closed without incident.",
+            "the bare year is not a needle -- if it were, every document blocks",
+            id="year-out-of-a-single-date",
+        ),
+        pytest.param(
+            "Park Avenue, Springfield",
+            "System prompt.\n\nThe Park entrance is on the north side.",
+            "a common-word constituent is not a needle",
+            id="common-word-constituent",
+        ),
+        pytest.param(
+            "$1,234,567.89",
+            "System prompt.\n\nLine 234 of the ledger was reconciled.",
+            "thousands separators are not a list",
+            id="amount-separators",
+        ),
+        pytest.param(
+            "Marguerite Vandenberg",
+            "System prompt.\n\nDr Vandenberg reviewed the chart this morning.",
+            "a component of a multi-word original is out of scope by design -- "
+            "whitespace is not a delimiter, so this rule cannot reach it",
+            id="partial-of-a-multi-word-original",
+        ),
+    ],
+)
+async def test_the_composite_limb_does_not_deny_ordinary_text(
+    tmp_path: Path, original: str, payload: str, why: str
+) -> None:
+    """The false-positive budget, measured through the real gate rather than argued.
+
+    A block is a denial, and a denial reachable from ordinary prose is an outage
+    with a security-shaped error code on it. Each row is a payload that a looser
+    version of :func:`_composite_needles` would have blocked -- one that split on
+    whitespace, or one that emitted needles for constituents below the digit floor --
+    and every one of them must still pass.
+    """
+    gate, audit = await _gate(tmp_path, vault=FakeVault({original}))
+    report = await gate.check(payload, SESSION)
+    assert report.originals_scanned == 1, why
+    await audit.close()
 
 
 @pytest.mark.parametrize(

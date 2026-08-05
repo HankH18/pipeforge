@@ -21,6 +21,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import pairwise
 from typing import ClassVar
 
 import pytest
@@ -476,6 +477,87 @@ async def test_date_shift_re_renders_in_the_source_format(env: Env) -> None:
         f"discharged {by_original['May 9, 2024']}, "
         f"follow-up {by_original['9 June 2024']}."
     )
+
+
+async def test_a_composite_date_span_keeps_its_intervals_instead_of_degrading(
+    env: Env, settings: Settings, registry: EntityRegistry
+) -> None:
+    """The utility half of the composite-span split: intervals instead of a token.
+
+    ``Prior ambulatory visits: {a}, {b}, and {c}.`` is ordinary clinical prose --
+    ``fixtures/generator.py`` writes it into every generated progress note -- and
+    spaCy returns the first two dates as a **single** ``DATE`` span (pinned in
+    ``tests/test_detection.py``). That composite does not parse, asserted below, so
+    Tier 2 had nothing to shift and degraded the whole span to a plain token by the
+    route ``test_unparseable_date_falls_back_to_a_plain_token`` pins. Two of the
+    three visit dates therefore lost every temporal relation they carried -- the one
+    property Tier 2 exists to preserve -- while the third, detected separately, kept
+    its shift, so one line of the document went to the provider carrying two
+    incomparable time systems.
+
+    Split, all three are Tier-2 surrogates under one session shift and every interval
+    between them survives.
+
+    The composite ``Detection`` is built by hand, as everything in this file is, and
+    put through the detector's real splitter. That keeps the test off spaCy while
+    still exercising the production rule; whether spaCy really produces this span is
+    a *detection* claim and is asserted where detection is tested.
+    """
+    text = "    Prior ambulatory visits: 03/11/2024, 09/17/2024, and 10/01/2024.\n"
+    composite = "03/11/2024, 09/17/2024"
+    sources = ["03/11/2024", "09/17/2024", "10/01/2024"]
+
+    assert parse_source_date(composite) is None, (
+        "premise: the composite is unparseable, so an unsplit span degrades to a "
+        "plain token and this test is measuring the split rather than luck"
+    )
+
+    detector = detector_module.Detector(registry, settings)
+    dates = [
+        *detector._split_composite_dates(text, span(text, composite, "DATE")),
+        span(text, "10/01/2024", "DATE"),
+    ]
+    for detection in dates:
+        assert text[detection.start : detection.end] == detection.text
+
+    result = await env.engine.obfuscate(
+        env.session_id, text, dates, strategy="pseudonymization", doc_category="medical"
+    )
+
+    # The utility claim, asserted before anything else so that it is what goes red:
+    # an unsplit composite is unparseable, so Tier 2 has nothing to shift and emits a
+    # plain token, and every interval the span carried is gone.
+    assert not [r for r in result.tokens if STRICT_TOKEN_RE.fullmatch(r.surrogate)], (
+        "a date span degraded to a plain token -- the interval property Tier 2 exists "
+        "for is lost for every date inside it"
+    )
+
+    by_original = {
+        await env.vault.get_by_surrogate(env.session_id, record.surrogate): record.surrogate
+        for record in result.tokens
+    }
+    assert set(by_original) == set(sources)
+
+    for original, surrogate in by_original.items():
+        assert re.fullmatch(r"\d{2}/\d{2}/\d{4}", surrogate), (original, surrogate)
+
+    strategy = build_strategy("pseudonymization", env.context())
+    assert isinstance(strategy, PseudonymizationStrategy)
+    shift = timedelta(days=strategy.shift_days)
+    for original in sources:
+        expected = datetime.strptime(original, "%m/%d/%Y").date() + shift
+        assert by_original[original] == expected.strftime("%m/%d/%Y"), original
+
+    # The property, stated as intervals rather than as three equalities: every gap
+    # between two visit dates is the same gap after obfuscation.
+    def gap(a: str, b: str) -> timedelta:
+        return datetime.strptime(b, "%m/%d/%Y") - datetime.strptime(a, "%m/%d/%Y")
+
+    for first, second in pairwise(sources):
+        assert gap(by_original[first], by_original[second]) == gap(first, second)
+
+    for original in sources:
+        assert original not in result.obfuscated_text
 
 
 async def test_unparseable_date_falls_back_to_a_plain_token(env: Env) -> None:

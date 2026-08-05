@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 # Presidio's PatternRecognizer does ``import regex as re`` and evaluates every
 # ``patterns:`` entry with it. Validating with the standard library's ``re`` would be
@@ -24,6 +24,10 @@ from secure_context_pipeline.surrogates import validate_entity_type
 
 __all__ = [
     "GAZETTEER_DIR",
+    "TIER_CONTENT",
+    "TIER_IDENTIFIER",
+    "TIER_NUMERIC",
+    "TIER_TEMPORAL",
     "EntityRegistry",
     "EntitySpec",
     "RegistryAction",
@@ -31,6 +35,28 @@ __all__ = [
 ]
 
 GAZETTEER_DIR = Path(__file__).resolve().parent / "data"
+
+#: The legal values of an entity's ``tier:`` (build doc section 9.3), and what each
+#: one *means* rather than only what the pseudonymizer does with it.
+#:
+#: These lived in ``obfuscation/strategies/pseudonymization.py``, which was the right
+#: home while that module was the only reader. It no longer is: the detector needs to
+#: know whether a span is supposed to denote a **date**, because spaCy hands it lists
+#: of dates as single spans and it has to split them (see
+#: ``Detector._split_composite_dates``). ``obfuscation.engine`` imports
+#: ``detection.detector``, so detection cannot read a constant defined over there, and
+#: the alternative -- keying the detector's rule off a Presidio built-in name --
+#: hardcodes a registry name into ``detection/``, which
+#: ``test_no_entity_name_is_hardcoded_in_detection_code`` correctly refuses.
+#:
+#: So they live with the field they are the domain of. This module is already "the
+#: only place that knows what an entity type means", the ``tier:`` validator below is
+#: written in terms of them, and both readers now depend downward on one definition
+#: instead of one of them re-deriving the number.
+TIER_IDENTIFIER: Final = 1
+TIER_TEMPORAL: Final = 2
+TIER_CONTENT: Final = 3
+TIER_NUMERIC: Final = 4
 
 
 class RegistryAction(StrEnum):
@@ -56,7 +82,7 @@ class EntitySpec(BaseModel):
     only_in_doc_categories: tuple[str, ...] = ()
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     strategy: str | None = None
-    tier: int = Field(default=1, ge=1, le=4)
+    tier: int = Field(default=TIER_IDENTIFIER, ge=TIER_IDENTIFIER, le=TIER_NUMERIC)
     hint: bool = False
     action: RegistryAction | None = None
 

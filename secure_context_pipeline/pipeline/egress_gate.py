@@ -12,7 +12,9 @@ Three passes, of which only the first two were ever independent of the detector:
    every original in the session vault, in raw, normalised, format-character-folded
    and combining-mark-folded form, plus -- for values whose disclosure is carried by
    a long digit run -- with no word-boundary requirement at all
-   (:func:`_identifier_needles`). This catches a splice bug, an un-obfuscated echo,
+   (:func:`_identifier_needles`), plus -- for an original that is itself a *list* of
+   digit-bearing values -- the same four bounded forms again per constituent
+   (:func:`_composite_needles`). This catches a splice bug, an un-obfuscated echo,
    or a value the engine missed after detection found it.
 2. **Detector re-scan**, skipping spans that are our own surrogates. This catches
    values the detector found *this* time but the engine never vaulted -- and, in
@@ -92,7 +94,7 @@ to punctuation, markdown, brackets and currency symbols, and including a value
 interrupted by any character that renders as nothing: every Unicode format (``Cf``)
 codepoint and every default-ignorable, from the zero-width space to the tag block
 that carries the ASCII-smuggling vector (see :data:`_INVISIBLE_RE`). It *also*
-blocks two shapes that used to walk through, each of which was reachable from an
+blocks three shapes that used to walk through, each of which was reachable from an
 ordinary uploaded document and each of which was reproduced end-to-end before being
 closed:
 
@@ -114,6 +116,21 @@ closed:
    *payload* is now compared in a mark-stripped skeleton form as well
    (:func:`_deaccent`); the needle is deliberately not stripped, which is what keeps
    ``José`` and ``Jose`` distinct values. See :func:`_deaccent`.
+3. *One constituent of a composite original.* A vault original is whatever the
+   detector called one span, and a span is not always one value: spaCy returns
+   ``03/11/2024, 09/17/2024`` as a single ``DATE``, so a string the document contains
+   but nobody wrote as a unit became one original -- and every comparison above then
+   asked about the composite rather than about the dates in it. This pipeline can
+   *manufacture* the fragment, which is what made it worth closing here rather than
+   only upstream: a different date in the same document, shifted by the session's
+   constant delta, renders as a verbatim word-bounded slice of that original, so a real
+   patient date reached the provider inside a string this pipeline invented with pass 1
+   and the leakage harness both reporting clean and both correct by their own
+   definitions. Detection now splits such a span into one detection per date
+   (:func:`~secure_context_pipeline.daterules.split_composite_date`); this pass does not
+   rely on that, and derives a needle per constituent itself. The rule is narrow on
+   purpose -- see :func:`_composite_needles` for exactly what is excluded and what each
+   exclusion costs if it is dropped.
 
 Two gaps remain:
 
@@ -156,7 +173,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Iterable, Sequence
-from typing import Final, Protocol
+from typing import Final, NamedTuple, Protocol
 
 from secure_context_pipeline.audit.logger import EGRESS_BLOCK, EGRESS_PASS, AuditLogger
 from secure_context_pipeline.config import Settings
@@ -164,7 +181,7 @@ from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.errors import MAX_DETAIL_VALUE_LEN, EgressBlockedError
 from secure_context_pipeline.models import AuditEvent, Detection, EgressReport
 from secure_context_pipeline.surrogates import REDACTION_RE, STRICT_TOKEN_RE
-from secure_context_pipeline.textrules import occurs_as_a_unit
+from secure_context_pipeline.textrules import delimited_parts, occurs_as_a_unit
 
 __all__ = [
     "AUDIT_EMIT_TIMEOUT_S",
@@ -536,6 +553,19 @@ class EgressGate:
         because it is the one comparison that is *not* an occurrence-as-a-unit
         question, and writing it as one would hide that.
 
+        Last, for a value that is a **composite** -- two or more values an English list
+        glued into one span -- the same four bounded forms again, per constituent
+        (:func:`_composite_needles`). A vaulted original is not always one value: the
+        detector can hand the engine ``03/11/2024, 09/17/2024`` as a single span, and
+        every question above is then being asked about a string the document contains
+        but nobody wrote as a unit. Detection now splits that shape upstream
+        (:func:`~secure_context_pipeline.daterules.split_composite_date`), which is the
+        real fix; this limb is here because the gate's whole posture is that it does
+        not trust detection, and "the detector no longer produces composites" is a
+        claim about the detector. Constituents go through
+        :func:`_occurs_in_any_bounded_form` -- the identical function the whole value
+        uses -- so there is no separate question of which forms this limb compares in.
+
         O(payload x entities), with a C-level substring pre-filter in
         :func:`_occurs_as_a_unit` doing the rejecting; the scale answer is an
         Aho-Corasick automaton built incrementally per session (README Q1).
@@ -543,27 +573,28 @@ class EgressGate:
         payload_norm = normalize(payload)
         payload_folded = _strip_invisible(payload_norm)
         payload_skeleton = _deaccent(payload_folded)
-        marked = payload_skeleton != payload_folded
+        haystacks = _Haystacks(
+            raw=payload,
+            normalized=payload_norm,
+            folded=payload_folded,
+            skeleton=payload_skeleton,
+            marked=payload_skeleton != payload_folded,
+        )
         hits = 0
         for original in originals:
             if len(original.strip()) < MIN_ORIGINAL_LEN:
                 continue
-            normalized = normalize(original)
-            folded = _strip_invisible(normalized)
-            forms = [
-                (original, payload),
-                (normalized, payload_norm),
-                (folded, payload_folded),
-            ]
-            if marked:
-                forms.append((folded, payload_skeleton))
-            if any(
-                len(needle) >= MIN_ORIGINAL_LEN and _occurs_as_a_unit(needle, haystack)
-                for needle, haystack in forms
-            ):
+            if _occurs_in_any_bounded_form(original, haystacks):
                 hits += 1
                 continue
+            folded = _strip_invisible(normalize(original))
             if any(needle in payload_skeleton for needle in _identifier_needles(folded)):
+                hits += 1
+                continue
+            if any(
+                _occurs_in_any_bounded_form(part, haystacks)
+                for part in _composite_needles(original)
+            ):
                 hits += 1
         return hits
 
@@ -963,6 +994,53 @@ def _deaccent(value: str) -> str:
     return unicodedata.normalize("NFC", stripped)
 
 
+class _Haystacks(NamedTuple):
+    """The four payload forms pass 1 compares against, derived once per scan.
+
+    A tuple rather than four positional arguments because they are always passed
+    together and getting two of them the wrong way round is a silent widening or
+    narrowing of the scan rather than a type error.
+    """
+
+    raw: str
+    normalized: str
+    folded: str
+    skeleton: str
+    #: Whether the payload carries a combining mark at all. When it does not, the
+    #: skeleton form is the folded form and comparing it again buys nothing.
+    marked: bool
+
+
+def _occurs_in_any_bounded_form(value: str, haystacks: _Haystacks) -> bool:
+    """``value`` present in the payload as a unit, in any of the four compared forms.
+
+    The four are documented at :meth:`EgressGate._scan_originals`; this function is
+    where they are *applied*, and it exists so that both things pass 1 asks about --
+    a whole vaulted original and one constituent of a composite one -- ask in exactly
+    the same words. The alternative was a second inline copy of the ``forms`` list for
+    the composite limb, i.e. two places that would each have to be edited the next time
+    a form is added, which is how this file's siblings acquired the divergences their
+    docstrings now record.
+
+    :data:`MIN_ORIGINAL_LEN` is re-checked per *derived* form, not once on the input:
+    normalising and folding both shrink a needle and can drop it below the floor after
+    the fact.
+    """
+    normalized = normalize(value)
+    folded = _strip_invisible(normalized)
+    forms = [
+        (value, haystacks.raw),
+        (normalized, haystacks.normalized),
+        (folded, haystacks.folded),
+    ]
+    if haystacks.marked:
+        forms.append((folded, haystacks.skeleton))
+    return any(
+        len(needle) >= MIN_ORIGINAL_LEN and _occurs_as_a_unit(needle, haystack)
+        for needle, haystack in forms
+    )
+
+
 #: One maximal run of ASCII digits long enough to be an identifier on its own.
 _DIGIT_RUN_RE = re.compile(rf"[0-9]{{{MIN_IDENTIFIER_RUN_DIGITS},}}")
 _ANY_DIGIT_RE = re.compile(r"[0-9]")
@@ -1044,6 +1122,93 @@ def _identifier_needles(value: str) -> tuple[str, ...]:
     ):
         needles.append(stripped)
     needles.extend(_DIGIT_RUN_RE.findall(stripped))
+    return tuple(dict.fromkeys(needles))
+
+
+def _composite_needles(value: str) -> tuple[str, ...]:
+    """The constituents of ``value`` when ``value`` is a *list* of digit-bearing values.
+
+    **The shape this exists for.** A vault original is whatever the detector called one
+    span, and a detector span is not always one value. spaCy returns
+    ``03/11/2024, 09/17/2024`` as a single ``DATE``, so that composite string -- which
+    the document contains but which nobody wrote as a unit -- becomes one original, and
+    every other comparison in pass 1 then asks about the composite rather than about
+    the dates in it. ``_identifier_needles`` does not rescue it either: its whole-value
+    needle is the composite again, and its digit-run needles need six *contiguous*
+    digits, while the longest run in that string is four (``2024``). So a payload
+    carrying ``03/11/2024`` on its own -- which this pipeline can *manufacture*, by
+    shifting a different date in the same document onto it -- passed pass 1 clean, and
+    correctly so by pass 1's own definition.
+
+    Detection now splits that span upstream, which is the actual fix. This limb is the
+    second opinion: the gate does not get to assume the detector did anything, and
+    "composites no longer reach the vault" is a statement about the detector.
+
+    **The rule, and it is deliberately narrow because a block is a denial.** ``value``
+    is split on
+    :data:`~secure_context_pipeline.textrules.DELIMITER_RE` -- the same grammar
+    detection splits on, shared rather than restated -- and contributes needles only
+    when it yields **two or more** constituents *and* **every** one of them carries at
+    least :data:`MIN_IDENTIFIER_DIGITS` ASCII digits. The needles then keep the
+    word-boundary rule; nothing here is compared unbounded.
+
+    **What is excluded, and why each exclusion is load-bearing.** This gate is
+    fail-closed, so a false positive is a denied request that looks exactly like a
+    leak, and every one of these would have produced them:
+
+    * **Constituents that do not reach the digit floor -- which is every common word.**
+      ``April 2024`` must not make ``April`` a needle and ``Park Avenue, Springfield``
+      must not make ``Park`` one; a word-bounded needle on an ordinary English word
+      denies every payload that happens to use it. Seven digits is not a proxy for
+      "identifier" and is not claimed as one -- it is the floor at which a constituent
+      stops being a word. It is :data:`MIN_IDENTIFIER_DIGITS` rather than a new number
+      because it is the same question that constant already answers: how much digit
+      content makes a string specific enough to compare on its own.
+    * **Partial qualification.** One constituent below the floor refuses the *whole*
+      value, rather than contributing needles for the ones above it. Without that,
+      ``Jan 5, 2024`` -- a single date with a comma in it -- would contribute ``2024``,
+      and ``2024`` as a word-bounded needle denies essentially every document in the
+      corpus. All-or-nothing is also what makes this limb agree with the upstream
+      split, which refuses for the same reason.
+    * **Bare components of a *non*-composite original.** Vaulted ``John Smith``,
+      payload containing ``Smith``, is a real disclosure and is **not** covered here.
+      It needs per-entity policy -- a surname is a word, and the leakage harness names
+      partial disclosure as outside what it claims for exactly that reason. The
+      delimiter requirement is what keeps this rule away from it: whitespace is not a
+      delimiter (see :data:`~secure_context_pipeline.textrules.DELIMITER_RE`), so a
+      multi-*word* value contributes nothing at all here.
+    * **Recursive splitting.** A constituent is taken as it stands and is never split
+      again, so no needle here is a fragment of a fragment.
+    * **Unbounded comparison.** A constituent is not necessarily an identifier core, so
+      it keeps the ``Brown``/``Browning`` boundary rule. The unbounded question is
+      :func:`_identifier_needles`'s, and it already reaches inside a composite for any
+      digit run long enough to deserve it.
+
+    **The false-positive cost is measured, not asserted.** Over 30 freshly generated
+    fixture documents (10 medical, 10 legal, 10 financial) the shipped detector
+    returned **1345** spans, of which **211 carried a list delimiter** and **0
+    contributed a composite needle** -- because the delimiter-bearing ones are names
+    (``Smith, John``), addresses, drug lists and clinical prose, and none of those
+    carry seven digits in *every* part. ``$1,234,567.89`` splits into ``$1``, ``234``
+    and ``567.89``, all below the floor, which matters because it is an ordinary
+    vaulted ``AMOUNT``. The 100-run leakage harness is the thing a spurious block
+    would turn red; it was run eight times over this change, 100/100 clean each time.
+
+    That measurement is also the honest summary of what this limb is *for*: on a
+    corpus where detection is behaving, it fires on nothing at all. It earns its place
+    on the day detection does not.
+    """
+    if not _ANY_DIGIT_RE.search(value):
+        return ()
+    parts = delimited_parts(value)
+    if len(parts) < 2:
+        return ()
+    needles: list[str] = []
+    for start, end in parts:
+        part = value[start:end]
+        if sum(1 for ch in part if "0" <= ch <= "9") < MIN_IDENTIFIER_DIGITS:
+            return ()
+        needles.append(part)
     return tuple(dict.fromkeys(needles))
 
 

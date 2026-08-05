@@ -31,8 +31,13 @@ from presidio_analyzer import AnalyzerEngine, EntityRecognizer
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 
 from secure_context_pipeline.config import Settings
+from secure_context_pipeline.daterules import split_composite_date
 from secure_context_pipeline.detection.recognizers import build_recognizers
-from secure_context_pipeline.detection.registry import EntityRegistry, EntitySpec
+from secure_context_pipeline.detection.registry import (
+    TIER_TEMPORAL,
+    EntityRegistry,
+    EntitySpec,
+)
 from secure_context_pipeline.errors import DetectionError, PipelineError
 from secure_context_pipeline.models import Detection
 
@@ -557,7 +562,7 @@ class Detector:
             for result in results:
                 detection = self._to_detection(result, text, offset, doc_category)
                 if detection is not None:
-                    candidates.append(detection)
+                    candidates.extend(self._split_composite_dates(text, detection))
 
         kept = resolve_overlaps(text, candidates, self._policy_types, self._custom_names)
         _verify_offsets(text, kept)
@@ -693,6 +698,88 @@ class Detector:
             text=text[start:end],
             score=score,
         )
+
+    def _split_composite_dates(self, text: str, detection: Detection) -> list[Detection]:
+        """``[detection]``, or one detection per date when the span is a *list* of them.
+
+        spaCy returns ``03/11/2024, 09/17/2024`` as a **single** ``DATE`` span. Two
+        things follow from that, and neither is visible from inside this module:
+
+        1. *Security.* The engine vaults ``detection.text``, so the whole composite
+           string -- a string that appears in the document but is not one value --
+           becomes one vault original. Both leak scanners in this project ask whether a
+           **whole** vaulted original occurs in the outbound payload. Neither asks
+           about a fragment, and the pipeline can manufacture one: a different date in
+           the same document, shifted by the session's constant delta, can render as a
+           verbatim, word-bounded *slice* of that composite. A real patient date then
+           travels to the provider inside a string this pipeline invented, with both
+           scanners reporting clean and both of them correct by their own definitions.
+        2. *Utility.* ``03/11/2024, 09/17/2024`` does not parse as a date, so Tier 2
+           degrades the whole span to a plain token and every interval it carried is
+           lost -- from a line of ordinary clinical prose ("Prior ambulatory visits:
+           ..."), not from anything adversarial. Split, each date gets the session
+           shift, and the intervals inside the list survive exactly as the intervals
+           between any other pair of dates in the document do.
+
+        The rule for *when* to split is
+        :func:`~secure_context_pipeline.daterules.split_composite_date` and is
+        deliberately all-or-nothing; see it. What this method owns is scope and
+        offsets.
+
+        **Scope** is the registry's temporal tier
+        (:data:`~secure_context_pipeline.detection.registry.TIER_TEMPORAL`) and nothing
+        else. A span that already parses is untouched -- the splitter refuses it -- and
+        so is every non-date entity type: a comma inside a name or an address is part
+        of the value, not a list separator, and there is no second reading of it worth
+        guessing at. The predicate is the ``tier:`` field rather than an entity name or
+        a Presidio built-in, so a temporal entity added by config tomorrow is covered
+        with no code change and ``detection/`` still branches on no registry name at
+        all -- which
+        ``tests/test_detection.py::test_no_entity_name_is_hardcoded_in_detection_code``
+        enforces, and which is why the tier constants now live in ``registry.py``.
+
+        Requiring the tier *and* the all-must-parse rule is belt and braces on purpose.
+        Either alone would probably do: no non-temporal span in the shipped corpus is a
+        list of parseable dates, and no temporal span that is not such a list splits.
+        But "probably" is doing the work in both sentences, and the cost of being wrong
+        is a detection whose text is not the value the engine thinks it vaulted.
+
+        **Offsets are verified rather than computed and trusted.** ``start`` and
+        ``end`` come out of arithmetic on two independent numbers -- the detection's
+        own absolute start and an offset relative to its text -- and the engine
+        *splices* by whatever this returns while *vaulting* ``detection.text``, so the
+        two disagreeing is a value silently swapped for another one. Every emitted
+        detection's text is therefore taken by slicing the document, and the slice is
+        compared against the substring the splitter actually identified. A mismatch
+        raises :class:`DetectionInvariantError` rather than emitting the detection, and
+        raises rather than asserts so ``python -O`` cannot remove the check.
+        """
+        spec = self._registry.get(detection.entity_type)
+        if spec is None or spec.tier != TIER_TEMPORAL:
+            return [detection]
+
+        parts = split_composite_date(detection.text)
+        if not parts:
+            return [detection]
+
+        constituents: list[Detection] = []
+        for relative_start, relative_end in parts:
+            start = detection.start + relative_start
+            end = detection.start + relative_end
+            expected = detection.text[relative_start:relative_end]
+            if text[start:end] != expected:
+                raise DetectionInvariantError(
+                    reason="composite_split_offset_drift",
+                    entity_type=detection.entity_type[:64],
+                    start=start,
+                    end=end,
+                    text_chars=len(text),
+                    detection_chars=len(expected),
+                )
+            constituents.append(
+                detection.model_copy(update={"start": start, "end": end, "text": text[start:end]})
+            )
+        return constituents
 
     def _floor_for(self, entity_type: str) -> float:
         """Lowest score worth returning for ``entity_type``.
