@@ -33,10 +33,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Self
 
 import aiosqlite
@@ -123,6 +123,10 @@ class _SessionCache:
     originals: set[str] = field(default_factory=set)
     #: Memoised immutable view handed to the EgressGate; invalidated on write.
     _view: frozenset[str] | None = field(default=None, init=False, repr=False)
+    #: Memoised immutable view of ``by_surrogate``; invalidated on write. Separate
+    #: from ``_view`` because the two answer different questions and are read by
+    #: different stages -- see :meth:`SessionVault.surrogates_for_session`.
+    _issued: Mapping[str, str] | None = field(default=None, init=False, repr=False)
 
     def add(self, index: tuple[str, str], record: TokenRecord, original: str) -> None:
         self.by_token[record.token_id] = original
@@ -130,6 +134,7 @@ class _SessionCache:
         self.by_original[index] = record
         self.originals.add(original)
         self._view = None
+        self._issued = None
 
     def note(self, token_id: str, surrogate: str, original: str) -> None:
         """Read-through population from a decrypted row.
@@ -147,6 +152,7 @@ class _SessionCache:
         self.by_surrogate[surrogate] = original
         self.originals.add(original)
         self._view = None
+        self._issued = None
 
     def taken(self, token_id: str, original: str) -> bool:
         """Whether ``token_id`` is already spoken for by a *different* original.
@@ -166,6 +172,19 @@ class _SessionCache:
         if cached is None:
             cached = frozenset(self.originals)
             self._view = cached
+        return cached
+
+    def issued(self) -> Mapping[str, str]:
+        """Immutable snapshot of ``surrogate -> original``.
+
+        A snapshot rather than a proxy over the live dict: the collision guard
+        walks every entry, and a mapping that can grow mid-walk is a
+        ``RuntimeError`` waiting for the first caller that awaits inside the loop.
+        """
+        cached = self._issued
+        if cached is None:
+            cached = MappingProxyType(dict(self.by_surrogate))
+            self._issued = cached
         return cached
 
     def __repr__(self) -> str:
@@ -465,6 +484,41 @@ class SessionVault:
         if cache is None:
             return frozenset()
         return cache.view()
+
+    def surrogates_for_session(self, session_id: str) -> Mapping[str, str]:
+        """``surrogate -> original`` for this session. **Synchronous, amortised O(1).**
+
+        The mirror of :meth:`originals_for_session`, memoised and invalidated the
+        same way, and it exists for one caller: the pseudonymization collision
+        guard, which cannot decide whether a candidate fake is safe from the
+        surrogate alone.
+
+        The question it answers is *"would this fake make an already-issued
+        surrogate un-restorable?"*, and that needs both halves of the pair. Two
+        surrogates where one occurs as a unit inside the other are restored
+        longest-first, so the short one never matches inside the long one; whether
+        that is correct or a lost value depends entirely on whether the *originals*
+        nest the same way. Written in this method's own direction, surrogate first:
+        ``{'Nathaniel Brightwater': 'Chelsea Hammond', 'Brightwater': 'Hammond'}``
+        is name-component linking working exactly as designed -- restoring the long
+        fake yields ``Chelsea Hammond``, which still carries the short one's
+        original as a unit. ``{'Daniel White': 'Thomas Duncan', 'White':
+        'Sherryside'}`` is two unrelated entities whose fakes collided, and there
+        the short original is simply gone from the answer. Only the pairing
+        distinguishes them, which is why this returns a mapping rather than the key
+        set.
+
+        Cache-only and never decrypts, for the same reason
+        :meth:`originals_for_session` is: it is read once per Tier-1 candidate on
+        the obfuscation hot path. An unknown or destroyed session returns empty,
+        which fails *permissive* rather than safe -- with no issued surrogates
+        there is nothing to collide with, and the caller's other guards are
+        unaffected.
+        """
+        cache = self._caches.get(session_id)
+        if cache is None:
+            return MappingProxyType({})
+        return cache.issued()
 
     # -- destruction -------------------------------------------------------
 

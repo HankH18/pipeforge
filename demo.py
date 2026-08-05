@@ -94,6 +94,7 @@ from secure_context_pipeline.surrogates import (
     extract_token_ids,
     format_surrogate,
 )
+from secure_context_pipeline.textrules import occurs_as_a_unit
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import (
     DEFAULT_DB_FILENAME as VAULT_DB_FILENAME,
@@ -473,39 +474,88 @@ class ScanResult:
     hits: int
     scanned: int
     skipped_short: int
+    #: Of ``hits``, how many occur only *inside a longer word*. Split out because
+    #: the two are different findings -- see :func:`scan_for_originals`.
+    substring_only: int = 0
+
+    @property
+    def leaks(self) -> int:
+        """Hits that occur as a unit -- the ones that are actually leaks."""
+        return self.hits - self.substring_only
 
     @property
     def detail(self) -> str:
-        return (
-            f"{self.scanned} vault originals scanned, {self.hits} found, "
+        base = (
+            f"{self.scanned} vault originals scanned, {self.leaks} found, "
             f"{self.skipped_short} skipped (<{MIN_ORIGINAL_LEN} chars)"
         )
+        if self.substring_only:
+            base += (
+                f"; {self.substring_only} more present only inside a longer word "
+                "(reported separately, not counted as a leak)"
+            )
+        return base
 
 
 def scan_for_originals(haystack: str, originals: frozenset[str]) -> ScanResult:
     """Count vault originals present in ``haystack``, raw and normalised.
 
-    Mirrors :meth:`EgressGate._scan_originals` on purpose: the gate is the
-    control, and this is an independent re-check of the control's output. Values
-    shorter than :data:`MIN_ORIGINAL_LEN` are skipped for the reason documented
-    there -- a two-character value matches inside almost any text and carries no
-    re-identification signal on its own. The count of skipped values is reported
-    so the exclusion is visible rather than hidden.
+    **Deliberately independent of the gate, and deliberately stricter**: plain
+    containment, no boundary rule. That is the point -- if this imported
+    :func:`~secure_context_pipeline.textrules.occurs_as_a_unit` it could only ever
+    agree with the control it exists to re-check, which is the failure mode that
+    let a leak sit behind a green ``100/100`` for three audit loops.
+
+    Being stricter means it sees things the gate deliberately ignores, so a raw hit
+    is classified rather than reported flat:
+
+    * **occurs as a unit** -- a real leak. Fatal.
+    * **present only inside a longer word** -- the ``Brown``/``Browning`` case: a
+      *generated fake* surname happens to contain a real vaulted one. The value is
+      not readable as itself and the gate is right not to block it, but it is worth
+      seeing, so it is reported separately and does not fail the run.
+
+    That distinction is not cosmetic. Pseudonyms are drawn from a random per-session
+    key, so the second case appears on roughly one run in a few hundred; counting it
+    as a leak made this demo fail intermittently for a reason that was not a leak --
+    the worst possible behaviour for the one artefact a reviewer runs live. (An
+    earlier version of this docstring claimed to mirror
+    ``EgressGate._scan_originals``. It never did: the gate applies a word-boundary
+    rule, plus identifier needles and folded forms. Saying so was itself an instance
+    of the recurring defect this project documents.)
+
+    Values shorter than :data:`MIN_ORIGINAL_LEN` are skipped -- a two-character value
+    matches inside almost any text and carries no re-identification signal on its own
+    -- and the skipped count is printed so the exclusion is visible rather than hidden.
     """
     normalised_haystack = normalize(haystack)
     hits = 0
+    substring_only = 0
     skipped = 0
     for original in originals:
         if len(original.strip()) < MIN_ORIGINAL_LEN:
             skipped += 1
             continue
-        if original in haystack:
-            hits += 1
-            continue
         normalised = normalize(original)
-        if len(normalised) >= MIN_ORIGINAL_LEN and normalised in normalised_haystack:
-            hits += 1
-    return ScanResult(hits=hits, scanned=len(originals) - skipped, skipped_short=skipped)
+        raw_hit = original in haystack
+        normalised_hit = len(normalised) >= MIN_ORIGINAL_LEN and normalised in normalised_haystack
+        if not (raw_hit or normalised_hit):
+            continue
+        hits += 1
+        # Classified with the shared rule, which is exactly the question "is this
+        # value readable as itself here?" -- not used to *find* the hit, only to
+        # grade one this module found on its own.
+        as_a_unit = occurs_as_a_unit(original, haystack) or occurs_as_a_unit(
+            normalised, normalised_haystack
+        )
+        if not as_a_unit:
+            substring_only += 1
+    return ScanResult(
+        hits=hits,
+        scanned=len(originals) - skipped,
+        skipped_short=skipped,
+        substring_only=substring_only,
+    )
 
 
 def residual_tokens(text: str) -> list[str]:
@@ -791,13 +841,13 @@ async def run_case(
     payload_scan = scan_for_originals(result.obfuscated_payload, originals)
     checks.record(
         f"[{strategy}] ZERO originals in the outbound payload",
-        payload_scan.hits == 0,
+        payload_scan.leaks == 0,
         payload_scan.detail,
     )
     response_scan = scan_for_originals(result.raw_llm_response, originals)
     checks.record(
         f"[{strategy}] ZERO originals in the raw provider response",
-        response_scan.hits == 0,
+        response_scan.leaks == 0,
         response_scan.detail,
     )
     residual = residual_tokens(result.restored_text)

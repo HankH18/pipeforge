@@ -93,18 +93,40 @@ construction**. Every generator reports that itself, in :class:`_Candidate`:
   the source" would put the real surname on the wire inside our own surrogate.
   Measured at ~1.9% of person spans before the split existed.
 
+Whole-string equality is not enough on the **surrogate** side either, and that
+half is about restoration rather than leakage. Two surrogates where one occurs as
+a unit inside the other are restored longest-first, so the short one never
+matches inside the long one. When the originals nest the same way that is
+name-component linking working as designed (``Hammond`` beside ``Chelsea
+Hammond``); when two *unrelated* entities happen to draw the same fake surname it
+is a value that never reaches the user, with ``restored_count`` up,
+``surrogate_misses`` at 0 and nothing anywhere saying so. Faker's surname pool is
+about a thousand deep, so a dozen name components in one document makes that a
+percent-scale event rather than a curiosity -- measured at 3 failures in 200
+pseudonymization runs of the leakage harness. The guard is
+:meth:`PseudonymizationStrategy._nests_with_an_issued_surrogate`, and it is the
+surrogate/original *pairing* rather than the surrogate set that tells the two
+cases apart.
+
 **Tier 2 never regenerates on collision; it degrades.** The date shift is a
 bijection, so varying it per date to dodge a collision would break the interval
 property that is the entire reason the tier exists. It still has to be guarded,
 because a shifted date is a *rendered string* and can carry a real original --
-either by equalling one or by containing one, as ``29 April 2024`` contains the
-separately vaulted ``April 2024``. It must also not *duplicate* a surrogate the
+by equalling one, by containing one (``29 April 2024`` contains the separately
+vaulted ``April 2024``), or by *being contained in* one, which is the direction
+the guard missed: a detector span covering two dates at once vaults
+``03/11/2024, 09/17/2024`` as a single original, and a neighbouring date shifted
+onto ``03/11/2024`` is then a verbatim slice of it. All three put a real value on
+the wire inside a string we invented, and the third is the one nothing else can
+catch: the first two leave a *whole* vaulted original in the payload, which the
+egress gate blocks, whereas a slice is what both the gate and the leakage harness
+document themselves as blind to. It must also not *duplicate* a surrogate the
 session already issued: Tier 2 is many-to-one by construction, so ``2024-01-05``
 and ``Friday, January 5, 2024`` shift to the same day and render to the same
 string, and two originals sharing one surrogate is the one collision restoration
-cannot undo. The single colliding date therefore degrades to
-a plain token and loses only its own temporal relation; every other date in the
-document keeps the shared shift. See :meth:`PseudonymizationStrategy._shift_date`.
+cannot undo. The single colliding date therefore degrades to a plain token and
+loses only its own temporal relation; every other date in the document keeps the
+shared shift. See :meth:`PseudonymizationStrategy._shift_date`.
 
 Nothing in this module logs, raises, or reprs an original value.
 """
@@ -597,6 +619,10 @@ class PseudonymizationStrategy(ObfuscationStrategy):
                 continue
             if await self._surrogate_taken(vault, session_id, candidate.text):
                 continue
+            if self._nests_with_an_issued_surrogate(
+                candidate.text, detection.text, vault, session_id
+            ):
+                continue
             if attempt:
                 logger.info(
                     "pseudonym regenerated after collision",
@@ -828,6 +854,89 @@ class PseudonymizationStrategy(ObfuscationStrategy):
             return False
         return True
 
+    def _nests_with_an_issued_surrogate(
+        self, candidate: str, original: str, vault: SessionVault, session_id: str
+    ) -> bool:
+        """Whether ``candidate`` would make an issued surrogate un-restorable, or vice versa.
+
+        **Whole-string equality is not enough here either, and for a second reason.**
+        :meth:`_surrogate_taken` asks whether this exact string is already spoken
+        for; that catches two originals sharing one surrogate. It cannot see the
+        case where one surrogate merely *contains* another as a unit, and that case
+        is equally unrestorable: the restorer compiles one longest-first alternation
+        (``deobfuscation.restorer._compile_surrogate_pattern``), so the long fake
+        always wins at a shared offset and the short one never matches inside it.
+
+        Whether that is a bug or the design depends entirely on the **originals**,
+        which is why this needs the pairing rather than the surrogate set:
+
+        * ``Hammond -> Brightwater`` beside ``Chelsea Hammond -> Nathaniel
+          Brightwater`` is name-component linking doing its job. The fakes nest and
+          so do the values: restoring the long fake yields ``Chelsea Hammond``,
+          which still carries ``Hammond`` as a unit, so the short surrogate's
+          original is in the answer even though its surrogate never matched. This
+          must be allowed -- rejecting it degrades every linked surname to a plain
+          token and deletes the feature.
+        * ``Sherryside -> White`` beside ``Thomas Duncan -> Daniel White`` is two
+          **unrelated** entities whose fakes collided: Faker draws surnames from a
+          pool of roughly a thousand, and ``NAME:last:duncan`` and
+          ``NAME:last:sherryside`` are independent draws from it, so a birthday
+          collision at a dozen name components per document is a percent-scale
+          event rather than a curiosity. Here the model writes ``Daniel White``,
+          the restorer correctly yields ``Thomas Duncan``, and ``Sherryside`` is
+          **silently absent from the user's answer** -- ``restored_count`` up,
+          ``surrogate_misses`` 0, ``_assert_no_surrogates`` unable to fire because
+          no fake survived. Measured at 3 failures in 200 pseudonymization runs of
+          the leakage harness before this guard existed.
+
+        So the test is *nesting on the surrogate side without the matching nesting
+        on the original side*, in either direction. The exact-equality case is left
+        to :meth:`_surrogate_taken`: two originals sharing one surrogate is a
+        different defect with a different remedy, and the orchestrator's step 4b
+        refuses the run over it.
+
+        Surrogates are compared **raw** because that is what the restorer matches
+        (its alternation is case-sensitive by design); originals are compared
+        **normalised**, so a value that differs only in case or spacing from the one
+        it nests in still counts as mirrored and is not degraded for nothing.
+
+        A rejected candidate takes the ordinary path: regenerate for the shapes that
+        vary with ``attempt``, and a plain token for persons, which deliberately do
+        not (see :meth:`_fake_person`). That is the right trade -- a token is a
+        fluency loss and fully restorable, whereas the fake it replaces is a value
+        the user would never have seen.
+
+        Cost: one pass over the session's issued surrogates per Tier-1 candidate,
+        rejected by the C-level substring pre-filter inside ``_occurs_as_a_unit`` on
+        all but a handful. Same shape, and the same answer at scale, as the pass
+        :meth:`_shift_date` makes over the originals.
+
+        **Called from Tier 1 only, and that scope is argued rather than assumed.**
+        A Tier-1 candidate is checked against *every* issued surrogate, dates
+        included, so the only pair this cannot see is a Tier-2 candidate nesting
+        with something already issued. A shifted date can only nest as a unit inside
+        another shifted date rendered in the same format, and the shift is one
+        constant per session -- so the two originals differ by exactly the same
+        offset and nest on the original side too, which is the mirrored case this
+        guard permits. Tier 2 therefore has nothing to reject; it keeps the
+        equality check (:meth:`_surrogate_taken`) that it does need.
+        """
+        issued = vault.surrogates_for_session(session_id)
+        if not issued:
+            return False
+        folded = normalize(original)
+        for surrogate, other in issued.items():
+            if surrogate == candidate:
+                continue  # _surrogate_taken's question, not this one
+            if _occurs_as_a_unit(candidate, surrogate):
+                if not _occurs_as_a_unit(folded, normalize(other)):
+                    return True
+            elif _occurs_as_a_unit(surrogate, candidate) and not _occurs_as_a_unit(
+                normalize(other), folded
+            ):
+                return True
+        return False
+
     # -- Tier 2 ------------------------------------------------------------
 
     async def _shift_date(
@@ -876,6 +985,50 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         exactly the failure the sweep exists to prevent. This is the same
         word-versus-whole-string reasoning :meth:`_fake_identifier` applies through
         :meth:`_invents_a_real_word`; Tier 2 needs it too.
+
+        **Containment is tested in BOTH directions, and for a while it was not.**
+        The paragraph above is about a rendered date that *swallows* an original.
+        The mirror case -- a rendered date that is itself *swallowed by* a longer
+        original -- is just as real and was measured at roughly one full leakage-harness
+        run in a hundred. It needs no exotic input, only a detector span that covers
+        more than one date: the fixture line ``Prior ambulatory visits: 03/11/2024,
+        09/17/2024, and 10/01/2024.`` comes back as the single ``DATE`` span
+        ``03/11/2024, 09/17/2024`` beside a separate ``10/01/2024``, so
+        ``03/11/2024, 09/17/2024`` is one vault original in its own right. A session
+        shift of ``-204`` days then takes ``10/01/2024`` to ``03/11/2024`` -- a
+        verbatim, word-bounded slice of that original -- and the one-directional test
+        waved it through, because ``'03/11/2024, 09/17/2024'`` does not occur inside
+        ``'03/11/2024'``.
+
+        Both halves of the damage are silent, which is what makes this worth a guard
+        rather than a note:
+
+        * the outbound payload carries ``03/11/2024``, a real appointment date of the
+          real patient, inside a string *we invented*. Neither the egress gate nor the
+          leakage harness reports it, because both ask whether a **whole** vaulted
+          value occurs and this is a slice of one -- so the pipeline manufactures
+          exactly the partial disclosure both scanners document themselves as blind
+          to;
+        * at restore, the token pass puts ``03/11/2024, 09/17/2024`` back into the
+          answer, and that value carries a **live surrogate** as a unit.
+          :meth:`~secure_context_pipeline.deobfuscation.restorer.Restorer._assert_no_surrogates`
+          is structurally unable to object -- it excuses residue lying inside a value
+          the restorer itself spliced, correctly, since a restored original may
+          legitimately contain another entity's fake, and in this case the splice is
+          made by the *token* pass, which runs after that assertion entirely. The
+          answer then holds one date string standing for two different days with
+          ``restored_count`` up, ``surrogate_misses`` 0 and outcome ``ok``.
+
+        So the test is symmetric: reject if the rendered date occurs as a unit in any
+        original, or any original occurs as a unit in it.
+
+        What this cannot close, stated rather than implied: the guard is evaluated
+        when the surrogate is minted, against the originals known then. A *later*
+        call in the same session that vaults a new original containing an
+        already-issued date surrogate reaches the same state, and no per-candidate
+        test can see a value that does not exist yet. Within one ``obfuscate`` call
+        there is no such window -- ``reserved_originals`` carries the whole
+        document's originals before the first surrogate is rendered.
 
         The containment test calls the one shared rule,
         :func:`~secure_context_pipeline.textrules.occurs_as_a_unit`,
@@ -942,8 +1095,13 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         shifted = f"{lead}{parsed.render(parsed.value + timedelta(days=self._shift_days))}{trail}"
         rendered = normalize(shifted)
         originals = self._normalized_originals(vault, session_id)
+        # Both directions. A rendered date that swallows an original and one that is
+        # swallowed by a longer original are the same defect -- a real vaulted value
+        # travelling verbatim inside a surrogate we invented -- and only the first
+        # was tested. See this method's docstring for the measured second case.
         if rendered == normalize(raw) or any(
-            _occurs_as_a_unit(value, rendered) for value in originals
+            _occurs_as_a_unit(value, rendered) or _occurs_as_a_unit(rendered, value)
+            for value in originals
         ):
             logger.info(
                 "shifted date collides with an original; emitting a plain token",

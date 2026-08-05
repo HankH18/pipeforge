@@ -62,6 +62,7 @@ from secure_context_pipeline.surrogates import (
     extract_token_ids,
     format_redaction,
 )
+from secure_context_pipeline.textrules import occurs_as_a_unit
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
 
@@ -1002,6 +1003,216 @@ async def test_two_originals_are_never_issued_the_same_surrogate(env: Env) -> No
     assert await env.vault.get_by_surrogate(session_id, first) == "Wilson"
 
 
+#: Pinned so the fakes below are the same strings in every run and a failure
+#: message is reproducible. Nothing here needs a *colliding* key: the nesting is
+#: constructed from whatever the generator produces, so these tests never wait on
+#: a Faker coincidence the way ``SURROGATE_CLASH_KEY`` does.
+SURROGATE_NESTING_KEY = (7).to_bytes(32, "big")
+
+#: Two values with nothing in common -- not a component of one another, no shared
+#: word. Whatever nesting the surrogates below have is therefore manufactured by
+#: the generator rather than inherited from the values.
+NESTING_PERSON = "Thomas Duncan"
+NESTING_PLACE = "Sherryside"
+
+
+async def _issue(
+    env: Env,
+    session_id: str,
+    *,
+    token_id: str,
+    surrogate: str,
+    original: str,
+) -> None:
+    """Put one ``surrogate -> original`` row in the vault, as the engine would."""
+    await env.vault.put(
+        session_id,
+        TokenRecord(
+            session_id=session_id,
+            token_id=token_id,
+            entity_type="NAME",
+            category=EntityCategory.PII,
+            surrogate=surrogate,
+            created_at=time.time(),
+        ),
+        original,
+    )
+
+
+def _person(text: str) -> Detection:
+    return Detection(
+        entity_type="NAME", category=EntityCategory.PII, start=0, end=len(text),
+        text=text, score=0.9,
+    )
+
+
+async def test_a_fake_nested_inside_an_issued_surrogate_is_refused(env: Env) -> None:
+    """A fake that hides inside a longer one is a value the user never gets back.
+
+    ``_surrogate_taken`` asks whether this exact string is spoken for, and that is
+    blind to the case where one surrogate merely *occurs as a unit inside*
+    another. The restorer compiles one longest-first alternation, so at a shared
+    offset the long fake always wins and the short one never matches inside it:
+    the model writes ``Marion <fake>``, the user correctly reads
+    ``Thomas Duncan``, and the value behind the short fake is **silently missing
+    from the answer** -- ``restored_count`` up, ``surrogate_misses`` 0,
+    ``_assert_no_surrogates`` unable to fire because no fake survived.
+
+    It is reachable from ordinary input rather than from a contrived key. Faker
+    draws surnames from a pool of roughly a thousand and every name component is
+    an independent draw from it, so a dozen components in one document collide at
+    percent scale -- measured at 3 failures in 200 pseudonymization runs of the
+    leakage harness, every one of them this shape.
+
+    The nesting is *constructed* here rather than waited for, so the test is
+    deterministic: whatever ``Sherryside`` fakes to, an unrelated person is issued
+    a surrogate ending in that same word.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=SURROGATE_NESTING_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+
+    lone = strategy._generate("NAME", NESTING_PLACE, 0).text
+    assert lone and " " not in lone, f"{lone!r} cannot nest inside anything"
+
+    # The counterfactual, taken first and in its own session: with nothing issued,
+    # this value really does fake to `lone`. Without it a guard that degraded
+    # every lone name to a token would satisfy the assertion below.
+    clean_session, _clean_expires = await env.sessions.create("test-user")
+    assert (
+        await strategy.make_surrogate(
+            _person(NESTING_PLACE), "beef0000", env.vault, session_id=clean_session
+        )
+        == lone
+    )
+
+    outer = f"Marion {lone}"
+    await _issue(
+        env, session_id, token_id="beef0001", surrogate=outer, original=NESTING_PERSON
+    )
+
+    # Premises: no other layer can account for the result below.
+    assert not occurs_as_a_unit(normalize(NESTING_PLACE), normalize(NESTING_PERSON)), (
+        "the originals nest, so this is the linking case and must NOT be refused"
+    )
+    assert normalize(lone) not in set(normalize(NESTING_PERSON).split()) | {
+        normalize(NESTING_PLACE)
+    }, f"{lone!r} is a word of a real original, so the word guard would reject it anyway"
+    assert not await strategy._surrogate_taken(env.vault, session_id, lone), (
+        "the equality check already covers this, so the nesting guard is not on trial"
+    )
+
+    surrogate = await strategy.make_surrogate(
+        _person(NESTING_PLACE), "beef0002", env.vault, session_id=session_id
+    )
+
+    # Identity, not inequality: a person fake ignores the whole-candidate counter
+    # (see ``_fake_person``), so the only other thing this path can produce is the
+    # token -- and "not equal to `lone`" would also be satisfied by a second fake
+    # surname, which would mean the linking rule had been broken instead.
+    assert surrogate == "[PII_NAME_beef0002]", (
+        f"{surrogate!r} nests inside {outer!r}, which stands for a different value"
+    )
+
+
+async def test_a_fake_that_swallows_an_issued_surrogate_is_refused(env: Env) -> None:
+    """The same hazard arriving in the other order, which one direction misses.
+
+    Here the *short* surrogate is already issued and the new candidate contains
+    it. Detection order decides which of the two a run sees, and a guard written
+    for one direction is correct exactly half the time -- so both are checked and
+    both are pinned.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=SURROGATE_NESTING_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+
+    full = strategy._generate("NAME", NESTING_PERSON, 0).text
+    assert len(full.split()) == 2, f"{full!r} is not a two-part fake"
+    tail = full.split()[-1]
+
+    clean_session, _clean_expires = await env.sessions.create("test-user")
+    assert (
+        await strategy.make_surrogate(
+            _person(NESTING_PERSON), "beef0010", env.vault, session_id=clean_session
+        )
+        == full
+    )
+
+    await _issue(
+        env, session_id, token_id="beef0011", surrogate=tail, original=NESTING_PLACE
+    )
+
+    assert not occurs_as_a_unit(normalize(NESTING_PLACE), normalize(NESTING_PERSON))
+    assert set(normalize(full).split()).isdisjoint(
+        {normalize(NESTING_PLACE), *normalize(NESTING_PERSON).split()}
+    ), f"{full!r} shares a word with a real original; the word guard would fire first"
+    assert not await strategy._surrogate_taken(env.vault, session_id, full)
+
+    surrogate = await strategy.make_surrogate(
+        _person(NESTING_PERSON), "beef0012", env.vault, session_id=session_id
+    )
+    assert surrogate == "[PII_NAME_beef0012]", (
+        f"{surrogate!r} swallows {tail!r}, which stands for a different value"
+    )
+
+
+async def test_name_component_linking_may_still_nest_its_own_surrogates(env: Env) -> None:
+    """The other half of the rule, and the one that stops it eating the feature.
+
+    Component linking issues ``Duncan`` and ``Thomas Duncan`` as separate values
+    whose fakes nest by construction, and that pair is *correct*: restoring the
+    long fake yields ``Thomas Duncan``, which still carries ``Duncan`` as a unit,
+    so the short surrogate's original is in the answer even though its surrogate
+    never matched. A guard that rejected on the surrogate nesting alone would
+    degrade every linked surname to a plain token and delete the feature the
+    module's whole component design exists for -- so the test is the *originals*,
+    not the surrogates.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=SURROGATE_NESTING_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+
+    full = await strategy.make_surrogate(
+        _person(NESTING_PERSON), "beef0020", env.vault, session_id=session_id
+    )
+    assert not STRICT_TOKEN_RE.fullmatch(full) and len(full.split()) == 2
+    await _issue(
+        env, session_id, token_id="beef0020", surrogate=full, original=NESTING_PERSON
+    )
+
+    component = NESTING_PERSON.split()[-1]
+    assert occurs_as_a_unit(normalize(component), normalize(NESTING_PERSON)), (
+        "premise: the originals nest, which is what makes this the safe case"
+    )
+
+    standalone = await strategy.make_surrogate(
+        _person(component), "beef0021", env.vault, session_id=session_id
+    )
+
+    assert not STRICT_TOKEN_RE.fullmatch(standalone), (
+        f"{component!r} degraded to a token: the nesting guard swallowed component linking"
+    )
+    assert standalone == full.split()[-1], (
+        f"{component!r} -> {standalone!r} does not match the surname inside {full!r}"
+    )
+
+
 #: A session key on which the two-digit mask over ``"MRN: 71"`` redraws ``71`` --
 #: the generated fake is byte-identical to the value it is replacing.
 SELF_EQUAL_MASK_KEY = (11).to_bytes(32, "big")
@@ -1485,6 +1696,115 @@ async def test_a_shifted_date_that_renders_another_original_degrades(env: Env) -
         clean_id, second, [span(second, source_text, "DOB")], strategy="pseudonymization"
     )
     assert clean_result.tokens[0].surrogate == f"{clean_landed.day} {clean_landed:%B %Y}"
+
+
+async def test_a_shifted_date_landing_inside_a_longer_original_degrades(env: Env) -> None:
+    """Tier 2's fourth collision: the containment test's **other direction**.
+
+    The test above catches a shifted date that *swallows* a vaulted original. This
+    one is the mirror -- a shifted date *swallowed by* a longer original -- and the
+    guard did not test for it. It is not an exotic shape: any detector span that
+    covers more than one date makes a multi-date string a vault original in its own
+    right, and the shipped medical fixture produces one on every seed. spaCy returns
+    ``Prior ambulatory visits: 03/11/2024, 09/17/2024, and 10/01/2024.`` as the
+    single ``DATE`` span ``03/11/2024, 09/17/2024`` beside a separate ``10/01/2024``,
+    so a session shift of ``-204`` days takes ``10/01/2024`` onto ``03/11/2024`` --
+    a verbatim, word-bounded slice of the other original.
+
+    Measured at roughly one full ``-m leakage`` run in a hundred before this guard,
+    and silent in both directions. The payload carries a real appointment date of
+    the real patient inside a string the pipeline invented, and neither the egress
+    gate nor the leakage harness reports it, because both ask whether a *whole*
+    vaulted value occurs. Then at restore the token pass puts
+    ``03/11/2024, 09/17/2024`` back into the answer, and that value carries a **live
+    surrogate** as a unit -- which ``Restorer._assert_no_surrogates`` is structurally
+    unable to object to, since it excuses residue inside a value the restorer itself
+    spliced (correctly: a restored original may legitimately contain another
+    entity's fake) and in this case the splice happens in the *token* pass, after
+    that assertion has already run. The answer then holds one date string standing
+    for two different days with ``restored_count`` up, ``surrogate_misses`` 0 and
+    outcome ``ok``.
+
+    Everything is computed from *this* session's shift rather than pinned, so the
+    test exercises whatever the key produces rather than one lucky constant.
+    """
+    strategy = build_strategy("pseudonymization", env.context())
+    assert isinstance(strategy, PseudonymizationStrategy)
+
+    landing = datetime(2024, 3, 11).date()
+    source = landing - timedelta(days=strategy.shift_days)
+    source_text = source.strftime("%m/%d/%Y")
+    rendered = landing.strftime("%m/%d/%Y")
+    # The second half of the run sits 7 days from the first, which the +/-30 shift
+    # floor puts permanently out of reach of ``source`` -- so the composite can
+    # never accidentally contain the very date under test whatever key this session
+    # drew, and the two spans below can never overlap.
+    composite = f"{rendered}, {(landing + timedelta(days=7)).strftime('%m/%d/%Y')}"
+
+    # Premises, computed rather than pinned. This is precisely the case the
+    # one-directional guard could not see: the original is far longer than the
+    # rendered date, so "does an original occur inside this surrogate?" -- the test
+    # that already shipped for the other three collisions -- answers no.
+    assert not occurs_as_a_unit(normalize(composite), normalize(rendered)), (
+        "premise: the old one-directional test passes this straight through"
+    )
+    assert occurs_as_a_unit(normalize(rendered), normalize(composite)), (
+        "premise: the rendered date really is a word-bounded slice of the original"
+    )
+    assert source_text not in composite and rendered != composite
+
+    # Control: with nothing vaulted, this date really does shift onto that slice.
+    # Without it the test could pass because the shift went somewhere else entirely.
+    detection = Detection(
+        entity_type="DATE", category=EntityCategory.PHI, start=0, end=len(source_text),
+        text=source_text, score=0.9,
+    )
+    strategy.reserved_originals = frozenset()
+    assert await strategy.make_surrogate(
+        detection, "aaaaaaaa", env.vault, session_id=env.session_id
+    ) == rendered
+
+    # The real engine, over the document shape that produces it.
+    unrelated = landing + timedelta(days=900)
+    unrelated_text = unrelated.strftime("%m/%d/%Y")
+    document = (
+        f"Prior ambulatory visits: {composite}, and {source_text}.\n"
+        f"Discharge planning conference scheduled for {unrelated_text}.\n"
+    )
+    result = await env.engine.obfuscate(
+        env.session_id,
+        document,
+        [
+            span(document, composite, "DATE"),
+            span(document, source_text, "DATE"),
+            span(document, unrelated_text, "DATE"),
+        ],
+        strategy="pseudonymization",
+    )
+    by_original = {
+        token.surrogate: await env.vault.get_by_surrogate(env.session_id, token.surrogate)
+        for token in result.tokens
+    }
+    surrogate_of = {original: s for s, original in by_original.items()}
+
+    # A plain ``in``, not the boundary predicate the guard itself uses: a leak
+    # assertion phrased in the guard's own terms shares its blind spot by
+    # construction.
+    assert rendered not in result.obfuscated_text, (
+        "a slice of a vaulted original went out inside the shifted date"
+    )
+    assert STRICT_TOKEN_RE.fullmatch(surrogate_of[source_text]), surrogate_of[source_text]
+
+    # Degradation is scoped to the one colliding date: every other date keeps the
+    # shared shift, so the intervals among them survive -- which is the whole
+    # reason Tier 2 exists.
+    assert surrogate_of[unrelated_text] == (
+        unrelated + timedelta(days=strategy.shift_days)
+    ).strftime("%m/%d/%Y")
+
+    # And the degraded date is still fully restorable -- it loses its temporal
+    # relation, not its value.
+    assert by_original[surrogate_of[source_text]] == source_text
 
 
 async def test_two_dates_for_one_day_are_never_issued_the_same_surrogate(env: Env) -> None:

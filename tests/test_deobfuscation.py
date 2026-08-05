@@ -1201,6 +1201,52 @@ async def test_longest_surrogate_wins(settings: Settings, audit: AuditLogger) ->
         assert surrogate not in result.text
 
 
+async def test_a_nested_fake_standing_for_an_unrelated_value_cannot_be_restored_here(
+    settings: Settings,
+) -> None:
+    """Why the nesting guard lives in obfuscation, and what it must never become.
+
+    Longest-first is right, and it is also *lossy* when the two fakes stand for
+    unrelated values. ``White`` is the whole fake for ``Sherryside`` and it is also
+    the surname inside ``Daniel White``, the fake for ``Thomas Duncan`` -- two
+    independent draws from Faker's thousand-deep surname pool that happened to
+    land on the same word. The model writes only the long one, so the long
+    alternative wins at that offset, ``Thomas Duncan`` is correctly restored, and
+    ``Sherryside`` is simply **not in the answer**: every counter reports a clean
+    run and ``_assert_no_surrogates`` cannot fire because no fake survived. This
+    is the 1-in-30 red the leakage harness was reporting.
+
+    Nothing here can repair it. The bytes ``Daniel White`` carry one entity's
+    reference and no trace of the other, so the only two outcomes available at
+    this stage are the correct-but-lossy one below and a **hybrid** -- splicing
+    ``Sherryside`` into a sentence about a different person, which is the silent
+    misattribution ``test_a_reflowed_two_word_fake_never_yields_a_half_real_name``
+    exists to forbid. So the pair must never be issued in the first place:
+    ``PseudonymizationStrategy._nests_with_an_issued_surrogate`` refuses it and the
+    losing value degrades to a plain token, which is a key rather than a guess.
+
+    This test pins both halves -- the loss is real, and the cure must not be worse
+    -- so that a future attempt to "fix" the miss in the restorer turns red here.
+    """
+    surrogates = {"Daniel White": "Thomas Duncan", "White": "Sherryside"}
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+    text = "Prepared by accountant Daniel White, reachable on request."
+
+    result = await restorer.restore(
+        SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates
+    )
+
+    assert result.text == "Prepared by accountant Thomas Duncan, reachable on request."
+    # The loss, stated: the second value is gone and nothing in the result says so.
+    assert "Sherryside" not in result.text
+    assert result.restored_count == 1
+    assert result.vault_misses == 0
+    assert result.surrogate_misses == 0
+    # And the cure that must never be applied here, named explicitly.
+    for hybrid in ("Daniel Sherryside", "Thomas Sherryside", "Sherryside Duncan"):
+        assert hybrid not in result.text, result.text
+
+
 async def test_surrogate_possessives_restore(settings: Settings) -> None:
     restorer = Restorer(vault=FakeVault(), settings=settings)
     text = "Torres's chart, Torres' prior notes, and Torres in person."
