@@ -131,7 +131,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1541 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1555 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   127 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 39 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
@@ -1728,73 +1728,102 @@ paralegal is a silent one.
    accepted" is doing more work than it looks, because that lifetime is not bounded by the
    session's TTL. Gap 17 below covers the *document store* and gap 12 the session
    registry; neither is this.
-8. **Two structural debts are named here rather than paid, and the reason is the calendar, not
-   the argument.** Both are real and both are cosmetic in the strict sense — no defect sits
-   behind either, which is exactly why neither was worth a large refactor on the last day.
-   - **`api/app.py` is 1,835 lines carrying seven concerns**, with all eight endpoint handlers
-     nested as closures inside one 345-line `_register_routes`. No endpoint is importable, so
-     none can be unit-tested without standing up the whole ASGI app, and the module cannot be
-     split while the closures bind to that function's locals. Around them the same file holds
-     rate limiting, service composition/DI, session auth and audit scoping, the error-mapping
-     contract, three ASGI middlewares and static-UI mounting. The fix is mechanical —
-     `api/routes/{sessions,documents,pipeline,audit}.py` as `APIRouter`s, plus
-     `middleware.py` / `errors.py` / `deps.py`; the error-mapping block already lifts cleanly.
-     Not done because the blast radius is the entire authenticated surface and a DI-wiring
-     mistake there is exactly the kind that a green suite would not catch.
-   - **The word-boundary rule is imported from the wrong layer and is still written out three
-     times.** `obfuscation/engine.py`, `deobfuscation/restorer.py` and
-     `obfuscation/strategies/pseudonymization.py` all import underscore-private names from
-     `pipeline/egress_gate.py`. The intent is right — the sweep and the gate have provably
-     disagreed twice, and a shared definition makes divergence an `ImportError`. The delivery
-     is half of it: only `pseudonymization.py` imports the actual *rule*; `engine.py` and
-     `restorer.py` import the *alphabet* and then reassemble the guards themselves, so a rename
-     breaks the import (as promised) but an edit to the rule still has to be made in three
-     places by hand. It also inverts the dependency graph: `obfuscation` and `deobfuscation`
-     now depend on `pipeline`, which depends on both. The fix is a leaf module
-     (`secure_context_pipeline/textrules.py` exporting public `ALNUM`, `boundary_guards`,
-     `occurs_as_a_unit`) imported by the gate, engine, restorer, strategy and harness — which
-     removes the private imports, removes the inverted edge, and makes the rule singular for
-     the first time.
-9. **No k-anonymity / generalization pass.** This is the real answer to the inference risk in
+8. **Two structural debts, since paid — and one of them was not cosmetic after all.** Both were
+   deferred once with the note that "no defect sits behind either". That was right about one and
+   wrong about the other, which is worth recording.
+   - **`api/app.py` was 1,835 lines carrying seven concerns**, with all eight endpoint handlers
+     nested as closures in one 345-line `_register_routes`, so no endpoint was importable. Now
+     **304 lines** — `create_app()` and the module docstring — over `constants.py`, `deps.py`,
+     `middleware.py`, `lifespan.py`, `errors.py` and `routes/{sessions,documents,pipeline,audit,
+     health}.py`. The stated blocker ("the closures bind to that function's locals") turned out
+     to be false: checked by AST, `_register_routes` has **zero** locals and every `app`
+     reference is inside a decorator, because dependencies already flow through `ServicesDep`.
+     The risk was a DI-wiring mistake, which a green suite would not catch — so the move was
+     guarded by a behavioural snapshot taken beforehand (route table, middleware stack, full
+     OpenAPI schema, and a 16-probe auth matrix of anonymous / owner / wrong-user /
+     unknown-session against every route). The post-move diff was empty. This one *was* cosmetic.
+   - **The word-boundary rule is now singular, in a leaf module.** `secure_context_pipeline/
+     textrules.py` imports nothing from the package and exports `ALNUM`, `LEFT_GUARD`/
+     `RIGHT_GUARD`, `guards_left`/`guards_right`, `boundary_guards`, `word_bounded_pattern` and
+     `occurs_as_a_unit`; the gate, engine, restorer, strategy and harness all depend *downward*
+     on it. **This one was not cosmetic.** The previous arrangement shared the *alphabet* but not
+     the *decision*: `engine.py` and `restorer.py` imported `_ALNUM` and then rebuilt the
+     assertions by hand, so a rename raised `ImportError` as advertised while an edit to the rule
+     still had to be made in three places, with nothing to catch a missed one. That is the same
+     defect this document records eleven other instances of, surviving *inside the fix for it* —
+     and calling it cosmetic was itself the mistake. `test_no_module_reassembles_the_boundary_
+     guards_by_hand` now scans package source and fails on any lookaround built next to an
+     alphabet reference outside the owning module, which is the check the old arrangement could
+     not express.
+
+9. **The pipeline could *manufacture* a partial value, not merely fail to catch one.** §1's first
+   named boundary — a slice of a multi-word original — is disclosed as something a *document* can
+   carry past the gate. This is the same blind spot reached from the other side, and it is worse:
+   the fragment was produced by our own obfuscation stage, so no amount of care with the input
+   would have avoided it. The egress gate and the 100-run harness each ask whether a **whole**
+   vaulted value occurs as a unit; neither asks whether a fragment is present.
+
+   spaCy returns `03/11/2024, 09/17/2024` as a **single** `DATE` span, so that composite string
+   becomes one vault original. A different date in the same document, `10/01/2024`, shifted by the
+   session's −204 days, renders as `03/11/2024` — a verbatim, word-bounded **slice** of that
+   original. The Tier-2 collision guard tested only whether a rendered date *contains* an
+   original, never whether it is *contained in* one, so a real appointment date of the real
+   patient went to the provider inside a string the pipeline itself invented. Both scanners
+   reported clean, correctly by their own definitions. `0 leaks` was true and misleading at once.
+
+   The guard is now symmetric and the colliding date degrades to a plain token. Proven
+   exhaustively rather than by sampling: `derive_date_shift_days` has exactly **540** reachable
+   values, so 50 fixture documents × 540 shifts enumerates the entire space of the driving
+   variable — **27 collisions before, 0 after**. The leakage harness went from 1 failing run in 8
+   to 8/8 clean.
+
+   **The residual limitation is the scanners, not that one guard.** Any future path that emits a
+   string containing a fragment of a vaulted value is still invisible to both. Closing it properly
+   means scanning for sub-spans of originals, which trades directly against false positives — the
+   `Brown`/`Browning` problem, one entity type at a time. It is not built, and it is the honest
+   qualifier on the headline claim: *no whole vaulted value reaches the provider* is what is
+   measured, and a composite detector span is what makes "whole" load-bearing.
+
+10. **No k-anonymity / generalization pass.** This is the real answer to the inference risk in
    §3, and it is not built.
-10. **Financial transaction dates pass through deliberately.** Amounts and counterparties are
+11. **Financial transaction dates pass through deliberately.** Amounts and counterparties are
    masked; the dates are not, because `DATE` is scoped to medical documents. That is a
    quasi-identifier residual and a real gap.
-11. **Sub-3-character spans are never obfuscated.** They carry no re-identification signal, and
+12. **Sub-3-character spans are never obfuscated.** They carry no re-identification signal, and
    sweeping them would corrupt unrelated words — but the floor is a policy choice, and it is
    applied uniformly rather than per-entity.
-12. **Single-process session registry.** Redis plus KMS envelope keys for multi-node.
-13. **The document read path leaks existence through timing** — ~18× between an absent
+13. **Single-process session registry.** Redis plus KMS envelope keys for multi-node.
+14. **The document read path leaks existence through timing** — ~18× between an absent
    `doc_id` and a wrong-owner one on a 2 MB blob. Content-identical, time-distinguishable;
    analysed in §3. A constant-time read closes it and costs a full disk read per miss.
-14. **Filenames are cleartext in the metadata table.** Deliberate and argued in §3; the fix, if
+15. **Filenames are cleartext in the metadata table.** Deliberate and argued in §3; the fix, if
    the requirement changes, is an encrypted column plus a blind index for listing.
-15. **The audit chain is unkeyed**, so it survives partial tampering but not a full rewrite by
+16. **The audit chain is unkeyed**, so it survives partial tampering but not a full rewrite by
    someone with DB write access (§5 Q5). An off-box append-only sink or an auditor-held HMAC
    key is the real answer; both are production infrastructure rather than a code change here.
-16. **The DOCX decompression-bomb guard bounds the declared size, not the transient cost.**
+17. **The DOCX decompression-bomb guard bounds the declared size, not the transient cost.**
    Checking the archive's declared uncompressed bytes closes the ~1000× amplification a zip
    bomb needs. It does not bound what `zipfile.ZipFile()` itself spends parsing the central
    directory before any check can run: an archive at the 16 MB upload cap can declare **zero**
    uncompressed bytes and still cost ~110 MB RSS, about 7×. Measured and pinned by a test. A
    real fix streams the archive or parses it in a memory-capped subprocess; the shipped guard
    is the cheap 99% and the residual is stated rather than implied.
-17. **SQLite write contention stalls every reader on the store**, not just the writer — five
+18. **SQLite write contention stalls every reader on the store**, not just the writer — five
    seconds of it, measured. Analysed in §4; the fix is Postgres and the Protocol seam exists.
-18. **A document's two blobs share one AAD** and can be swapped on disk (§3). Integrity only,
+19. **A document's two blobs share one AAD** and can be swapped on disk (§3). Integrity only,
    and closing it means deviating from the specified AAD.
-19. **Co-reference display enrichment** — a UX feature, per Q2.
-20. **`Settings.llm_max_retries` is an *attempt* count, not a retry count.** It is consumed as
+20. **Co-reference display enrichment** — a UX feature, per Q2.
+21. **`Settings.llm_max_retries` is an *attempt* count, not a retry count.** It is consumed as
    `max(1, min(llm_max_retries, MAX_ATTEMPTS))`, so `1` means one attempt and **no** retry —
    the opposite of what an operator setting "max retries = 1" expects. The behaviour is
    correct and tested; the name is wrong. It is a rename (`llm_max_attempts`) rather than a
    logic change, and it is recorded here rather than quietly renamed because the setting is
    already in `.env.example` and changing it is a breaking config change.
-21. **Streaming responses with incremental restore.** Today the full response is restored in
+22. **Streaming responses with incremental restore.** Today the full response is restored in
    one pass, so a streaming UI would show tokens before restoration.
-22. **OpenTelemetry spans per pipeline stage.** Timings exist in `stats` and the audit log but
+23. **OpenTelemetry spans per pipeline stage.** Timings exist in `stats` and the audit log but
    are not exported.
-23. **An OpenAI provider class** — one class plus one registry entry, by construction.
+24. **An OpenAI provider class** — one class plus one registry entry, by construction.
 
 ---
 
