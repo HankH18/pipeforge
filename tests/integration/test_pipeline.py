@@ -42,6 +42,7 @@ from fixtures import generator
 from secure_context_pipeline.audit.logger import (
     DEOBFUSCATE,
     DETECT,
+    EGRESS_BLOCK,
     EGRESS_PASS,
     LLM_CALL,
     OBFUSCATE,
@@ -385,6 +386,60 @@ async def test_happy_path_end_to_end(make_harness: HarnessFactory) -> None:
 # ---------------------------------------------------------------------------
 # 2. No detectable entities
 # ---------------------------------------------------------------------------
+
+
+async def test_a_run_that_vaulted_values_blocks_if_pass_one_scanned_an_empty_set(
+    make_harness: HarnessFactory,
+) -> None:
+    """The gate's most load-bearing pass is the one that fails silently.
+
+    Pass 1 is the only pass independent of detector recall, and with an empty
+    originals set it is a no-op that returns 0 rather than an error.
+    ``SessionVault.originals_for_session`` returns ``frozenset()`` for an unknown or
+    destroyed session -- "fails safe" for the vault's contract, and the exact opposite
+    for the gate's. The resulting ``EGRESS_PASS`` carries ``originals_scanned: 0``,
+    which is byte-identical in the audit trail to a document that legitimately held
+    nothing sensitive.
+
+    Before ``_verify_pass_one_had_something_to_scan``, **nothing in the system read
+    that field back**: it was set, written to the audit detail, and asserted only in
+    tests. This drives the fault directly -- a vault whose cache has gone away
+    underneath a run that really did vault values -- and requires the run to block
+    rather than to call the provider.
+
+    The two numbers compared are differently sourced on purpose: the token count is
+    the run's own manifest from the obfuscation stage, and ``originals_scanned`` comes
+    back from the vault's cache through the gate. That is what makes their agreement
+    evidence rather than a restatement.
+    """
+    harness: Harness = await make_harness()
+    document = generator.generate(SEED, "medical")
+    doc_id = await harness.upload(document, "medical", "medical_note.txt")
+    session_id, _ = await harness.sessions.create("test-user")
+
+    real_originals = harness.vault.originals_for_session
+
+    def _amnesiac(sid: str) -> frozenset[str]:
+        """The vault forgets, exactly as it does for a destroyed session."""
+        return frozenset()
+
+    harness.vault.originals_for_session = _amnesiac  # type: ignore[method-assign]
+    try:
+        with pytest.raises(EgressBlockedError) as exc:
+            await harness.orchestrator.run(
+                session_id, USER_ID, doc_id, PROMPT, "tokenization"
+            )
+    finally:
+        harness.vault.originals_for_session = real_originals  # type: ignore[method-assign]
+
+    assert exc.value.detail["reason"] == "pass_one_scanned_nothing"
+    assert harness.provider.calls == 0, "the provider must not be reached"
+
+    events = await harness.audit.query(session_id=session_id, limit=1000)
+    blocks = [e for e in events if e.event_type == EGRESS_BLOCK]
+    assert [e.detail["reason"] for e in blocks] == ["pass_one_scanned_nothing"]
+    assert blocks[0].detail["tokens_issued"] > 0
+    assert await harness.audit.verify_chain(session_id) is True
 
 
 async def test_entity_type_not_found(make_harness: HarnessFactory) -> None:

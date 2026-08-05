@@ -660,10 +660,10 @@ async def test_extraction_runs_off_the_event_loop_thread() -> None:
         return await real_to_thread(wrapper)
 
     original = asyncio.to_thread
-    asyncio.to_thread = recording  # type: ignore[assignment]
+    asyncio.to_thread = recording
     try:
         await extract_text("thread.txt", b"payload")
     finally:
-        asyncio.to_thread = original  # type: ignore[assignment]
+        asyncio.to_thread = original
 
     assert seen and all(tid != loop_thread for tid in seen)

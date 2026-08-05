@@ -46,6 +46,7 @@ __all__ = [
     "Detector",
     "get_analyzer",
     "reset_analyzer_cache",
+    "resolve_overlaps",
     "warm_up",
 ]
 
@@ -160,7 +161,7 @@ _SOFT_BREAK = re.compile(r"(?<=[.!?])[ \t]+|\n+")
 # chunk. Chunking itself is untouched -- the window only widens what the analyzer
 # sees, never what ``chunk_text`` returns -- so offsets stay relative to the chunk's
 # own absolute start, a straddling entity is matched whole by at least one window,
-# and the duplicate the neighbouring window finds is collapsed by _resolve_overlaps.
+# and the duplicate the neighbouring window finds is collapsed by resolve_overlaps.
 #
 # Must exceed the longest span the registry can produce -- the widest is
 # CASE_STRATEGY's ~40-character prefix plus its 240-character sentence tail.
@@ -323,17 +324,31 @@ def chunk_text(text: str, max_chars: int) -> list[tuple[int, str]]:
 # ---------------------------------------------------------------------------
 # Overlap resolution
 # ---------------------------------------------------------------------------
-def _resolve_overlaps(
+def resolve_overlaps(
     text: str,
-    candidates: list[Detection],
+    candidates: Sequence[Detection],
     policy_types: frozenset[str] = frozenset(),
     pattern_types: frozenset[str] = frozenset(),
 ) -> list[Detection]:
     """Sorted, strictly non-overlapping spans that **cover every candidate**.
 
+    Public and shared on purpose. The obfuscation engine re-runs this over the
+    spans it is about to splice, because splicing overlapping spans is undefined
+    and ``ObfuscationEngine.obfuscate`` accepts detections from *any* source, not
+    only from :class:`Detector`. That second call used to be a hand-written copy
+    of this function in :mod:`~secure_context_pipeline.obfuscation.engine`,
+    described in its own docstring as mirroring this one -- and it had drifted:
+    it carried no ``pattern_types`` dimension and no specificity guard on the
+    union-covering winner, so the two disagreed about *which label* an overlap
+    keeps. The label picks the entity's tier, action and threshold, so the two
+    copies could route the same spans to different pseudonymization paths. One
+    implementation with two call sites cannot drift; two cannot be kept honest by
+    a docstring.
+
     Explicit greedy pass: candidates are ranked and the winner of an overlap is the
     one that survives. The build doc's rule is score, then span length, then
-    earliest start.
+    earliest start. Adjacent spans (``a.end == b.start``) are not overlaps and are
+    both kept.
 
     Two categorical dimensions rank **above** all of that, in this order.
 
@@ -461,7 +476,7 @@ class Detector:
         self._recognizers: list[EntityRecognizer] = list(build_recognizers(registry))
         self._aliases = registry.presidio_aliases()
         # Entities whose registry action is categorical (strip/redact). These
-        # outrank score in overlap resolution -- see _resolve_overlaps.
+        # outrank score in overlap resolution -- see resolve_overlaps.
         self._policy_types = frozenset(
             name for name, spec in registry.entities.items() if spec.action is not None
         )
@@ -469,7 +484,7 @@ class Detector:
         # Entities served by a recognizer this package builds, rather than by one of
         # Presidio's. Used twice: Presidio reports these under the registry name so
         # no remapping is needed, and they are the more specific claim when they
-        # overlap a built-in hit -- see _resolve_overlaps.
+        # overlap a built-in hit -- see resolve_overlaps.
         self._custom_names = frozenset(
             name for name, spec in registry.entities.items() if spec.patterns or spec.gazetteer
         )
@@ -544,7 +559,7 @@ class Detector:
                 if detection is not None:
                     candidates.append(detection)
 
-        kept = _resolve_overlaps(text, candidates, self._policy_types, self._custom_names)
+        kept = resolve_overlaps(text, candidates, self._policy_types, self._custom_names)
         _verify_offsets(text, kept)
 
         logger.debug(

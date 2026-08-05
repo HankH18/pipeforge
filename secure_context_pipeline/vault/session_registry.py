@@ -28,6 +28,7 @@ sleeping; production callers use the default :func:`time.time`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import secrets
 import time
@@ -100,6 +101,38 @@ def _short(session_id: str) -> str:
     return session_id[:MAX_DETAIL_VALUE_LEN]
 
 
+def _handle(session_id: str) -> str:
+    """A stable, non-reversible correlation tag for a session ID. **Not the ID.**
+
+    A session ID is a *credential*: ``DELETE /sessions/{id}?user_id=...`` needs only
+    the pair, and that deletion is irreversible by construction -- popping the key is
+    cryptographic erasure, so every vault row for the session becomes undecryptable
+    garbage. There is no undo and no recovery path. Writing a live session ID and its
+    owning ``user_id`` onto one INFO record therefore put both halves of that pair in
+    the application's log stream, where they reach whatever ships logs off the host.
+
+    Note what the fix is *not*. :func:`_short` clamps to
+    :data:`~secure_context_pipeline.errors.MAX_DETAIL_VALUE_LEN` (64), and every ID
+    this module mints is a 32-char uuid4 hex, so ``_short`` is the identity function
+    on exactly the IDs that matter. ``destroy`` applied it and ``create`` did not,
+    which read like an inconsistency worth closing by copying ``_short`` into
+    ``create`` -- and that would have changed nothing at all while looking like a fix.
+    ``_short`` exists to stop a hostile *caller-supplied* ID from overflowing an
+    error's detail ceiling. It was never a mask, and this is not the same problem.
+
+    A truncated SHA-256 is: it is stable, so an operator can still follow one session
+    from creation through destruction and expiry in the logs, and it is not the
+    credential, so a log reader cannot use it to destroy anything. uuid4 carries 122
+    bits of entropy, so the digest is not invertible by search -- no salt is needed,
+    and a per-process salt would only break the correlation this exists to preserve.
+
+    The audit trail is deliberately unchanged: it records full session IDs by design
+    (they are the join key for a session's events, and the audit DB is access-
+    controlled). This is about the INFO log stream, which is not.
+    """
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+
+
 class SessionRegistry:
     """``{session_id: _Session(key, expires_at, user_id)}`` guarded by an ``asyncio.Lock``.
 
@@ -151,7 +184,10 @@ class SessionRegistry:
         logger.info(
             "session created",
             extra={
-                "session_id": session_id,
+                # A correlation handle, never the live ID -- see `_handle`. This
+                # record also carries `user_id`, so logging the ID here would have
+                # put both halves of the DELETE /sessions credential pair on one line.
+                "session": _handle(session_id),
                 "user_id": _short(user_id),
                 "ttl_seconds": ttl,
                 "active": len(self._sessions),
@@ -173,7 +209,10 @@ class SessionRegistry:
         logger.info(
             "session key destroyed",
             extra={
-                "session_id": _short(session_id),
+                # Same handle as the creation record, so the two still join on one
+                # session. `_short` was a no-op here too: a minted ID is 32 chars
+                # against a 64-char ceiling.
+                "session": _handle(session_id),
                 "existed": existed,
                 "active": len(self._sessions),
             },

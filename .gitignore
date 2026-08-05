@@ -4,7 +4,23 @@
 *.key
 
 # runtime data (encrypted blobs + sqlite)
-data/
+#
+# ANCHORED (leading slash) on purpose, and the slash is load-bearing. An unanchored
+# `data/` matches a directory of that name at ANY depth, which also matched
+# `secure_context_pipeline/detection/data/` -- the shipped gazetteers `diagnoses.txt`
+# and `medications.txt`. `entities.yaml` names both as required gazetteers and
+# `load_registry` fails closed without them, so with the unanchored rule a fresh
+# `git clone` could not start: `demo.py` exited 2 on
+# `ConfigError(reason='registry_gazetteer_missing')` and the suite raised 457 errors.
+# It was invisible locally precisely because the files were ignored -- `git status`
+# reported clean and every local run worked.
+#
+# `.dockerignore` keeps the UNANCHORED spelling for the same intent, because Docker's
+# matcher anchors at the context root already; see the comment there. The two files
+# look inconsistent and must stay that way. Pinned by
+# `tests/test_api.py::test_every_runtime_asset_the_registry_needs_actually_reaches_the_image`,
+# which now asserts the files are *tracked by git*, not merely present on disk.
+/data/
 *.db
 *.db-wal
 *.db-shm

@@ -1,14 +1,30 @@
 """Content-exposure tests for :mod:`secure_context_pipeline.models` and ``config``.
 
 Build doc section 16 is the requirement: no original entity value may ever be
-logged, printed, ``repr``-ed, or embedded anywhere. A model has exactly two ways
-to emit its fields as text, and until this module existed only one field
-(``Detection.text``) was checked on either of them:
+logged, printed, ``repr``-ed, or embedded anywhere. A model has **three** ways to
+emit its fields, and until this module existed only one field (``Detection.text``)
+was checked on any of them:
 
 * ``repr()`` / ``str()`` / ``f"{model}"`` -- what an accidental interpolation in a
-  log line produces;
-* ``model_dump()`` / ``model_dump_json()`` -- what reaches an HTTP response body
-  or a JSON log line, and which bypasses ``__repr__`` entirely.
+  log line produces. Masked.
+* ``model_dump()`` / ``model_dump(mode="json")`` / ``model_dump_json()`` *at
+  default settings* -- what reaches an HTTP response body or a JSON log line, and
+  which bypasses ``__repr__`` entirely. Masked on the provider-ward path.
+* **attribute access and its aliases** -- ``getattr``, ``model.__dict__``,
+  ``vars()``, ``dict(model)``, ``list(model)``, ``pickle``, ``copy.deepcopy``,
+  ``model_copy().__dict__``, and ``model_dump(serialize_as_any=True)``, which asks
+  pydantic to serialize by runtime type and so skips every ``field_serializer``.
+  **Not masked**, and not maskable while the value must stay readable.
+
+This module's docstring used to say there were exactly two, and ``models.py`` and
+``config.py`` said so too. That was measurably false in the worse direction:
+``Detection.model_dump()`` returned ``'***'`` while ``dict(detection)['text']``
+returned the original, and ``Settings.model_dump()`` returned ``'***'`` while
+``Settings.model_dump(serialize_as_any=True)`` returned the base64 master key. No
+test looked at any of it. So the third exit is now measured field by field and
+vector by vector in :data:`THIRD_EXIT_LEAKS` below -- pinned in **both**
+directions, so neither a new leak nor a silently-fixed one can leave the prose
+stale. A limitation stated exactly is worth more than a guarantee that is not one.
 
 **Why this is quantified rather than a list of assertions.** ``models.py``'s own
 docstring states the lesson -- "a list only ever covers the columns its author
@@ -34,15 +50,20 @@ from sharing a blind spot with the thing it checks.
 
 from __future__ import annotations
 
+import base64
+import copy
 import inspect
+import pickle
+import secrets
 import types
 import typing
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum
 
 import pytest
 from pydantic import BaseModel
 
+from secure_context_pipeline import config as config_module
 from secure_context_pipeline import models
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.models import MASK, EntityCategory, SpanOut, TokenRecord
@@ -521,4 +542,322 @@ def test_every_secret_shaped_settings_field_is_masked_on_both_exits() -> None:
     for name in secret_shaped:
         assert Settings.model_fields[name].repr is False, (
             f"Settings.{name} is secret-shaped but not repr=False"
+        )
+
+
+# ---------------------------------------------------------------------------
+# The THIRD exit: attribute access and every alias of it
+#
+# `repr` and `model_dump` are the two exits this file was originally written
+# against, and both are masked. They are not the only ways a value leaves a model.
+# Pydantic keeps field values in the instance `__dict__`, so every spelling of
+# "read the attribute" -- including two `model_dump` calls that opt out of the
+# schema -- returns the value in full. That is not a bug to fix here; it is a
+# boundary to state exactly, because the alternative is a docstring that promises
+# more than the code delivers, which is the failure mode this suite exists for.
+#
+# The tables below are the statement, and the tests make it a measurement.
+# ---------------------------------------------------------------------------
+
+
+def _pickled(model: BaseModel, field: str) -> str:
+    """``pickle.dumps`` output as text.
+
+    ``latin-1`` maps every byte to exactly one character, so an ASCII substring
+    search over the decoded form is exact -- no byte can be lost or merged the way
+    a lossy decode or a ``repr()`` escape could hide a match.
+    """
+    return pickle.dumps(model).decode("latin-1")
+
+
+#: Exit 1. What an accidental ``f"{model}"`` in a log line produces.
+REPR_VECTORS: dict[str, Callable[[BaseModel, str], str]] = {
+    "repr()": lambda m, _f: repr(m),
+    "str()": lambda m, _f: str(m),
+    'f"{model}"': lambda m, _f: f"{m}",
+}
+
+#: Exit 2. Serialization at its default settings -- HTTP bodies and JSON logs.
+DUMP_VECTORS: dict[str, Callable[[BaseModel, str], str]] = {
+    "model_dump()": lambda m, _f: repr(m.model_dump()),
+    'model_dump(mode="json")': lambda m, _f: repr(m.model_dump(mode="json")),
+    "model_dump_json()": lambda m, _f: m.model_dump_json(),
+}
+
+#: Exit 3. Attribute access, spelled ten ways. Each entry maps a vector to the
+#: reason it cannot be masked -- the reason is a property of the *vector*, not of
+#: any field, which is why it is stated once here instead of 60 times below.
+UNMASKABLE_VECTORS: dict[str, str] = {
+    "getattr()": (
+        "the supported read path itself: Detection.text is spliced into the outbound "
+        "payload and Settings.master_key is decoded by master_key_bytes(). A model that "
+        "hid this value from its own attribute would not be able to do its job."
+    ),
+    "__dict__": "pydantic stores field values here; this IS the attribute, spelled differently",
+    "vars()": "vars(obj) returns obj.__dict__ -- the same object as the row above",
+    "dict()": (
+        "dict(model) consumes BaseModel.__iter__, which yields __dict__ items directly; "
+        "no serializer is involved, so no field_serializer can intercept it"
+    ),
+    "list()": "the same __iter__ protocol as dict(model), materialised as pairs",
+    "model_dump(serialize_as_any=True)": (
+        "duck-typed serialization: the caller explicitly asks pydantic to serialize by each "
+        "value's RUNTIME type, which bypasses the declared schema and every field_serializer "
+        "on it. Documented pydantic behaviour, not a defect in this package."
+    ),
+    "model_dump_json(serialize_as_any=True)": "the JSON twin of the row above, same mechanism",
+    "pickle.dumps()": (
+        "pickle serialises __dict__ and must preserve it byte-for-byte to round-trip; "
+        "a masking pickle would produce an object that silently is not the original"
+    ),
+    "copy.deepcopy().__dict__": "a copy carries the same __dict__ by definition",
+    "model_copy().__dict__": (
+        "model_copy copies field values rather than serialising them -- deliberately, and "
+        "config.py recommends it for exactly that reason"
+    ),
+}
+
+ATTRIBUTE_VECTORS: dict[str, Callable[[BaseModel, str], str]] = {
+    "getattr()": lambda m, f: repr(getattr(m, f)),
+    "__dict__": lambda m, _f: repr(m.__dict__),
+    "vars()": lambda m, _f: repr(vars(m)),
+    "dict()": lambda m, _f: repr(dict(m)),
+    "list()": lambda m, _f: repr(list(m)),
+    "model_dump(serialize_as_any=True)": lambda m, _f: repr(m.model_dump(serialize_as_any=True)),
+    "model_dump_json(serialize_as_any=True)": lambda m, _f: m.model_dump_json(
+        serialize_as_any=True
+    ),
+    "pickle.dumps()": _pickled,
+    "copy.deepcopy().__dict__": lambda m, _f: repr(copy.deepcopy(m).__dict__),
+    "model_copy().__dict__": lambda m, _f: repr(m.model_copy().__dict__),
+}
+
+_ALL_ATTRIBUTE_VECTORS = frozenset(ATTRIBUTE_VECTORS)
+
+#: ``(model, field) -> the exact set of exit-3 vectors the value survives.``
+#:
+#: This is the allow-list, and it is an equality, not a ceiling: the measured set
+#: must match it exactly. That direction matters twice over. A value that starts
+#: surviving a *new* vector fails, which is the leak case. A value that stops
+#: surviving one also fails -- because either somebody hardened the model and the
+#: prose in ``models.py``/``config.py`` is now stale, or the test builder quietly
+#: failed to plant the value at all, which would make every masking assertion in
+#: this file vacuously true. That second case is the one this suite has had to
+#: rediscover repeatedly, so it is checked structurally rather than trusted.
+#:
+#: Every field here is a key or an original. The set is *derived* from the
+#: declarations (``REPR_MASKED``, :data:`DUMP_MASKED`, ``repr=False``) by
+#: :func:`_sensitive_fields`, and the test below asserts the derivation and this
+#: table name the same fields -- so a new secret cannot ship unclassified.
+THIRD_EXIT_LEAKS: dict[tuple[str, str], frozenset[str]] = {
+    ("Detection", "text"): _ALL_ATTRIBUTE_VECTORS,
+    ("PipelineResult", "restored_text"): _ALL_ATTRIBUTE_VECTORS,
+    ("SpanOut", "surrogate"): _ALL_ATTRIBUTE_VECTORS,
+    ("Settings", "anthropic_api_key"): _ALL_ATTRIBUTE_VECTORS,
+    ("Settings", "master_key"): _ALL_ATTRIBUTE_VECTORS,
+    ("TokenRecord", "surrogate"): _ALL_ATTRIBUTE_VECTORS,
+}
+
+
+def _sensitive_fields() -> list[tuple[type[BaseModel], str]]:
+    """Every field the package *declares* to be a key or an original value.
+
+    Derived from the declarations themselves -- each model's ``REPR_MASKED``,
+    :data:`DUMP_MASKED`, and ``Settings``' ``repr=False`` -- rather than from a
+    hand-written list, for the reason ``models.py`` states and this repository has
+    proved more than once: a list only covers what its author remembered.
+    """
+    by_name = {cls.__name__: cls for cls in _model_classes()}
+    pairs: set[tuple[type[BaseModel], str]] = set()
+    for cls in _model_classes():
+        pairs.update((cls, name) for name in getattr(cls, "REPR_MASKED", frozenset()))
+    pairs.update((by_name[model_name], name) for model_name, name in DUMP_MASKED)
+    pairs.update(
+        (Settings, name) for name, info in Settings.model_fields.items() if info.repr is False
+    )
+    assert pairs, "no sensitive fields discovered -- the derivation is broken, not the package"
+    return sorted(pairs, key=lambda pair: (pair[0].__name__, pair[1]))
+
+
+def _sensitive_instance(cls: type[BaseModel], field: str) -> tuple[BaseModel, str]:
+    """An instance of ``cls`` carrying a distinctive value in ``field``, and that value.
+
+    The value is computed here and returned *independently* of the instance -- it is
+    never read back off the model with ``getattr``. If it were, a builder that
+    dropped the value would still agree with itself and every leak check would pass
+    over an empty field. The ``getattr()`` vector then serves as the anchor: it must
+    always report a leak, which is only possible if the plant actually landed.
+    """
+    if cls is Settings:
+        # `master_key` has to survive Settings' own base64-and-length validation,
+        # so the planted value is a real 32-byte key: 44 distinctive base64
+        # characters, which is exactly what escapes in production if one of these
+        # vectors is taken. Both secrets are always set, so the instance is valid
+        # whichever one is under test.
+        #
+        # `anthropic_api_key` MUST be passed under its alias. It declares
+        # `validation_alias=AliasChoices("ANTHROPIC_API_KEY")`, which *replaces* the
+        # field name as an accepted input key, and `extra="ignore"` then silently
+        # discards the field-name spelling -- `Settings(anthropic_api_key=...)`
+        # leaves the field at None with no error. The `getattr()` anchor below is
+        # what caught that; without it this builder would have been measuring an
+        # empty field and reporting the absence of a value as the absence of a leak.
+        key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+        api_key = f"sk-ant-{CANARY}"
+        settings = Settings(**{"master_key": key, "ANTHROPIC_API_KEY": api_key})  # type: ignore[arg-type]
+        return settings, key if field == "master_key" else api_key
+    return _instance_with(cls, field, CANARY), CANARY
+
+
+def _measure(cls: type[BaseModel], field: str) -> dict[str, frozenset[str]]:
+    """Which vectors, in each of the three exits, emit the planted value."""
+    model, planted = _sensitive_instance(cls, field)
+    groups = {"repr": REPR_VECTORS, "dump": DUMP_VECTORS, "attribute": ATTRIBUTE_VECTORS}
+    return {
+        group: frozenset(
+            name for name, render in vectors.items() if planted in render(model, field)
+        )
+        for group, vectors in groups.items()
+    }
+
+
+_SENSITIVE = _sensitive_fields()
+_SENSITIVE_IDS = [f"{cls.__name__}.{field}" for cls, field in _SENSITIVE]
+
+
+def test_the_three_exit_vector_tables_are_well_formed_and_disjoint() -> None:
+    """The tables are the specification; check the specification before using it.
+
+    A vector listed in two exits, or an ``UNMASKABLE_VECTORS`` reason with no
+    matching renderer, would make the sweeps below quietly measure something other
+    than what they claim to.
+    """
+    groups = {"repr": REPR_VECTORS, "dump": DUMP_VECTORS, "attribute": ATTRIBUTE_VECTORS}
+    seen: set[str] = set()
+    for name, vectors in groups.items():
+        assert vectors, f"the {name} exit has no vectors"
+        overlap = seen & set(vectors)
+        assert not overlap, f"vector(s) claimed by two exits: {sorted(overlap)}"
+        seen |= set(vectors)
+
+    assert set(UNMASKABLE_VECTORS) == set(ATTRIBUTE_VECTORS), (
+        "every attribute-access vector needs a stated reason it cannot be masked, and every "
+        "stated reason needs a vector that exercises it; symmetric difference: "
+        f"{sorted(set(UNMASKABLE_VECTORS) ^ set(ATTRIBUTE_VECTORS))}"
+    )
+    for name, reason in UNMASKABLE_VECTORS.items():
+        assert reason.strip(), f"{name} was exempted without a stated reason"
+
+
+def test_every_declared_key_and_original_is_named_in_the_third_exit_table() -> None:
+    """The derived sensitive set and :data:`THIRD_EXIT_LEAKS` must name the same fields.
+
+    Both directions, for the usual two reasons. A new secret that nobody classified
+    is the leak this table exists to catch; a stale entry naming a renamed field is
+    the quieter failure, where the table stops constraining anything while the suite
+    stays green.
+    """
+    derived = {(cls.__name__, field) for cls, field in _SENSITIVE}
+    declared = set(THIRD_EXIT_LEAKS)
+    assert derived == declared, (
+        "THIRD_EXIT_LEAKS does not describe the package. Unclassified key/original field(s): "
+        f"{sorted(derived - declared)}. Stale entries naming fields that are no longer "
+        f"declared sensitive: {sorted(declared - derived)}."
+    )
+    for key, vectors in THIRD_EXIT_LEAKS.items():
+        unknown = set(vectors) - set(ATTRIBUTE_VECTORS)
+        assert not unknown, (
+            f"{key} expects a leak on {sorted(unknown)}, which is not an attribute-access "
+            "vector. Only exit 3 may be allow-listed -- a leak through repr or through "
+            "default serialization is a defect, not an exemption."
+        )
+
+
+@pytest.mark.parametrize(("cls", "field"), _SENSITIVE, ids=_SENSITIVE_IDS)
+def test_no_key_or_original_survives_repr_or_default_serialization(
+    cls: type[BaseModel], field: str
+) -> None:
+    """Exits 1 and 2 are the ones that are masked. Prove it for every sensitive field.
+
+    ``repr`` must never carry a key or an original -- that is section 16, and it
+    holds regardless of direction, because a log line is not a response body.
+    ``dump`` is allowed to carry one only where :data:`DUMP_SERIALIZABLE` says the
+    value is the product the caller asked for, and there it is required to, since a
+    field that silently stopped serializing would break the API rather than the
+    security claim.
+    """
+    measured = _measure(cls, field)
+    assert measured["repr"] == frozenset(), (
+        f"{cls.__name__}.{field} is a key or an original and it reached "
+        f"{sorted(measured['repr'])} -- section 16 forbids this on every path"
+    )
+
+    serializes = (cls.__name__, field) in DUMP_SERIALIZABLE
+    expected = frozenset(DUMP_VECTORS) if serializes else frozenset()
+    assert measured["dump"] == expected, (
+        f"{cls.__name__}.{field} is "
+        + ("allow-listed as serializable" if serializes else "not allow-listed as serializable")
+        + f" but reached exactly {sorted(measured['dump'])} of the default-serialization "
+        f"vectors; expected {sorted(expected)}"
+    )
+
+
+@pytest.mark.parametrize(("cls", "field"), _SENSITIVE, ids=_SENSITIVE_IDS)
+def test_the_third_exit_leaks_exactly_what_the_docstrings_claim_it_leaks(
+    cls: type[BaseModel], field: str
+) -> None:
+    """Attribute access is unmasked, and this pins *precisely* how unmasked.
+
+    This test is unusual in asserting that a value **does** escape. It is not
+    endorsing the escape -- it is refusing to let ``models.py`` and ``config.py``
+    describe a boundary that nobody measures. Those two module docstrings each
+    claimed there were two exits and that serialization could not route around the
+    repr mask; both statements were false, and no test in the repository could have
+    noticed, because none of these vectors appeared anywhere in ``tests/``.
+
+    If a future change closes one of these vectors -- a ``SecretStr`` field, an
+    overridden ``__iter__`` -- this test goes red on purpose. Deleting the entry is
+    then the correct fix, together with the prose that promised it.
+    """
+    measured = _measure(cls, field)["attribute"]
+    expected = THIRD_EXIT_LEAKS[(cls.__name__, field)]
+
+    assert "getattr()" in measured, (
+        f"{cls.__name__}.{field} did not survive plain attribute access. Exactly two things "
+        f"cause that, and they need opposite responses. Either the builder never planted the "
+        f"value -- in which case every other assertion about this field is vacuous and the "
+        f"builder is the bug -- or the field became self-masking (a SecretStr-style wrapper, "
+        f"whose repr is '**********'), in which case this is good news and the fix is to "
+        f"update THIRD_EXIT_LEAKS and the models.py/config.py docstrings. Vectors that still "
+        f"carried it: {sorted(measured)}."
+    )
+    assert measured == expected, (
+        f"{cls.__name__}.{field}: the third exit moved. Newly leaking: "
+        f"{sorted(measured - expected)}. No longer leaking: {sorted(expected - measured)}. "
+        "Update THIRD_EXIT_LEAKS *and* the module docstrings in models.py / config.py -- "
+        "they cite this table by name."
+    )
+
+
+def test_models_and_config_docstrings_describe_the_third_exit() -> None:
+    """The prose has to name the unmasked exit, not just the two masked ones.
+
+    Both module docstrings previously described a two-exit world, which read as a
+    complete guarantee and was not one. Checking for *mentions of the mechanism*
+    rather than for exact sentences is deliberate: an exact-sentence check breaks on
+    harmless rewording, while rewriting back to a two-exit story means deleting
+    every one of these tokens, which is precisely the regression worth catching.
+
+    What it cannot do is judge whether the prose is *accurate* -- only that it
+    engages with the third exit at all. The accuracy check is the measurement test
+    above; this one keeps the two from drifting apart.
+    """
+    tokens = ("__dict__", "serialize_as_any", "pickle", "dict(", "vars(")
+    for module in (models, config_module):
+        doc = module.__doc__ or ""
+        present = [token for token in tokens if token in doc]
+        assert len(present) >= 3, (
+            f"{module.__name__}'s module docstring mentions only {present} of the "
+            f"attribute-access exit's mechanisms {list(tokens)}. A docstring that describes "
+            "only repr() and model_dump() overstates the guarantee; see THIRD_EXIT_LEAKS."
         )

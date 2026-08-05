@@ -2,6 +2,31 @@
 
     fetch+decrypt -> detect -> obfuscate -> inject -> EGRESS GATE -> provider -> restore
 
+**Two inputs go through detect -> obfuscate, not one.** The outbound payload is
+``{system prompt} + {user prompt} + {obfuscated document}``, so the user prompt is
+as much an egress channel as the document is, and for a long time only the document
+was treated as one: the prompt was interpolated raw. It was *scanned* -- it is inside
+``InjectedPayload.serialized``, which is the string the gate is handed -- but pass 1
+only knows values the vault learned from the document, and pass 2 blocks on
+:data:`~secure_context_pipeline.pipeline.egress_gate.HIGH_SEVERITY_TYPES` alone, so a
+name, a date of birth, an email address or a street address typed into the prompt box
+was seen, counted as a ``rescan_warnings`` increment, and shipped. Measured over HTTP
+against the real app, with values appearing nowhere in the document::
+
+    NAME       SENT 200  verbatim-in-outbound-payload=True
+    DOB        SENT 200  verbatim-in-outbound-payload=True
+    EMAIL      SENT 200  verbatim-in-outbound-payload=True
+    ADDRESS    SENT 200  verbatim-in-outbound-payload=True
+    PHONE      SENT 200  verbatim-in-outbound-payload=True
+    DIAGNOSIS  SENT 200  verbatim-in-outbound-payload=True
+
+"The user typed it themselves" is not a defence when the product's one claim is that
+no original value reaches the provider: the user is not the party the guarantee
+protects, the data subject is, and in the deployment this models the two are
+different people. So the prompt is now a first-class input -- see
+:meth:`PipelineOrchestrator._detect_and_obfuscate_prompt` for the ordering and for
+what that does and does not buy.
+
 Every stage is timed, and every audit event emitted anywhere in the run carries the
 same ``run_id``. That single ID is what lets a compliance query reconstruct the
 complete detect -> obfuscate -> egress -> LLM -> restore chain for one request.
@@ -23,7 +48,7 @@ The gate answers "did an original leave?". It cannot answer "did the right value
 come back?", and that is the other way a run goes wrong invisibly: two originals
 issued one surrogate restore to a single value, so one entity's identifier is
 printed where another's belongs. :func:`_assert_surrogates_are_distinct` refuses
-that run, at step 4b -- before the payload is even assembled.
+that run, at step 4d -- before the payload is even assembled.
 """
 
 from __future__ import annotations
@@ -122,12 +147,28 @@ class PipelineOrchestrator:
         detections: Sequence[Detection] = await self._detector.detect(text, doc_category)
         stats["detect_ms"] = _ms(mark)
         stats["entities_detected"] = float(len(detections))
+
+        # 3b. Detect over the prompt as well. Detection is stateless, so running it
+        #     here rather than next to the prompt's obfuscation costs nothing and
+        #     lets the one DETECT event describe the whole input.
+        mark = time.perf_counter()
+        prompt_detections: Sequence[Detection] = await self._detector.detect(
+            user_prompt, doc_category
+        )
+        stats["prompt_detect_ms"] = _ms(mark)
+        stats["prompt_entities_detected"] = float(len(prompt_detections))
+
         # ``doc_id`` and ``fetch_ms`` ride on DETECT rather than on a fetch event of
         # their own: build doc section 7 fixes the event-type vocabulary and step 2
         # of the section-4 narrative has no member of it (see README Deviations).
         # A uuid4 hex document ID is not content, and it is what turns "what
         # happened in this session" into "which documents were read" -- the first
         # question a HIPAA access review actually asks.
+        #
+        # The prompt's counts ride here too, for the same reason and one more: a
+        # *second* DETECT event would make "how many entities were in the document"
+        # ambiguous for every existing compliance query, and ``prompt_chars`` /
+        # ``prompt_count`` are counts, which is all this schema can hold anyway.
         await self._emit(
             AuditEvent(
                 ts=time.time(),
@@ -141,6 +182,9 @@ class PipelineOrchestrator:
                     "chars": len(text),
                     "doc_id": doc_id[:MAX_DETAIL_VALUE_LEN],
                     "fetch_ms": round(stats["fetch_ms"], 3),
+                    "prompt_chars": len(user_prompt),
+                    "prompt_count": len(prompt_detections),
+                    "prompt_elapsed_ms": round(stats["prompt_detect_ms"], 3),
                 },
             )
         )
@@ -156,31 +200,58 @@ class PipelineOrchestrator:
             run_id=run_id,
         )
         stats["obfuscate_ms"] = _ms(mark)
-        stats["tokens_issued"] = float(len(obf.tokens))
         stats["redactions"] = float(len(obf.redactions))
         stats["stripped"] = float(len(obf.stripped))
 
-        # 4b. Distinct originals must own distinct surrogates, checked here rather
-        #     than trusted. See :func:`_assert_surrogates_are_distinct`.
-        _assert_surrogates_are_distinct(obf.tokens, session_id, run_id)
+        # 4b. Obfuscate the prompt, in the same session and deliberately AFTER the
+        #     document. See :meth:`_detect_and_obfuscate_prompt`.
+        mark = time.perf_counter()
+        prompt_obf: ObfuscationResult = await self._detect_and_obfuscate_prompt(
+            session_id,
+            user_prompt,
+            prompt_detections,
+            strategy=chosen,
+            doc_category=doc_category,
+            run_id=run_id,
+        )
+        stats["prompt_obfuscate_ms"] = _ms(mark)
 
-        # 5. Assemble the payload.
+        # 4c. One token list for the whole payload. Everything downstream that asks
+        #     "what did this run put on the wire?" -- the gate's skip-list, the
+        #     collision guard, the restorer's issued set and its pseudonym map --
+        #     has to be asked about *both* halves of it, and asking it about
+        #     ``obf.tokens`` alone was silently correct only while the prompt could
+        #     not carry a surrogate. See :func:`_merge_tokens`.
+        tokens = _merge_tokens(obf.tokens, prompt_obf.tokens)
+        stats["tokens_issued"] = float(len(tokens))
+        stats["prompt_tokens_issued"] = float(len(tokens) - len(obf.tokens))
+
+        # 4d. Distinct originals must own distinct surrogates, checked here rather
+        #     than trusted. See :func:`_assert_surrogates_are_distinct`.
+        _assert_surrogates_are_distinct(tokens, session_id, run_id)
+
+        # 5. Assemble the payload. Both halves are obfuscated text by this point,
+        #    which is what the injector's parameter names now say out loud.
         mark = time.perf_counter()
         payload = self._injector.build(
-            strategy=chosen, user_prompt=user_prompt, obfuscated_document=obf.obfuscated_text
+            strategy=chosen,
+            obfuscated_prompt=prompt_obf.obfuscated_text,
+            obfuscated_document=obf.obfuscated_text,
         )
         # The exact strings this run spliced into the document. This one line is the
         # load-bearing half of the gate's pass-2 skip-list: ``_protected_spans``
         # protects a token-shaped span by grammar and a surrogate by *string
-        # equality*, and only the second can be trusted, because the emitter and the
-        # matcher can drift (``format_surrogate`` anchors its validators with ``$``,
-        # which also matches before a trailing newline, so it can emit a token
-        # ``STRICT_TOKEN_RE`` rejects). Sending ``frozenset()`` here would false-block
+        # equality*, and only the second is a property of *this* module rather than a
+        # hope about another one: string equality cannot drift, whereas "the emitter
+        # only ever produces what the matcher accepts" is a claim about two patterns
+        # in a third file staying in agreement. (They do today, and it is enforced;
+        # they have not always. README §8 carries the history.) Sending ``frozenset()``
+        # here would false-block
         # every pseudonymization run on its own well-formed output while leaving the
         # gate's own tests green, since they hand ``check()`` their surrogates
         # directly -- so the seam is pinned from this side by
         # ``test_the_gate_is_handed_the_surrogates_this_run_actually_emitted``.
-        surrogates = frozenset(t.surrogate for t in obf.tokens)
+        surrogates = frozenset(t.surrogate for t in tokens)
         stats["inject_ms"] = _ms(mark)
 
         # The two strings the provider will be handed, bound to locals here and not
@@ -198,6 +269,12 @@ class PipelineOrchestrator:
 
         # 6b. The gate cleared a specific string. Prove that is the string we send.
         await self._verify_release(session_id, run_id, report.payload_sha256, system, user)
+
+        # 6c. The gate scanned a specific *set*. Prove it was not empty when we know
+        #     it should not have been. See ``_verify_pass_one_had_something_to_scan``.
+        await self._verify_pass_one_had_something_to_scan(
+            session_id, run_id, len(tokens), report.originals_scanned
+        )
 
         # 7. Provider call -- only reachable past a passing gate, and only with the
         #    bytes that gate cleared.
@@ -228,7 +305,7 @@ class PipelineOrchestrator:
 
         # 8. Restore. LLM output is untrusted text -- string operations only.
         mark = time.perf_counter()
-        surrogate_map = await self._surrogate_map(session_id, obf, chosen)
+        surrogate_map = await self._surrogate_map(session_id, tokens, chosen)
         restored = await self._restorer.restore(
             session_id,
             llm.text,
@@ -240,7 +317,7 @@ class PipelineOrchestrator:
             # the model invented (`fabricated`, a WARNING -- expected). Without it
             # every production miss is recorded as `indeterminate`, which is honest
             # but useless to an auditor asking whether the vault lost data.
-            issued={token.token_id for token in obf.tokens},
+            issued={token.token_id for token in tokens},
             run_id=run_id,
         )
         stats["restore_ms"] = _ms(mark)
@@ -266,12 +343,92 @@ class PipelineOrchestrator:
             obfuscated_payload=payload.serialized,
             raw_llm_response=llm.text,
             strategy=chosen,
+            # DOCUMENT spans only, and ``prompt_obf.spans`` is deliberately not
+            # merged in. ``SpanOut`` offsets are documented as offsets into the
+            # original document and the UI uses them to highlight it; a prompt span
+            # carries prompt-space offsets, so appending it would silently
+            # mis-highlight a region of the document and there is nothing in the
+            # type to say which space a span belongs to. What the prompt did is
+            # reported instead as ``prompt_entities_detected`` /
+            # ``prompt_tokens_issued`` in ``stats``, as one ``OBFUSCATE`` audit event
+            # per vaulted value, and -- in full -- in ``obfuscated_payload``, which
+            # carries the obfuscated prompt verbatim. Carrying prompt spans properly
+            # needs a span space on ``SpanOut``, which is an API change.
             detections=list(obf.spans),
             stats=stats,
             audit_seq=audit_seq,
         )
 
     # ------------------------------------------------------------------
+    async def _detect_and_obfuscate_prompt(
+        self,
+        session_id: str,
+        user_prompt: str,
+        detections: Sequence[Detection],
+        *,
+        strategy: str,
+        doc_category: str | None,
+        run_id: str,
+    ) -> ObfuscationResult:
+        """Run the user prompt through the same engine the document goes through.
+
+        The prompt is half of the outbound payload, and until this existed it was
+        the half nothing obfuscated -- reproduced end-to-end over HTTP with six
+        entity types, see this module's docstring. The options were (a) detect and
+        obfuscate it like the document, (b) block on any detection in it, and (c)
+        write the hole down as an accepted boundary. This is (a).
+
+        **Why (a) and not (b).** Blocking is easy to defend and expensive to live
+        with: the natural prompt for this product is *"summarise this record for
+        Dr Okafor"* or *"compare against the 03/12/1985 admission"*, and (b) turns
+        every one of those into a 422 with no way forward. It is also strictly
+        weaker where it matters. Blocking on detection protects only what the
+        detector finds; obfuscating on detection protects what the detector finds
+        **and** -- through the engine's cross-call residual sweep -- every value this
+        *session* has already vaulted, whether or not the detector fires on it in
+        this short, context-free string. NER on a nine-word question is much worse
+        than NER on a clinical note, so that second half is not a rounding error:
+        it is the half that catches the common case, a user re-typing a name that
+        is in the document they are asking about.
+
+        **Ordering is load-bearing: the document is obfuscated first.** The sweep
+        chases values vaulted on an *earlier* call in the same session, so running
+        the prompt second means every original the document vaulted is masked in the
+        prompt too, with the *same* surrogate -- which is also what keeps the
+        cross-reference the user was making intact for the model. Reversing the two
+        would leave that to prompt-only NER.
+
+        The residual of that ordering is a value the prompt vaults that also appears
+        in the already-obfuscated document text and that the detector missed there.
+        That is not a leak: pass 1 of the gate scans the assembled payload against
+        the whole session vault, so the value is now vaulted and the request blocks.
+        It is a denial, which is the direction this pipeline is allowed to be wrong
+        in, and it is the same trade the document half already makes.
+
+        ``doc_category`` is the *document's* category, passed on purpose. The prompt
+        carries no category of its own, and ``None`` is not the neutral choice it
+        looks like: the registry scopes ``DATE``, ``AMOUNT``, ``CLIENT_IDENTITY`` and
+        ``CASE_STRATEGY`` to particular categories, so an uncategorised prompt would
+        have a date of birth typed into it fall out of scope entirely. A question
+        asked *about* a medical record is a medical question.
+
+        **What this does not buy.** The prompt is now exactly as protected as the
+        document and no more: a value no recogniser anchors on is missed here for
+        the same reason it is missed there, and the guarantee remains an egress
+        property with respect to the vault and a recall property with respect to
+        everything else (see :mod:`~secure_context_pipeline.pipeline.egress_gate`).
+        What changed is that the prompt is no longer a *category* of input that was
+        exempt from the pipeline the product is named after.
+        """
+        return await self._engine.obfuscate(
+            session_id,
+            user_prompt,
+            detections,
+            strategy=strategy,
+            doc_category=doc_category,
+            run_id=run_id,
+        )
+
     async def _verify_release(
         self,
         session_id: str,
@@ -346,14 +503,110 @@ class PipelineOrchestrator:
             run_id=run_id[:MAX_DETAIL_VALUE_LEN],
         )
 
+    async def _verify_pass_one_had_something_to_scan(
+        self,
+        session_id: str,
+        run_id: str,
+        tokens_issued: int,
+        originals_scanned: int,
+    ) -> None:
+        """Block if this run vaulted values and the gate then scanned an empty set.
+
+        Pass 1 is the only gate pass that does not depend on detector recall, and the
+        whole "this is an *egress* property, not a *detection* property" argument
+        rests on it. It is also the pass that fails **silently** when it fails: with
+        an empty originals set it is a no-op that returns 0, and ``EGRESS_PASS`` then
+        records ``originals_scanned: 0`` -- byte-identical in the audit trail to a
+        document that legitimately contained nothing sensitive, a shape the
+        integration suite asserts as normal.
+
+        ``SessionVault.originals_for_session`` returns ``frozenset()`` for an unknown
+        or destroyed session. Its docstring calls that "fails *safe*", and for the
+        vault's own contract it is: it never invents values. For the gate's contract
+        it is the opposite, and nothing was joining the two beliefs -- ``grep
+        originals_scanned`` across the repo found the field set, written to the audit
+        detail, and asserted in tests, with **no production reader at all**.
+
+        This is that reader, and it is deliberately built from two *different sources*
+        rather than one: ``tokens_issued`` is this run's own manifest, accumulated by
+        the obfuscation stage, and ``originals_scanned`` comes back from the vault's
+        cache through the gate. Agreement between them means something precisely
+        because neither is derived from the other. That is the differently-sourced
+        cross-check this codebase's recurring defect class calls for, and it is the
+        one place it was cheap to add.
+
+        **The predicate is deliberately weak, and that is not laziness.** The tempting
+        assertion is ``originals_scanned >= tokens_issued``, and it is wrong: the
+        engine dedupes by ``(entity_type, normalize(text))`` while the vault's
+        originals set is a set of *strings*, so one value claimed by two entity types
+        is two tokens and one original, and the strong form would false-block on
+        ordinary documents. What is asserted is only the condition that can never be
+        legitimate -- **we vaulted something and the gate saw nothing** -- which is
+        exactly the silent no-op above and nothing else.
+
+        Fails as an ``EgressBlockedError`` for the same reason ``_verify_release``
+        does: an unscanned payload is an unreleased payload.
+        """
+        if tokens_issued == 0 or originals_scanned > 0:
+            return
+        logger.error(
+            "egress pass 1 scanned an empty originals set for a run that vaulted "
+            "values; blocking",
+            extra={
+                "session_id": session_id,
+                "run_id": run_id,
+                "tokens_issued": tokens_issued,
+                "originals_scanned": originals_scanned,
+            },
+        )
+        # Best-effort, exactly as in ``_verify_release``: the block below is already
+        # guaranteed, and an audit-layer failure must not replace a typed
+        # EGRESS_BLOCKED with whatever the writer threw.
+        try:
+            await self._emit(
+                AuditEvent(
+                    ts=time.time(),
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type=EGRESS_BLOCK,
+                    detail={
+                        "reason": "pass_one_scanned_nothing",
+                        "hit_count": 0,
+                        "entity_types": "",
+                        "tokens_issued": tokens_issued,
+                    },
+                )
+            )
+        except Exception as exc:
+            logger.error(
+                "empty-scan block could not be audited; the block itself still stands",
+                extra={
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "error": type(exc).__name__,
+                },
+            )
+        raise EgressBlockedError(
+            session_id=session_id[:MAX_DETAIL_VALUE_LEN],
+            reason="pass_one_scanned_nothing",
+            hit_count=0,
+            run_id=run_id[:MAX_DETAIL_VALUE_LEN],
+        )
+
     async def _surrogate_map(
-        self, session_id: str, obf: ObfuscationResult, strategy: str
+        self, session_id: str, tokens: Sequence[TokenRecord], strategy: str
     ) -> dict[str, str] | None:
         """Surrogate -> original, for pseudonymization only.
 
         Tokenization restores by hash, so it needs no map. Pseudonyms are ordinary
         words with no embedded key, so the restorer needs the candidate list; the
         values come back out of the vault rather than being carried along the run.
+
+        ``tokens`` is the *merged* list (:func:`_merge_tokens`), so it includes
+        surrogates the prompt contributed. Passing only the document's would be the
+        quiet failure of this whole change: under pseudonymization a fake reads
+        exactly like a real value, so an unmapped prompt pseudonym is not a visible
+        ``[UNRESOLVED_ENTITY]`` -- the caller reads the invented name as the answer.
 
         **Known limitation -- chained restoration under pseudonymization.** The
         restorer runs its surrogate pass before its token pass. A vaulted original
@@ -364,7 +617,7 @@ class PipelineOrchestrator:
 
         Reaching it needs a same-session **token-ID** collision *and* document text
         matching this project's own token grammar. Stated precisely so the guard at
-        step 4b is not mistaken for a fix for this:
+        step 4d is not mistaken for a fix for this:
         :func:`_assert_surrogates_are_distinct` refuses two originals sharing one
         *surrogate*, which is a different collision. The token-ID half is held
         upstream instead, by the engine's ``_unique_token_id`` and the ``counter``
@@ -380,7 +633,7 @@ class PipelineOrchestrator:
         if strategy != "pseudonymization":
             return None
         mapping: dict[str, str] = {}
-        for token in obf.tokens:
+        for token in tokens:
             mapping[token.surrogate] = await self._vault.get_by_surrogate(
                 session_id, token.surrogate
             )
@@ -411,6 +664,39 @@ class PipelineOrchestrator:
             await self._audit.emit(event)
 
 
+def _merge_tokens(
+    document: Sequence[TokenRecord], prompt: Sequence[TokenRecord]
+) -> list[TokenRecord]:
+    """Every surrogate this run put on the wire, document half first.
+
+    The two halves overlap by design and the overlap must not be counted twice. A
+    value mentioned in both the document and the prompt is **one vault row**: the
+    engine resolves it to the record that already exists, and the prompt's residual
+    sweep splices the document's own surrogate in. So the merge de-duplicates on
+    ``token_id`` -- the vault's identity for a value -- and not on ``surrogate``,
+    which under pseudonymization is a realistic fake that could in principle be
+    drawn twice, and not on object identity, which would keep both copies.
+
+    The document's list is copied through **unchanged**, dupes and all, rather than
+    itself de-duplicated. That is deliberate: ``stats["tokens_issued"]`` is derived
+    from the length of this list and an integration test holds it equal to the
+    session's vault row count, so a de-dupe here would quietly change a number that
+    is asserted elsewhere against a different source of truth. What this function
+    is allowed to decide is only which *prompt* records are new.
+
+    Order is document-then-prompt and stable, so the surrogate set, the pseudonym
+    restore map and the collision guard all see the same sequence every run.
+    """
+    merged = list(document)
+    seen = {record.token_id for record in merged}
+    for record in prompt:
+        if record.token_id in seen:
+            continue
+        seen.add(record.token_id)
+        merged.append(record)
+    return merged
+
+
 def _assert_surrogates_are_distinct(
     tokens: Sequence[TokenRecord], session_id: str, run_id: str
 ) -> None:
@@ -434,7 +720,7 @@ def _assert_surrogates_are_distinct(
     not, and in a clinical or legal document it is the one failure a reviewer would
     rather have been an error.
 
-    It runs at step 4b -- before injection, before the gate, before the provider --
+    It runs at step 4d -- before injection, before the gate, before the provider --
     because the collision exists the moment the surrogates do. Failing here costs no
     model call and keeps an ambiguous payload from being assembled at all.
 

@@ -25,6 +25,15 @@ dependencies = [
     # detection
     "presidio-analyzer>=2.2.355,<3",
     "spacy>=3.7,<3.9",
+    # `detection/registry.py` compiles every shipped pattern with `regex`, not `re`,
+    # and that is a hard requirement rather than a preference: MRN and ACCOUNT_NUMBER
+    # use PCRE `\K` and possessive quantifiers, which stdlib `re` refuses to compile
+    # at all ("bad escape \K"). Every path that touches the registry -- config,
+    # detector, engine, strategies -- therefore fails at IMPORT time without it.
+    # It resolved until now only because presidio-analyzer happens to require it
+    # transitively; a resolver that satisfied presidio otherwise would break the
+    # package outright. Declared explicitly so the dependency is ours, not luck.
+    "regex>=2023.0.0",
     # crypto
     "cryptography>=43.0,<47",
     # storage / io

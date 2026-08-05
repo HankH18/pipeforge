@@ -67,6 +67,7 @@ from typing import Final
 from secure_context_pipeline.audit.logger import OBFUSCATE, REDACT, STRIP, AuditLogger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import derive_token_id, normalize
+from secure_context_pipeline.detection.detector import resolve_overlaps
 from secure_context_pipeline.detection.registry import EntityRegistry, RegistryAction
 from secure_context_pipeline.errors import PipelineError, VaultMissError
 from secure_context_pipeline.models import (
@@ -440,7 +441,18 @@ class ObfuscationEngine:
     def _plan(
         self, text: str, detections: Sequence[Detection], doc_category: str | None
     ) -> list[_Planned]:
-        """Drop, scope, de-overlap and classify. Returns spans in offset order."""
+        """Drop, scope, de-overlap and classify. Returns spans in offset order.
+
+        De-overlapping runs :func:`detection.detector.resolve_overlaps` -- the same
+        function object the detector uses, not a copy of it -- with the same two
+        categorical rank dimensions derived from this engine's registry. Splicing
+        overlapping spans is undefined, and ``obfuscate`` accepts detections from
+        any source, so the pass is not redundant just because ``Detector`` already
+        returns disjoint spans. What it must not be is a *second opinion*: the
+        surviving label picks the tier, action and threshold applied below, so two
+        implementations that rank differently obfuscate the same document
+        differently depending on which one ran.
+        """
         limit = len(text)
         candidates = [
             detection
@@ -449,12 +461,16 @@ class ObfuscationEngine:
             and self._in_scope(detection.entity_type, doc_category)
             and self._is_enforceable(detection)
         ]
+        entities = self._registry.entities
         policy_types = frozenset(
-            name for name, spec in self._registry.entities.items() if spec.action is not None
+            name for name, spec in entities.items() if spec.action is not None
+        )
+        pattern_types = frozenset(
+            name for name, spec in entities.items() if spec.patterns or spec.gazetteer
         )
         planned = [
             self._classify(detection)
-            for detection in _resolve_overlaps(text, candidates, policy_types)
+            for detection in resolve_overlaps(text, candidates, policy_types, pattern_types)
         ]
         return [item for item in planned if item is not None]
 
@@ -782,83 +798,6 @@ def _word_bounded(surface: str) -> str:
     left = f"(?<!{_ALNUM})" if _ALNUM_RE.match(surface[0]) else ""
     right = f"(?!{_ALNUM})" if _ALNUM_RE.match(surface[-1]) else ""
     return left + re.escape(surface) + right
-
-
-def _resolve_overlaps(
-    text: str, detections: Sequence[Detection], policy_types: frozenset[str] = frozenset()
-) -> list[Detection]:
-    """Non-overlapping spans that **cover every detection**: rank picks the label only.
-
-    Splicing overlapping spans is undefined, and two registry entities can claim
-    the same underlying recognizer hit. Adjacent spans (``a.end == b.start``) are
-    not overlaps and are both kept.
-
-    ``policy_types`` (``action: strip`` / ``action: redact``) outrank score: a
-    categorical "must never leave" rule should not lose to a contained span that
-    merely scored higher.
-
-    **The loser is absorbed into the winner, never merely dropped.** Ranking
-    decides *whose label* survives; it must not decide *whether the text is
-    protected*. Dropping is only safe when the winner **contains** the loser -- on
-    a partial overlap the loser's uncovered remainder stays in the document in the
-    clear. ``CASE_STRATEGY``'s ``[^.\\n]{0,120}`` tail stopping one character into
-    a name overlaps ``CLIENT_IDENTITY`` without containing it, and the payload
-    became ``[REDACTED_CASE_STRATEGY]riyanka Raghunathan`` -- a name on the wire.
-    With no policy entity involved at all: a spaCy ``PERSON`` at 0.85 running into
-    an ``MRN:`` label clips the 0.7 pattern hit and leaks the digits.
-
-    So an overlapping detection widens the winner to the **union** of the two
-    spans. Every detection is then covered by exactly one kept span whatever the
-    ranking decided, and the failure mode flips from under- to over-redaction.
-
-    This mirrors :func:`detection.detector._resolve_overlaps` deliberately. The
-    detector already hands over non-overlapping spans, so this is latent there --
-    but this function exists precisely to be correct "when handed detections from
-    any other source", and in that role the drop rule leaks.
-    """
-    ranked = sorted(
-        detections,
-        key=lambda d: (
-            0 if d.entity_type in policy_types else 1,
-            -d.score,
-            -(d.end - d.start),
-            d.start,
-            d.entity_type,
-        ),
-    )
-    kept: list[Detection] = []
-    for detection in ranked:
-        touching = [
-            index
-            for index, other in enumerate(kept)
-            if detection.start < other.end and other.start < detection.end
-        ]
-        if not touching:
-            kept.append(detection)
-            continue
-        # ``kept`` is in rank order and ``detection`` ranks below all of it, so
-        # ``members`` runs best-ranked first. The union cannot reach a span outside
-        # ``touching``: its bounds come from the detection or from a span already
-        # overlapping it, so there is no gap for an untouched span to hide in.
-        members = [kept[index] for index in touching] + [detection]
-        start = min(member.start for member in members)
-        end = max(member.end for member in members)
-        # A span that already *is* the union takes the label even if outranked,
-        # otherwise a clipped fragment steals the label from the entity containing
-        # it -- the same principle as ranking policy actions above score.
-        winner = next(
-            (member for member in members if member.start == start and member.end == end),
-            members[0],
-        )
-        if winner.start != start or winner.end != end:
-            winner = winner.model_copy(
-                update={"start": start, "end": end, "text": text[start:end]}
-            )
-        kept[touching[0]] = winner
-        for index in reversed(touching[1:]):
-            del kept[index]
-    kept.sort(key=lambda d: (d.start, d.end))
-    return kept
 
 
 def _group(planned: Sequence[_Planned]) -> dict[tuple[str, str], _Group]:

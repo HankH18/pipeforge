@@ -29,11 +29,11 @@ from secure_context_pipeline.detection.detector import (
     PRESIDIO_LOGGER_NAME,
     DetectionInvariantError,
     Detector,
-    _resolve_overlaps,
     _verify_offsets,
     chunk_text,
     get_analyzer,
     reset_analyzer_cache,
+    resolve_overlaps,
     warm_up,
 )
 from secure_context_pipeline.detection.recognizers import (
@@ -2272,7 +2272,7 @@ HELD_OUT_INCIDENTAL_MASKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
 # Two MRN rows used to sit here -- 'Chart No. 2207731' and 'Billing reference: chart
 # 5518044', both masked by a DATE detection over the bare digit run. Both are now
 # claimed by MRN itself: the identifier-position pattern matches them, and a registry
-# pattern outranks a Presidio built-in categorically in _resolve_overlaps, so the
+# pattern outranks a Presidio built-in categorically in resolve_overlaps, so the
 # specific claim takes the label from the general one. They are gone from this table
 # rather than reworded, which is exactly what the ``==`` assertion is for.
 
@@ -3213,7 +3213,7 @@ async def test_an_unlabelled_digit_run_stays_masked_even_though_date_is_the_wron
 
     The right fix is relabelling, not dropping, and it is already in place for every
     case where the document names the record at all: an identifier-position match
-    outranks a built-in categorically in ``_resolve_overlaps``, which is why the two
+    outranks a built-in categorically in ``resolve_overlaps``, which is why the two
     held-out chart numbers that used to be masked as DATE are now typed MRN.
     """
     text = "Accession column\n8814027\n2207731\n5518044\nend of export."
@@ -3476,7 +3476,7 @@ def test_resolve_overlaps_absorbs_a_partially_overlapping_loser() -> None:
         entity_type="CLIENT_IDENTITY", category="LEGAL", start=10, end=20, text=text[10:20],
         score=0.85,
     )
-    kept = _resolve_overlaps(text, [winner, loser], frozenset({"CASE_STRATEGY"}))
+    kept = resolve_overlaps(text, [winner, loser], frozenset({"CASE_STRATEGY"}))
 
     assert len(kept) == 1
     assert (kept[0].start, kept[0].end) == (0, 20), "the union must be covered"
@@ -3500,7 +3500,7 @@ def test_resolve_overlaps_gives_the_label_to_the_span_that_covers_the_union() ->
     whole = Detection(
         entity_type="MRN", category="PHI", start=6, end=18, text=text[6:18], score=0.7
     )
-    kept = _resolve_overlaps(text, [fragment, whole])
+    kept = resolve_overlaps(text, [fragment, whole])
 
     assert len(kept) == 1
     assert kept[0].entity_type == "MRN"
@@ -3526,7 +3526,7 @@ def test_resolve_overlaps_prefers_a_registry_pattern_over_a_general_ner_label() 
     specific = Detection(
         entity_type="EMAIL", category="PII", start=6, end=30, text=text[6:30], score=0.70
     )
-    kept = _resolve_overlaps(text, [general, specific], frozenset(), frozenset({"EMAIL"}))
+    kept = resolve_overlaps(text, [general, specific], frozenset(), frozenset({"EMAIL"}))
 
     assert len(kept) == 1
     assert kept[0].entity_type == "EMAIL"
@@ -3544,7 +3544,7 @@ def test_policy_action_still_outranks_a_registry_pattern() -> None:
     amount = Detection(
         entity_type="AMOUNT", category="FIN", start=18, end=25, text=text[18:25], score=0.70
     )
-    kept = _resolve_overlaps(
+    kept = resolve_overlaps(
         text,
         [strategy, amount],
         frozenset({"CASE_STRATEGY"}),
@@ -3566,7 +3566,7 @@ def test_resolve_overlaps_leaves_contained_and_disjoint_spans_alone() -> None:
     apart = Detection(
         entity_type="NAME", category="PII", start=37, end=45, text=text[37:45], score=0.85
     )
-    kept = _resolve_overlaps(text, [outer, inner, apart])
+    kept = resolve_overlaps(text, [outer, inner, apart])
 
     assert [(d.entity_type, d.start, d.end) for d in kept] == [
         ("SETTLEMENT_TERM", 4, 33),
@@ -3656,7 +3656,7 @@ async def test_a_bare_gazetteer_hit_is_still_strong_enough_to_tokenize(
 
     # An exact match against a curated clinical list is stronger evidence than a
     # shape-based regex, and score is what breaks the tie once the two categorical
-    # dimensions in _resolve_overlaps agree -- which they do for any two custom
+    # dimensions in resolve_overlaps agree -- which they do for any two custom
     # recognizers. Asserted as a relationship rather than behaviourally because no
     # document in either corpus overlaps a gazetteer hit with a pattern hit, so
     # there is nothing honest to measure it on; the ordering is a design invariant

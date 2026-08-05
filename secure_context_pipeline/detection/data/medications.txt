@@ -1,0 +1,208 @@
+# Medication gazetteer -- build doc section 9.2.
+#
+# Format: TSV, one entry per line -- `term<TAB>class_hint`.
+#   term        lowercase generic or brand name (single- or multi-word)
+#   class_hint  lowercase, hyphenated, <= 24 chars; DRUG CLASS only, never a patient
+#
+# The class column feeds Tier-3 class-annotated tokens (section 9.3):
+#   metformin -> [PHI_MEDICATION_2f4a|oral-antidiabetic]
+# The hint must carry enough clinical signal for the LLM to reason about the
+# class while the value itself stays in the vault.
+#
+# Blank lines and `#` lines are comments. Terms are unique file-wide and sorted
+# alphabetically within each section. Generic clinical vocabulary only -- there
+# is no patient data of any kind in this file (section 16).
+
+# --- Lipid lowering ------------------------------------------------------
+atorvastatin	statin
+crestor	statin
+ezetimibe	lipid-lowering-other
+fenofibrate	fibrate
+lipitor	statin
+rosuvastatin	statin
+simvastatin	statin
+
+# --- Antihypertensive / heart failure ------------------------------------
+amlodipine	ccb
+atenolol	beta-blocker
+carvedilol	beta-blocker
+chlorthalidone	diuretic-thiazide
+diltiazem	ccb
+enalapril	ace-inhibitor
+furosemide	diuretic-loop
+hydrochlorothiazide	diuretic-thiazide
+labetalol	beta-blocker
+lasix	diuretic-loop
+lisinopril	ace-inhibitor
+losartan	arb
+metoprolol	beta-blocker
+norvasc	ccb
+propranolol	beta-blocker
+ramipril	ace-inhibitor
+spironolactone	diuretic-k-sparing
+valsartan	arb
+verapamil	ccb
+
+# --- Antithrombotic / antiarrhythmic -------------------------------------
+amiodarone	antiarrhythmic
+apixaban	anticoagulant
+aspirin	antiplatelet
+clopidogrel	antiplatelet
+digoxin	cardiac-glycoside
+eliquis	anticoagulant
+enoxaparin	anticoagulant
+nitroglycerin	nitrate
+plavix	antiplatelet
+rivaroxaban	anticoagulant
+ticagrelor	antiplatelet
+warfarin	anticoagulant
+xarelto	anticoagulant
+
+# --- Diabetes ------------------------------------------------------------
+dapagliflozin	sglt2-inhibitor
+empagliflozin	sglt2-inhibitor
+farxiga	sglt2-inhibitor
+glimepiride	oral-antidiabetic
+glipizide	oral-antidiabetic
+glyburide	oral-antidiabetic
+humalog	insulin
+insulin glargine	insulin
+insulin lispro	insulin
+januvia	oral-antidiabetic
+jardiance	sglt2-inhibitor
+lantus	insulin
+linagliptin	oral-antidiabetic
+liraglutide	glp1-agonist
+metformin	oral-antidiabetic
+ozempic	glp1-agonist
+pioglitazone	oral-antidiabetic
+semaglutide	glp1-agonist
+sitagliptin	oral-antidiabetic
+tirzepatide	glp1-agonist
+
+# --- Hormone / steroid / bone --------------------------------------------
+alendronate	bisphosphonate
+dexamethasone	corticosteroid
+estradiol	estrogen-hormone
+hydrocortisone	corticosteroid
+levothyroxine	thyroid-hormone
+methimazole	antithyroid
+methylprednisolone	corticosteroid
+prednisone	corticosteroid
+synthroid	thyroid-hormone
+
+# --- Psychiatric / neurologic --------------------------------------------
+alprazolam	benzodiazepine
+aripiprazole	antipsychotic
+bupropion	antidepressant-other
+carbidopa-levodopa	antiparkinsonian
+citalopram	ssri
+clonazepam	benzodiazepine
+donepezil	cholinesterase-inhib
+duloxetine	snri
+escitalopram	ssri
+fluoxetine	ssri
+gabapentin	anticonvulsant
+lamotrigine	anticonvulsant
+levetiracetam	anticonvulsant
+lexapro	ssri
+lithium	mood-stabilizer
+lorazepam	benzodiazepine
+methylphenidate	cns-stimulant
+mirtazapine	antidepressant-other
+olanzapine	antipsychotic
+paroxetine	ssri
+phenytoin	anticonvulsant
+pregabalin	anticonvulsant
+quetiapine	antipsychotic
+risperidone	antipsychotic
+seroquel	antipsychotic
+sertraline	ssri
+sumatriptan	triptan-antimigraine
+topiramate	anticonvulsant
+trazodone	antidepressant-other
+valproate	anticonvulsant
+venlafaxine	snri
+xanax	benzodiazepine
+zoloft	ssri
+zolpidem	sedative-hypnotic
+
+# --- Analgesia / musculoskeletal -----------------------------------------
+acetaminophen	analgesic-antipyretic
+celecoxib	nsaid
+cyclobenzaprine	muscle-relaxant
+diclofenac	nsaid
+fentanyl	opioid-analgesic
+hydrocodone	opioid-analgesic
+ibuprofen	nsaid
+meloxicam	nsaid
+morphine	opioid-analgesic
+naproxen	nsaid
+oxycodone	opioid-analgesic
+tizanidine	muscle-relaxant
+tramadol	opioid-analgesic
+tylenol	analgesic-antipyretic
+
+# --- Gastrointestinal ----------------------------------------------------
+esomeprazole	ppi
+famotidine	h2-blocker
+omeprazole	ppi
+ondansetron	antiemetic
+pantoprazole	ppi
+polyethylene glycol	laxative
+prilosec	ppi
+promethazine	antiemetic
+protonix	ppi
+zofran	antiemetic
+
+# --- Respiratory / allergy -----------------------------------------------
+advair	ics-laba-combo
+albuterol	bronchodilator
+budesonide	inhaled-corticosteroid
+cetirizine	antihistamine
+diphenhydramine	antihistamine
+fluticasone	inhaled-corticosteroid
+hydroxyzine	antihistamine
+ipratropium	bronchodilator
+loratadine	antihistamine
+montelukast	leukotriene-modifier
+tiotropium	bronchodilator
+ventolin	bronchodilator
+
+# --- Anti-infective ------------------------------------------------------
+acyclovir	antiviral
+amoxicillin	antibiotic-penicillin
+augmentin	antibiotic-penicillin
+azithromycin	antibiotic-macrolide
+ceftriaxone	antibiotic-cephalosporin
+cephalexin	antibiotic-cephalosporin
+ciprofloxacin	antibiotic-quinolone
+doxycycline	antibiotic-tetracycline
+fluconazole	antifungal
+levofloxacin	antibiotic-quinolone
+metronidazole	antibiotic-anaerobic
+oseltamivir	antiviral
+sulfamethoxazole-trimethoprim	antibiotic-sulfa
+valacyclovir	antiviral
+vancomycin	antibiotic-glycopeptide
+
+# --- Oncology / immunology -----------------------------------------------
+adalimumab	tnf-inhibitor
+azathioprine	immunosuppressant
+cisplatin	chemotherapy
+doxorubicin	chemotherapy
+etanercept	tnf-inhibitor
+methotrexate	immunosuppressant
+paclitaxel	chemotherapy
+tacrolimus	immunosuppressant
+tamoxifen	hormonal-oncology
+
+# --- Other ---------------------------------------------------------------
+allopurinol	antigout
+colchicine	antigout
+ferrous sulfate	iron-supplement
+finasteride	5-alpha-reductase-inh
+hydroxychloroquine	dmard-antimalarial
+potassium chloride	electrolyte-supplement
+sildenafil	pde5-inhibitor
+tamsulosin	bph-alpha-blocker

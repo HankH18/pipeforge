@@ -1,0 +1,252 @@
+# Diagnosis gazetteer -- build doc section 9.2.
+#
+# Format: TSV, one entry per line -- `term<TAB>class_hint`.
+#   term        lowercase condition name (single- or multi-word), incl. common
+#               clinical abbreviations (copd, gerd, adhd)
+#   class_hint  lowercase, hyphenated, <= 24 chars; DISEASE CATEGORY only,
+#               never a patient
+#
+# The class column feeds Tier-3 class-annotated tokens (section 9.3):
+#   type 2 diabetes -> [PHI_DIAGNOSIS_9c1e|endocrine-metabolic]
+# The hint keeps class-level clinical reasoning available to the LLM while the
+# specific condition stays in the vault.
+#
+# Blank lines and `#` lines are comments. Terms are unique file-wide and sorted
+# alphabetically within each section. Generic clinical vocabulary only -- there
+# is no patient data of any kind in this file (section 16).
+
+# --- Cardiovascular ------------------------------------------------------
+angina	cardiovascular
+aortic stenosis	cardiovascular
+atrial fibrillation	cardiovascular
+atrial flutter	cardiovascular
+bradycardia	cardiovascular
+cardiomyopathy	cardiovascular
+chest pain	cardiovascular
+congestive heart failure	cardiovascular
+coronary artery disease	cardiovascular
+deep vein thrombosis	cardiovascular
+hypertension	cardiovascular
+hypotension	cardiovascular
+myocardial infarction	cardiovascular
+peripheral artery disease	cardiovascular
+pulmonary embolism	cardiovascular
+supraventricular tachycardia	cardiovascular
+syncope	cardiovascular
+tachycardia	cardiovascular
+valvular heart disease	cardiovascular
+
+# --- Endocrine / metabolic -----------------------------------------------
+adrenal insufficiency	endocrine-metabolic
+diabetes mellitus	endocrine-metabolic
+diabetic ketoacidosis	endocrine-metabolic
+gestational diabetes	endocrine-metabolic
+hyperglycemia	endocrine-metabolic
+hyperkalemia	endocrine-metabolic
+hyperlipidemia	endocrine-metabolic
+hyperthyroidism	endocrine-metabolic
+hypoglycemia	endocrine-metabolic
+hypokalemia	endocrine-metabolic
+hyponatremia	endocrine-metabolic
+hypothyroidism	endocrine-metabolic
+metabolic syndrome	endocrine-metabolic
+obesity	endocrine-metabolic
+polycystic ovary syndrome	endocrine-metabolic
+prediabetes	endocrine-metabolic
+thyroid nodule	endocrine-metabolic
+type 1 diabetes	endocrine-metabolic
+type 2 diabetes	endocrine-metabolic
+vitamin d deficiency	endocrine-metabolic
+
+# --- Respiratory ---------------------------------------------------------
+acute bronchitis	respiratory
+acute respiratory failure	respiratory
+allergic rhinitis	respiratory
+asthma	respiratory
+bronchiectasis	respiratory
+bronchitis	respiratory
+chronic cough	respiratory
+chronic obstructive pulmonary disease	respiratory
+copd	respiratory
+emphysema	respiratory
+obstructive sleep apnea	respiratory
+pleural effusion	respiratory
+pneumonia	respiratory
+pulmonary fibrosis	respiratory
+shortness of breath	respiratory
+sinusitis	respiratory
+upper respiratory infection	respiratory
+
+# --- Neurologic ----------------------------------------------------------
+alzheimer disease	neurologic
+bell palsy	neurologic
+concussion	neurologic
+delirium	neurologic
+dementia	neurologic
+epilepsy	neurologic
+essential tremor	neurologic
+migraine	neurologic
+multiple sclerosis	neurologic
+parkinson disease	neurologic
+peripheral neuropathy	neurologic
+restless legs syndrome	neurologic
+sciatica	neurologic
+seizure disorder	neurologic
+stroke	neurologic
+transient ischemic attack	neurologic
+vertigo	neurologic
+
+# --- Psychiatric ---------------------------------------------------------
+adhd	psychiatric
+adjustment disorder	psychiatric
+alcohol use disorder	psychiatric
+anxiety disorder	psychiatric
+bipolar disorder	psychiatric
+eating disorder	psychiatric
+generalized anxiety disorder	psychiatric
+insomnia	psychiatric
+major depressive disorder	psychiatric
+obsessive-compulsive disorder	psychiatric
+opioid use disorder	psychiatric
+panic disorder	psychiatric
+post-traumatic stress disorder	psychiatric
+schizophrenia	psychiatric
+social anxiety disorder	psychiatric
+substance use disorder	psychiatric
+tobacco use disorder	psychiatric
+
+# --- Musculoskeletal -----------------------------------------------------
+bursitis	musculoskeletal
+carpal tunnel syndrome	musculoskeletal
+chronic low back pain	musculoskeletal
+fibromyalgia	musculoskeletal
+frozen shoulder	musculoskeletal
+gout	musculoskeletal
+herniated disc	musculoskeletal
+osteoarthritis	musculoskeletal
+osteopenia	musculoskeletal
+osteoporosis	musculoskeletal
+plantar fasciitis	musculoskeletal
+rotator cuff tear	musculoskeletal
+scoliosis	musculoskeletal
+spinal stenosis	musculoskeletal
+tendinitis	musculoskeletal
+
+# --- Gastrointestinal ----------------------------------------------------
+appendicitis	gastrointestinal
+cholecystitis	gastrointestinal
+cholelithiasis	gastrointestinal
+cirrhosis	gastrointestinal
+constipation	gastrointestinal
+diverticulitis	gastrointestinal
+diverticulosis	gastrointestinal
+gastritis	gastrointestinal
+gastroenteritis	gastrointestinal
+gastroesophageal reflux disease	gastrointestinal
+gastrointestinal bleeding	gastrointestinal
+gerd	gastrointestinal
+hemorrhoids	gastrointestinal
+hiatal hernia	gastrointestinal
+irritable bowel syndrome	gastrointestinal
+nonalcoholic fatty liver disease	gastrointestinal
+pancreatitis	gastrointestinal
+peptic ulcer disease	gastrointestinal
+
+# --- Renal / genitourinary -----------------------------------------------
+acute kidney injury	renal
+benign prostatic hyperplasia	renal
+chronic kidney disease	renal
+diabetic nephropathy	renal
+end-stage renal disease	renal
+erectile dysfunction	renal
+hydronephrosis	renal
+nephrolithiasis	renal
+overactive bladder	renal
+prostatitis	renal
+pyelonephritis	renal
+urinary incontinence	renal
+
+# --- Hematologic ---------------------------------------------------------
+anemia	hematologic
+anticoagulation therapy	hematologic
+b12 deficiency	hematologic
+iron deficiency anemia	hematologic
+leukocytosis	hematologic
+neutropenia	hematologic
+pancytopenia	hematologic
+sickle cell disease	hematologic
+thrombocytopenia	hematologic
+vitamin b12 deficiency	hematologic
+
+# --- Oncologic -----------------------------------------------------------
+bladder cancer	oncologic
+breast cancer	oncologic
+cervical cancer	oncologic
+colorectal cancer	oncologic
+leukemia	oncologic
+lung cancer	oncologic
+lymphoma	oncologic
+melanoma	oncologic
+multiple myeloma	oncologic
+ovarian cancer	oncologic
+pancreatic cancer	oncologic
+prostate cancer	oncologic
+renal cell carcinoma	oncologic
+thyroid cancer	oncologic
+
+# --- Infectious ----------------------------------------------------------
+cellulitis	infectious
+clostridioides difficile infection	infectious
+conjunctivitis	infectious
+covid-19	infectious
+hepatitis b	infectious
+hepatitis c	infectious
+herpes zoster	infectious
+hiv	infectious
+influenza	infectious
+lyme disease	infectious
+osteomyelitis	infectious
+otitis media	infectious
+pharyngitis	infectious
+sepsis	infectious
+septic shock	infectious
+shingles	infectious
+tuberculosis	infectious
+urinary tract infection	infectious
+
+# --- Dermatologic --------------------------------------------------------
+acne vulgaris	dermatologic
+actinic keratosis	dermatologic
+atopic dermatitis	dermatologic
+basal cell carcinoma	dermatologic
+contact dermatitis	dermatologic
+eczema	dermatologic
+onychomycosis	dermatologic
+pressure ulcer	dermatologic
+rosacea	dermatologic
+seborrheic dermatitis	dermatologic
+urticaria	dermatologic
+
+# --- Autoimmune ----------------------------------------------------------
+ankylosing spondylitis	autoimmune
+celiac disease	autoimmune
+crohn disease	autoimmune
+giant cell arteritis	autoimmune
+hashimoto thyroiditis	autoimmune
+lupus	autoimmune
+polymyalgia rheumatica	autoimmune
+psoriasis	autoimmune
+psoriatic arthritis	autoimmune
+rheumatoid arthritis	autoimmune
+sjogren syndrome	autoimmune
+systemic lupus erythematosus	autoimmune
+ulcerative colitis	autoimmune
+
+# --- Ophthalmologic ------------------------------------------------------
+cataract	ophthalmologic
+diabetic retinopathy	ophthalmologic
+dry eye syndrome	ophthalmologic
+glaucoma	ophthalmologic
+macular degeneration	ophthalmologic
+retinal detachment	ophthalmologic
+uveitis	ophthalmologic

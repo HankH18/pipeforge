@@ -34,6 +34,7 @@ import importlib.metadata
 import json
 import re
 import secrets
+import subprocess
 import sys
 import tempfile
 import time
@@ -2706,29 +2707,66 @@ async def test_the_dockerignore_matcher_agrees_with_a_real_docker_build() -> Non
     assert not _dockerignore_match("*.db", "a/audit.db")
 
 
+def _git_tracked(relative: str) -> bool | None:
+    """Is ``relative`` in git's index? ``None`` when there is no git tree to ask.
+
+    Deliberately shells out rather than reading ``.gitignore`` and reimplementing
+    git's matcher. A reimplementation of the matcher is exactly what shipped the
+    bug this helper exists to catch: the pattern ``data/`` was *read* as anchored
+    by a human and applied unanchored by git, and any hand-written checker would
+    have been written from the same misreading. ``git ls-files`` is the other
+    implementation.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        return None
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", relative],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - no git binary
+        return None
+    return completed.returncode == 0
+
+
 async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image() -> None:
     """``entities.yaml`` names gazetteer files, and ``load_registry`` fails closed.
 
-    This is not a hypothetical failure mode; it is a live one, one directory
-    over. ``.gitignore`` line 7 is ``data/``, which in git's grammar matches a
-    directory named ``data`` at *any* depth -- including
-    ``secure_context_pipeline/detection/data/``, where the gazetteers live. They
-    are therefore untracked, and a fresh ``git clone`` of this repository cannot
-    start: ``load_registry`` raises
+    Three separate things have to be true for a stranger to start this system, and
+    the interesting one is the third:
+
+    1. every gazetteer ``entities.yaml`` names is on disk;
+    2. a ``COPY`` in the ``Dockerfile`` brings it into the image, and
+       ``.dockerignore`` does not filter it back out;
+    3. **git tracks it**, so it survives ``git clone``.
+
+    (3) is asserted because it was once false, and the earlier version of this
+    test could not see that. ``.gitignore`` read ``data/``; in git's grammar an
+    unanchored pattern matches a directory of that name at *any* depth, so it also
+    matched ``secure_context_pipeline/detection/data/``. Both gazetteers were
+    untracked, a fresh clone could not start -- ``demo.py`` exited 2 on
     ``ConfigError(reason='registry_gazetteer_missing', entity_type='DIAGNOSIS')``
-    before the lifespan finishes. Verified by cloning.
+    and the suite raised 457 errors -- and none of that was visible locally,
+    because an ignored file leaves ``git status`` clean and every local run works.
+    This test asserted ``(REPO_ROOT / relative).is_file()``, which reads the
+    author's working tree, where the file was present the whole time. **The
+    checker shared the blind spot of the thing it checked**: it could only observe
+    the state that the bug does not affect. That is the defect class this project
+    has been hunting, in its packaging form, and the fix is to ask a source that
+    does not share the blind spot -- git's own index, via ``git ls-files``.
 
-    The image escapes that only because ``.dockerignore`` reads the same line
-    differently -- its patterns are anchored to the context root -- which is luck
-    rather than design, and luck is exactly what a test is for. What is asserted
-    here is the property the container depends on: every file the registry
-    requires exists, is under a path the Dockerfile copies, and is not filtered
-    out on the way in. Adding ``**/data/`` to ``.dockerignore`` -- the natural
-    "fix" if someone tries to make the two ignore files agree -- fails here.
+    The ignore rule is now ``/data/``: runtime blobs still ignored, gazetteers
+    tracked. The image escapes the whole question only because ``.dockerignore``
+    reads the same line differently -- its patterns are anchored to the context
+    root -- which is why the two ignore files must *not* be harmonised, and why
+    adding ``**/data/`` to ``.dockerignore`` fails this test.
 
-    Fixing the git half is one character (``data/`` -> ``/data/``), and is not
-    this file's to make: it leaves the runtime ``data/`` ignored and makes the
-    gazetteers trackable. Verified in a scratch clone.
+    Outside a git working tree (an exported tarball, a wheel) the answer is
+    ``None`` and (3) is skipped rather than faked, because there is no index to
+    disagree with the disk: in that world (1) already *is* the whole question.
     """
     dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
     registry_text = (REPO_ROOT / "entities.yaml").read_text(encoding="utf-8")
@@ -2755,4 +2793,12 @@ async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image
         assert not _dockerignored(relative, dockerignore), (
             f".dockerignore filters {relative} out of the build context, so the "
             f"container starts and immediately fails registry validation"
+        )
+        tracked = _git_tracked(relative)
+        assert tracked is not False, (
+            f"{relative} exists on disk but git does not track it, so it is absent "
+            f"from a fresh clone and from any archive built out of the index -- "
+            f"`load_registry` then fails closed and nothing starts. Check "
+            f"`git check-ignore -v {relative}`: an unanchored ignore pattern "
+            f"matches a directory of that name at any depth."
         )

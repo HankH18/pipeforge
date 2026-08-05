@@ -4,6 +4,18 @@ Assembles ``{system prompt} + {user prompt} + {obfuscated document}`` and expose
 the exact serialized string that will be sent, so the egress gate scans the real
 bytes rather than a reconstruction of them.
 
+**This module assembles; it does not sanitize, and its parameter names now say so.**
+Both untrusted halves arrive here already obfuscated -- ``obfuscated_prompt`` and
+``obfuscated_document`` -- and the second one carried that name from the start while
+the first was called ``user_prompt`` and was in fact the raw string a user typed.
+Nothing here was wrong: the injector never claimed to obfuscate anything. What was
+wrong is that the name made the omission invisible at the only call site, and the
+prompt reached the provider in the clear for exactly as long as that name held.
+Renaming it is not cosmetic -- it is the reason a reader of
+:meth:`~secure_context_pipeline.pipeline.orchestrator.PipelineOrchestrator.run` can
+now see, without leaving the call, which of its two inputs has been through the
+pipeline. See that module's docstring for the measured leak and the fix.
+
 Rule 4 of the token contract is the co-reference mitigation. It reduces -- it does
 not eliminate -- indirect references like "the patient". That is acceptable and
 documented: under tokenization the model only ever saw a *token*, so a paraphrase
@@ -115,7 +127,7 @@ class ContextInjector:
         self,
         *,
         strategy: str,
-        user_prompt: str,
+        obfuscated_prompt: str,
         obfuscated_document: str,
     ) -> InjectedPayload:
         """Assemble the payload, fencing the document so it reads as data.
@@ -130,7 +142,7 @@ class ContextInjector:
 
         Any fence-shaped tag in the body is therefore neutralised first, so the only
         ``<DOCUMENT>``/``</DOCUMENT>`` in the payload are the ones assembled here.
-        The same applies to ``user_prompt``: it is interpolated into the same
+        The same applies to ``obfuscated_prompt``: it is interpolated into the same
         structure and, in a deployment where the prompt and the document come from
         different actors, is no more trusted than the document.
 
@@ -140,9 +152,18 @@ class ContextInjector:
         only ever sees placeholders, so a successful injection reaches surrogates,
         not originals. Neutralisation happens *before* the egress gate scans, so the
         gate still scans exactly the bytes that will be sent.
+
+        **Both arguments are obfuscated text, and this method cannot check that.**
+        It has no detector, no vault and no session, so "has this been through
+        detect -> obfuscate?" is not a question it is able to ask -- passing a raw
+        string still produces a payload, and it did for a long time. The name is the
+        contract; the enforcement is one call upstream, where the orchestrator runs
+        both halves through the engine, and it is pinned end-to-end by
+        ``test_pii_typed_into_the_prompt_never_reaches_the_provider`` in
+        ``tests/test_egress_gate.py``.
         """
         user = (
-            f"{self._neutralize_fence(user_prompt.strip())}\n\n"
+            f"{self._neutralize_fence(obfuscated_prompt.strip())}\n\n"
             f"<{self._label}>\n"
             f"{self._neutralize_fence(obfuscated_document)}\n"
             f"</{self._label}>"

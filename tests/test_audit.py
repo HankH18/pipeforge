@@ -716,9 +716,9 @@ async def test_audit_event_is_frozen_and_its_detail_is_read_only() -> None:
     event = make_event()
 
     with pytest.raises(ValidationError):
-        event.entity_type = "reassigned"  # type: ignore[misc]
+        event.entity_type = "reassigned"
     with pytest.raises(ValidationError):
-        event.detail = {"count": 1}  # type: ignore[misc]
+        event.detail = {"count": 1}
 
     # In-place mutation of the detail mapping.
     with pytest.raises(TypeError):
@@ -1969,7 +1969,7 @@ async def test_enabling_wal_retries_a_concurrent_opener_but_not_a_broken_file(
                 raise sqlite3.OperationalError("database is locked")
             return real_execute(sql, *rest, **kw)
 
-        connection.execute = execute  # type: ignore[method-assign]
+        connection.execute = execute
         return connection
 
     monkeypatch.setattr(logger_module.aiosqlite, "connect", flaky_connect)
@@ -2001,7 +2001,7 @@ async def test_enabling_wal_retries_a_concurrent_opener_but_not_a_broken_file(
                 raise sqlite3.DatabaseError("file is not a database")
             return real_execute(sql, *rest, **kw)
 
-        connection.execute = execute  # type: ignore[method-assign]
+        connection.execute = execute
         return connection
 
     monkeypatch.setattr(logger_module.aiosqlite, "connect", broken_connect)

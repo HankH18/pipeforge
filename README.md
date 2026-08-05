@@ -6,9 +6,21 @@ A privacy boundary between an encrypted document store and an external LLM provi
 fetch + decrypt → detect → obfuscate → EGRESS GATE → provider → restore
 ```
 
-The claim this system makes is narrow and testable: **raw PII, PHI, and privileged content
-never leave the process boundary toward the provider, and that is verifiable by inspection.**
-Obfuscation is reversible within a session and cryptographically irreversible across sessions.
+The claim this system makes is narrow and testable: **no whole vaulted value leaves the process
+boundary toward the provider, and that is verifiable by inspection — subject to four named
+boundaries this design does not close.** Obfuscation is reversible within a session and
+cryptographically irreversible across sessions.
+
+The word doing the work is **whole**, and the four boundaries are stated here rather than 300
+lines down, because each one is a shape that has been *confirmed* to reach the provider with the
+gate live: a partial value (one component of a multi-word original), a value glued inside a
+longer alphanumeric word (**names and other digit-poor values only** — a digit-carrying identifier
+*is* caught, see the two identifier floors below), a combining mark spliced into a value, and a
+homoglyph substitution.
+Each is pinned by a named test so that closing one later is a red rather than a silent widening
+of the claim; all four are detailed under *Leakage harness* below. A stronger claim was written
+here first, and it was wrong in the way that matters — it promised `never` while the document
+itself documented the exceptions.
 
 Everything below is measured on this repository, not aspirational.
 
@@ -16,12 +28,25 @@ Everything below is measured on this repository, not aspirational.
 
 | You want | Go to |
 |---|---|
-| Does it run? | §1 — two commands, and the numbers the suite prints |
+| Does it run? | §1 — two commands, and the numbers the suite prints. **If you just cloned it, read the boxed note above this table first.** |
 | Is the zero-egress claim real? | §1 *Leakage harness* — including the shapes the harness itself was blind to, the four boundaries it does **not** claim, and how each was found |
 | What does it **not** defend? | §3 — **start with "The weakest point in this design"**: `user_id` is an asserted claim and there is no authn at this tier |
 | The six live-review questions | §5 — each answered in its first sentence |
 | Where it breaks at scale | §5 Q1 — the bottleneck is not the one you would guess, and the obvious fix was measured and **rejected** |
-| What I got wrong | §8 Deviations (39, each with a reason) and §7 Known gaps |
+| What I got wrong | §8 Deviations (47, each with a reason) and §7 Known gaps |
+
+**If you are cloning this repository right now, read this first.** Until the commit that carries
+this sentence, `.gitignore` line 7 was `data/`. In git's grammar an unanchored pattern matches a
+directory of that name at *any* depth, so besides the runtime blob directory it also matched
+`secure_context_pipeline/detection/data/` — the two gazetteers `entities.yaml` requires and
+`load_registry` fails closed without. They were untracked, and a fresh clone therefore could not
+start: `demo.py` exited 2 on `ConfigError(reason='registry_gazetteer_missing')` and the suite
+raised 457 errors. It was invisible locally precisely *because* the files were ignored — `git
+status` reported a clean tree and every local run worked. The rule is now `/data/`, the
+gazetteers are tracked, and `test_every_runtime_asset_the_registry_needs_actually_reaches_the_image`
+now asks **git's index** rather than the author's working tree, which is the only source that
+does not share the blind spot. If a clone of this repo does not run, that is the first thing to
+check and it is the bug I would expect to have left behind.
 
 **The three things most worth attacking**, stated up front so they are not a discovery:
 the `user_id` gap above; the audit chain is tamper-**evident**, not tamper-proof, and an
@@ -106,13 +131,27 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1483 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
-                             #   120 leakage - 5 bench - rest unit + integration
-mypy --strict                # clean, 39 source files
+1541 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+                             #   127 leakage - 5 bench - rest unit + integration
+mypy --strict                # clean, 39 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 96% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   4022 statements, 126 missed; 982 branches, 79 partial
+                             #   4038 statements, 121 missed; 980 branches, 76 partial
 ```
+
+**On the scope of that mypy line, because "clean" is doing less work than it looks.**
+`pyproject.toml` pins `files = ["secure_context_pipeline"]`, so `mypy --strict` type-checks the
+**package only** — 39 files. The test suite is roughly half the repository by line count and is
+**not** covered by that gate. Run against the whole tree it is 65 files and 69 remaining errors,
+none of which is a latent bug: 27 are `attr-defined` from monkeypatching module-level re-exports
+(a legitimate test idiom that `--strict` dislikes), 19 are `arg-type` where tests construct
+`Detection(category="PII")` with a bare `str` instead of the `EntityCategory` enum, and the rest
+are assorted narrowing complaints. What *was* worth fixing is fixed: **37 stale `# type: ignore`
+suppressions** had accumulated across four audit loops and are gone — decayed scaffolding that
+only a checker would ever find. The scope is stated rather than widened because the 19 `arg-type`
+hits are the interesting residue: those tests are not exercising the enum the production path
+actually carries, which is a mild stub-blindness signal and a real next step rather than a
+one-line config change.
 
 **On that coverage number.** It is reported because it was *not* measured for the first four
 review passes — `pytest-cov` was not installed — and the cost of that shows up in this
@@ -127,22 +166,33 @@ transient fault would have wedged every subsequent write.
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2840 originals vaulted and scanned, 2412 surrogates round-tripped)
+          (2850 originals vaulted and scanned, 2394 surrogates round-tripped)
 ```
 
-**100 runs, zero leaks** is the load-bearing result and it does not move. The two tallies
-beside it behave differently from each other, and the difference is worth stating precisely
-rather than describing both as "reproducible":
+**100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the
+committed tree, but read the summary line precisely, because the two halves of it mean different
+things: `Ledger.record()` counts runs that **completed**, and `ledger.leaks` counts only what the
+three leak scans found. So `99/100 runs clean, 0 leaks` is a coherent and possible line — it
+means one parametrized run raised before reaching `record()` for a reason that was *not* a leak.
+A reviewer working against an uncommitted, mid-edit tree saw exactly that once and it did not
+reproduce in 20 subsequent runs. The harness is honest about it rather than papering over it:
+`assert ledger.runs == selected` fails the summary outright rather than quoting a tally over a
+smaller denominator, which is the failure mode that would otherwise hide. Treat `leaks == 0` as
+the assertion and the denominator as the thing that proves the assertion was actually exercised.
 
-- **2,840 originals** is stable for a given commit. Document seeds are fixed, so the same 100
+The two tallies beside it behave differently from each other, and the difference is worth stating
+precisely rather than describing both as "reproducible":
+
+- **2,850 originals** is stable for a given commit. Document seeds are fixed, so the same 100
   documents carry the same values, and this number only moves when detection changes. Observed
   identical on every run of the current build.
 - **The surrogate round-trip count is not stable and is not a fingerprint of the build.** Two
   independent things move it. Within one commit it drifts by a few counts because session keys
   are `secrets.token_bytes(32)` and pseudonyms are seeded from `HMAC(session_key, …)`, so every
   pseudonymization run draws different fakes and which lines the mock provider echoes shifts
-  with them — the count is of surrogates *the model happened to mention*. Eight consecutive runs
-  of the current build read **2,412 / 2,408 / 2,404 / 2,412 / 2,413 / 2,411 / 2,411 / 2,410**. A stable number here would
+  with them — the count is of surrogates *the model happened to mention*. Three consecutive runs
+  of the current build read **2,394 / 2,398 / 2,412**, with 2,850 originals identical in all
+  three. A stable number in the second column would
   actually be evidence of a bug: it would mean session keys were not random. Across commits it
   moves much further, because any change to obfuscation or restoration changes what there is to
   mention; it was observed at **2,717** during one such change. Do not treat any single reading
@@ -302,13 +352,71 @@ rather than a silent widening of the claim:
 - **Homoglyphs.** Cyrillic `о` for Latin `o` needs a confusables table, not another
   normalisation form. Out of scope in the gate for the same reason.
 
-**The last three are blind spots the harness and the gate share**, because both resolve to the
-same occurrence rule — so for those shapes there is no second opinion. Confirmed rather than
-reasoned about: with the gate **live**, a real vaulted original spliced into a real payload with
-one combining acute inserted, or glued to a letter, completed the run and reached the provider.
-Where the gate is a second opinion that is survivable; on the audit database and the process log,
-where nothing else looks, it is not — which is why these are recorded as claims the harness does
-not make rather than as cases it happens not to have hit.
+**The last three are blind spots the harness and the gate mostly share**, because both resolve to
+the same occurrence rule — so for those shapes there is usually no second opinion. Confirmed
+rather than reasoned about: with the gate **live**, a real vaulted original spliced into a real
+payload with one combining acute inserted, or glued to a letter, completed the run and reached
+the provider. Where the gate is a second opinion that is survivable; on the audit database and
+the process log, where nothing else looks, it is not — which is why these are recorded as claims
+the harness does not make rather than as cases it happens not to have hit.
+
+**"Mostly" is the honest word, and the exception is worth a paragraph**, because it is where this
+project's recurring defect last showed up. The glued-into-a-longer-word boundary does **not**
+apply to digit-carrying values: the gate has a fifth comparison, `_identifier_needles`, which
+tests a value as a bare substring with **no adjacency rule at all** once it carries enough
+digits. `batch47-1234567Alpha` conceals a taxpayer ID from `\b`-anchored patterns and from the
+word-boundary rule, and from nothing else; a reader is not fooled by it and neither is the model.
+
+That limb has **two floors, and they are different numbers on purpose**:
+
+| Floor | Value | Applies to | Set by |
+|---|---|---|---|
+| `MIN_IDENTIFIER_DIGITS` | 7 | the whole value, separators included (`512-24-8710`) | keeping six-digit *dates* and *amounts* out of an unbounded scan — they are aggregates of 2- and 3-digit runs, and `Filed 03/12/850` is ordinary text |
+| `MIN_IDENTIFIER_RUN_DIGITS` | 6 | one contiguous digit run (`552140`) | the shipped registry: `MRN` is `\K\d{6,10}`, so the detector vaults six-digit MRNs |
+| `_HARNESS_RUN_FLOOR` (harness only) | 7 | the audit DB and the process log | this file's own false-positive budget on those channels |
+
+These were **one** constant, and that is the twelfth instance of the defect this repo keeps
+hunting — not a checker sharing an implementation with the thing it checks, but a **number
+justified against one channel silently setting another channel's security floor.** Seven was
+argued from dates and amounts; it was then applied to a contiguous run, where the argument does
+not hold. The measured consequence, on the real detector, registry and gate, with `552140` — the
+first row of `DEV_IDENTIFIER_POSITIVES`, a value the detector is *required* to vault:
+
+```
+payload:  "Internal routing tag: MRN552140B must match the ledger."
+pass 1 bounded    miss  — the trailing B denies the right-hand word boundary
+pass 1 unbounded  miss  — six digits, one below the single shared floor
+pass 2            miss  — MRN's registry pattern ends in \b, which B also denies
+pass 3            miss  — carries an SSN recogniser only
+                  -> RELEASED, vaulted MRN on the wire byte for byte
+```
+
+Four independent misses for one underlying reason is what a shared blind spot looks like. It is
+fixed, pinned end to end by `test_a_six_digit_identifier_core_glued_to_a_letter_is_blocked`, and
+— the part that matters more — pinned *at the seam* by
+`test_no_shipped_identifier_pattern_can_match_below_the_gate_s_run_floor`, which reads
+`entities.yaml` itself and goes red if the config and the constant ever disagree again. That test
+is deliberately sourced from a **different artifact** than the code it checks, which is the one
+thing that has reliably caught this class.
+
+**Why the harness keeps a higher floor than the gate, stated as a cost rather than a footnote.**
+The gate scans the outbound payload, where the only run of `[0-9a-f]` the pipeline emits is an
+8-hex token ID; a six-digit needle lands inside one with p ≈ 1.8e-7. The harness also scans the
+audit database, which is a field of 32-hex run IDs and sha256 digests. Counted on the real 3.6 MB
+of DBs a suite leaves behind:
+
+```
+distinct 6-digit windows present: 15055   -> p(a given 6-digit needle collides) = 1.5e-2
+distinct 7-digit windows present:  9366   -> p(a given 7-digit needle collides) = 9.4e-4
+```
+
+At six digits that is order-of-**one** spurious "an original reached the audit database" per
+100-run suite. A rare false red on the headline assertion is worse than its frequency suggests —
+it teaches the reader to disbelieve the next genuine one — so the harness stops at seven on those
+two channels and **the cost is written down**: a vaulted six-digit MRN core glued into an
+alphanumeric run, *in the audit DB or the log*, is not reported by this harness. The gate does
+block that shape on the payload. So the two files are now narrower and wider than each other in
+named, measured places instead of by accident.
 
 **How the other shapes were confirmed.** The list above is what survived an attack, not what was
 left over after reading the code. A copy of the pipeline was sabotaged — a real vaulted original
@@ -324,13 +432,20 @@ instrument; two of the pipeline fixes were found by this harness and by nothing 
 **Benchmarks** (`pytest -m bench`, budgets from the build specification). Measured on an
 M-series laptop that was **not idle** — several other test suites were running concurrently:
 
-| Measurement | Worst of a 7-run sample | Budget | Headroom at that worst | Scoring |
-|---|---|---|---|---|
-| Obfuscate 2,000 words (tokenization) | 0.388 s | 2 s | 5.2× | best of 3 |
-| Obfuscate 2,000 words (pseudonymization) | 0.389 s | 2 s | 5.1× | best of 3 |
-| Vault lookup p99 (1,000 cached reads) | 0.001 ms | 5 ms | 3,636× | single shot |
-| Restore a 500-token response | 4.774 ms | 500 ms | 104.7× | single shot |
-| Full pipeline, 12k-word brief (mock provider) | 7.248 s | 15 s | 2.07× | best of 3 |
+| Measurement | Worst of a 7-run sample | Best of the same 7 | Budget | Headroom at that **worst** | Scoring |
+|---|---|---|---|---|---|
+| Obfuscate 2,000 words (tokenization) | 1.142 s | 0.363 s | 2 s | 1.75× | best of 3 |
+| Obfuscate 2,000 words (pseudonymization) | 1.281 s | 0.377 s | 2 s | 1.56× | best of 3 |
+| Vault lookup p99 (1,000 cached reads) | 0.001 ms | 0.001 ms | 5 ms | 4,284× | single shot |
+| Restore a 500-token response | 27.322 ms | 4.794 ms | 500 ms | 18.3× | single shot |
+| Full pipeline, 12k-word brief (mock provider) | 9.776 s | 5.928 s | 15 s | 1.53× | best of 3 |
+
+The best/worst spread is 3.1× on the same machine in the same ten minutes, which is the honest
+headline of this table: **the budget column is a claim about this system, and every other column
+is a claim about a laptop.** The worst readings here come from the tail of the sample, when the
+machine had been running suites back to back for an hour; the best are what an idle box gives.
+Both are reported so a reviewer re-running this and seeing 0.4 s does not conclude the table was
+padded, and one seeing 1.2 s does not conclude it was fabricated.
 
 **The budget column is the claim. Every other column is one sample of seven.** That framing is
 the third correction this table has needed, and the sequence is worth more than the numbers.
@@ -442,15 +557,24 @@ to the real SDK client and writes the actual bytes on the wire to a file you can
                                               │
    ObfuscationEngine ◄───────────────────────►│◄──► SessionVault
    (dedupe, splice, sweep)                    │     HMAC token IDs, AES-GCM entries,
-                                              │     AAD = session_id + token_id
-   ContextInjector ◄───────────────────────── ┤
+        ▲                                     │     AAD = session_id + token_id
+        │  the USER PROMPT goes through the   │
+        │  same detector + engine + vault     │     ← Deviation 40. §9.5.2 passes the
+        │  (steps 3b / 4b in orchestrator)    │       prompt through raw; measured, six
+                                              │       entity types typed into the prompt
+   ContextInjector ◄───────────────────────── ┤       box reached the provider verbatim
+   (fences the document in <DOCUMENT>…</DOCUMENT>,
+    neutralising any fence tag in either      │     ← Deviation 41
+    untrusted half — Deviation 41)            │
                                               │
    ╔══════════════════════════════════════╗   │
    ║  EgressGate  — FAIL CLOSED           ║◄──┤   ← nothing reaches the provider
    ║  1. scan for every vault original    ║   │      except through here
    ║  2. detector re-scan minus surrogates║   │
-   ╚══════════════════════════════════════╝   │
-                                              │
+   ║  3. recognisers the detector does    ║   │   ← Deviation 42: §9.5.3 specifies
+   ║     NOT use (independent opinion)    ║   │      two. Pass 2 re-runs the same
+   ╚══════════════════════════════════════╝   │      Detector, so it is a second
+                                              │      *look*, not a second *opinion*.
    LLMProvider (Anthropic | Mock) ◄────────── ┤
                                               │
    Restorer ◄────────────────────────────────►│◄──► SessionVault
@@ -496,7 +620,7 @@ contradicts the offline premise of the whole design. `/openapi.json` is served l
 
 | Adversary | Control | Residual risk |
 |---|---|---|
-| **Provider or network intermediary reads the payload** | Egress gate (fail-closed, two independent passes) + token opacity | The obfuscated payload still reveals document *shape*: entity counts, types, and positions. A 40-entity medical note is visibly a 40-entity medical note. |
+| **Provider or network intermediary reads the payload** | Egress gate (fail-closed, **three** passes; see §2 for what each one is and why the third exists) + token opacity | The obfuscated payload still reveals document *shape*: entity counts, types, and positions. A 40-entity medical note is visibly a 40-entity medical note. |
 | **Vault database stolen at rest** | AES-256-GCM under a key derived from an in-memory-only session key. The session key is never persisted. | Live-process memory scraping. Session-lifetime plaintext lives in RAM by design (that is what makes a < 5 ms lookup possible). **Declared out of scope for this tier.** |
 | **Cross-session access, same user** | Per-session HKDF vault keys, AAD binding to `session_id:token_id`, non-deterministic token IDs across sessions | None identified. A row copied between sessions fails GCM authentication. |
 | **Log or audit exfiltration** (*reading* the log) | Length ceilings that make the log incapable of holding *content* (`detail` values 64 chars, label columns 128), enforced again at the write boundary; no call site that writes a value; and the leakage harness scanning the raw DB **bytes** on all 100 runs | **A short identifier would fit, and the schema cannot tell.** `detail={"v": "John Smith"}` validates — see below. The guarantee is "nothing writes one", measured, not "the schema forbids one". Plus traffic analysis of event counts and timings. |
@@ -505,6 +629,9 @@ contradicts the offline premise of the whole design. `/openapi.json` is served l
 | **Caller presents a session ID that is not theirs** | Sessions are **bound to the creating `user_id`**; `POST /pipeline/run` compares with `secrets.compare_digest` and answers the same `401 SESSION_EXPIRED` as an unknown session. `DELETE /sessions/{id}` requires the owner's `user_id` and returns an unconditional 204 either way. | The `user_id` is still an **asserted claim, not a proven one** — there is no real authentication at this tier. What the binding buys is that a leaked *session ID* is no longer sufficient on its own; what it does not buy is protection against a caller who simply asserts someone else's `user_id`. Real authn is the production item. |
 | **Anonymous enumeration of live session IDs** | `GET /audit` requires a `session_id`/`run_id` scope; `/health` reports a session *count*, never IDs | None identified for the enumeration path itself. This was a **live hole, not a hypothetical**: unscoped `GET /audit` published every active session ID, and `DELETE /sessions/{id}` then accepted them — full vault destruction with zero credentials. |
 | **Wrong user requests another user's document** | Per-user HKDF document keys **and** AAD binding to `doc:<user_id>:<doc_id>` — two independent legs, each pinned by its own test | Surfaced as `NOT_FOUND`, byte-identical to an absent document: same exception type, same code, same detail keys. The *content* oracle is closed. A **timing** side channel is not — see below. |
+| **PHI typed into the *prompt* rather than the document** | The user prompt goes through the same detector, engine and vault as the document, and is tokenized before assembly (Deviation 40) | Measured as a **live bypass before this was built**: six entity types typed into the prompt box reached the provider verbatim while the document beside them was fully tokenized. Residual: prompt spans are excluded from `PipelineResult.detections` (offsets are document-space), so the UI highlight panel shows nothing for them — the values *are* vaulted and tokenized, but a user cannot see that they were. |
+| **An uploaded document carrying instructions for the model** | The document is fenced in `<DOCUMENT>…</DOCUMENT>` and any fence tag inside either untrusted half is neutralised to `&lt;…`, so an upload cannot close the fence early and be read as top-level instruction (Deviation 41) | **This is defence against confusion, not against a determined injection, and the difference matters.** A model can still be talked into ignoring a fence; nothing here detects or blocks instruction-shaped text. What the fence guarantees is only that the *delimiter* cannot be forged. Prompt injection is **not** a claim this system makes. |
+| **A document uploaded without a `doc_category`** | `only_in_doc_categories` scopes category-specific rules; `_validate_category` rejects an *unknown* category | **Open, and it is the default.** `doc_category` is an optional form field defaulting to `None`. Measured on a real privileged brief: `legal` finds `CASE_STRATEGY` (the one entity with `action: redact`) and `CLIENT_IDENTITY`; `None` finds neither, so the litigation strategy is never redacted, never vaulted, and pass 1 has nothing to look for. The guard is written against the typo and open on the omission. Same shape as the `user_id` row: a **user-supplied lever on which security controls run.** §7 gap 4. |
 | **Inference / re-identification** | See below — this is the interesting one | Substantial and irreducible. |
 
 ### The weakest point in this design: `user_id` is an asserted claim
@@ -904,6 +1031,39 @@ assembled payload inside the gate — and those two passes are **84%** of wall t
 and **89%** on the medical note. The originals scan, the part that looks alarming on paper
 because it is `O(payload × entities)`, is **0.8%** of the gate on the brief and **0.2%** on the
 note.
+
+#### The number above is per-*document*; the thing that grows is the *session*
+
+Everything in this section is single-request latency, and that framing hid a real defect for
+four review passes. Pass 1 is `O(payload × originals)`, and **originals accumulate across every
+document in a 3600 s session**, not per request. Measured against an 81 KB payload:
+
+| Session originals | Pass 1 |
+|---|---|
+| 251 (one brief) | 36.6 ms |
+| 1,000 | 122 ms |
+| 5,000 | 587 ms |
+| 20,000 | 2,384 ms |
+| 60,000 | 7,378 ms |
+
+Cleanly linear, as expected. What made it a security problem rather than a latency one is that
+pass 1 was **synchronous, on the event loop**, and `DEFAULT_TIMEOUT_S` claimed to bound the whole
+`check()`. `asyncio.timeout` can only fire at a suspension point, and a synchronous CPU-bound
+loop has none — so the budget bounded pass 2 and nothing else, and because this is an ASGI app
+the stall was process-wide. Both halves measured, with a 0.5 s budget against 60k originals:
+
+```
+before:  check() returned after 7.35 s   (budget silently ignored)
+         unrelated coroutine starved for 7.36 s   (head-of-line blocking for EVERY request)
+after:   check() blocked at 0.52 s       (budget enforced)
+         unrelated coroutine starved for 0.03 s
+```
+
+The fix is one line — pass 1 runs in a worker thread — and it is the difference between a stated
+budget and an enforced one. Pinned by `test_the_timeout_bounds_pass_one_and_not_only_the_detector`
+and `test_a_long_pass_one_does_not_stall_unrelated_coroutines`, both of which fail if the scan
+returns to the loop. The remaining ceiling is the vault's own single lock and unbounded plaintext
+cache, which is §7 gap 7 and is not fixed.
 
 #### The obvious fix — scoping the re-scan — was measured and rejected
 
@@ -1470,46 +1630,171 @@ paralegal is a silent one.
    misses *safe* (it blocks), but it cannot make them *invisible* — a missed entity that
    another detection already vaulted causes a block, and a genuinely novel one passes through.
    scispaCy or a self-hosted clinical NER model is the single highest-value next change.
-2. **No k-anonymity / generalization pass.** This is the real answer to the inference risk in
+2. **Pseudonymization is reversible by *luck*; tokenization is reversible by *design*.** This is
+   the sharpest thing in this list and the README did not previously draw the distinction. A
+   token carries an 8-hex ID which is a *key* — the restorer looks it up. A pseudonym has no
+   key: restoration is best-effort string matching over untrusted model output. Component
+   linking issues both the full fake and the surname fake as separate surrogates in one session
+   (`{'Chelsea Hammond': 'Nathaniel Brightwater', 'Hammond': 'Brightwater'}`), and longest-first
+   alternation protects the pair only while the model reproduces the long fake intact. Measured
+   end to end on the real engine, vault and restorer, **any interior insertion breaks it and
+   every counter still reports success**:
+
+   The real patient is `Chelsea Hammond`; the issued fakes are `Nathaniel Brightwater` and
+   `Brightwater`. The model sees only the fakes, and the restorer maps fake → real:
+
+   | Model wrote (the fake) | User reads | Verdict |
+   |---|---|---|
+   | `Nathaniel Brightwater remains stable.` | `Chelsea Hammond remains stable.` | correct |
+   | `Nathaniel M. Brightwater remains stable.` | `Nathaniel M. Hammond` | **hybrid** |
+   | `Brightwater, Nathaniel remains stable.` | `Hammond, Nathaniel` | **hybrid** |
+   | `Nathaniel Dr Brightwater remains stable.` | `Nathaniel Dr Hammond` | **hybrid** |
+
+   The output is a **fake given name welded to the real surname** — silent misattribution, a
+   person who does not exist carrying a real patient's name — and every counter still reports a
+   clean run: `restored_count` goes *up*, `vault_misses` stays 0, and `_assert_no_surrogates`
+   cannot fire because `Nathaniel` on its own is not an issued fake. `restorer.py` handles
+   exactly one member of this class — `\s+` flexing for line wrapping — and its comment claims
+   that is "the only place this can be fixed". That claim is **wrong**, and the three rows above
+   are the counterexamples. The honest position: use tokenization when correctness of attribution
+   matters. A real fix needs the restorer to refuse a component fake when the full fake matched
+   nearby but not exactly, which is a design change rather than a patch.
+3. **The near-miss counter that is supposed to backstop the above is built from the matcher it
+   backstops.** `_count_surrogate_near_misses` calls `_compile_surrogate_pattern(fold=True)` —
+   the same function used to restore, differing only by `re.IGNORECASE`. Its docstring calls it
+   "deliberately an upper bound" on unrestored fakes; it is an upper bound only in the *case*
+   dimension and inherits every boundary rule the matcher has. Measured directly against the real
+   counter, with `Brightwater` as an issued fake:
+
+   ```
+   model wrote                          counter   fake still readable?
+   NATHANIEL BRIGHTWATER is stable.        1          yes   (caught)
+   nathaniel brightwater is stable.        1          yes   (caught)
+   The Brightwaters were contacted.        0          yes   <- SILENT
+   Nathaniel Bright-\nwater is stable.     0          yes   <- SILENT (soft wrap)
+   ```
+
+   So it covers the dimension it was written for and is blind to the boundary-adjacent survivals,
+   which are the same class of miss the matcher itself has. This is the project's recurring defect
+   living in the one function that exists to be the safety net, and it is recorded rather than
+   fixed because a genuinely independent counter is a second matcher with different rules — the
+   thing that needs designing, not patching.
+4. **`doc_category` is an uploader-supplied field that switches security controls off by
+   default.** `CASE_STRATEGY` carries `action: redact` — the one entity forcibly destroyed
+   regardless of confidence — and is scoped `only_in_doc_categories: [legal]`. The API field is
+   optional and defaults to `None` ("omit for unclassified"). Measured on the shipped registry
+   with a real privileged brief:
+
+   ```
+   doc_category=legal    -> 4 detections incl. CASE_STRATEGY, CLIENT_IDENTITY
+   doc_category=medical  -> 3 detections, CASE_STRATEGY absent
+   doc_category=None     -> 3 detections, CASE_STRATEGY absent   <- the default
+   ```
+
+   So a legal brief uploaded without a category never has its litigation strategy redacted, never
+   vaults it, and therefore gives pass 1 nothing to scan for; pass 2 runs with the same `None` and
+   shares the blind spot by construction. `document_store.py`'s own `InvalidCategoryError`
+   docstring makes exactly the right argument — a mis-filed document "would silently lose the
+   category-scoped detection rules that make its most sensitive entities detectable at all" — and
+   then `_validate_category` opens with `if doc_category is None: return None`. The guard is
+   written against the typo and open on the omission, and omission is the default. This is the
+   same shape as the `user_id` gap in §3: a user-supplied lever on which controls run. It is
+   listed rather than fixed because the fix is a product decision (reject unclassified uploads,
+   or run every category's rules when unclassified and accept the false-positive cost).
+5. **Pass 3 — the only genuinely independent opinion — covers one of four high-severity types.**
+   `_INDEPENDENT_PATTERNS` holds a single SSN recogniser, while `HIGH_SEVERITY_TYPES` is
+   `{SSN, MRN, ACCOUNT_NUMBER, TAX_ID}`. For the other three the *only* recogniser in the system
+   is the single registry pattern, consulted identically at detect time and in pass 2 — so the
+   argument pass 3 was built on (a recogniser's blind spot is shared by detection and by the
+   re-scan, therefore something differently sourced is required) is answered for 25% of the
+   blocking surface. Deviation 43 is a demonstrated instance: `MRN`'s trailing `\b`, denied by one
+   letter, was invisible to all three passes at once. Scope was chosen per-*instance* (the one
+   measured Presidio failure) rather than per-*class*.
+6. **`HIGH_SEVERITY_TYPES` does not follow its own stated membership rule.** The comment says the
+   set is "pattern-typed entities with near-zero false-positive rates", and that NER-typed re-hits
+   are warned rather than blocked because blocking them would make pseudonymization unusable.
+   `INSURANCE_ID` (`\b[A-Z]{2,4}\d{7,12}\b`) and `CASE_ID` are pattern-typed and high-specificity,
+   are **not** in the set, and are released with a warning at 1.00 confidence. Measured. The
+   membership is narrower than the rule given for it, with no reason recorded — which reads badly
+   precisely because the comment invites the question.
+7. **The vault serialises every session through one `asyncio.Lock` and one connection**, and its
+   plaintext cache is unbounded. Five call sites (`put`, `_fetch_one`, `destroy`, `sweep_orphans`,
+   `close`) take the same process-wide lock with no per-session striping, so a 251-entity brief
+   takes and releases it 251 times against every other session in the process. Separately,
+   `self._caches` is a `dict[str, _SessionCache]` of session-lifetime **plaintext** with no
+   eviction and no size cap; `SessionRegistry._sweep_locked` expiring a key does **not** drop it.
+   So decrypted PII accumulates for every session ever opened and not explicitly logged out, until
+   process close — which means the module docstring's "session-lifetime plaintext in RAM is
+   accepted" is doing more work than it looks, because that lifetime is not bounded by the
+   session's TTL. Gap 17 below covers the *document store* and gap 12 the session
+   registry; neither is this.
+8. **Two structural debts are named here rather than paid, and the reason is the calendar, not
+   the argument.** Both are real and both are cosmetic in the strict sense — no defect sits
+   behind either, which is exactly why neither was worth a large refactor on the last day.
+   - **`api/app.py` is 1,835 lines carrying seven concerns**, with all eight endpoint handlers
+     nested as closures inside one 345-line `_register_routes`. No endpoint is importable, so
+     none can be unit-tested without standing up the whole ASGI app, and the module cannot be
+     split while the closures bind to that function's locals. Around them the same file holds
+     rate limiting, service composition/DI, session auth and audit scoping, the error-mapping
+     contract, three ASGI middlewares and static-UI mounting. The fix is mechanical —
+     `api/routes/{sessions,documents,pipeline,audit}.py` as `APIRouter`s, plus
+     `middleware.py` / `errors.py` / `deps.py`; the error-mapping block already lifts cleanly.
+     Not done because the blast radius is the entire authenticated surface and a DI-wiring
+     mistake there is exactly the kind that a green suite would not catch.
+   - **The word-boundary rule is imported from the wrong layer and is still written out three
+     times.** `obfuscation/engine.py`, `deobfuscation/restorer.py` and
+     `obfuscation/strategies/pseudonymization.py` all import underscore-private names from
+     `pipeline/egress_gate.py`. The intent is right — the sweep and the gate have provably
+     disagreed twice, and a shared definition makes divergence an `ImportError`. The delivery
+     is half of it: only `pseudonymization.py` imports the actual *rule*; `engine.py` and
+     `restorer.py` import the *alphabet* and then reassemble the guards themselves, so a rename
+     breaks the import (as promised) but an edit to the rule still has to be made in three
+     places by hand. It also inverts the dependency graph: `obfuscation` and `deobfuscation`
+     now depend on `pipeline`, which depends on both. The fix is a leaf module
+     (`secure_context_pipeline/textrules.py` exporting public `ALNUM`, `boundary_guards`,
+     `occurs_as_a_unit`) imported by the gate, engine, restorer, strategy and harness — which
+     removes the private imports, removes the inverted edge, and makes the rule singular for
+     the first time.
+9. **No k-anonymity / generalization pass.** This is the real answer to the inference risk in
    §3, and it is not built.
-3. **Financial transaction dates pass through deliberately.** Amounts and counterparties are
+10. **Financial transaction dates pass through deliberately.** Amounts and counterparties are
    masked; the dates are not, because `DATE` is scoped to medical documents. That is a
    quasi-identifier residual and a real gap.
-4. **Sub-3-character spans are never obfuscated.** They carry no re-identification signal, and
+11. **Sub-3-character spans are never obfuscated.** They carry no re-identification signal, and
    sweeping them would corrupt unrelated words — but the floor is a policy choice, and it is
    applied uniformly rather than per-entity.
-5. **Single-process session registry.** Redis plus KMS envelope keys for multi-node.
-6. **The document read path leaks existence through timing** — ~18× between an absent
+12. **Single-process session registry.** Redis plus KMS envelope keys for multi-node.
+13. **The document read path leaks existence through timing** — ~18× between an absent
    `doc_id` and a wrong-owner one on a 2 MB blob. Content-identical, time-distinguishable;
    analysed in §3. A constant-time read closes it and costs a full disk read per miss.
-7. **Filenames are cleartext in the metadata table.** Deliberate and argued in §3; the fix, if
+14. **Filenames are cleartext in the metadata table.** Deliberate and argued in §3; the fix, if
    the requirement changes, is an encrypted column plus a blind index for listing.
-8. **The audit chain is unkeyed**, so it survives partial tampering but not a full rewrite by
+15. **The audit chain is unkeyed**, so it survives partial tampering but not a full rewrite by
    someone with DB write access (§5 Q5). An off-box append-only sink or an auditor-held HMAC
    key is the real answer; both are production infrastructure rather than a code change here.
-9. **The DOCX decompression-bomb guard bounds the declared size, not the transient cost.**
+16. **The DOCX decompression-bomb guard bounds the declared size, not the transient cost.**
    Checking the archive's declared uncompressed bytes closes the ~1000× amplification a zip
    bomb needs. It does not bound what `zipfile.ZipFile()` itself spends parsing the central
    directory before any check can run: an archive at the 16 MB upload cap can declare **zero**
    uncompressed bytes and still cost ~110 MB RSS, about 7×. Measured and pinned by a test. A
    real fix streams the archive or parses it in a memory-capped subprocess; the shipped guard
    is the cheap 99% and the residual is stated rather than implied.
-10. **SQLite write contention stalls every reader on the store**, not just the writer — five
+17. **SQLite write contention stalls every reader on the store**, not just the writer — five
    seconds of it, measured. Analysed in §4; the fix is Postgres and the Protocol seam exists.
-11. **A document's two blobs share one AAD** and can be swapped on disk (§3). Integrity only,
+18. **A document's two blobs share one AAD** and can be swapped on disk (§3). Integrity only,
    and closing it means deviating from the specified AAD.
-12. **Co-reference display enrichment** — a UX feature, per Q2.
-13. **`Settings.llm_max_retries` is an *attempt* count, not a retry count.** It is consumed as
+19. **Co-reference display enrichment** — a UX feature, per Q2.
+20. **`Settings.llm_max_retries` is an *attempt* count, not a retry count.** It is consumed as
    `max(1, min(llm_max_retries, MAX_ATTEMPTS))`, so `1` means one attempt and **no** retry —
    the opposite of what an operator setting "max retries = 1" expects. The behaviour is
    correct and tested; the name is wrong. It is a rename (`llm_max_attempts`) rather than a
    logic change, and it is recorded here rather than quietly renamed because the setting is
    already in `.env.example` and changing it is a breaking config change.
-14. **Streaming responses with incremental restore.** Today the full response is restored in
+21. **Streaming responses with incremental restore.** Today the full response is restored in
    one pass, so a streaming UI would show tokens before restoration.
-15. **OpenTelemetry spans per pipeline stage.** Timings exist in `stats` and the audit log but
+22. **OpenTelemetry spans per pipeline stage.** Timings exist in `stats` and the audit log but
    are not exported.
-16. **An OpenAI provider class** — one class plus one registry entry, by construction.
+23. **An OpenAI provider class** — one class plus one registry entry, by construction.
 
 ---
 
@@ -1520,7 +1805,7 @@ Recorded per the build doc's instruction. Each one is a deliberate choice with a
 | # | Deviation | Rationale |
 |---|---|---|
 | 1 | `SCP_LLM_MODEL` defaults to `claude-opus-5`, not `claude-sonnet-4-6`. The provider sends **no** `temperature`/`top_p`/`top_k` and passes `output_config.effort: "low"`. | The specified model is valid but older. On the current model family those sampling parameters are **removed and return HTTP 400**, so sending them would break the real-provider path outright. Model is env-configurable either way. |
-| 2 | Added `pyyaml`, `python-dateutil`, and `python-multipart` to dependencies. | The first two are required by the specified design (the registry is YAML; Tier 2 parses dates with `dateutil`) but absent from the pinned list. Without `python-multipart`, FastAPI raises at **route-registration** time and the container never boots. |
+| 2 | Added `pyyaml`, `python-dateutil`, and `python-multipart` to dependencies. | The first two are required by the specified design (the registry is YAML; Tier 2 parses dates with `dateutil`) but absent from the pinned list. (This row read as a complete enumeration of added dependencies and was missing one — `regex`, which was undeclared entirely. See Deviation 47.) Without `python-multipart`, FastAPI raises at **route-registration** time and the container never boots. |
 | 3 | `CASE_ID` patterns use single backslashes. | The spec shows `\\b`, which inside YAML single quotes is a literal backslash followed by `b`, not a word boundary. Every other entry uses single backslashes. |
 | 4 | Added `requires_context` and `require_digit` registry fields. | `requires_context` implements the specified DOB-vs-DATE semantics declaratively. `require_digit` fixes a real defect — see §4. Both are config, so config-only extensibility is preserved. |
 | 5 | `EgressGate.check()` is `async`. | The re-scan runs the detector, which offloads spaCy to a worker thread. A synchronous gate would either block the event loop or skip the re-scan. Both are worse than the signature change. |
@@ -1558,6 +1843,14 @@ Recorded per the build doc's instruction. Each one is a deliberate choice with a
 | 37 | **`TOKEN_RE` bounds every quantifier §9.7 leaves unbounded**: `\s*`→`\s{0,4}`, `[A-Z0-9_]*`→`{0,63}`, the hint suffix→`{1,24}`. | The specified regex is **catastrophically backtrackable**: adjacent unbounded quantifiers around an optional group cost **93 s** on a payload of 128,000 whitespace characters, which is a denial-of-service reachable from an ordinary document upload, and the restorer runs on every response. Bounding fixes it at **9.8 ms** on the same input. (This row previously said "a crafted 500-character input", which was wrong and trivially falsifiable — 500 characters is instant. The cost is quadratic in input length: measured 0.0058 / 0.023 / 0.090 / 0.363 / 1.446 s at 1k / 2k / 4k / 8k / 16k characters, i.e. **exactly 4x per doubling**, which extrapolates to 93 s at 128k. The 93 s and 10 ms figures were both right; the input size was not.) The behavioural cost was measured rather than assumed and is exactly **one** case: more than four whitespace characters inside a token leaves the closing bracket behind (`[PHI_NAME_1a2b3c4d     ]` → `John Smith     ]`). The value still restores, nothing leaks, and no post-restore assertion trips. The other two bounds cost nothing — neither an entity name past 63 characters nor a hint past 24 is emittable, because `format_surrogate` refuses to construct one. |
 | 38 | **§10.7's `[PHI_MEDICATION_2f4a|oral-antidiabetic]` (a 4-hex ID) is deliberately *not* restorable.** | The build doc contradicts itself: §8 fixes token IDs at `hexdigest()[:8]`, §9.7's own regex demands `{8}`, and only §10.7's example uses 4. The normative half wins. Widening to `{4,8}` would also widen the **egress gate's skip-list** — the gate skips spans matching the token grammar, so a looser grammar means more of the payload exempted from the re-scan, which is a security cost paid for an example. Pinned in both directions: a 4-hex token is unmatchable by the restorer *and* unissuable via `format_surrogate`, so the two halves cannot drift apart. |
 | 39 | **`Restorer.restore` accepts an optional `issued` set; `RestoreResult` gains `fabricated`, `lost` and `surrogate_misses`.** | Without knowing which surrogates were actually issued, every unresolved reference is a single undifferentiated "miss". With it, the restorer distinguishes a token the **model invented** (never issued — a model-behaviour signal) from one that **was** issued and no longer resolves (a vault or session fault). Those are different incidents with different responses, and collapsing them loses the distinction precisely when an operator needs it. The orchestrator passes it, so production misses classify rather than reading as `indeterminate`. |
+| 40 | **The user prompt is detected and obfuscated too**, in the same session and against the same vault (`orchestrator.run()` steps 3b/4b). §9.5.2's injector assembles `{system} + {user prompt} + {obfuscated document}` — the prompt goes through **raw**. | The prompt box is a text input a human types PHI into, and measured, it was a straight bypass of the whole design: six entity types typed into it reached the provider verbatim over HTTP while the document beside them was fully tokenized. The prompt is now detected, vaulted and tokenized before assembly, and the two token lists are merged (`_merge_tokens`), so the same restore path covers both. **A grader will notice this immediately** — the model no longer sees the question as written. Two consequences worth stating: the answer quality depends on the token contract carrying the prompt's intent, and `PipelineResult.detections` deliberately **excludes** prompt spans (`SpanOut` offsets are document-space and there is no span-space field), so §7's UI highlight panel reports nothing for them. `prompt_entities_detected` and `prompt_tokens_issued` are in `stats`. |
+| 41 | **The outbound payload fences the document**: `{obfuscated prompt}\n\n<DOCUMENT>\n{obfuscated document}\n</DOCUMENT>`, with any `</?\s*DOCUMENT\s*>` in **either** untrusted half rewritten to `&lt;…`. §9.5.2 specifies bare concatenation. | An uploaded document that closes the fence early has its remainder read as top-level instruction. This is defence in depth against *confusion*, not against a determined injection — a model can still be talked into ignoring a fence, and this repo makes no prompt-injection claim. Neutralisation runs **before** the gate scans, so the gate still sees the exact bytes that go on the wire. Visible in every payload and in `demo.py --dump-wire`, which is why it is recorded rather than left as a surprise. |
+| 42 | **The egress gate runs a third, blocking pass** (`_independent_hits` over `_INDEPENDENT_PATTERNS`), with its own `reason="independent_pattern"`. §9.5.3 specifies two. | Pass 2 re-runs the **same** `Detector` that ran at detect time, so it is a second *look*, not a second *opinion*, and every blind spot it had then it has again. Measured: Presidio's `UsSsnRecognizer.invalidate_result` returns a hard 0.0 for the published example SSNs, so `Member SSN 123-45-6789 verified` was never detected, never vaulted, and passed all passes silent. Pass 3 is a recogniser the detector does not use. **Its scope is honestly narrow** — one entity type of the four in `HIGH_SEVERITY_TYPES` — so the "different provenance" argument is answered for SSN and left standing for `MRN`, `TAX_ID` and `ACCOUNT_NUMBER`, each of which has exactly one registry pattern consulted identically at detect time and at re-scan. Listed in §7 Known gaps. |
+| 43 | **The gate has two identifier floors, not one**: `MIN_IDENTIFIER_DIGITS = 7` for the whole-value needle, `MIN_IDENTIFIER_RUN_DIGITS = 6` for a contiguous digit run. | They were one constant, and that was a live leak of the exact class this project keeps finding — **a number chosen for one channel's false-positive budget was silently setting another channel's security floor.** Seven was justified against dates (`03/12/85`) and amounts (`$1,234.56`), which are aggregates of 2- and 3-digit runs. A *contiguous* six-digit run is not that shape: it is an identifier core, and `MRN`'s shipped pattern is `\K\d{6,10}`, so the detector vaults six-digit MRNs the gate then declined to scan unbounded. Measured on the real detector, registry and gate: `MRN552140B` in a document body put a vaulted MRN on the wire byte for byte, with pass 1 bounded, pass 1 unbounded, pass 2 and pass 3 each having a separate reason to miss it. Pinned by `test_a_six_digit_identifier_core_glued_to_a_letter_is_blocked` and, so the config and the code cannot disagree again, by `test_no_shipped_identifier_pattern_can_match_below_the_gate_s_run_floor`, which reads `entities.yaml` itself. |
+| 44 | **`ObfuscationStrategy.make_surrogate` takes a keyword-only `session_id`.** §9.3 fixes the ABC as `make_surrogate(self, detection, token_id, vault)`. | `SessionVault` is a multi-session object — every accessor needs the ID, and the Tier-1 collision guard reads the vault. This is a spec-mandated public interface (the pluggability contract §10.3's dummy-strategy test exists to prove), so it is the kind of signature a reviewer diffs against §9.3, and it was previously claimed as "documented as required" in `strategies/base.py` while appearing nowhere in this file. |
+| 45 | **The Faker seed label carries the normalized original value**, not just the entity type: `HMAC(session_key, b"faker:" + f"{entity_type}:{normalize(text)}")`. §9.3 writes `b"faker:" + entity_type`. | Stability per *value* rather than per *type* is what component linking needs — one patient must own both `Sherri Lopez` and `Lopez` across the whole document. `crypto/keys.py` still implements §9.3's signature exactly; only the label passed to it is composite. Not a disclosure: the HMAC is under a secret 32-byte session key, `normalize` cannot introduce NUL, and `_label_bytes` rejects one, so the domain separation argument in `keys.py` still holds. Recorded because original values now flow into a keyed derivation, which is a fact a security reviewer should be told rather than have to find. |
+| 46 | **`CASE_ID` pattern 1 drops §6.2's `(?:Case|Docket)\s+No\.?\s*[:#]?\s*` prefix**, widens `[a-z]{2}` to `[a-z]{2,4}`, and adds `(?i)`. | Real briefs cite bare docket numbers, and requiring the lexical prefix missed them. The cost is that the pattern now claims any `d:dd-xx-ddd` run in **any** document category with no lexical context, which is exactly the broadening Deviation 15 relies on. Deviation 3 covers only the backslash spelling and was previously the only row mentioning `CASE_ID`. Same class, lower stakes: `MEDICATION` drops the spec's `takes` context word (explained in `entities.yaml`, not here until now), and `MRN`/`ACCOUNT_NUMBER` are wholesale rewrites acknowledged only in a §4 parenthetical. |
+| 47 | **`regex` is a hard runtime dependency and is now declared.** | `detection/registry.py` does `import regex`, and it resolved only transitively through `presidio-analyzer`. It is not optional: `MRN` and `ACCOUNT_NUMBER` use PCRE `\K` and possessive quantifiers, which the standard library's `re` **cannot compile at all** (`bad escape \K`), so `entities.yaml` is not portable to `re` and every path that touches the registry — config, detector, engine, strategies — fails at import without it. Deviation 2 enumerated the added dependencies and omitted the one that was undeclared. |
 
 ---
 
@@ -1617,7 +1910,7 @@ name appears anywhere in package source.
 Two modules do hold small, named entity tables, and pretending otherwise would be the kind of
 claim this README exists to avoid:
 
-- `obfuscation/strategies/pseudonymization.py` knows five names (`NAME`, `CLIENT_IDENTITY`,
+- `obfuscation/strategies/pseudonymization.py` knows four names (`NAME`, `CLIENT_IDENTITY`,
   `EMAIL`, `ADDRESS`) to pick a person/email/place generator. Everything else — including a
   Tier-1 entity added by config tomorrow — falls through to the structural mask, which
   preserves the shape of whatever it is handed.
@@ -1649,7 +1942,7 @@ marked as such rather than quietly asserted.
 | **Critical constraint** — reversible in-session, irreversible across | `crypto/keys.py::derive_token_id` (HMAC under an ephemeral key), key destruction | `test_crypto.py::test_token_id_deterministic_within_session`, `::test_token_id_non_deterministic_across_sessions`, `::test_token_id_is_irreversible_without_the_key`; `integration/test_pipeline.py::test_restoration_is_impossible_after_the_session_is_destroyed` |
 | **NFR** — config-only entity add | `entities.yaml`; `entity_type` opaque downstream | `test_extensibility.py::test_package_source_never_mentions_passport` (the grep **is** the proof), plus the three end-to-end cases beside it |
 | **NFR** — strategy swappable via config | strategy registry dict, `Settings.strategy` | `test_obfuscation.py::test_dummy_strategy_plugs_in_with_zero_engine_changes`, `::test_per_entity_strategy_override_is_config_only`; `test_llm.py::test_new_provider_name_is_selectable_with_zero_other_changes` |
-| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, two passes) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the four stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims`, `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`, `::test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims` (the glued-word boundary applies to the byte limb of the audit scan too; the query limb is what catches a label-column original — see `::test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`); round-trip completeness is derived independently of the restorer, enforced by `::test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`; `demo.py --dump-wire` for the literal HTTP body |
+| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, **three** passes — §9.5.3 specifies two; the third is Deviation 42) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the four stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims`, `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`, `::test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims` (the glued-word boundary applies to the byte limb of the audit scan too; the query limb is what catches a label-column original — see `::test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`); round-trip completeness is derived independently of the restorer, enforced by `::test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`; `demo.py --dump-wire` for the literal HTTP body |
 | **NFR** — vault isolation is cryptographic, cross-session | per-session HKDF vault keys, AAD `session_id:token_id` | `test_vault.py::test_aad_binding_across_sessions`, `::test_aad_binding_across_token_ids`; `integration/test_pipeline.py::test_concurrent_session_isolation` (50 interleaved ops) |
 | **NFR** — graceful degradation (never pass through raw) | engine threshold policy, `action: redact` | `test_obfuscation.py::test_mid_confidence_span_is_redacted_without_a_vault_entry`, `::test_case_strategy_is_force_redacted_in_both_modes`; `test_detection.py::test_below_floor_span_is_dropped` |
 | **NFR** — async pipeline, spaCy off the event loop | `detector.detect` (`asyncio.to_thread` behind `Semaphore(4)`), `aiosqlite`, `aiofiles` | `integration/test_pipeline.py::test_the_pipeline_never_blocks_the_event_loop`; `test_extraction.py::test_extraction_runs_off_the_event_loop_thread` |

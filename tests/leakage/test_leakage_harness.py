@@ -8,16 +8,27 @@ obfuscation strategies, no original value ever reached the outbound payload, the
 audit log, or the process log, and everything the model actually referred to came
 back intact.
 
+**Both halves of the payload carry originals, and one of them did not until recently.**
+The outbound payload is ``{system prompt} + {user prompt} + {obfuscated document}``,
+and for its whole history this module sent one module-level constant --
+``"Summarise this record and list the key parties, dates and figures."`` -- as the
+prompt on all 100 runs. So the third of the payload a *user* writes was PII-free by
+construction, and every "100/100 clean" ever quoted was a statement about the document
+half with nothing to say about the other. Each run now draws a real planted literal out
+of its own fixture and puts it in the prompt, rotating a name, an email address and a
+phone number across the runs; see :func:`prompt_for`.
+
 Four assertions per run (build doc section 10.5):
 
 1. **Outbound payload holds zero originals**, checked against the vault's own
-   ``originals_for_session`` in raw, normalised *and* invisible-character-folded
-   form -- the same **three** forms ``EgressGate._scan_originals`` compares, so the
-   harness cannot pass on a normalisation the gate would also catch -- and with no
-   minimum length, so a short value the gate skips still fails here. No span is
-   exempt, including the pipeline's own output: a pseudonym that reproduces a real
-   value verbatim puts that value on the wire wherever it sits. The run
-   additionally asserts that no surrogate equals the value it replaces.
+   ``originals_for_session`` in raw, normalised, invisible-character-folded and
+   combining-mark-skeleton form, plus the unbounded identifier needles -- the same
+   **five** comparisons ``EgressGate._scan_originals`` makes, so the harness cannot
+   pass on a form the gate would catch -- and with no minimum length, so a short
+   value the gate skips still fails here. No span is exempt, including the
+   pipeline's own output: a pseudonym that reproduces a real value verbatim puts
+   that value on the wire wherever it sits. The run additionally asserts that no
+   surrogate equals the value it replaces.
 2. **Audit DB and captured log output hold zero originals.** The audit side is
    queried through :meth:`AuditLogger.query` and, as defence in depth, the raw
    SQLite files are scanned as bytes -- a value that never survives the query API
@@ -39,9 +50,18 @@ Four assertions per run (build doc section 10.5):
    is a broken answer, and a surviving pseudonym is a silently wrong one.
 
 **What this harness measures, and what it does not.** The claim is about *whole
-vaulted values*, per channel, per session. Five boundaries are deliberate, and are
+vaulted values*, per channel, per session. Four boundaries are deliberate, and are
 stated here rather than left to be discovered. Each is pinned by a test, so a change
-that closes one is a red rather than a silent widening of the headline claim:
+that closes one is a red rather than a silent widening of the headline claim.
+
+There used to be five. The one that left -- *a combining mark spliced into a value* --
+did not leave because it was closed here; it left because **the gate had closed it and
+this file had not noticed**, and was still printing a paragraph explaining why the gate
+could not. That paragraph's reasoning ("folding marks out would make ``José`` and
+``Jose`` the same value") is a statement about the *needle*, and the gate strips marks
+from the **haystack** only, which collapses nothing. The harness was therefore weaker
+than the code it measures, and arguing on the record for a limitation the code no
+longer had. See :func:`test_the_scan_sees_a_combining_mark_spliced_into_a_value`:
 
 * **Partial disclosure is out of scope.** If a splice bug leaves one component of a
   multi-word original behind -- the surname of a vaulted full name -- neither this
@@ -51,7 +71,7 @@ that closes one is a red rather than a silent widening of the headline claim:
   manufacture reds indistinguishable from the real thing. See
   :func:`test_a_partial_value_leak_is_outside_what_this_harness_claims`, which pins
   the boundary so it cannot be forgotten.
-* **A value glued into a longer word is out of scope -- on the text channels.**
+* **A NAME glued into a longer word is out of scope -- on the text channels.**
   ``xJohn Smithx`` carries the original byte for byte and is not reported by
   :func:`find_in_text`, because :func:`_occurs_as_a_unit` asserts a word boundary on
   each side whose adjacent needle character is alphanumeric. Removing that assertion
@@ -59,6 +79,16 @@ that closes one is a red rather than a silent widening of the headline claim:
   multi-word originals does not help either, because ``chronic low back pains``
   contains ``chronic low back pain``.
   See :func:`test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`.
+
+  **The word NAME is load-bearing and used to be missing.** The false-positive
+  argument above is a *word-list* argument -- ``Browning`` is a real word containing
+  ``Brown`` -- and it does not transfer to an identifier: ``batch47-1234567Alpha`` is
+  not a real anything containing a taxpayer ID. The gate drew that distinction and
+  this harness did not, so ``47-1234567`` inside ``batch47-1234567Alpha`` was a value
+  the **gate blocked and the harness called clean**. :func:`find_in_text` now carries
+  the gate's :func:`_identifier_needles`, so any value with seven or more digits is
+  additionally compared as a bare substring with no adjacency requirement at all. See
+  :func:`test_the_scan_sees_an_identifier_glued_into_a_longer_run`.
 
   It bites hardest on the audit *file*, where it is a boundary of one **limb** rather
   than of the whole assertion. SQLite writes a record's column values end to end with
@@ -71,12 +101,6 @@ that closes one is a red rather than a silent widening of the headline claim:
   could carry the case alone was tried and reverted -- ``8.2`` is an ordinary vaulted
   lab value and ``{"elapsed_ms":18.25}`` then reads as a leak. See
   :func:`test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`.
-* **A combining mark spliced into a value is out of scope.** ``normalize`` is NFKC,
-  which composes -- so a *decomposed* rendering of an accented original is caught,
-  but a mark that was never in the vaulted value is not removable by any
-  normalisation form. Folding marks out would make ``José`` and ``Jose`` the same
-  value, which the gate's ``_INVISIBLE_RE`` deliberately refuses. See
-  :func:`test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`.
 * **Cross-session leakage is out of scope here.** Each run scans only its own
   session's originals. Cross-session isolation is a cryptographic property, proven
   in ``test_vault.py::test_aad_binding_across_sessions`` and
@@ -86,12 +110,26 @@ that closes one is a red rather than a silent widening of the headline claim:
   in the gate: catching Cyrillic U+043E for Latin ``o`` needs a confusables table,
   not another normalisation form.
 
-The last three share one cause and it is worth naming: they are the shapes for which
-the harness and the gate are blind **together**, because both resolve to the same
-occurrence rule. Where the gate is a second opinion that failure is survivable; on
-the audit database and the process log, where nothing else looks, it is not -- which
-is why they are recorded here as claims the harness does not make rather than as
-cases it happens not to have hit.
+The first, second and fourth share one cause and it is worth naming: they are the
+shapes for which the harness and the gate are blind **together**, because both resolve
+to the same occurrence rule. Where the gate is a second opinion that failure is
+survivable; on the audit database and the process log, where nothing else looks, it is
+not -- which is why they are recorded here as claims the harness does not make rather
+than as cases it happens not to have hit.
+
+**Blind together is the survivable case. Blind alone is not, and it is the one that
+keeps happening.** Every time the gate has gained a limb, this file has been a release
+behind it, and each gap was a real hole rather than a stylistic one: the gate gained
+the invisible-character fold and the harness reported clean through a U+200B; the gate
+gained :func:`_deaccent` and the harness reported clean through a combining mark; the
+gate gained :func:`_identifier_needles` and the harness reported clean through
+``batch47-1234567Alpha``. On the payload those are survivable -- the gate still blocks.
+On the audit database and the process log **the harness is the only opinion there is**,
+so each one was a complete bypass of the "zero originals in the audit log" half of the
+headline claim for as long as it lasted.
+:func:`test_the_harness_scan_is_never_weaker_than_the_gate_scan` now drives both
+implementations over the same inputs and fails on any payload the gate blocks and this
+file calls clean, so the next limb the gate grows is a red here rather than a silence.
 
 Then one adversarial run that removes detection from the argument entirely: a
 value of a shape **no recogniser in the registry matches** is planted in the
@@ -100,8 +138,12 @@ blind to it and the value rides through to the payload untouched. The gate must
 still block, the block must be audited, and the provider must never be called.
 That is the fail-closed property, proven independent of detection recall.
 
-Run it with ``pytest -m leakage``. Roughly 40 s: the spaCy analyzer and the whole
-component graph are built once for the module and every run gets a fresh session.
+Run it with ``pytest -m leakage``. Roughly 57 s on this machine, measured rather than
+remembered -- the spaCy analyzer and the whole component graph are built once for the
+module and every run gets a fresh session. The number in this sentence had drifted to
+"40 s" while the suite actually took 53 s, which is harmless here and is the same habit
+that makes a stale claim about a *limit* dangerous, so it is measured when it is
+quoted.
 """
 
 from __future__ import annotations
@@ -113,8 +155,9 @@ import logging
 import re
 import secrets
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -137,13 +180,17 @@ from secure_context_pipeline.models import (
     MAX_AUDIT_LABEL_LEN,
     MAX_DETAIL_VALUE_LEN,
     AuditEvent,
+    Detection,
     PipelineResult,
     TokenRecord,
 )
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import (
+    MIN_ORIGINAL_LEN,
     EgressGate,
+    _deaccent,
+    _identifier_needles,
     _occurs_as_a_unit,
     _strip_invisible,
 )
@@ -163,7 +210,15 @@ REGISTRY_PATH = REPO_ROOT / "entities.yaml"
 RUNS = 100
 
 USER_ID = "leakage-user"
-PROMPT = "Summarise this record and list the key parties, dates and figures."
+
+#: The instruction half of every prompt. Carries no PII and never did -- which was
+#: the whole problem, see :func:`prompt_for`.
+BASE_PROMPT = "Summarise this record and list the key parties, dates and figures."
+
+#: Used only by the two adversarial tests below, where the planted value is the
+#: subject of the test and the prompt is deliberately inert. The 100 runs use
+#: :func:`prompt_for`.
+PROMPT = BASE_PROMPT
 
 #: Both strategies alternate across the runs; three document kinds rotate under
 #: them, so every (strategy, kind) pair is exercised many times over.
@@ -206,6 +261,92 @@ def plan_run(index: int) -> tuple[int, str, str]:
 def run_id_for(index: int) -> str:
     seed, kind, strategy = plan_run(index)
     return f"{index:03d}-{kind}-{strategy}-seed{seed}"
+
+
+#: Rotated across the runs so the prompt half carries a different *shape* of original
+#: each time: a person's name (NER-typed), an email address (pattern-typed), and a
+#: phone number -- which is ten digits, so it is also the one that puts the gate's
+#: :func:`_identifier_needles` limb on the prompt channel. Every fixture kind plants
+#: all three at every seed, asserted in :func:`test_the_prompt_carries_a_real_original`.
+PROMPT_ENTITY_TYPES = ("NAME", "EMAIL", "PHONE")
+
+#: A lower-case role noun immediately before the value. Not decoration: ``fixtures``
+#: documents that bare object-position names are dropped by spaCy often enough to
+#: matter, and its own documents place every person behind one of these for that
+#: reason. The prompt is a nine-word string with no clinical context, which is the
+#: worst case NER ever sees, so it gets the same treatment.
+PROMPT_ROLE_NOUN = {"medical": "patient", "legal": "client", "financial": "customer"}
+
+PROMPT_FRAMES = {
+    "NAME": "Pay particular attention to the entries for {role} {value}.",
+    "EMAIL": "Cross-check any correspondence sent to {value}.",
+    "PHONE": "Confirm the contact number {value} against the rest of the file.",
+}
+
+
+def drawn_original(seed: int, kind: str, entity_type: str) -> str:
+    """One planted literal of ``entity_type`` from the document run ``seed``/``kind``.
+
+    Read out of :func:`fixtures.generator.expected_entities`, which returns the exact
+    strings the generator interpolated, so this is the same value the vault will hold
+    rather than something re-parsed out of the rendered text.
+
+    The longest candidate, tie-broken by position, so ``NAME`` yields ``Marguerite
+    Vandenberg`` rather than the bare surname the generator also plants -- a full name
+    is what a user actually types, and the surname is a substring of it anyway.
+    """
+    candidates = generator.expected_entities(seed, kind).get(entity_type, [])
+    if not candidates:
+        raise AssertionError(
+            f"fixtures plant no {entity_type} in {kind}/seed {seed}, so the prompt for "
+            "this run would carry no original and the run would silently go back to "
+            "measuring a PII-free constant"
+        )
+    return sorted(candidates, key=lambda v: (-len(v), candidates.index(v)))[0]
+
+
+def prompt_for(index: int) -> str:
+    """The user prompt for run ``index`` -- **carrying a real original from the document**.
+
+    Until this existed the module held a single constant, ``"Summarise this record and
+    list the key parties, dates and figures."``, and used it for all 100 runs. The
+    payload is ``{system prompt} + {user prompt} + {obfuscated document}``, so a third
+    of the outbound bytes -- and the only third a *user* writes -- was PII-free by
+    construction on every run behind the headline number. "No original reached the
+    payload" was therefore a claim about the document half only, and nothing in the
+    file said so.
+
+    That is not a small gap, because the prompt is the input a person types. The
+    natural prompt for this product is *"summarise this record for Marguerite
+    Vandenberg"* or *"cross-check the 03/12/1985 admission"*: real deployments put the
+    same values in the prompt that are in the document, and a pipeline that obfuscates
+    only the document ships them straight to the provider. A harness that only ever
+    sends a constant cannot tell the difference between a pipeline that handles that
+    and a pipeline that does not.
+
+    So every run now draws a real planted literal from its own document and puts it in
+    the prompt, rotating through three shapes (:data:`PROMPT_ENTITY_TYPES`). What that
+    buys, per run and on both strategies:
+
+    * the prompt half of assertion 1 is no longer vacuous -- there is a value in it
+      that must not reach the provider;
+    * the value is one the *document* also vaults, so the round trip has to keep the
+      user's own cross-reference intact rather than merely surviving it;
+    * one run in three puts a ten-digit phone number in the prompt, which is the
+      identifier shape :func:`_identifier_needles` exists for.
+
+    The value is deliberately **not** invented: it is drawn from the fixture, so if the
+    pipeline ever stops treating the prompt as an input to obfuscate, all 100 runs
+    block at the gate rather than 100 runs quietly passing on a prompt that never
+    contained anything. Fail-loud is the correct direction for that regression, and
+    :func:`test_the_prompt_carries_a_real_original` states the premise directly so the
+    failure names its own cause.
+    """
+    seed, kind, _strategy = plan_run(index)
+    entity_type = PROMPT_ENTITY_TYPES[index % len(PROMPT_ENTITY_TYPES)]
+    value = drawn_original(seed, kind, entity_type)
+    frame = PROMPT_FRAMES[entity_type].format(role=PROMPT_ROLE_NOUN[kind], value=value)
+    return f"{BASE_PROMPT} {frame}"
 
 
 # ---------------------------------------------------------------------------
@@ -458,46 +599,196 @@ occurs_as_a_unit = _occurs_as_a_unit
 
 
 def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
-    """Every original occurring in ``haystack``, in all **three** forms the gate scans.
+    """Every original occurring in ``haystack``, in **every** comparison the gate makes.
+
+    Four bounded forms and then one unbounded limb -- the same five comparisons, in
+    the same order, as ``EgressGate._scan_originals``:
 
     1. **raw** -- the byte-exact value;
     2. **normalised** -- NFKC, whitespace collapsed, casefolded, so a value split
        across a line break or re-cased by a splice bug still trips;
     3. **folded** -- normalised with zero-width, soft-hyphen and bidi format
-       characters removed.
+       characters removed;
+    4. **skeleton** -- the folded needle against a folded haystack with every
+       *combining mark* stripped (:func:`_deaccent`). Asymmetric on purpose, and the
+       asymmetry is the whole reason it is safe: only the haystack is stripped, so a
+       mark spliced into a mark-free vaulted value is caught while a vaulted ``José``
+       still does not match a payload that says ``Jose``;
+    5. **identifier needles** (:func:`_identifier_needles`) -- a bare substring test
+       with **no adjacency requirement at all**, for values carrying a run of at least
+       :data:`MIN_IDENTIFIER_DIGITS` digits.
 
-    The third form is the one this function used to be missing, and the omission
-    inverted the whole point of the module. The docstring here claimed these were
-    "the same two forms the EgressGate scans, so the harness cannot pass on a
-    normalisation the gate would also miss" -- but the gate scans *three*
-    (``EgressGate._scan_originals``), and had done since the invisible-character
-    bypass was closed there. So the harness was **weaker than the code it
-    measures**: an original carrying one U+200B read as clean here.
+    **Forms 4 and 5 are the ones this function did not have while the gate did**, and
+    that asymmetry is the single defect this module exists to prevent, in its most
+    dangerous direction. On the outbound payload the gate is a second opinion, so a
+    leak this function missed would still be blocked. On the **audit database and the
+    process log this function also scans, the harness is the only opinion there is**
+    -- nothing else looks at those bytes. Measured on the real functions before the
+    fix, not reasoned about:
 
-    That asymmetry is not symmetric in consequence. On the outbound payload the
-    gate is a second opinion, so a leak the harness missed would still be blocked.
-    On the **audit database and the process log this function also scans, the
-    harness is the only opinion there is** -- nothing else looks at those bytes --
-    so an invisible character was a complete bypass of the "zero originals in the
-    audit log" claim. Verified by sabotage: a real pipeline run with one U+200B
-    spliced into a real vaulted original reported clean through the harness while
-    the gate blocked it.
+        find_in_text({"47-1234567"}, '{"detail":{"note":"batch47-1234567Alpha"}}')
+            -> []                                   # the harness reported clean
+        _identifier_needles("47-1234567")
+            -> ('47-1234567', '1234567')            # the gate blocks this payload
 
-    No minimum length, deliberately: the gate skips originals shorter than
-    :data:`~secure_context_pipeline.pipeline.egress_gate.MIN_ORIGINAL_LEN`, and
-    the harness does not, so a short value the gate would wave through still fails
-    here. That is the one direction in which the harness *should* be stricter than
-    the gate, and it stays that way.
+    The same shape hid a combining mark: a mark spliced into ``John Smith`` read
+    clean here while the gate's skeleton form blocked it. Both are pinned below --
+    :func:`test_the_scan_sees_an_identifier_glued_into_a_longer_run` and
+    :func:`test_the_scan_sees_a_combining_mark_spliced_into_a_value`.
+
+    Form 5 keeps the gate's own function rather than restating its rule, for exactly
+    the reason form 1-4's occurrence rule is imported: a re-derived copy is a copy
+    that can drift, and this file has already paid for four of those.
+
+    No minimum length on the bounded forms, deliberately: the gate skips originals
+    shorter than
+    :data:`~secure_context_pipeline.pipeline.egress_gate.MIN_ORIGINAL_LEN`, and the
+    harness does not, so a short value the gate would wave through still fails here.
+    That is the one direction in which the harness *should* be stricter than the
+    gate, and it stays that way.
     """
-    folded = normalize(haystack)
-    stripped = _strip_invisible(folded)
-    return sorted(
-        o
-        for o in originals
-        if occurs_as_a_unit(o, haystack)
-        or occurs_as_a_unit(normalize(o), folded)
-        or occurs_as_a_unit(_strip_invisible(normalize(o)), stripped)
+    norm_hay = normalize(haystack)
+    folded_hay = _strip_invisible(norm_hay)
+    skeleton_hay = _deaccent(folded_hay)
+    found: list[str] = []
+    for original in originals:
+        normalised = normalize(original)
+        folded = _strip_invisible(normalised)
+        if (
+            occurs_as_a_unit(original, haystack)
+            or occurs_as_a_unit(normalised, norm_hay)
+            or occurs_as_a_unit(folded, folded_hay)
+            or occurs_as_a_unit(folded, skeleton_hay)
+            or any(needle in skeleton_hay for needle in _identifier_needles(folded))
+        ):
+            found.append(original)
+    return sorted(found)
+
+
+#: This module's own floor for the unbounded identifier limb, on the channels where
+#: **this module is the only opinion there is**. Seven, where the gate's run floor is
+#: six, and the gap is deliberate, measured, and narrow.
+#:
+#: These used to be one number, and that was the defect: a threshold whose entire
+#: justification is *this file's* false-positive budget on the audit database was also
+#: setting the *gate's* security floor on the outbound payload. The two channels have
+#: collision surfaces that differ by more than an order of magnitude, so one number
+#: could not be right for both, and the number that shipped was right for this one.
+#:
+#: Measured on the real 3.6 MB audit/vault/document DBs a suite leaves behind, by
+#: counting the distinct digit windows actually present in them::
+#:
+#:     distinct 6-digit windows: 15055  -> p(a given 6-digit needle collides) = 1.5e-2
+#:     distinct 7-digit windows:  9366  -> p(a given 7-digit needle collides) = 9.4e-4
+#:
+#: The 100 runs contribute roughly 100 identifier needles, so at six digits that is
+#: order-of-one spurious "an original reached the audit database" **per suite**, and at
+#: seven it is ~0.09. The anchoring on these limbs was introduced to remove a 1e-6
+#: false-red rate, on the argument that a rare false red on the headline assertion is
+#: worse than its frequency suggests. 1.5e-2 is four orders the wrong side of that
+#: line; 9.4e-4 is the side it was drawn for.
+#:
+#: **What it costs is stated rather than hidden**: a vaulted six-digit MRN core glued
+#: into an alphanumeric run, in the audit database or the process log, is not reported
+#: by this module. The gate does block that shape on the payload -- that is what
+#: ``MIN_IDENTIFIER_RUN_DIGITS`` is for -- so the uncovered case is specifically the
+#: two channels the gate never sees. Pinned by
+#: :func:`test_the_scan_sees_an_identifier_glued_into_a_longer_run`.
+_HARNESS_RUN_FLOOR = 7
+
+
+def _harness_identifier_needles(value: str) -> tuple[str, ...]:
+    """:func:`_identifier_needles`, narrowed to :data:`_HARNESS_RUN_FLOOR`.
+
+    A *filter* over the gate's own output rather than a re-derivation of its rule.
+    That distinction is the whole point: a re-derived copy is a copy that can drift,
+    and this file has already paid for four of those. Narrowing what the gate returns
+    keeps the relationship between the two exactly one fact wide -- this module drops
+    needles carrying fewer than seven digits, and nothing else -- so a reader can
+    check the claim by reading six lines instead of comparing two rules.
+    """
+    return tuple(
+        needle
+        for needle in _identifier_needles(value)
+        if sum(1 for ch in needle if "0" <= ch <= "9") >= _HARNESS_RUN_FLOOR
     )
+
+
+def find_in_digit_heavy_text(originals: frozenset[str], haystack: str) -> list[str]:
+    """:func:`find_in_text` for the audit database and the process log.
+
+    Identical in its four bounded forms; the only difference is that the unbounded
+    identifier limb uses :func:`_harness_identifier_needles` instead of the gate's
+    own, i.e. it stops at :data:`_HARNESS_RUN_FLOOR` digits rather than at the gate's
+    run floor. :data:`_HARNESS_RUN_FLOOR` carries the measurement and the cost.
+
+    Kept as a separate function rather than a flag on :func:`find_in_text`, because
+    the payload scan **must** stay exactly as wide as the gate -- that is the property
+    :func:`test_the_harness_is_never_weaker_than_the_gate_on_generated_input` fuzzes,
+    and a boolean parameter is one mistaken default away from silently narrowing it.
+    """
+    norm_hay = normalize(haystack)
+    folded_hay = _strip_invisible(norm_hay)
+    skeleton_hay = _deaccent(folded_hay)
+    found: list[str] = []
+    for original in originals:
+        normalised = normalize(original)
+        folded = _strip_invisible(normalised)
+        if (
+            occurs_as_a_unit(original, haystack)
+            or occurs_as_a_unit(normalised, norm_hay)
+            or occurs_as_a_unit(folded, folded_hay)
+            or occurs_as_a_unit(folded, skeleton_hay)
+            or any(needle in skeleton_hay for needle in _harness_identifier_needles(folded))
+        ):
+            found.append(original)
+    return sorted(found)
+
+
+def describe_hits(originals: list[str], haystack: str) -> list[str]:
+    """Failure-message text for a leak: the value **masked**, plus which limb fired.
+
+    Same reasoning as
+    :func:`test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did`,
+    applied to the runtime failure rather than to a test: a report that says only "an
+    original reached the audit log" leaves the reader to work out whether they are
+    looking at a splice bug, a normalisation, or the identifier limb matching seven
+    digits inside a hex run ID. Those need completely different responses, and the
+    distinction is free at the point of failure and expensive an hour later.
+
+    It matters most for the two limbs added last. ``identifier`` is the only one that
+    can fire on something innocent -- it is a bare substring test, and this module has
+    a measured false-positive rate for it on digit-heavy channels (see
+    :func:`find_in_bytes`) -- so a red naming ``['identifier']`` alone is the one a
+    reader should check the arithmetic on before believing, and a red naming ``['raw']``
+    is one they should not.
+
+    Never renders the value: :func:`mask` gives a length and two characters, which is
+    build doc section 16's rule and applies to test output like everything else.
+    """
+    norm_hay = normalize(haystack)
+    folded_hay = _strip_invisible(norm_hay)
+    skeleton_hay = _deaccent(folded_hay)
+    described: list[str] = []
+    for original in originals:
+        normalised = normalize(original)
+        folded = _strip_invisible(normalised)
+        limbs = [
+            name
+            for name, fired in (
+                ("raw", occurs_as_a_unit(original, haystack)),
+                ("normalised", occurs_as_a_unit(normalised, norm_hay)),
+                ("folded", occurs_as_a_unit(folded, folded_hay)),
+                ("skeleton", occurs_as_a_unit(folded, skeleton_hay)),
+                (
+                    "identifier",
+                    any(needle in skeleton_hay for needle in _identifier_needles(folded)),
+                ),
+            )
+            if fired
+        ]
+        described.append(f"{mask(original)} via {limbs or ['byte-limb-only']}")
+    return described
 
 
 #: A JSON ``\uXXXX`` escape. See :func:`_unescape_json_unicode`.
@@ -602,6 +893,37 @@ def find_in_bytes(originals: frozenset[str], haystack: bytes) -> list[str]:
     ``{"elapsed_ms":18.25}`` reports a leak that is not there. Measured before
     shipping, not after.
 
+    **This limb deliberately does NOT carry the gate's identifier needles, and that
+    is a decision with a number behind it rather than an omission.**
+    :func:`find_in_text` gained :func:`_identifier_needles` -- a bare substring test
+    for values carrying seven or more digits -- because the gate has it and a checker
+    weaker than the code it checks launders the claim. Putting the same limb *here*
+    was measured first, on the real 1.8 MB audit blob a full 100-run session
+    accumulates, and it fails the standard this very docstring sets three paragraphs
+    up:
+
+        pure-digit identifier needles across the 100 runs, by length:
+            7 digits: 100   9: 34   10: 33   12: 66   13: 33
+        p(a random needle of that length occurs somewhere in the final blob):
+            7 digits: 9.7e-04   8: 6.0e-05   9: 3.7e-06   10: 2.3e-07   12: 8.8e-10
+        => expected spurious reds per full 100-run suite: 0.049
+           i.e. ~4.7% chance of a false "original in the audit database" per run
+
+    Almost all of it is the seven-digit MRN: an audit *file* is 1.8 MB of hex run
+    IDs, sha256 digests and float timestamps, which is four orders of magnitude more
+    digit surface than the 8-hex token ID the gate's own risk arithmetic reasons about
+    (see :data:`MIN_IDENTIFIER_DIGITS`). 4.7% per suite is ~4,700x the 1e-6 rate this
+    limb's anchoring was introduced to remove, on the one assertion where a rare false
+    red is most expensive -- it teaches the reader to disbelieve the next genuine one.
+
+    What that costs is bounded, because this limb is not where the identifier case
+    lands. A glued identifier in a **live** audit row is caught by the query limb,
+    which is :func:`find_in_text` and does carry the needles; what is uncovered is a
+    glued identifier in bytes only this limb can reach -- a freed page, a WAL remnant,
+    a superseded row image -- which is the same stated boundary this limb already has
+    for a glued *name*. Pinned, with the arithmetic, by
+    :func:`test_the_byte_limb_declines_the_identifier_needles_and_says_what_that_costs`.
+
     ``errors="replace"`` is what makes decoding safe here: an invalid byte becomes
     U+FFFD, which is not alphanumeric and therefore acts as a boundary, so binary
     garbage can never glue itself onto a needle and manufacture a match. Valid
@@ -620,6 +942,59 @@ def find_in_bytes(originals: frozenset[str], haystack: bytes) -> list[str]:
         for o in originals
         if occurs_as_a_unit(o, decoded) or occurs_as_a_unit(o, unescaped)
     )
+
+
+class _NoVault:
+    """Satisfies the gate's ``VaultLike``. Never consulted -- see :func:`_gate_scan_hits`."""
+
+    def originals_for_session(self, session_id: str) -> frozenset[str]:
+        return frozenset()
+
+
+class _NoDetector:
+    """Satisfies the gate's ``DetectorLike``. Never consulted -- pass 1 does not detect."""
+
+    async def detect(self, text: str, doc_category: str | None = None) -> Sequence[Detection]:
+        return ()
+
+
+@lru_cache(maxsize=1)
+def _reference_gate() -> EgressGate:
+    """One gate instance for the scan-comparison tests. Its collaborators are stubs.
+
+    ``EgressGate._scan_originals`` is a pure function of ``(payload, originals)`` --
+    it reads nothing off ``self`` -- so the vault, detector and settings handed in
+    here exist only to satisfy the constructor.
+
+    The key is generated here rather than left to ``Settings()``'s environment lookup.
+    A bare ``Settings()`` works under pytest only because ``tests/conftest.py`` injects
+    ``SCP_MASTER_KEY`` at import time, which makes this helper depend on a fixture file
+    it never mentions -- and the failure mode is a ``ConfigError`` from the middle of a
+    scan comparison, which reads like a gate bug rather than a missing env var.
+    """
+    return EgressGate(
+        vault=_NoVault(),
+        detector=_NoDetector(),
+        settings=Settings(
+            master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+            registry_path=REGISTRY_PATH,
+            llm_provider="mock",
+        ),
+    )
+
+
+def _gate_scan_hits(originals: frozenset[str], payload: str) -> int:
+    """How many originals the **real gate** reports in ``payload``. Pass 1, entire.
+
+    Every "and the gate agrees" claim in this module goes through here, and that is a
+    correction rather than a convenience. Those claims used to be made against
+    :func:`_occurs_as_a_unit` -- **one limb of a five-limb scan** -- and the
+    consequence was not hypothetical: when the gate grew ``_deaccent``, a test whose
+    name promised the gate could not see a combining mark went on passing, because the
+    limb it interrogated was not the limb that had changed. A checker that asks the
+    thing it checks a narrower question than the one it reports on has not checked it.
+    """
+    return _reference_gate()._scan_originals(payload, originals)
 
 
 async def surrogate_map(harness: Harness, session_id: str, result: PipelineResult) -> dict[str, str]:
@@ -779,6 +1154,50 @@ def test_the_leak_scan_bites() -> None:
     assert not find_in_bytes(frozenset({planted}), b"\x00\x01nothing here")
 
 
+def test_the_failure_message_names_the_limb_and_never_the_value() -> None:
+    """:func:`describe_hits` runs **only** when a run is already failing. So test it.
+
+    Code on the failure path is the code nothing exercises, and when it breaks it does
+    so at the worst possible moment: an exception raised while formatting an assertion
+    message replaces a precise "an original reached the audit log" with a
+    ``TypeError`` from a test module, which is exactly the report that gets dismissed
+    as harness flakiness.
+
+    Two properties, and the second is build doc section 16 rather than ergonomics:
+
+    * the limb attribution is **correct** -- a reader deciding whether a red is a real
+      splice bug or the identifier limb catching seven digits inside a hex run ID is
+      making that call off this string;
+    * no original is ever rendered into it, however alarming the failure.
+    """
+    name = "Marguerite Vandenberg"
+    tax_id = "47-1234567"
+
+    assert describe_hits([name], f"The client {name} signed.") == [
+        f"{mask(name)} via ['raw', 'normalised', 'folded', 'skeleton']"
+    ]
+
+    # The one limb whose reds a reader should check before believing.
+    identifier_only = describe_hits([tax_id], "routing tag batch47-1234567Alpha here")
+    assert identifier_only == [f"{mask(tax_id)} via ['identifier']"], identifier_only
+
+    # A value the byte limb found and the query view does not carry is labelled, not
+    # silently rendered as an empty list.
+    assert describe_hits([name], "nothing to see here") == [
+        f"{mask(name)} via ['byte-limb-only']"
+    ]
+
+    # Section 16: the value never appears, in any of the three shapes.
+    for rendered in (
+        *describe_hits([name], f"The client {name} signed."),
+        *identifier_only,
+        *describe_hits([name], "nothing to see here"),
+    ):
+        assert name not in rendered and tax_id not in rendered, (
+            f"the failure message renders an original: {rendered!r}"
+        )
+
+
 def test_the_scan_sees_markdown_and_punctuation_wrapped_originals() -> None:
     """The regression cases the previous occurrence rule was blind to.
 
@@ -898,6 +1317,65 @@ def test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things
     assert find_in_bytes(frozenset({"4823910"}), b'detail{"v":"MRN 4823910"}') == ["4823910"]
 
 
+def test_the_byte_limb_declines_the_identifier_needles_and_says_what_that_costs() -> None:
+    """The one place :func:`find_in_text` is stricter than :func:`find_in_bytes`, on purpose.
+
+    :func:`find_in_text` gained the gate's :func:`_identifier_needles` -- a bare
+    substring test, no adjacency requirement, for values carrying at least
+    :data:`MIN_IDENTIFIER_DIGITS` digits -- because the gate has it and a checker
+    weaker than the code it checks launders the claim. The byte limb did **not**, and
+    that asymmetry is a decision with a measurement behind it rather than an oversight
+    of the same kind this module keeps finding.
+
+    What was measured: the real audit blob a full 100-run session accumulates is
+    1.8 MB of hex run IDs, sha256 digests and float timestamps. Counting the distinct
+    seven-digit windows actually present in it gives p = 9.7e-4 that *any* given
+    seven-digit needle occurs somewhere by chance, and the 100 runs contribute exactly
+    100 seven-digit needles (one MRN each). That is 0.049 expected spurious reds per
+    suite -- a ~4.7% chance, per run of the headline artifact, of a false "an original
+    reached the audit database".
+
+    The anchoring on this limb was introduced to remove a **1e-6** false-red rate, on
+    the argument that a rare false red on this assertion is worse than its frequency
+    suggests because it teaches the reader to disbelieve the next genuine one. 4.7% is
+    four orders of magnitude the wrong side of that line, so the limb stays anchored
+    and the cost is written down instead.
+
+    The cost is bounded: a glued identifier in a **live** audit row is caught by the
+    query limb, which is :func:`find_in_text` and does carry the needles. What is
+    uncovered is a glued identifier in bytes only this limb reaches -- a freed page, a
+    WAL remnant, a superseded row image -- which is the same boundary this limb
+    already has for a glued name.
+
+    Both halves are asserted, so neither the decision nor its cost can rot into an
+    assumption.
+    """
+    mrn = "MRN: 5567281"
+    digits = "5567281"
+
+    # The cost, stated as a fact about the code rather than as prose.
+    glued_bytes = b"sess-a1b2EGRESS_BLOCKchartMRN5567281Bdeadbeef"
+    assert digits.encode() in glued_bytes, "premise: the digits really are in the file"
+    assert not find_in_bytes(frozenset({mrn}), glued_bytes), (
+        "the byte limb has gained the identifier needles -- if that is deliberate, "
+        "re-measure the seven-digit false-positive rate against a real 1.8 MB audit "
+        "blob first; it was 4.7% per suite when this was last measured"
+    )
+
+    # ...and the limb that does carry the case, on the query view of the same row.
+    quoted = json.dumps([{"entity_type": "chartMRN5567281B"}], ensure_ascii=False)
+    assert find_in_text(frozenset({mrn}), quoted) == [mrn], (
+        "the query limb is what covers a glued identifier in a live audit row; if it "
+        "stops firing, assertion 2 is blind to the shape on both limbs"
+    )
+
+    # The false positive the decision is protecting, made concrete: a seven-digit
+    # value really can sit inside an ordinary 32-hex run ID.
+    run_id = b"run_id=a3f25567281c14e7b9d0e5a6182f4cc71"
+    assert digits.encode() in run_id, "premise: the collision is real, not theoretical"
+    assert not find_in_bytes(frozenset({mrn}), run_id)
+
+
 def test_the_scan_sees_an_invisible_character_bypass() -> None:
     """One U+200B must not make an original invisible to this module.
 
@@ -997,6 +1475,61 @@ def test_the_log_scan_sees_structured_extra_fields(
     assert find_in_text(frozenset({planted}), log_haystack(caplog)) == [planted]
 
 
+def test_the_prompt_carries_a_real_original() -> None:
+    """The prompt half of the payload is not a PII-free constant. Checked, not assumed.
+
+    For all 100 runs the prompt was one module-level string -- *"Summarise this record
+    and list the key parties, dates and figures."* -- so the third of the outbound
+    payload a **user** writes contained nothing any scan could have found. Every
+    "100/100 runs clean" ever quoted was a statement about the document half.
+
+    :func:`prompt_for` fixed that by drawing a real planted literal out of each run's
+    own fixture. This test is what stops that quietly reverting, because the failure
+    mode is silent by construction: if the draw ever returns something the document
+    does not vault -- a fixture edit, a renamed entity type, a span boundary moving --
+    the prompt goes back to being unscanned bytes and every assertion downstream still
+    passes.
+
+    So the properties the 100 runs depend on are asserted here directly: the value is
+    non-empty, it really is one of the fixture's planted literals for that exact run,
+    all three rotated shapes are reachable at every seed, and the prompt actually
+    contains it. The run itself then asserts the other half -- that the value is in the
+    session vault, so the payload scan is hunting for it.
+    """
+    seen_types: set[str] = set()
+    for index in range(RUNS):
+        seed, kind, _strategy = plan_run(index)
+        entity_type = PROMPT_ENTITY_TYPES[index % len(PROMPT_ENTITY_TYPES)]
+        seen_types.add(entity_type)
+
+        value = drawn_original(seed, kind, entity_type)
+        planted = generator.expected_entities(seed, kind)
+        assert value in planted[entity_type], (
+            f"run {index}: the prompt value is not one of the literals the generator "
+            f"planted in this document, so the vault will not hold it ({mask(value)})"
+        )
+        assert len(value) >= MIN_ORIGINAL_LEN, (
+            f"run {index}: the prompt value is shorter than the gate's floor, so the "
+            f"gate would skip it and the prompt half of the scan is decorative"
+        )
+
+        prompt = prompt_for(index)
+        assert value in prompt, f"run {index}: prompt_for dropped the value it drew"
+        assert prompt.startswith(BASE_PROMPT), (
+            f"run {index}: the instruction half of the prompt changed shape"
+        )
+
+    assert seen_types == set(PROMPT_ENTITY_TYPES), (
+        f"only {sorted(seen_types)} of {sorted(PROMPT_ENTITY_TYPES)} prompt shapes are "
+        "reachable across the runs, so the rotation is not rotating"
+    )
+
+    # The rotation must actually vary the bytes, or this is the old constant wearing a
+    # function. Compared across the first six runs, which cover every (kind, shape).
+    prompts = {prompt_for(i) for i in range(6)}
+    assert len(prompts) == 6, f"the per-run prompts are not distinct: {len(prompts)}/6"
+
+
 def test_a_partial_value_leak_is_outside_what_this_harness_claims() -> None:
     """The boundary of the claim, pinned so it cannot be quietly forgotten.
 
@@ -1090,52 +1623,319 @@ def test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims() 
     ) == [original]
 
 
-def test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims() -> None:
-    """The third stated boundary: a combining mark spliced into a value defeats the scan.
+def test_the_scan_sees_a_combining_mark_spliced_into_a_value() -> None:
+    """A boundary that stopped being one, and the stale argument that hid it.
 
-    ``normalize`` is NFKC, which *composes* -- so a value written in decomposed form
-    is caught (asserted below, because that half is a real capability and nothing
-    else pins it). What NFKC cannot do is remove a mark that was never in the
-    vaulted value: ``J`` + U+0301 + ``ohn Smith`` normalises to ``J́ohn Smith``,
-    which is simply a different string from ``john smith``.
+    This test used to be called
+    ``test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`` and
+    asserted the opposite of what it asserts now. It was wrong, and the *way* it was
+    wrong is the recurring defect of this project in its purest form: it argued, at
+    length and persuasively, that the gate could not catch this either -- while the
+    gate had already been catching it for a release.
 
-    This is deliberate upstream and not an oversight here. ``_INVISIBLE_RE`` in the
-    egress gate folds 145 format codepoints and names its own limit in as many
-    words -- *"no letter, digit, space or combining diacritic is in here, so
-    ``José`` and ``Jose`` remain different values"*. Folding marks out would collapse
-    two genuinely distinct originals into one and manufacture reds on any document
-    carrying both spellings of a name, which is ordinary in the documents this
-    system protects.
+    The argument was: ``_INVISIBLE_RE`` folds 145 format codepoints and stops short of
+    combining marks on purpose, because folding marks would make ``José`` and ``Jose``
+    the same value. That sentence is true, and it is about the **needle**.
+    ``EgressGate._deaccent`` strips marks from the **haystack** only, which collapses
+    nothing: a vaulted ``José`` keeps its accent and therefore still does not match a
+    payload saying ``Jose``. The old test never noticed because it checked the gate's
+    agreement against ``_occurs_as_a_unit`` on the *folded* forms -- one limb of a
+    five-limb scan, and not the limb that had changed. Checking a sub-limb and
+    reporting it as the gate's verdict is how a checker convinces itself it is not
+    weaker than the thing it checks.
 
-    So it belongs with homoglyph substitution rather than with the zero-width
-    bypass: catching it needs a confusables/skeleton table, not another
-    normalisation form. Verified by sabotage rather than reasoned about -- a real
-    vaulted original was spliced into a real payload with one combining acute
-    inserted, and with the gate **live** the run completed and the value reached the
-    provider, so this is a property of the pipeline and not only of the instrument.
+    So all three claims are now made against the real functions:
+
+    * :func:`find_in_text` catches a mark spliced into a mark-free vaulted value;
+    * the gate's whole ``_scan_originals`` catches the same payload -- read off the
+      real gate, not off one of its limbs;
+    * ``José`` and ``Jose`` remain **different values**, which is the property the
+      old argument was actually protecting and which nothing had ever asserted.
     """
     original = "John Smith"
     mark = unicodedata.lookup("COMBINING ACUTE ACCENT")
     mutated = f"Reference: {original[0]}{mark}{original[1:]} confirmed."
 
     assert original not in mutated, "premise: the raw value is genuinely not present"
-    assert not find_in_text(frozenset({original}), mutated), (
-        "if this now fires, the scan has gained combining-mark folding -- good, but "
-        "the README's stated boundary must change with it, and `José` vs `Jose` must "
-        "be re-checked, because that is what the fold would also collapse"
+    assert find_in_text(frozenset({original}), mutated) == [original], (
+        "a combining mark spliced into a vaulted value hides it from this scan again, "
+        "while EgressGate._deaccent still catches it -- the harness is weaker than the "
+        "code it measures, which is the one thing this module may not be"
     )
-    # The gate agrees. The two must not disagree about what an occurrence is, and a
-    # boundary only counts as *stated* if it is the same boundary on both sides.
-    assert not _occurs_as_a_unit(
-        _strip_invisible(normalize(original)), _strip_invisible(normalize(mutated))
-    ), "the gate now sees this and the harness does not -- the checker is weaker again"
 
-    # The half that DOES hold: NFKC composes, so a decomposed rendering of an
-    # accented original is still caught. Nothing else in this module asserted it.
+    # The gate's real verdict, off the whole scan rather than one limb of it.
+    assert _gate_scan_hits(frozenset({original}), mutated) == 1, (
+        "premise: the gate blocks this payload -- if it no longer does, the gate lost "
+        "_deaccent and that is a finding about the gate, not about this test"
+    )
+
+    # The property the old argument was protecting, which nothing ever asserted:
+    # stripping marks from the haystack does NOT collapse two distinct originals.
+    assert not find_in_text(frozenset({"José"}), "the client Jose signed the release"), (
+        "`José` and `Jose` have been collapsed into one value -- that is the false "
+        "positive the gate's asymmetric _deaccent exists to avoid"
+    )
+    assert _gate_scan_hits(frozenset({"José"}), "the client Jose signed the release") == 0
+
+    # NFKC composes, so a decomposed rendering of an accented original is caught too.
     accented = "José Ruiz"
     decomposed = unicodedata.normalize("NFD", accented)
     assert accented not in f"client {decomposed} signed", "premise: NFD is a distinct string"
     assert find_in_text(frozenset({accented}), f"client {decomposed} signed") == [accented]
+
+
+def test_the_scan_sees_an_identifier_glued_into_a_longer_run() -> None:
+    """The gate's :func:`_identifier_needles` limb, which this file did not have.
+
+    The boundary rule refuses to call ``Brown`` inside ``Browning`` an occurrence, and
+    it is right to -- that is a word-list argument about *names*. It does not transfer
+    to a nine-digit identifier, and the document body is written by whoever uploads
+    the file. The gate drew that distinction; this harness did not, so for one release
+    these were values the **gate blocked and this file called clean**:
+
+        find_in_text({"47-1234567"}, '{"detail":{"note":"batch47-1234567Alpha"}}') -> []
+
+    On the payload that is survivable, because the gate blocks anyway. On the audit
+    query view and the process log -- which this function also scans and the gate never
+    sees -- it was a straight hole in the "zero originals in the audit log" claim.
+
+    The needles are the gate's own function, not a restatement of its rule, so the two
+    cannot drift; what is asserted here is that they are actually *applied*.
+    """
+    tax_id = "47-1234567"
+    mrn = "MRN: 5567281"
+
+    glued = '{"detail":{"note":"batch47-1234567Alpha"}}'
+    assert tax_id in glued, "premise: the identifier is present byte for byte"
+    assert not occurs_as_a_unit(tax_id, glued), (
+        "premise: the boundary rule alone still refuses this -- that is why the "
+        "identifier limb has to exist"
+    )
+    assert find_in_text(frozenset({tax_id}), glued) == [tax_id]
+
+    # The label-carrying half: the vaulted span includes its own label, so the whole
+    # value never appears -- but the digits do, and the digits are the secret.
+    chart = "chart row MRN5567281B reconciled"
+    assert mrn not in chart, "premise: the vaulted value itself is genuinely absent"
+    assert find_in_text(frozenset({mrn}), chart) == [mrn]
+
+    # The gate agrees on both, read off the whole scan.
+    assert _gate_scan_hits(frozenset({tax_id}), glued) == 1
+    assert _gate_scan_hits(frozenset({mrn}), chart) == 1
+
+    # And the limb stays off values it is not for: a name has no digits.
+    assert not _identifier_needles("Marguerite Vandenberg")
+    assert not find_in_text(
+        frozenset({"Marguerite Vandenberg"}), 'reviewer=Marguerite Vandenbergx'
+    )
+
+    # A six-digit run IS in scope for the gate, and is NOT in scope for this module.
+    # That is the one place this file is deliberately narrower than the gate, and it
+    # is a measured decision rather than drift -- see _HARNESS_RUN_FLOOR, which is
+    # what the next two assertions are really about.
+    assert _identifier_needles("382892") == ("382892",), (
+        "the gate scans six-digit runs unbounded (a six-digit MRN core is a real "
+        "registry shape); if this stops being true the gate has regressed"
+    )
+    assert not _harness_identifier_needles("382892"), (
+        f"this module's own floor is {_HARNESS_RUN_FLOOR} digits, because it scans "
+        "the audit database where a 32-hex run_id gives a six-digit needle 27 "
+        "landing sites -- the false positive this module has already paid for once"
+    )
+
+
+#: Payloads the gate's pass 1 blocks, one per comparison it makes, with the limb each
+#: one exists to exercise. Named rather than generated so a reader can see which limb
+#: is which, and so a limb that stops existing is a red with a name attached.
+#:
+#: The ``(only)`` entries were added after measuring, not after reading. Deleting one
+#: limb at a time from :func:`find_in_text` and re-running this file showed that
+#: removing the **raw** limb and removing the **normalised** limb both left every test
+#: green: the ordinary corpus entries satisfy two or three limbs at once, so any one of
+#: them can leave without a red. That is the same trap the gate documents about its own
+#: three bounded forms -- "a suite whose probes all satisfy two forms at once cannot see
+#: the third leave" -- and this corpus had walked straight into it. Each limb now has at
+#: least one payload that *only* it can catch.
+#:
+#: The sabotage matrix, for the next person who edits :func:`find_in_text`:
+#: raw and normalised are held by the ``(only)`` entries here; folded is held by the
+#: fuzz below (its ``é`` needles are the ones deaccenting breaks); skeleton and
+#: identifier are held by both.
+_GATE_BLOCKING_PAYLOADS: tuple[tuple[str, str, str], ...] = (
+    ("raw", "Marguerite Vandenberg", "The client Marguerite Vandenberg signed."),
+    # The payload ONLY the raw form catches. NFKC expands U+2120 to ``SM``, which glues
+    # an alphanumeric onto the needle in all three derived forms, so the byte-exact
+    # comparison is the last one standing. The gate keeps its own test for this
+    # (`test_the_raw_form_is_the_only_thing_that_sees_some_leaks`); without the entry
+    # here, deleting the raw limb from find_in_text left this whole file green.
+    ("raw (only)", "Dr Smith", "the note names Dr Smith℠ throughout"),
+    ("normalised", "Marguerite Vandenberg", "client MARGUERITE\nVANDENBERG signed"),
+    # The payload ONLY the normalised form catches, and the reason the gate keeps three
+    # near-identical bounded forms: re-cased with a zero-width space on each side, so
+    # folding them out glues ``x`` onto the needle and the folded and skeleton forms
+    # both go quiet. Without this entry, deleting the normalised limb from find_in_text
+    # left every other test in this file green -- measured, by doing it.
+    ("normalised (only)", "John Smith", "x​JOHN SMITH​x"),
+    ("folded (zero width)", "Marguerite Vandenberg", "client Marguerite​ Vandenberg signed"),
+    ("folded (tag character)", "John Smith", "client Joh\U000e0041n Smith signed"),
+    ("skeleton (combining mark)", "John Smith", "client Joh́n Smith signed"),
+    ("identifier (whole value)", "47-1234567", "routing tag batch47-1234567Alpha here"),
+    ("identifier (digit run)", "MRN: 5567281", "chart row MRN5567281B reconciled"),
+    ("identifier (bare run elsewhere)", "Account No. 100200300400", "ref 100200300400 posted"),
+    ("markdown emphasis", "John Smith", "the memo names _John Smith_ as counsel"),
+    ("punctuation-edged needle", "(415) 555-0123", "tel(415) 555-0123 on file"),
+)
+
+
+def test_the_harness_scan_is_never_weaker_than_the_gate_scan() -> None:
+    """The rule that would have caught all three of the last three misses at once.
+
+    This module's history is one defect repeated: the gate grows a limb, this file
+    does not, and for one release the harness reports clean through a payload the gate
+    blocks. It happened with the invisible-character fold, again with ``_deaccent``,
+    and again with :func:`_identifier_needles`. Each time it was found by a human
+    reading two files side by side, and each time the fix was to copy the missing limb
+    across -- which fixes the instance and leaves the mechanism intact.
+
+    On the outbound payload the consequence is survivable: the gate blocks whatever
+    this file misses. On the **audit database and the process log the harness alone
+    scans**, it is a straight bypass of half the headline claim, and it lasts until
+    somebody happens to diff the two files again.
+
+    So the relationship is asserted instead of maintained. The property is one-way and
+    that direction is the whole point:
+
+        gate blocks  =>  harness reports
+
+    The converse is deliberately *not* asserted. The harness is allowed to be stricter
+    and is: it applies no ``MIN_ORIGINAL_LEN`` floor, so a two-character value the gate
+    waves through still fails here. Asserting equality would make the harness's one
+    deliberate advantage over the gate into a test failure.
+
+    Driven off :func:`_gate_scan_hits`, which calls the gate's whole ``_scan_originals``
+    rather than any one of its limbs -- that distinction is exactly what the previous
+    version of the combining-mark test got wrong.
+    """
+    missed: list[str] = []
+    for limb, original, payload in _GATE_BLOCKING_PAYLOADS:
+        originals = frozenset({original})
+        blocked = _gate_scan_hits(originals, payload)
+        assert blocked == 1, (
+            f"premise for the {limb} case: the gate is supposed to block {payload!r}. "
+            "It does not, so either the gate lost a limb -- a finding about the gate -- "
+            "or this corpus entry no longer describes the shape it was written for"
+        )
+        if not find_in_text(originals, payload):
+            missed.append(f"{limb}: {mask(original)} in {mask(payload)}")
+
+    assert not missed, (
+        f"{len(missed)} payload(s) block at the egress gate and read CLEAN through this "
+        f"module's own scan: {missed}. On the payload the gate covers for that; on the "
+        "audit database and the process log nothing does, so each one is a hole in the "
+        "'zero originals in the audit log' claim until it is closed"
+    )
+
+
+#: How a generated payload mutates the value spliced into it. One entry per limb the
+#: gate's pass 1 has, so a payload that only that limb can catch is reachable by
+#: construction rather than by luck.
+_MUTATIONS = (
+    "verbatim",
+    "upper",
+    "combining_mark",
+    "zero_width",
+    "line_break",
+    # Re-cased AND wrapped in zero-widths. The one shape that reaches the *normalised*
+    # form on its own: folding the wrappers out glues the affixes onto the needle, so
+    # the folded and skeleton comparisons both go quiet and only the normalised one is
+    # left. Without it the fuzz stayed green through deleting that limb.
+    "upper_zero_width_wrap",
+)
+
+
+def _mutate(value: str, mutation: str, at: int) -> str:
+    """``value`` as a payload might carry it, under one mutation, at offset ``at``."""
+    if not value:
+        return value
+    cut = at % len(value)
+    if mutation == "upper":
+        return value.upper()
+    if mutation == "upper_zero_width_wrap":
+        return f"​{value.upper()}​"
+    if mutation == "combining_mark":
+        return value[: cut + 1] + "́" + value[cut + 1 :]
+    if mutation == "zero_width":
+        return value[: cut + 1] + "​" + value[cut + 1 :]
+    if mutation == "line_break":
+        return value[: cut + 1] + "\n" + value[cut + 1 :]
+    return value
+
+
+#: Values to splice in. Two branches, because one strategy cannot reach both halves of
+#: pass 1. Prose-shaped draws exercise the four bounded forms; digit-shaped draws are
+#: what make :func:`_identifier_needles` reachable at all -- a needle needs seven ASCII
+#: digits before that limb looks at it, and a general text strategy over an alphabet
+#: with one digit character produces such a needle essentially never. Measured: with
+#: the prose branch alone, deleting the identifier limb outright left this test green
+#: through 3,000 examples while the corpus test above named three failures.
+_FUZZ_VALUES = st.one_of(
+    st.text(alphabet="ab1_ .-é", min_size=1, max_size=9),
+    st.text(alphabet="0123456789", min_size=6, max_size=11),
+    st.text(alphabet="0123456789-() ", min_size=7, max_size=14),
+    st.text(alphabet="0123456789A-: ", min_size=7, max_size=14),
+)
+
+
+@given(
+    original=_FUZZ_VALUES,
+    prefix=st.text(alphabet="ab1_ .-", max_size=6),
+    suffix=st.text(alphabet="ab1_ .-", max_size=6),
+    mutation=st.sampled_from(_MUTATIONS),
+    at=st.integers(min_value=0, max_value=12),
+)
+@settings(max_examples=3_000, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_the_harness_is_never_weaker_than_the_gate_on_generated_input(
+    original: str, prefix: str, suffix: str, mutation: str, at: int
+) -> None:
+    """The same one-way property, past the ten shapes somebody thought of.
+
+    :func:`test_the_harness_scan_is_never_weaker_than_the_gate_scan` compares the two
+    scans over a hand-written corpus, and a hand-written corpus encodes the limbs its
+    author already knew about -- which is precisely the thing that has been wrong three
+    times running here. Each miss was a limb nobody had written a case for *yet*.
+
+    **The payload is built from the value rather than drawn beside it, and that is not a
+    convenience.** The first version of this test drew ``original`` and ``payload`` as
+    two independent strings over a shared alphabet, on the reasoning that a tiny
+    alphabet makes them collide often. Measured against a deliberate sabotage -- the
+    skeleton and identifier limbs deleted from :func:`find_in_text`, which the corpus
+    test above catches in four places -- it stayed **green through 2,000 examples**. Two
+    independent draws collide on a three-character needle a couple of percent of the
+    time, and then have to collide *again* on the mark or the zero-width character in
+    the right position, which is a probability small enough that the test was decorative.
+
+    So the value is spliced in: ``prefix + mutate(original) + suffix``, with one mutation
+    per limb (:data:`_MUTATIONS`) -- verbatim, re-cased, a combining mark inserted, a
+    zero-width space inserted, a line break inserted -- and the affixes supply the
+    adjacency the boundary rule and :func:`_identifier_needles` disagree about. Every
+    draw now exercises a limb instead of almost every draw being a trivial non-match.
+
+    The value strategy has a digit-shaped branch for the same measured reason
+    (:data:`_FUZZ_VALUES`): the identifier limb does not look at a needle until it
+    carries seven ASCII digits, so a prose alphabet never reaches it and the test was
+    blind to that limb's removal even after the splicing fix.
+
+    A failure is a payload hypothesis has shrunk to a minimal pair, which is the part a
+    hand-written corpus cannot do at all.
+    """
+    payload = prefix + _mutate(original, mutation, at) + suffix
+    originals = frozenset({original})
+    if _gate_scan_hits(originals, payload):
+        assert find_in_text(originals, payload) == [original], (
+            "the egress gate blocks this payload and this module's scan calls it clean, "
+            "so any leak of this shape into the audit database or the process log would "
+            "be reported as 100/100 runs clean"
+        )
 
 
 def test_a_short_surrogate_inside_a_longer_word_has_not_survived() -> None:
@@ -1158,7 +1958,7 @@ def test_a_short_surrogate_inside_a_longer_word_has_not_survived() -> None:
 
 
 def _reference_occurs_as_a_unit(needle: str, haystack: str) -> bool:
-    """An independently written statement of the occurrence rule.
+    """A second derivation of the occurrence rule. **It can only catch divergence.**
 
     Deliberately shares no machinery with the implementation it checks: explicit
     index arithmetic and :meth:`str.isalnum` instead of regex lookarounds. The
@@ -1166,8 +1966,27 @@ def _reference_occurs_as_a_unit(needle: str, haystack: str) -> bool:
     each side where the needle's own edge character is alphanumeric, the character
     beyond it is not.*
 
-    Two independent derivations agreeing is evidence. One derivation imported into
-    four call sites is not, which is the lesson of the bug this file now documents.
+    **Read that sentence next to :func:`_occurs_as_a_unit`'s docstring: it is the same
+    specification.** Two derivations of one spec agreeing is evidence that neither was
+    mistyped. It is not evidence that the spec is right, and this file's entire defect
+    history is spec error rather than transcription error -- ``_`` counting as a word
+    character, a needle whose first character is punctuation, a value glued between two
+    SQLite column values, an identifier inside ``batch47-1234567Alpha``. Every one of
+    those would have been reproduced faithfully by *both* derivations, and the 220-pair
+    differential and the 2,000-example fuzz would have stayed green through all of them.
+    They did stay green through all of them.
+
+    So this function is kept for what it is genuinely good at -- catching the day
+    somebody edits one copy of the rule and not the other -- and the spec-error
+    question is asked somewhere else, by a reference written to a **different**
+    specification entirely: see :func:`_reference_contains` and
+    :func:`test_every_occurrence_this_module_declines_to_report_is_named_on_the_record`.
+
+    It is also the pseudonym predicate for round-trip *completeness*
+    (:func:`expected_round_trip`), which is a different job again and the reason it is
+    not simply deleted: there the requirement is a predicate the restorer does not
+    share, and plain containment would be wrong -- a short Faker draw inside an
+    ordinary word is not the model mentioning that surrogate.
     """
     if not needle:
         return False
@@ -1268,6 +2087,152 @@ def test_the_occurrence_rule_has_no_fourth_copy() -> None:
     assert 0 < positives < pairs, (
         f"the differential corpus is degenerate: {positives}/{pairs} positive"
     )
+
+
+def _reference_contains(needle: str, haystack: str) -> bool:
+    """A reference written to a **different specification**: *is the value in the text?*
+
+    Not another derivation of the occurrence rule -- a different question, and the
+    difference is the point. :func:`_reference_occurs_as_a_unit` restates the rule the
+    implementation already encodes, so the two can only ever disagree about
+    *transcription*. This asks the question a compliance reviewer asks, which is the
+    one the headline claim is written in: **the payload either carries the value or it
+    does not.**
+
+    Every place the two answers differ is a place this module knows the value is there
+    and has decided not to report it. That set is a design decision -- the
+    ``Brown``/``Browning`` trade -- and a design decision is only on the record if it is
+    written down: :data:`_DECLINED_BY_DESIGN` enumerates it pair by pair, and
+    :func:`test_every_occurrence_this_module_declines_to_report_is_named_on_the_record`
+    fails on any *unlisted* difference.
+
+    That is the check the two same-spec derivations structurally cannot make. A spec
+    error does not look like a disagreement between two copies of the spec; it looks
+    like a value that is plainly present and quietly unreported. Against this
+    reference, that is exactly what it looks like.
+    """
+    return bool(needle) and needle in haystack
+
+
+#: The one reason this module ever declines to report a value it can see. Named, so
+#: that a second reason cannot be added without somebody typing a second name.
+_GLUED = (
+    "adjacent to an alphanumeric on a side where the needle's own edge is alphanumeric "
+    "-- the Brown/Browning trade, which does not apply to digit-carrying values "
+    "(_identifier_needles) and is stated as a boundary in this module's docstring"
+)
+
+#: **Every** (needle, haystack) pair in the differential corpus where the value is
+#: present and :func:`find_in_text` reports nothing. Enumerated rather than described,
+#: because a description is a rule and a rule is what keeps turning out to be wrong.
+#: An entry here is a suppression somebody signed for; a suppression that is *not* here
+#: is a spec error, and that is what the test below is looking for.
+_DECLINED_BY_DESIGN: dict[tuple[str, str], str] = {
+    ("John Smith", "xJohn Smith"): _GLUED,
+    ("John Smith", "John Smithx"): _GLUED,
+    ("John Smith", "xJohn Smithx"): _GLUED,
+    ("John Smith", "1John Smith"): _GLUED,
+    ("John Smith", "John Smith1"): _GLUED,
+    ("Brown", "xBrown"): _GLUED,
+    ("Brown", "Brownx"): _GLUED,
+    ("Brown", "xBrownx"): _GLUED,
+    ("Brown", "1Brown"): _GLUED,
+    ("Brown", "Brown1"): _GLUED,
+    ("$1,234.56", "$1,234.56x"): _GLUED,
+    ("$1,234.56", "x$1,234.56x"): _GLUED,
+    ("$1,234.56", "$1,234.561"): _GLUED,
+    ("Case No. 3:24-cv-01188", "xCase No. 3:24-cv-01188"): _GLUED,
+    ("Case No. 3:24-cv-01188", "Case No. 3:24-cv-01188x"): _GLUED,
+    ("Case No. 3:24-cv-01188", "xCase No. 3:24-cv-01188x"): _GLUED,
+    ("Case No. 3:24-cv-01188", "1Case No. 3:24-cv-01188"): _GLUED,
+    ("Case No. 3:24-cv-01188", "Case No. 3:24-cv-011881"): _GLUED,
+    ("ada.brown@example.com", "xada.brown@example.com"): _GLUED,
+    ("ada.brown@example.com", "ada.brown@example.comx"): _GLUED,
+    ("ada.brown@example.com", "xada.brown@example.comx"): _GLUED,
+    ("ada.brown@example.com", "1ada.brown@example.com"): _GLUED,
+    ("ada.brown@example.com", "ada.brown@example.com1"): _GLUED,
+    ("HbA1c of 8.2", "xHbA1c of 8.2"): _GLUED,
+    ("HbA1c of 8.2", "HbA1c of 8.2x"): _GLUED,
+    ("HbA1c of 8.2", "xHbA1c of 8.2x"): _GLUED,
+    ("HbA1c of 8.2", "1HbA1c of 8.2"): _GLUED,
+    ("HbA1c of 8.2", "HbA1c of 8.21"): _GLUED,
+    ("O'Brien", "xO'Brien"): _GLUED,
+    ("O'Brien", "O'Brienx"): _GLUED,
+    ("O'Brien", "xO'Brienx"): _GLUED,
+    ("O'Brien", "1O'Brien"): _GLUED,
+    ("O'Brien", "O'Brien1"): _GLUED,
+}
+
+
+def test_every_occurrence_this_module_declines_to_report_is_named_on_the_record() -> None:
+    """The differential that can catch a **spec error**, which the other two cannot.
+
+    :func:`test_the_occurrence_rule_has_no_fourth_copy` and its fuzz compare
+    :func:`_occurs_as_a_unit` against :func:`_reference_occurs_as_a_unit`. Those two are
+    written to the *same specification* -- compare their docstrings, the sentences are
+    the same sentence -- so the pair can detect a mistyped implementation and can never
+    detect a mistaken rule. Four for four, a mistaken rule is what this file has
+    actually shipped, and the differential was green through every one of them.
+
+    This one compares the module's real leak decision, :func:`find_in_text`, against
+    :func:`_reference_contains`: *is the value in the text, yes or no*. That is the
+    question the headline claim is written in, and it is not derived from the
+    implementation at all. Wherever the two differ, this module can see a value and is
+    choosing not to report it, and every such choice has to be in
+    :data:`_DECLINED_BY_DESIGN` **by name**.
+
+    Both directions fail loudly, and the second one matters as much as the first:
+
+    * an **unlisted** suppression is a value the module quietly stopped reporting. That
+      is what a spec error looks like from the outside, and it is the only view from
+      which it looks like anything at all;
+    * a **listed** pair that is now reported means the ledger has rotted into fiction.
+      Left alone it would grow into a list of things that used to be true, which is
+      worse than no list, because the next reader trusts it.
+
+    A third assertion keeps the corpus from going degenerate: containment and the
+    module's scan must each answer both ways over it, or agreement is vacuous.
+    """
+    unlisted: list[tuple[str, str]] = []
+    stale: list[tuple[str, str]] = []
+    present = 0
+    reported = 0
+
+    for needle in _DIFFERENTIAL_NEEDLES:
+        for wrapper in _DIFFERENTIAL_WRAPPERS:
+            haystack = wrapper.replace("{}", needle)
+            in_text = _reference_contains(needle, haystack)
+            found = bool(find_in_text(frozenset({needle}), haystack))
+            present += in_text
+            reported += found
+            if in_text and not found and (needle, haystack) not in _DECLINED_BY_DESIGN:
+                unlisted.append((needle, haystack))
+            if found and (needle, haystack) in _DECLINED_BY_DESIGN:
+                stale.append((needle, haystack))
+
+    assert not unlisted, (
+        f"{len(unlisted)} occurrence(s) are present in the text and reported by nothing "
+        f"in this module, and are not on the record as a deliberate suppression: "
+        f"{[(mask(n), mask(h)) for n, h in unlisted[:5]]}. Either the scan lost a limb "
+        "-- which is a leak in the audit and log channels, where it is the only opinion "
+        "-- or the suppression is intended, in which case add it to "
+        "_DECLINED_BY_DESIGN with a reason and change the module docstring's stated "
+        "boundaries to match"
+    )
+    assert not stale, (
+        f"{len(stale)} pair(s) in _DECLINED_BY_DESIGN are now reported after all: "
+        f"{[(mask(n), mask(h)) for n, h in stale[:5]]}. The scan got stricter -- good -- "
+        "but delete these entries, or the ledger becomes a list of limitations this "
+        "module no longer has and the next reader believes it"
+    )
+
+    # ...and the corpus is not degenerate in either direction.
+    pairs = len(_DIFFERENTIAL_NEEDLES) * len(_DIFFERENTIAL_WRAPPERS)
+    assert 0 < reported < present < pairs, (
+        f"the containment differential is degenerate: {present}/{pairs} pairs carry the "
+        f"value and {reported} are reported, so it is not exercising both answers"
+    )
+    assert _DECLINED_BY_DESIGN, "an empty ledger cannot fail; the corpus must reach the trade"
 
 
 #: A small alphabet with one character from each class the occurrence rule cares
@@ -1524,7 +2489,11 @@ async def test_no_original_ever_leaves_the_process(
     )
     session_id, _expires_at = await harness.sessions.create("test-user")
     calls_before = harness.provider.calls
-    result = await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, strategy)
+    # A per-run prompt carrying a real original from THIS document -- see prompt_for.
+    # The prompt is a third of the outbound payload and the only third a user writes,
+    # and it was a PII-free module constant on all 100 runs until this.
+    prompt = prompt_for(index)
+    result = await harness.orchestrator.run(session_id, USER_ID, doc_id, prompt, strategy)
 
     # The payload this test scans has to be the payload that was actually sent.
     # `result.obfuscated_payload` is the orchestrator's own record of it; the
@@ -1548,6 +2517,19 @@ async def test_no_original_ever_leaves_the_process(
         f"run {index} vaulted nothing, so every leak scan below would be vacuous "
         f"(kind={kind}, seed={seed})"
     )
+
+    # The prompt's own value has to be one of the values the scans below hunt for, or
+    # the prompt half of assertion 1 is decorative. Asserted rather than assumed: the
+    # value is drawn from the fixture's planted literals, and if the vault ever stops
+    # holding exactly that string -- a fixture edit, a span boundary moving -- the
+    # prompt would go back to being unscanned bytes and nothing else would say so.
+    prompt_value = drawn_original(seed, kind, PROMPT_ENTITY_TYPES[index % 3])
+    assert prompt_value in originals, (
+        f"run {index}: the value this run put in the user prompt is not in the session "
+        f"vault, so the payload scan is not looking for it and the prompt half of this "
+        f"test measures nothing (kind={kind}, seed={seed}, {mask(prompt_value)})"
+    )
+
     mapping = await surrogate_map(harness, session_id, result)
 
     # --- 0. no surrogate stands for itself ---------------------------------
@@ -1577,7 +2559,7 @@ async def test_no_original_ever_leaves_the_process(
         ledger.leaks += len(payload_leaks)
     assert not payload_leaks, (
         f"run {index} ({kind}/{strategy}, seed {seed}): {len(payload_leaks)} original(s) "
-        f"present in the outbound payload: {[mask(v) for v in payload_leaks]}"
+        f"present in the outbound payload: {describe_hits(payload_leaks, sent_payload)}"
     )
 
     # --- 2a. the audit trail, through the query API and on disk -------------
@@ -1589,7 +2571,7 @@ async def test_no_original_ever_leaves_the_process(
     audit_json = json.dumps(
         [event.model_dump() for event in events], default=str, ensure_ascii=False
     )
-    audit_leaks = find_in_text(originals, audit_json)
+    audit_leaks = find_in_digit_heavy_text(originals, audit_json)
     audit_leaks += [
         value
         for value in find_in_bytes(originals, harness.audit_bytes())
@@ -1599,19 +2581,21 @@ async def test_no_original_ever_leaves_the_process(
         ledger.leaks += len(audit_leaks)
     assert not audit_leaks, (
         f"run {index}: {len(audit_leaks)} original(s) reached the audit log: "
-        f"{[mask(v) for v in audit_leaks]}"
+        f"{describe_hits(audit_leaks, audit_json)} (a value listed as 'byte-limb-only' "
+        "was found in the raw DB file and not in the query view)"
     )
 
     # --- 2b. every log line the package emitted, at DEBUG -------------------
     # ``log_haystack`` rather than ``caplog.text``: the default formatter renders
     # no ``extra=`` fields, and that is where this package puts every variable it
     # logs. Scanning ``caplog.text`` alone checked the constant half of each line.
-    log_leaks = find_in_text(originals, log_haystack(caplog))
+    logged = log_haystack(caplog)
+    log_leaks = find_in_digit_heavy_text(originals, logged)
     if log_leaks:
         ledger.leaks += len(log_leaks)
     assert not log_leaks, (
         f"run {index}: {len(log_leaks)} original(s) reached the log output: "
-        f"{[mask(v) for v in log_leaks]}"
+        f"{describe_hits(log_leaks, logged)}"
     )
 
     # --- 3. round-trip completeness ----------------------------------------

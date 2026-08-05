@@ -170,6 +170,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_S",
     "HIGH_SEVERITY_TYPES",
     "MIN_IDENTIFIER_DIGITS",
+    "MIN_IDENTIFIER_RUN_DIGITS",
     "MIN_ORIGINAL_LEN",
     "EgressGate",
 ]
@@ -194,22 +195,64 @@ HIGH_SEVERITY_TYPES = frozenset({"SSN", "MRN", "ACCOUNT_NUMBER", "TAX_ID"})
 # folding both shrink a needle and can drop it below the floor after the fact.
 MIN_ORIGINAL_LEN = 3
 
-#: How many ASCII digits a vaulted value must carry before pass 1 scans it with the
-#: word-boundary rule switched **off** -- see :func:`_identifier_needles` for the
-#: rule and :func:`_occurs_as_a_unit` for what is being switched off.
+#: How many ASCII digits a vaulted value must carry **in total** before pass 1 scans
+#: the whole value as a bare substring -- see :func:`_identifier_needles` for the rule
+#: and :func:`_occurs_as_a_unit` for the word-boundary rule being switched off.
 #:
-#: Seven rather than six, and the difference is arithmetic rather than taste. The
-#: needle is compared as a bare substring, so it can land inside a run of characters
-#: this pipeline emitted itself, and the only such run made of ``[0-9a-f]`` is an
-#: 8-hex token ID. A specific 6-digit needle appears somewhere in a random 8-hex ID
-#: with probability ~3x16^-6 = 1.8e-7; at seven digits it is ~2x16^-7 = 7.5e-9. A
-#: run carries tens of tokens and a session carries thousands of originals, so the
-#: first number is a flake a long CI history would eventually see and the second is
-#: not. What seven costs is a six-digit MRN core (the registry's ``\\d{6,10}`` allows
-#: one): that value is still scanned in all four bounded forms, just not as a bare
-#: substring. Fixture MRNs are seven digits, which is also the shortest an MRN
-#: actually written by the chart systems this models tends to be.
+#: This floor governs the *whole-value* needle only, the one that keeps separators:
+#: ``512-24-8710``, ``(415) 555-0123``. Seven rather than six is what keeps two very
+#: common low-entropy shapes out of an unbounded comparison, and both are aggregates
+#: of short runs rather than identifiers: a two-digit-year date (``03/12/85``, six
+#: digits) and an amount under ``$99,999.99`` (``$1,234.56``, six digits). Scanning
+#: those without an adjacency rule blocks on ``Filed 03/12/850`` and
+#: ``Line item $1,234.567``, which are ordinary text, not disclosures. Both are pinned
+#: by ``test_a_value_below_the_identifier_floor_keeps_the_boundary_rule``.
 MIN_IDENTIFIER_DIGITS: Final = 7
+
+#: How long one **contiguous** run of ASCII digits must be before pass 1 scans that
+#: run as a bare substring. Six, and it is deliberately *lower* than
+#: :data:`MIN_IDENTIFIER_DIGITS` because it answers a different question.
+#:
+#: These were one constant, and that was a defect of the exact kind this module keeps
+#: finding: **one number chosen for one channel's false-positive budget was silently
+#: setting another channel's security floor.** Seven was justified against the shapes
+#: above -- dates and amounts -- which are aggregates of 2- and 3-digit runs. A
+#: *contiguous* six-digit run is not that shape. It is an identifier core, and the
+#: shipped registry says so: ``MRN``'s pattern is ``\\K\\d{6,10}``, so the detector
+#: vaults six-digit MRNs and the gate then declined to scan them unbounded.
+#:
+#: That was a live leak, not a theoretical one. Measured on the real detector, the
+#: real registry and the real gate, with ``552140`` -- the first row of
+#: ``DEV_IDENTIFIER_POSITIVES`` in ``tests/test_detection.py``, a value the detector is
+#: *required* to find and vault::
+#:
+#:     payload:  "Internal routing tag: MRN552140B must match the ledger."
+#:     pass 1 bounded forms: miss (the trailing ``B`` denies the right boundary)
+#:     pass 1 unbounded:     miss (six digits, below the old single floor)
+#:     pass 2:               miss (``MRN``'s pattern ends in ``\\b``, denied by ``B``)
+#:     pass 3:               miss (SSN only)
+#:     -> RELEASED, with a real vaulted MRN on the wire byte for byte.
+#:
+#: The false-positive arithmetic at six is run against the right channel this time.
+#: :meth:`EgressGate._scan_originals` reads the **outbound payload** and nothing else,
+#: and the only run of ``[0-9a-f]`` the pipeline emits into a payload is an 8-hex token
+#: ID. A specific six-digit needle lands inside a random 8-hex ID with probability
+#: ~3x16^-6 = 1.8e-7; a 251-entity document carries ~251 of them, so a document with
+#: five six-digit originals expects 2.2e-4 spurious blocks. A spurious block is also
+#: the direction this gate is allowed to be wrong in -- it denies a request, it does
+#: not release a value.
+#:
+#: **The 32-hex ``run_id`` arithmetic that argued for seven belongs to a different
+#: scanner.** It is the leakage harness that scans the audit database, where run IDs
+#: give a six-digit needle 27 landing sites instead of 3; that floor now lives in
+#: ``tests/leakage/test_leakage_harness.py`` under its own name, measured on its own
+#: channel. Neither file inherits the other's budget by accident any more.
+#:
+#: Pinned in both directions: ``test_a_six_digit_identifier_core_glued_to_a_letter_is
+#: _blocked`` (the leak above, end to end through the real gate) and
+#: ``test_no_shipped_identifier_pattern_can_match_below_the_gate_s_run_floor`` (the
+#: registry and this constant can no longer disagree without a red).
+MIN_IDENTIFIER_RUN_DIGITS: Final = 6
 
 #: Wall-clock budget for one whole ``check()``. Exceeding it blocks, because a
 #: detector that never returns is indistinguishable from one that has not finished
@@ -349,7 +392,29 @@ class EgressGate:
         originals = self._vault.originals_for_session(session_id)
 
         # --- pass 1: known originals, raw and normalised -------------------
-        leaked_count = self._scan_originals(payload, originals)
+        # Offloaded to a worker thread, and that is a correctness fix rather than a
+        # performance one. Two things were false while this ran inline:
+        #
+        # 1. :data:`DEFAULT_TIMEOUT_S` says it is a "budget for one whole check()".
+        #    ``asyncio.timeout`` can only fire at a suspension point, and a synchronous
+        #    CPU-bound loop has none, so the budget bounded pass 2 and nothing else.
+        #    Measured: a 0.5 s budget against a 60k-original scan returned after
+        #    **7.35 s**. With the await here, the budget is real for pass 1 too, which
+        #    is what makes "hold the request open forever is not a safe answer" true
+        #    rather than aspirational.
+        # 2. The stall was process-wide, not request-local. This is an ASGI app, so a
+        #    scan on the event loop is head-of-line blocking for every concurrent
+        #    request: an unrelated coroutine observed a **7.36 s** scheduling gap
+        #    during one gate check.
+        #
+        # The scan is pure -- it reads two immutable arguments and returns an int --
+        # so there is nothing to synchronise. A thread cannot be killed mid-scan, so on
+        # timeout the request is blocked at the budget while the worker finishes and is
+        # discarded; that is the intended semantics, since the alternative is releasing
+        # a payload whose scan never completed. Pinned by
+        # ``test_the_timeout_bounds_pass_one_and_not_only_the_detector`` and
+        # ``test_a_long_pass_one_does_not_stall_unrelated_coroutines``.
+        leaked_count = await asyncio.to_thread(self._scan_originals, payload, originals)
         if leaked_count:
             await self._emit_block(
                 session_id, run_id, reason="vault_original", hit_count=leaked_count
@@ -634,19 +699,21 @@ class EgressGate:
         chose (``oral-antidiabetic``), not a value, so a detector hit on one is a
         finding worth having rather than a false positive worth suppressing.
 
-        Neither narrowing can cost us a false block on a real token -- and it is worth
-        being exact about *why*, because the tempting argument is wrong and an audit
-        found it wrong. The tempting argument is that
-        :func:`~secure_context_pipeline.surrogates.format_surrogate` validates
-        category, entity type, token id and hint, so its output is a
-        ``STRICT_TOKEN_RE`` match *by construction*. It is not: those three validators
-        anchor with ``$``, which in Python matches at end-of-string **or just before a
-        trailing newline**, while this pattern demands a literal ``]`` immediately
-        after the hash. A field carrying a trailing newline is therefore accepted by
-        the emitter and rejected by this matcher, and ``load_registry`` accepts an
-        entity named ``"NAME\\n"``, so a config file can reach it. (The fix belongs in
-        ``surrogates.py`` -- ``\\Z`` or ``fullmatch`` rather than ``$`` -- and is
-        reported rather than papered over here.)
+        Neither narrowing can cost us a false block on a real token, and the reason is
+        deliberately **not** "``format_surrogate`` validates its fields, so its output
+        is a ``STRICT_TOKEN_RE`` match by construction". That argument is the tempting
+        one and it is not what this rests on: it is a claim about one module's
+        validators holding a property that this module needs, with nothing joining
+        them. It was once false -- the validators anchored with ``$``, which in Python
+        also matches just before a trailing newline, so ``"NAME\\n"`` was an accepted
+        entity type that produced a token this matcher rejects, and ``load_registry``
+        would take it from a config file. ``surrogates.py`` now anchors ``\\A``/``\\Z``
+        and validates with ``fullmatch``, and ``load_registry`` calls
+        ``validate_entity_type`` at load, so all three doors are shut.
+
+        The history is recorded in README §8 rather than re-argued here, because a
+        docstring that describes a *past* bug has to be re-verified on every refactor
+        and nothing re-verifies it. What belongs here is the current contract.
 
         What the property actually rests on is the other leg: the orchestrator hands
         ``check()`` the exact surrogate strings this run emitted, and those are
@@ -904,7 +971,7 @@ def _deaccent(value: str) -> str:
 
 
 #: One maximal run of ASCII digits long enough to be an identifier on its own.
-_DIGIT_RUN_RE = re.compile(rf"[0-9]{{{MIN_IDENTIFIER_DIGITS},}}")
+_DIGIT_RUN_RE = re.compile(rf"[0-9]{{{MIN_IDENTIFIER_RUN_DIGITS},}}")
 _ANY_DIGIT_RE = re.compile(r"[0-9]")
 
 
@@ -927,18 +994,25 @@ def _identifier_needles(value: str) -> tuple[str, ...]:
     (``TAX_ID``'s pattern anchors on ``\\b``, which ``batch`` denies it). ``batch`` in
     front of it conceals nothing from a reader and nothing from the model.
 
-    So a value that carries at least :data:`MIN_IDENTIFIER_DIGITS` digits is also
-    compared as a bare substring, in two shapes:
+    So a digit-carrying value is also compared as a bare substring, in two shapes --
+    and the two have **different floors**, because they are different claims:
 
-    * **the whole value**, when it contains no letter at all -- ``512-24-8710``,
+    * **the whole value**, when it contains no letter at all and it carries at least
+      :data:`MIN_IDENTIFIER_DIGITS` digits in total -- ``512-24-8710``,
       ``47-1234567``, ``(415) 555-0123``. The separators are part of what is
-      disclosed, so the needle keeps them.
-    * **each long digit run inside it**, whatever else the value contains. This is
-      the half that matters for a vaulted span that includes its own label:
-      ``MRN: 5567281`` never appears in ``MRN5567281B``, but ``5567281`` does, and
-      the digits are the secret. It also covers ``Account No. 100200300400`` against
-      a bare ``100200300400`` elsewhere in the document, and ``BCBS123456789``
-      against a bare ``123456789``.
+      disclosed, so the needle keeps them. The floor is seven here because six-digit
+      *totals* are mostly dates and amounts (``03/12/85``, ``$1,234.56``), which are
+      aggregates of short runs rather than identifiers.
+    * **each contiguous digit run of at least :data:`MIN_IDENTIFIER_RUN_DIGITS`**,
+      whatever else the value contains. This is the half that matters for a vaulted
+      span that includes its own label: ``MRN: 5567281`` never appears in
+      ``MRN5567281B``, but ``5567281`` does, and the digits are the secret. It also
+      covers ``Account No. 100200300400`` against a bare ``100200300400`` elsewhere
+      in the document, and ``BCBS123456789`` against a bare ``123456789``. The floor
+      is six here because the shipped registry vaults six-digit MRNs
+      (``\\K\\d{6,10}``) and a contiguous six-digit run is an identifier core, not a
+      date. See :data:`MIN_IDENTIFIER_RUN_DIGITS` for the leak that proved the two
+      floors had to be separate numbers.
 
     The false-positive risk this accepts is the one the boundary rule was avoiding,
     and it is a different size here. For a name it is ordinary -- Brown/Browning is a
@@ -961,10 +1035,10 @@ def _identifier_needles(value: str) -> tuple[str, ...]:
     keeps finding it got wrong.
 
     Values that contribute nothing at all and keep exactly the four bounded forms:
-    every name and every value with no digits; short dates (``03/12/85``, six
-    digits); amounts below seven digits (``$1,234.56``); docket numbers
-    (``1:23-cv-04567`` -- letters, and no run reaches seven); lab values
-    (``A1C 7.4``).
+    every name and every value with no digits; short dates (``03/12/85`` -- six
+    digits in total, but its longest run is two); amounts below seven digits
+    (``$1,234.56`` -- longest run three); docket numbers (``1:23-cv-04567`` --
+    letters, and no run reaches six); lab values (``A1C 7.4``).
     """
     if not _ANY_DIGIT_RE.search(value):
         return ()

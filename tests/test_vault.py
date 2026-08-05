@@ -1296,6 +1296,155 @@ async def test_token_id_collision_re_derivation(
     assert vault.originals_for_session(session_id) == frozenset({VALUE_A, VALUE_B})
 
 
+async def test_the_collision_retry_budget_survives_eight_consecutive_collisions(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """``MAX_COLLISION_RETRIES`` is load-bearing at 8, not decoration.
+
+    ``test_token_id_collision_re_derivation`` above only ever needs *one*
+    re-derivation, so it passes with the budget set to 1 -- the constant could be
+    cut to a single retry and the whole suite stayed green. That matters because
+    the budget is what stands between a truncation collision and a
+    ``token_collision_unresolved`` outage: at 4-byte token IDs a session with a
+    few thousand entities has a ~0.1% chance of one collision, and the counter
+    path is the only thing that resolves it.
+
+    So this walks the budget to its documented end. Counters 0..7 for one value
+    are pre-occupied by *other* originals, which forces the resolver to reach
+    counter 8 -- the last candidate a budget of 8 offers. No monkeypatching: the
+    collisions are manufactured by handing real derived IDs to real ``put``
+    calls, so what is exercised is the shipped derivation, not a stub of it.
+
+    Deliberately hard-coded rather than written against ``MAX_COLLISION_RETRIES``:
+    a test that indexes the constant it is guarding moves with it and guards
+    nothing.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    session_key = await session_registry.key(session_id)
+    victim = "Marisol Okonkwo-Bright"
+
+    # The eight IDs the resolver will try before counter 8: the value's own
+    # counter-0 ID plus its counters 1..7.
+    blocked = [
+        derive_token_id(session_key, "PATIENT_NAME", victim, counter=counter)
+        for counter in range(8)
+    ]
+    assert len(set(blocked)) == 8, "the counter must change the derived ID"
+
+    # Occupy every one of them with a *different* original, which is what makes
+    # them collisions rather than this value seen before.
+    for index, token_id in enumerate(blocked):
+        decoy = f"Decoy Original {index:02d}"
+        await vault.put(
+            session_id,
+            TokenRecord(
+                session_id=session_id,
+                token_id=token_id,
+                entity_type="PATIENT_NAME",
+                category=EntityCategory.PHI,
+                surrogate=f"[PHI_PATIENT_NAME_{token_id}]",
+                created_at=time.time(),
+            ),
+            decoy,
+        )
+    assert len(read_rows(db_path, session_id)) == 8
+
+    await vault.put(
+        session_id,
+        TokenRecord(
+            session_id=session_id,
+            token_id=blocked[0],
+            entity_type="PATIENT_NAME",
+            category=EntityCategory.PHI,
+            surrogate=f"[PHI_PATIENT_NAME_{blocked[0]}]",
+            created_at=time.time(),
+        ),
+        victim,
+    )
+
+    stored = await vault.get_by_original(session_id, "PATIENT_NAME", normalize(victim))
+    assert stored is not None
+    assert stored.token_id == derive_token_id(
+        session_key, "PATIENT_NAME", victim, counter=8
+    ), "the eighth re-derivation must still be inside the budget"
+    assert stored.token_id not in blocked
+
+    # Nine rows, nine originals, none overwritten: a budget that ran out would
+    # have raised, and a budget that wrapped would have replaced a decoy's row.
+    assert len(read_rows(db_path, session_id)) == 9
+    assert await vault.get_by_token(session_id, stored.token_id) == victim
+    for index, token_id in enumerate(blocked):
+        assert await vault.get_by_token(session_id, token_id) == f"Decoy Original {index:02d}"
+
+
+async def test_an_exhausted_collision_budget_raises_instead_of_reusing_an_id(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """Past the budget the vault fails loudly. Reusing an ID would mis-restore.
+
+    The companion to the test above: that one pins the floor (the budget really
+    does reach counter 8), this one pins that the loop is *bounded* and that its
+    end is an error rather than a silently duplicated token ID -- two originals
+    on one ID means ``get_by_token`` returns the wrong person's value with
+    nothing red anywhere.
+
+    The band assertion is the upper guard. A budget of 8 is "absurd headroom" as
+    the constant's own note says; a budget of 10**9 turns a collision storm into
+    a hang, and this test would be the thing that hangs, so state the bound.
+    """
+    assert 2 <= vault_module.MAX_COLLISION_RETRIES <= 64, (
+        "the retry budget must stay a small bounded number"
+    )
+
+    session_id, _ = await session_registry.create("test-user")
+    session_key = await session_registry.key(session_id)
+    victim = "Anselm Fairweather-Nkemdirim"
+
+    # Every candidate the resolver can produce -- counter 0 through the budget --
+    # is already held by another original.
+    for counter in range(vault_module.MAX_COLLISION_RETRIES + 1):
+        token_id = derive_token_id(session_key, "PATIENT_NAME", victim, counter=counter)
+        await vault.put(
+            session_id,
+            TokenRecord(
+                session_id=session_id,
+                token_id=token_id,
+                entity_type="PATIENT_NAME",
+                category=EntityCategory.PHI,
+                surrogate=f"[PHI_PATIENT_NAME_{token_id}]",
+                created_at=time.time(),
+            ),
+            f"Blocker {counter:02d}",
+        )
+    rows_before = len(read_rows(db_path, session_id))
+
+    with pytest.raises(PipelineError) as excinfo:
+        await vault.put(
+            session_id,
+            TokenRecord(
+                session_id=session_id,
+                token_id=derive_token_id(session_key, "PATIENT_NAME", victim),
+                entity_type="PATIENT_NAME",
+                category=EntityCategory.PHI,
+                surrogate="[PHI_PATIENT_NAME_blocked]",
+                created_at=time.time(),
+            ),
+            victim,
+        )
+
+    detail = excinfo.value.detail
+    assert detail["reason"] == "token_collision_unresolved"
+    assert detail["entity_type"] == "PATIENT_NAME"
+    assert detail["attempts"] == vault_module.MAX_COLLISION_RETRIES
+    # Section 16: the original must not ride out on the exception.
+    rendered = f"{excinfo.value!r} {excinfo.value}"
+    assert victim not in rendered
+
+    # Nothing was written and nothing was overwritten.
+    assert len(read_rows(db_path, session_id)) == rows_before
+    assert victim not in vault.originals_for_session(session_id)
+
+
 async def test_read_through_does_not_fork_a_value_into_two_tokens(
     vault: SessionVault, session_registry: SessionRegistry, db_path: Path
 ) -> None:

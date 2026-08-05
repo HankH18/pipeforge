@@ -24,10 +24,13 @@ from datetime import datetime, timedelta
 from typing import ClassVar
 
 import pytest
+from pydantic import ValidationError
 
+from secure_context_pipeline.api.schemas import MAX_PROMPT_CHARS, PipelineRunRequest
 from secure_context_pipeline.audit.logger import OBFUSCATE, REDACT, STRIP, AuditLogger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import derive_token_id, normalize
+from secure_context_pipeline.detection import detector as detector_module
 from secure_context_pipeline.detection.registry import GAZETTEER_DIR, EntityRegistry, EntitySpec
 from secure_context_pipeline.errors import ConfigError, PipelineError, VaultMissError
 from secure_context_pipeline.models import (
@@ -327,7 +330,7 @@ class _LowestChoice(random.Random):
     total statement about which is which, with no coincidences to argue about.
     """
 
-    def choice(self, seq):  # type: ignore[no-untyped-def, override]
+    def choice(self, seq):  # type: ignore[no-untyped-def]
         return seq[0]
 
 
@@ -3014,7 +3017,31 @@ async def test_a_clipped_fragment_does_not_steal_the_label_from_its_container(
 
 
 async def test_contained_and_disjoint_spans_are_left_alone(env: Env) -> None:
-    """Absorption must not fire where there is nothing to absorb."""
+    """Absorption must not fire where there is nothing to absorb.
+
+    The label assertion below was changed from ``{"SSN", "NAME"}`` when the
+    engine's private copy of the overlap resolver was deleted in favour of
+    :func:`detection.detector.resolve_overlaps`. It was not loosened and it is not
+    an accommodation of new behaviour -- it asserted the *opposite* of a shipped,
+    documented rule, and the two implementations returned different labels for
+    these exact three spans at commit ``fee5806``, before any of that change::
+
+        PRISTINE detector: [('ACCOUNT_NUMBER', 4, 15, 0.5), ('NAME', 25, 35, 0.9)]
+        PRISTINE engine  : [('SSN', 4, 15, 0.9), ('NAME', 25, 35, 0.9)]
+
+    README Deviation #35 -- "Overlap resolution ranks pattern/gazetteer-backed
+    entities above presidio-backed ones, below policy actions, above score" -- is
+    the cited rule, and ``ACCOUNT_NUMBER`` is pattern-backed while ``SSN`` is
+    presidio-backed (``presidio: US_SSN``, no ``patterns:`` in ``entities.yaml``).
+    ``{"SSN", "NAME"}`` therefore encoded the defect as the contract. It is the
+    same span geometry as
+    ``test_resolve_overlaps_prefers_a_registry_pattern_over_a_general_ner_label``
+    in ``tests/test_detection.py``, which asserts the opposite outcome -- the repo
+    held two contradictory expectations for one input.
+
+    What Deviation #35 promises is that *only the label* moves, so this test now
+    pins coverage and reversibility explicitly rather than leaving them implied.
+    """
     text = "SSN 123-45-6789 and name John Smith on file."
     ssn = span(text, "123-45-6789", "SSN")
     inner = Detection(  # fully contained by the SSN span, lower ranked
@@ -3028,12 +3055,25 @@ async def test_contained_and_disjoint_spans_are_left_alone(env: Env) -> None:
     )
 
     assert len(result.spans) == 2, "the contained span collapses, the disjoint one survives"
-    assert {item.entity_type for item in result.spans} == {"SSN", "NAME"}
+    # The pattern-backed label wins over the presidio-backed one it sits inside.
+    assert {item.entity_type for item in result.spans} == {"ACCOUNT_NUMBER", "NAME"}
     assert [(item.start, item.end) for item in result.spans] == [
         (ssn.start, ssn.end), (name.start, name.end)
     ], "a contained loser must not widen its winner"
     assert "123-45-6789" not in result.obfuscated_text
     assert "John Smith" not in result.obfuscated_text
+    # "Only the label moves": the full SSN span is still masked as one unit, still
+    # obfuscated rather than downgraded to an irreversible redaction, and still
+    # restores to the value that stood there. Asserting the label alone would let a
+    # future ranking change silently trade a token for a redaction.
+    assert [item.action for item in result.spans] == [
+        EntityAction.OBFUSCATED, EntityAction.OBFUSCATED
+    ]
+    for item in result.spans:
+        assert item.surrogate is not None
+        assert await env.vault.get_by_surrogate(env.session_id, item.surrogate) == (
+            text[item.start : item.end]
+        )
 
 
 async def test_out_of_range_spans_are_dropped(env: Env) -> None:
@@ -3136,8 +3176,8 @@ async def test_the_sweep_floor_is_measured_after_normalization(env: Env, strateg
     # The consequence, from the gate itself: were this vaulted, no form of it would
     # ever be counted -- even in a payload that carries it verbatim.
     gate = egress_gate.EgressGate(
-        vault=env.vault,  # type: ignore[arg-type]
-        detector=SilentDetector(),  # type: ignore[arg-type]
+        vault=env.vault,
+        detector=SilentDetector(),
         settings=env.settings,
     )
     carrying = f"Reviewed by {padded.text} on the ward."
@@ -3279,3 +3319,272 @@ async def test_empty_detection_list_is_a_no_op(env: Env, strategy: str) -> None:
     assert result.tokens == []
     assert result.spans == []
     assert await env.vault.row_count(env.session_id) == 0
+
+
+# ---------------------------------------------------------------------------
+# 15. Overlap resolution: one implementation, two call sites
+# ---------------------------------------------------------------------------
+#
+# The engine used to carry its own private ``_resolve_overlaps``, whose docstring
+# said it mirrored ``detection.detector``'s "deliberately". It did not. The
+# detector's ranked a fourth categorical dimension (registry pattern/gazetteer
+# backing, README Deviation #35) that the engine's had no parameter for, and it
+# guarded the union-covering winner on categorical class where the engine's did
+# not. Measured at commit fee5806, before the copy was deleted::
+#
+#     detector, pattern_types={'EMAIL'} : [('EMAIL', 6, 30)]
+#     engine   (no pattern_types param) : [('NAME',  6, 30)]
+#
+#     detector, policy_types={'CASE_STRATEGY'} : [('CASE_STRATEGY', 0, 63)]
+#     engine,   policy_types={'CASE_STRATEGY'} : [('NAME',          0, 63)]
+#
+# Neither divergence is a leak -- the union is masked either way -- but the
+# surviving label picks the entity's tier, action, threshold and strategy, so the
+# same spans were obfuscated two different ways depending on which resolver ran.
+# The second row is the sharper one: a policy ``action: redact`` entity keeps its
+# label under the detector and loses it under the engine, so privileged prose the
+# registry says must be destroyed was instead pseudonymized and vaulted.
+#
+# The cases below are the shared input the two used to disagree on. Expectations
+# are written out literally rather than computed from either implementation: a
+# differential test whose expected value is one side's output cannot fail.
+
+#: Categorical facts these cases depend on, stated here rather than derived, and
+#: pinned against the shipped registry by the guard test below.
+POLICY_TYPES_IN_PLAY = frozenset({"CASE_STRATEGY"})
+PATTERN_TYPES_IN_PLAY = frozenset({"CASE_STRATEGY", "EMAIL", "MRN"})
+
+#: ``(label, text, [(entity_type, start, end, score)], [(entity_type, start, end)])``
+OVERLAP_CASES: list[tuple[str, str, list[tuple[str, int, int, float]], list[tuple[str, int, int]]]] = [
+    (
+        "pattern-backed label survives a wider general NER span",
+        "Email awhitlock@mailer.example for details.",
+        [("NAME", 0, 30, 0.85), ("EMAIL", 6, 30, 0.70)],
+        [("EMAIL", 0, 30)],
+    ),
+    (
+        "policy label survives a general span that swallows it",
+        # Synthetic geometry on purpose: the property is about ranking, and the
+        # engine's contract is to be correct for detections from ANY source, not
+        # only for the disjoint spans ``Detector`` happens to hand it.
+        "AAAAAAAAAABBBBBBBBBBCCCCCCCCCC",
+        [("CASE_STRATEGY", 0, 20, 0.70), ("NAME", 0, 30, 0.85)],
+        [("CASE_STRATEGY", 0, 30)],
+    ),
+    (
+        "a clipped fragment does not take the label off the identifier around it",
+        "Chart MRN: 4471902 filed.",
+        [("DATE", 11, 18, 0.85), ("MRN", 6, 18, 0.70)],
+        [("MRN", 6, 18)],
+    ),
+]
+
+
+def overlap_case_spans(text: str, raw: list[tuple[str, int, int, float]]) -> list[Detection]:
+    return [
+        Detection(
+            entity_type=entity_type,
+            category=CATEGORY_OF[entity_type],
+            start=start,
+            end=end,
+            text=text[start:end],
+            score=score,
+        )
+        for entity_type, start, end, score in raw
+    ]
+
+
+def test_the_registry_classifications_these_cases_rest_on(registry: EntityRegistry) -> None:
+    """The hard-coded categorical sets above must still describe ``entities.yaml``.
+
+    Without this the literal expectations rot silently the day someone gives
+    ``NAME`` a ``patterns:`` entry, and the differential test would then be
+    asserting the wrong outcome rather than reporting a changed rule.
+    """
+    for name in ("NAME", "DATE"):
+        spec = registry.entities[name]
+        assert not (spec.patterns or spec.gazetteer), f"{name} is expected to be presidio-backed"
+        assert spec.action is None
+    for name in sorted(PATTERN_TYPES_IN_PLAY):
+        spec = registry.entities[name]
+        assert spec.patterns or spec.gazetteer, f"{name} is expected to be registry-backed"
+    assert registry.entities["CASE_STRATEGY"].action is not None
+    for name in sorted(PATTERN_TYPES_IN_PLAY - POLICY_TYPES_IN_PLAY):
+        assert registry.entities[name].action is None
+
+
+def test_overlap_resolution_is_one_implementation_not_two() -> None:
+    """The engine must *call* the detector's resolver, not re-implement it.
+
+    This is the structural half of the reconciliation. Two copies of a ranking
+    rule cannot be kept in step by a docstring claiming they are -- that is
+    exactly what was claimed, and exactly what failed.
+    """
+    assert engine_module.resolve_overlaps is detector_module.resolve_overlaps
+    assert not hasattr(engine_module, "_resolve_overlaps"), (
+        "the engine grew a private overlap resolver again"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "text", "raw", "expected"),
+    OVERLAP_CASES,
+    ids=[case[0] for case in OVERLAP_CASES],
+)
+def test_the_detector_resolver_matches_the_written_expectation(
+    label: str, text: str, raw: list[tuple[str, int, int, float]], expected: list[tuple[str, int, int]]
+) -> None:
+    kept = detector_module.resolve_overlaps(
+        text, overlap_case_spans(text, raw), POLICY_TYPES_IN_PLAY, PATTERN_TYPES_IN_PLAY
+    )
+    assert [(d.entity_type, d.start, d.end) for d in kept] == expected, label
+    for detection in kept:
+        assert detection.text == text[detection.start : detection.end]
+
+
+@pytest.mark.parametrize(
+    ("label", "text", "raw", "expected"),
+    OVERLAP_CASES,
+    ids=[case[0] for case in OVERLAP_CASES],
+)
+async def test_the_engine_de_overlaps_to_the_same_written_expectation(
+    env: Env,
+    label: str,
+    text: str,
+    raw: list[tuple[str, int, int, float]],
+    expected: list[tuple[str, int, int]],
+) -> None:
+    """The engine's planned spans, end to end, against the same literal table.
+
+    Deliberately *not* ``assert engine_output == detector_output``: the two share
+    a function object now, so comparing them to each other would pass no matter
+    what either one does. The table is the third opinion.
+    """
+    result = await env.engine.obfuscate(
+        env.session_id, text, overlap_case_spans(text, raw), strategy="tokenization"
+    )
+    assert [(item.entity_type, item.start, item.end) for item in result.spans] == expected, label
+    # Coverage is the invariant the label question must never disturb: every input
+    # span is inside some kept span, so nothing rides out in the clear.
+    for _entity_type, start, end, _score in raw:
+        assert any(item.start <= start and end <= item.end for item in result.spans)
+
+
+async def test_privileged_prose_swallowed_by_a_name_span_is_redacted_not_pseudonymized(
+    env: Env,
+) -> None:
+    """The consequence of the divergence, stated as behaviour rather than labels.
+
+    ``CASE_STRATEGY`` carries ``action: redact``: the registry's position is that
+    strategy prose has no reasoning value worth a surrogate and a pseudonym of it
+    would *fabricate strategy*. Under the engine's old private resolver a
+    higher-scoring ``NAME`` span containing it took the label, so the same text
+    was obfuscated instead -- a reversible token, a vault row, and privileged
+    content preserved in the payload under a name-shaped pseudonym.
+    """
+    text = "AAAAAAAAAABBBBBBBBBBCCCCCCCCCC"
+    spans = overlap_case_spans(
+        text, [("CASE_STRATEGY", 0, 20, 0.70), ("NAME", 0, 30, 0.85)]
+    )
+
+    result = await env.engine.obfuscate(env.session_id, text, spans, strategy="tokenization")
+
+    assert result.obfuscated_text == "[REDACTED_CASE_STRATEGY]"
+    assert [item.action for item in result.spans] == [EntityAction.REDACTED]
+    assert result.spans[0].surrogate is None
+    # Redaction is irreversible by design, so there must be no vault row and no
+    # original for the egress gate to have to defend.
+    assert result.tokens == []
+    assert await env.vault.row_count(env.session_id) == 0
+    assert env.vault.originals_for_session(env.session_id) == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# 16. Bounded resources: guards that must have a biting test
+# ---------------------------------------------------------------------------
+#
+# Each constant below was mutated one at a time with the whole suite run, and the
+# suite stayed green -- the guard was enforced by a comment and nothing else. The
+# tests here are written against hard-coded magnitudes rather than against the
+# constants they guard, because a test that reads the constant moves with it.
+
+
+async def test_the_token_collision_budget_survives_eight_consecutive_collisions(
+    env: Env,
+) -> None:
+    """``MAX_TOKEN_COLLISION_RETRIES`` is load-bearing at 8.
+
+    The engine settles the token ID *before* the strategy renders a surrogate
+    around it, because the restorer keys on the 8-hex core: an ID chosen after
+    the fact restores the wrong entity. That makes this budget the only thing
+    between a 4-byte truncation collision and a hard failure, and
+    ``test_token_id_collision_is_re_derived_...`` only ever needs one retry, so
+    the constant could be cut to 1 with nothing red.
+
+    Counters 0..7 are pre-occupied by other originals using the real derivation
+    -- no stubbed ``derive_token_id`` -- so the engine must reach counter 8.
+    """
+    victim = "Rowan Delacroix-Sung"
+    blocked = [
+        derive_token_id(env.session_key, "NAME", victim, counter=counter)
+        for counter in range(8)
+    ]
+    assert len(set(blocked)) == 8
+
+    for index, token_id in enumerate(blocked):
+        await env.vault.put(
+            env.session_id,
+            TokenRecord(
+                session_id=env.session_id,
+                token_id=token_id,
+                entity_type="NAME",
+                category=EntityCategory.PII,
+                surrogate=f"[PII_NAME_{token_id}]",
+                created_at=time.time(),
+            ),
+            f"Unrelated Holder {index:02d}",
+        )
+
+    text = f"Patient {victim} was admitted."
+    result = await env.engine.obfuscate(
+        env.session_id, text, [span(text, victim, "NAME")], strategy="tokenization"
+    )
+
+    assert len(result.tokens) == 1
+    issued = result.tokens[0].token_id
+    assert issued == derive_token_id(env.session_key, "NAME", victim, counter=8), (
+        "the eighth re-derivation must still be inside the budget"
+    )
+    assert issued not in blocked
+    # The occupied IDs are untouched and the value round-trips on its own ID.
+    for index, token_id in enumerate(blocked):
+        assert await env.vault.get_by_token(env.session_id, token_id) == (
+            f"Unrelated Holder {index:02d}"
+        )
+    assert await env.vault.get_by_token(env.session_id, issued) == victim
+    assert victim not in result.obfuscated_text
+
+
+def test_an_oversized_prompt_is_refused_at_the_schema_boundary() -> None:
+    """``MAX_PROMPT_CHARS`` must reject a megabyte prompt.
+
+    Lives with the obfuscation tests because it is a property of the *outbound
+    payload*, which this module owns: the prompt is spliced verbatim into the
+    text handed to the provider and re-scanned there by the egress gate, so an
+    unbounded prompt is an unbounded scan, an unbounded provider payload and an
+    unbounded request body accepted before any auth-shaped check has run.
+
+    Raising the ceiling to 10**9 left the whole suite green -- every existing
+    assertion about the cap was written against ``MAX_PROMPT_CHARS`` itself, so
+    it moved with the constant. The literals below do not.
+    """
+    with pytest.raises(ValidationError):
+        PipelineRunRequest(user_id="u", doc_id="d", prompt="x" * 1_000_000)
+
+    # ...and the fix for that must not be a cap so tight it breaks real use: a
+    # long but ordinary question still has to be accepted.
+    accepted = PipelineRunRequest(user_id="u", doc_id="d", prompt="x" * 2_000)
+    assert len(accepted.prompt) == 2_000
+
+    # The band the two literals above imply, stated once so the intent is legible.
+    assert 2_000 <= MAX_PROMPT_CHARS < 1_000_000

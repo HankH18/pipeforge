@@ -1,18 +1,42 @@
 """Settings -- the ONLY component in the package that reads the environment.
 
-Everything else receives a ``Settings`` instance. Nothing key-like is ever logged:
-the master key and API key are ``repr=False``, are scrubbed by the overridden
-``__repr__`` below, **and** are replaced with ``'***'`` by a field serializer so
-that ``model_dump()`` / ``model_dump_json()`` cannot route around the repr mask.
+Everything else receives a ``Settings`` instance. The master key and the API key
+are ``repr=False``, are scrubbed by the overridden ``__repr__`` below, **and** are
+replaced with ``'***'`` by a field serializer, so neither ``repr()`` nor
+``model_dump()``/``model_dump_json()`` at their default settings can emit one.
 
-That last part is the one that actually matters. ``repr=False`` only covers
+The serializer is the part that actually matters. ``repr=False`` only covers
 ``repr()``; before the serializer was added, ``Settings(...).model_dump_json()``
 emitted the base64 master key in full -- one debug endpoint, one structured log
 line, or one ``JSONResponse(content=settings.model_dump())`` away from publishing
-the key that every per-user document key is derived from. Read the raw bytes via
-:meth:`Settings.master_key_bytes`, never by serializing the model.
+the key that every per-user document key is derived from.
 
-The deliberate consequence: a dumped ``Settings`` does not round-trip --
+**The masks stop there, and the boundary is worth stating exactly, because it is
+narrower than "the secrets are masked" sounds.** A ``field_serializer`` constrains
+*serialization*. It cannot constrain attribute access, and pydantic keeps field
+values in the instance ``__dict__``, so the master key is present in full in::
+
+    settings.master_key                        dict(settings) / list(settings)
+    settings.__dict__ / vars(settings)         pickle.dumps(settings)
+    copy.deepcopy(settings).__dict__           settings.model_copy().__dict__
+    settings.model_dump(serialize_as_any=True) and its ``model_dump_json`` twin
+
+The last pair is the one that reads as a contradiction and is not: passing
+``serialize_as_any=True`` asks pydantic for *duck-typed* serialization -- serialize
+each value by its runtime type -- which deliberately bypasses the declared schema,
+and with it every ``field_serializer`` on this class. ``model_dump(...)`` masking
+in one call and leaking in the other is pydantic behaving as documented.
+
+None of that is closeable by adding a third serializer; it would take a
+self-masking value type (``pydantic.SecretStr``), which is a change to this
+class's public read API. So the honest statement of the guarantee is: **the two
+accidental exits are masked, the deliberate ones are not.** Read the raw bytes via
+:meth:`Settings.master_key_bytes` -- the supported path -- and never hand a
+``Settings`` to a generic object dumper. ``tests/test_models.py::THIRD_EXIT_LEAKS``
+measures the full list above on every run, so this paragraph fails a test rather
+than quietly going stale if it drifts in either direction.
+
+The deliberate consequence of masking: a dumped ``Settings`` does not round-trip --
 ``Settings(**settings.model_dump())`` raises, because ``'***'`` is not base64. That
 is the correct direction to fail in. Use ``model_copy(update=...)`` to derive a
 variant; it copies field values rather than serializing them.
@@ -86,10 +110,13 @@ class Settings(BaseSettings):
     @field_serializer("master_key", "anthropic_api_key", when_used="always")
     @staticmethod
     def _mask_secret(value: str | None) -> str | None:
-        """Never let a secret out through ``model_dump``/``model_dump_json``.
+        """Mask secrets on ``model_dump``/``model_dump_json`` at default settings.
 
-        ``repr=False`` masks only ``repr()``. Serialization is the other exit, and
-        it is the one that reaches HTTP responses and structured logs.
+        ``repr=False`` masks only ``repr()``. Default serialization is the other
+        accidental exit, and it is the one that reaches HTTP responses and
+        structured logs. It is not *every* exit -- see the module docstring for the
+        attribute-access paths this cannot reach, and ``serialize_as_any=True``,
+        which opts out of this serializer by design.
         """
         return None if value is None else MASK
 

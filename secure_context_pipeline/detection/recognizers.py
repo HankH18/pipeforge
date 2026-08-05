@@ -54,7 +54,6 @@ __all__ = [
     "gazetteer_terms",
     "load_gazetteer",
     "normalise_term",
-    "reset_gazetteer_cache",
 ]
 
 logger = logging.getLogger(__name__)
@@ -149,11 +148,6 @@ def class_hint_for(
         return None
     hint = load_gazetteer(spec.gazetteer).get(normalise_term(matched_text))
     return hint or None
-
-
-def reset_gazetteer_cache() -> None:
-    """Drop the parsed-gazetteer cache. Tests only."""
-    _GAZETTEER_CACHE.clear()
 
 
 def _precompile(recognizer: PatternRecognizer) -> None:

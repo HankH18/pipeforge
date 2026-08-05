@@ -17,16 +17,20 @@ enumerating ``model_fields`` rather than a hand-written list of column names.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import importlib
 import inspect
 import json
+import logging
+import pickle
 import pkgutil
 import re
 import secrets
 import sys
 import typing
+import uuid
 from collections.abc import Iterator
 
 import pytest
@@ -52,6 +56,8 @@ from secure_context_pipeline.models import (
 # purpose: the AAD framing argument in `crypto/aead.py` depends on this exact
 # width, so loosening it there must fail a test here.
 from secure_context_pipeline.store.document_store import _DOC_ID_RE as DOC_ID_RE
+from secure_context_pipeline.vault import session_registry as session_registry_module
+from secure_context_pipeline.vault.session_registry import SessionRegistry
 
 HEX8 = re.compile(r"^[0-9a-f]{8}$")
 
@@ -1030,8 +1036,131 @@ def test_every_field_settings_hides_from_repr_is_also_hidden_from_dump(
         assert real not in repr(settings), f"{name} survived repr()"
 
 
+async def test_no_log_record_carries_a_live_session_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A session ID is a credential, and the registry must not log one.
+
+    ``DELETE /sessions/{id}?user_id=...`` needs exactly that pair, and the deletion
+    is irreversible: popping the key is cryptographic erasure. ``create`` logged the
+    full 32-char live ID *and* its owning ``user_id`` on one INFO record, which put
+    both halves in the log stream.
+
+    The assertions are over every field of every record rather than over the one
+    field that was wrong. A leak that moves to a neighbouring key -- into the message
+    string, into ``ttl_seconds`` -- is the same leak, and a test naming ``session_id``
+    would not have seen it.
+    """
+    registry = SessionRegistry(_settings())
+    with caplog.at_level(logging.INFO, logger="secure_context_pipeline.vault.session_registry"):
+        session_id, _ = await registry.create("alice@example.com")
+        await registry.destroy(session_id)
+
+    assert caplog.records, "no log records captured -- this test would pass vacuously"
+    for record in caplog.records:
+        rendered = f"{record.getMessage()} {sorted(record.__dict__.items(), key=str)}"
+        assert session_id not in rendered, (
+            f"{record.getMessage()!r} carries the live session ID, which is half of an "
+            "irreversible DELETE credential"
+        )
+
+    # Not vacuous: the records must still be useful. One stable handle joins the
+    # creation record to the destruction record, and the owner is still recorded.
+    handles = {
+        record.__dict__["session"] for record in caplog.records if "session" in record.__dict__
+    }
+    assert handles == {session_registry_module._handle(session_id)}, (
+        "create and destroy must emit the same handle, or the log loses the ability to "
+        "follow one session"
+    )
+    assert any("alice@example.com" in str(record.__dict__.values()) for record in caplog.records)
+
+
+def test_short_is_the_identity_on_every_session_id_this_module_mints() -> None:
+    """Pin the reason ``_short`` was *not* the fix for the record above.
+
+    ``_short`` clamps to a 64-character ceiling and a minted session ID is 32-char
+    uuid4 hex, so it is the identity function on exactly the values that matter. It
+    guards a hostile *caller-supplied* ID from overflowing an error detail; it has
+    never been a mask. ``destroy`` applied it, ``create`` did not, and closing that
+    inconsistency by copying ``_short`` into ``create`` would have changed nothing
+    while looking like a fix. This test fails if anyone tries.
+    """
+    minted = uuid.uuid4().hex
+    assert len(minted) == 32
+    assert session_registry_module._short(minted) == minted, "_short is not a mask"
+
+    handle = session_registry_module._handle(minted)
+    assert minted not in handle
+    assert handle != minted[: len(handle)], "a prefix of the ID is still the ID, partially"
+    assert handle == session_registry_module._handle(minted), "handles must be stable"
+    assert handle != session_registry_module._handle(uuid.uuid4().hex)
+
+
+def test_the_master_key_survives_attribute_access_and_that_is_the_stated_boundary() -> None:
+    """The masks cover ``repr`` and default serialization. They cover nothing else.
+
+    The two tests above check the guarantee. This one checks the *limit* of it, and
+    it is here rather than only in ``tests/test_models.py`` because this file is
+    where the key hierarchy is argued: a reader who has just seen every document key
+    derived from ``master_key_bytes()`` should find out in the same place that the
+    root of that hierarchy is one ``dict(settings)`` away from a log line.
+
+    ``config.py``'s module docstring claimed a field serializer meant
+    ``model_dump()``/``model_dump_json()`` "cannot route around the repr mask". The
+    two rows below marked *duck-typed* are the counterexample: they are
+    ``model_dump`` calls, and they return the key. ``tests/test_models.py``
+    quantifies this over every key and original in the package; this test states the
+    master-key case literally, so the claim cannot be re-broadened without a
+    concrete, readable failure.
+    """
+    settings = _settings()
+    key = settings.master_key
+    assert len(key) == 44, "a 32-byte key is 44 base64 characters; the plant is wrong otherwise"
+
+    # The guarantee, restated so this test fails if the masks regress.
+    assert key not in repr(settings)
+    assert key not in settings.model_dump_json()
+    assert settings.model_dump()["master_key"] == MASK
+
+    # The boundary. Each of these returns the master key in full, today, by design
+    # of pydantic -- not by a defect in this package.
+    unmasked = {
+        "getattr": settings.master_key,
+        "__dict__": repr(settings.__dict__),
+        "vars()": repr(vars(settings)),
+        "dict()": repr(dict(settings)),
+        "pickle": pickle.dumps(settings).decode("latin-1"),
+        "deepcopy": repr(copy.deepcopy(settings).__dict__),
+        "model_copy": repr(settings.model_copy().__dict__),
+        "model_dump(serialize_as_any=True) [duck-typed]": repr(
+            settings.model_dump(serialize_as_any=True)
+        ),
+        "model_dump_json(serialize_as_any=True) [duck-typed]": settings.model_dump_json(
+            serialize_as_any=True
+        ),
+    }
+    still_masked = [name for name, rendered in unmasked.items() if key not in rendered]
+    assert not still_masked, (
+        f"{still_masked} no longer expose the master key. That is an improvement, not a "
+        "failure -- but config.py's module docstring and tests/test_models.py::"
+        "THIRD_EXIT_LEAKS both describe the old behaviour and are now wrong. Update them."
+    )
+
+    # ...and the supported path still works, which is the reason none of the above
+    # can simply be closed.
+    assert len(settings.master_key_bytes()) == 32
+
+
 def test_detection_text_does_not_survive_serialization() -> None:
-    """The one field in the package that holds an original value, masked on both exits."""
+    """The one field in the package that holds an original value, masked on both
+    exits that *can* be masked -- ``repr`` and default serialization.
+
+    Attribute access is the third exit and is not masked; see
+    ``tests/test_models.py::THIRD_EXIT_LEAKS``. The final assertion here is that
+    third exit, and it is required rather than tolerated: obfuscation splices
+    ``det.text`` into the payload.
+    """
     det = Detection(
         entity_type="SSN",
         category=EntityCategory.PII,

@@ -8,18 +8,53 @@ zero-PII-in-logs requirement:
    length-capped, so the claim is enforced by the schema rather than by convention.
    The check quantifies over ``model_fields`` rather than over a list of column
    names, because a list only ever covers the columns its author remembered.
-2. **Every model in this module is classified for both exits, and the
-   classification is quantified over ``model_fields`` for the same reason point 1
-   is.** The two exits are ``repr()``/``str()`` -- what an accidental
-   ``f"{result}"`` in a log line emits -- and ``model_dump_json()`` -- what
-   reaches an HTTP response or a JSON log line. They need *different* rules,
-   because a field can be forbidden on one and mandatory on the other::
+2. **Every model in this module is classified for each exit it can be masked on,
+   and the classification is quantified over ``model_fields`` for the same reason
+   point 1 is.** There are *three* exits. Two are masked here; the third is not,
+   and cannot be::
 
-       repr   masks originals AND surrogates: a log reader cannot tell a
-              pseudonymized fake from a real value, so both are '***'.
-       dump   masks originals on the PROVIDER-ward path only: the user-ward
-              product (``PipelineResult.restored_text``) has to serialize -- it
-              is the answer the caller asked for.
+       repr        ``repr()``/``str()``/``f"{result}"`` -- what an accidental
+                   interpolation in a log line emits. Masks originals AND
+                   surrogates: a log reader cannot tell a pseudonymized fake
+                   from a real value, so both are '***'.
+       dump        ``model_dump()``, ``model_dump(mode="json")`` and
+                   ``model_dump_json()`` *at their default settings* -- what
+                   reaches an HTTP response or a JSON log line. Masks originals
+                   on the PROVIDER-ward path only: the user-ward product
+                   (``PipelineResult.restored_text``) has to serialize -- it is
+                   the answer the caller asked for.
+       attribute   ``getattr(model, field)`` and every alias of it:
+                   ``model.__dict__``, ``vars(model)``, ``dict(model)`` and
+                   ``list(model)`` (which consume ``BaseModel.__iter__``, i.e.
+                   the instance ``__dict__``, and never reach a serializer),
+                   ``pickle.dumps``, ``copy.deepcopy(model).__dict__``,
+                   ``model.model_copy().__dict__``, and
+                   ``model_dump(serialize_as_any=True)`` / its JSON twin --
+                   duck-typed serialization, which asks pydantic to serialize by
+                   each value's *runtime* type and therefore to skip the declared
+                   schema's field serializers entirely.
+                   **Not masked. Not maskable at this layer.**
+
+   The third exit is not an oversight and is not closeable by adding another
+   serializer. Pydantic keeps field values in the instance ``__dict__``, and a
+   ``field_serializer`` is a property of *serialization* -- it cannot constrain
+   attribute access. Nor should it: attribute access is the supported read path.
+   ``Detection.text`` exists to be spliced into the outbound payload, so a
+   ``Detection`` that hid ``text`` from its own attribute would be useless. Every
+   spelling above is that same read, reworded.
+
+   What this means for the headline claim is worth stating plainly, because the
+   masks are easy to over-read: **they are defence-in-depth against an accidental
+   log line, not the control that keeps originals away from the provider.** That
+   control is the egress gate, which re-scans the assembled payload against the
+   session vault and fails closed. An accident reaches for ``f"{result}"``; it
+   does not reach for ``pickle.dumps`` or ``serialize_as_any=True``.
+
+   The exact boundary is *measured* rather than asserted: for every field this
+   module declares as a key or an original,
+   ``tests/test_models.py::THIRD_EXIT_LEAKS`` records the precise set of exits the
+   value survives, and the test fails if reality moves in **either** direction --
+   a newly leaking exit, or a leak that quietly stopped and left this text stale.
 
    The masked-in-``repr`` set is declared per class as
    :attr:`_MaskedRepr.REPR_MASKED` and rendered by one shared ``__repr__`` that
@@ -31,10 +66,18 @@ zero-PII-in-logs requirement:
    ``TokenRecord`` masks, in the object the API returns) and
    ``PipelineResult.restored_text`` (originals by construction) both rendered in
    full before the quantified test existed.
-3. ``Detection.text`` is *also* masked on serialization. ``repr`` masking alone is
-   a leak waiting to happen: ``model_dump_json()`` bypasses ``__repr__`` entirely,
-   and it is the form that reaches HTTP responses and JSON log lines. ``text`` is
-   for in-memory splicing only; read it as an attribute, never by serializing.
+3. ``Detection.text`` is *also* masked on default serialization. ``repr`` masking
+   alone is a leak waiting to happen: ``model_dump_json()`` bypasses ``__repr__``
+   entirely, and it is the form that reaches HTTP responses and JSON log lines.
+   ``text`` is for in-memory splicing only; read it as an attribute, never by
+   serializing.
+
+   Read that instruction the way it is written -- ``detection.text`` is the
+   *supported* path, so per point 2 the value is fully available through it and
+   through every alias of it. ``Detection.model_dump()`` is ``'***'``;
+   ``dict(detection)['text']`` is the original. The mask stops a debugging
+   ``model_dump_json()`` from becoming a leak; it does not make ``Detection`` a
+   secret container, and nothing in this package treats it as one.
 
    ``Detection.text`` is the only original value on the *provider-ward* path --
    the models that flow toward obfuscation and egress. It is not the only original
