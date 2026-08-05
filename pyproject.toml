@@ -51,6 +51,18 @@ dev = [
     # connection open hangs the interpreter in Py_FinalizeEx after the summary
     # prints -- CI sees a job timeout instead of a red test.
     "pytest-timeout>=2.3,<3",
+    # Branch coverage. Not installed for four review passes, and the cost of that
+    # was measurable: every "deleting X leaves the suite green" finding in this
+    # repo was found by hand, one mutation at a time. The partial-branch list is
+    # the cheap version of that search.
+    #   python -m pytest --cov=secure_context_pipeline --cov-branch \
+    #       --cov-report=term-missing:skip-covered -q
+    "pytest-cov>=6,<9",
+    # Property-based testing. Used for the one thing in this codebase that has been
+    # wrong four times in four different ways -- the "does this value occur in this
+    # text" rule -- where a hand-written corpus only ever encodes the cases somebody
+    # already thought of. See tests/leakage/test_leakage_harness.py.
+    "hypothesis>=6.100,<7",
     "mypy>=1.13,<2",
     "ruff>=0.8,<1",
     "types-PyYAML",

@@ -28,7 +28,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import fnmatch
 import importlib.metadata
+import json
+import re
 import secrets
 import sys
 import tempfile
@@ -43,9 +47,11 @@ from unittest import mock
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI, UploadFile
+from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 from packaging.requirements import Requirement
 
+from secure_context_pipeline.api import app as app_module
 from secure_context_pipeline.api.app import (
     DEFAULT_AUDIT_PAGE,
     MAX_AUDIT_PAGE,
@@ -2131,8 +2137,8 @@ async def test_caller_supplied_identifiers_are_bounded_at_the_boundary(
         assert over not in response.text
 
     # The *floor* is load-bearing too, and for a reason that is easy to lose.
-    # ``_audit_scope_owner`` answers ``None`` for a scope whose owner it cannot
-    # prove, and both callers reject that before comparing. Returning ``""``
+    # ``_resolve_audit_scope`` answers ``owner=None`` for a scope whose owner it
+    # cannot prove, and both callers reject that before comparing. Returning ``""``
     # there instead of ``None`` -- an ordinary-looking fail-open edit -- is
     # byte-identical over HTTP on every route, but *only* because an empty
     # ``user_id`` is unsendable: ``min_length=1`` rejects it on ``GET /audit``
@@ -2151,3 +2157,602 @@ async def test_caller_supplied_identifiers_are_bounded_at_the_boundary(
     )
     assert app_module._clamp("y" * 500) == "y" * MAX_DETAIL_VALUE_LEN
     assert len(app_module._clamp("y" * 500)) == MAX_DETAIL_VALUE_LEN
+
+
+# ---------------------------------------------------------------------------
+# 16. The interim window before real authentication is metered and loud
+#
+# ``user_id`` is asserted, not proven -- that is take-home scope and the module
+# docstring says so. What was NOT scope was that the window be *silent*: the
+# audit-scope proof answered right-or-wrong about a human-readable username with
+# no delay, no lockout and no record, so a dictionary attack against a leaked
+# ``run_id`` was free and invisible in the tamper-evident log it was aimed at.
+# Measured before these tests existed: 500 wrong guesses -> 500 identical empty
+# 200s, 0.86 ms each, ZERO rows written; the 501st (the real owner) returned the
+# run's events including its ``doc_id``, and that ``doc_id`` plus the guessed
+# username read the victim's plaintext.
+#
+# Every test below drives its own meters through ``app.state.rate_limits`` and
+# restores them, so exhausting a budget here cannot starve another test.
+# ---------------------------------------------------------------------------
+def _wide_meter() -> Any:
+    """A meter that cannot fire, for the axis a test is *not* exercising."""
+    return app_module._RateLimiter(capacity=1_000_000, refill_per_second=1_000_000.0)
+
+
+def _tight_meter(capacity: int) -> Any:
+    """``capacity`` tokens and effectively no refill for the length of a test."""
+    return app_module._RateLimiter(capacity=capacity, refill_per_second=1e-9)
+
+
+@contextlib.contextmanager
+def _meters(app: FastAPI, *, writes: Any = None, audit_proofs: Any = None) -> Any:
+    """Install fresh meters for one test and put the originals back.
+
+    Always *fresh*: reusing the module-scoped buckets would let one test spend
+    another's budget, and the whole file shares one app (and therefore one
+    caller key -- ``ASGITransport`` reports the same client for every request).
+    """
+    original = app.state.rate_limits
+    app.state.rate_limits = app_module._RateLimits(
+        writes=writes if writes is not None else _wide_meter(),
+        audit_proofs=audit_proofs if audit_proofs is not None else _wide_meter(),
+    )
+    try:
+        yield
+    finally:
+        app.state.rate_limits = original
+
+
+async def test_a_failed_audit_scope_proof_is_recorded_in_the_chain_it_attacks(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    """A wrong-user probe must leave a mark, and leave it where the victim looks.
+
+    The ownership proof itself is correct and stays correct -- the response is
+    still the byte-identical empty page, because answering 403 would restore the
+    existence oracle. What is new is that the attempt is no longer *free of
+    consequence*: it writes an ``AUDIT_ACCESS_DENIED`` row naming the claimed
+    ``user_id``, filed under the session the scope resolved to, so the owner
+    reads their own intruders out of ``GET /audit?session_id=...`` -- the very
+    endpoint being attacked.
+
+    Deleting the ``_deny_audit_scope`` call from ``query_audit`` restores the
+    silence and fails here; so does filing the row under a scope the owner cannot
+    read, which is the mistake that would make the record technically present and
+    practically useless.
+    """
+    session_id = await _create_session(client)
+    doc_id = await _upload(client)
+    run = await _run(client, session_id, doc_id)
+    assert run.status_code == 200, run.text
+    run_id = run.json()["run_id"]
+
+    owned = {"user_id": OWNER, "session_id": session_id}
+    before = (await client.get("/audit", params={**owned, "limit": MAX_AUDIT_PAGE})).json()
+    chain_before = (await client.get("/audit/verify")).json()["length"]
+
+    with _meters(app):
+        # Two probes: one naming the session directly, one naming only the run.
+        by_session = await client.get(
+            "/audit", params={"user_id": INTRUDER, "session_id": session_id}
+        )
+        by_run = await client.get("/audit", params={"user_id": INTRUDER, "run_id": run_id})
+        by_verify = await client.get(
+            "/audit/verify", params={"user_id": INTRUDER, "session_id": session_id}
+        )
+
+    # The answers are unchanged: still empty, still not a 403.
+    assert by_session.status_code == 200 and by_session.json()["events"] == [], by_session.text
+    assert by_run.status_code == 200 and by_run.json()["events"] == [], by_run.text
+    assert by_verify.json() == {"valid": True, "length": 0, "session_id": session_id}
+
+    # But three rows now exist that did not before, and the owner can see them.
+    after = (await client.get("/audit", params={**owned, "limit": MAX_AUDIT_PAGE})).json()
+    denies = [
+        event for event in after["events"] if event["event_type"] == app_module.AUDIT_ACCESS_DENIED
+    ]
+    assert len(denies) == 3, (
+        f"three denied probes must leave three rows the owner can read; got {len(denies)}. "
+        f"before={before['returned']} after={after['returned']}"
+    )
+    assert all(row["detail"]["claimed_user_id"] == INTRUDER for row in denies), denies
+    assert {row["detail"]["route"] for row in denies} == {"/audit", "/audit/verify"}, denies
+    # The run-scoped probe is filed against the run it named, so a compliance
+    # reader can correlate the attempt with the run that leaked the identifier.
+    assert [row["run_id"] for row in denies].count(run_id) == 1, denies
+
+    # The intruder still cannot read their own rows -- the record is for the
+    # victim and the operator, and the probe is not its own oracle.
+    theirs = await client.get("/audit", params={"user_id": INTRUDER, "session_id": session_id})
+    assert theirs.json()["events"] == [], theirs.text
+
+    # And the chain is still verifiable with the new rows in it: a monitoring
+    # control that breaks tamper-evidence would be a downgrade, not a fix.
+    verified = await client.get("/audit/verify")
+    assert verified.json()["valid"] is True, verified.text
+    assert verified.json()["length"] > chain_before, verified.text
+
+
+async def test_audit_scope_guessing_is_throttled_but_the_owner_never_is(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    """The oracle is bounded per caller, and bounding it must not bound the owner.
+
+    Both halves matter. Without the meter a 10 000-name dictionary against one
+    held ``run_id`` costs about nine seconds; with it, the same dictionary is
+    rationed to ``AUDIT_PROOF_REFILL_PER_SECOND`` answers a second. And because
+    only *failures* are charged, the real owner's queries never touch the budget
+    -- a meter that throttled correct answers would be denial of service dressed
+    up as a control, and this test fails if someone reaches for that shortcut.
+
+    The numbers are absolute rather than written in terms of the constants: an
+    assertion phrased relative to ``AUDIT_PROOF_BURST`` is exactly what raising
+    ``AUDIT_PROOF_BURST`` satisfies.
+    """
+    session_id = await _create_session(client)
+    doc_id = await _upload(client)
+    run_id = (await _run(client, session_id, doc_id)).json()["run_id"]
+
+    with _meters(app, audit_proofs=_tight_meter(5)):
+        statuses = [
+            (
+                await client.get("/audit", params={"user_id": f"guess{i}", "run_id": run_id})
+            ).status_code
+            for i in range(40)
+        ]
+        # Exactly five answered; every later guess is refused outright.
+        assert statuses.count(200) == 5, statuses
+        assert statuses[:5] == [200] * 5, statuses
+        assert set(statuses[5:]) == {429}, statuses
+
+        refused = await client.get("/audit", params={"user_id": "guess999", "run_id": run_id})
+        assert refused.json()["code"] == "RATE_LIMITED", refused.text
+        assert refused.json()["detail"]["retry_after_seconds"] > 0, refused.text
+
+        # The owner is unaffected by the storm aimed at them.
+        owner = await client.get("/audit", params={"user_id": OWNER, "run_id": run_id})
+        assert owner.status_code == 200, owner.text
+        assert owner.json()["returned"] > 0, owner.text
+
+        # ...and the other audit route shares the budget, or the oracle just
+        # moves one URL over.
+        moved = await client.get(
+            "/audit/verify", params={"user_id": "guess999", "session_id": session_id}
+        )
+        assert moved.status_code == 429, moved.text
+
+    # With the meters restored the module's own budget is untouched.
+    normal = await client.get("/audit", params={"user_id": OWNER, "run_id": run_id})
+    assert normal.status_code == 200, normal.text
+
+
+async def test_a_throttled_audit_probe_writes_no_row(app: FastAPI, client: AsyncClient) -> None:
+    """The meter is charged *before* the record is written, and the order is the point.
+
+    Recording a denied proof is a durable, anonymous write into a log that is
+    append-only and unprunable by construction. Writing it first -- or writing it
+    unconditionally -- would trade a silent oracle for the unbounded ``audit.db``
+    growth that ``WRITE_BURST`` exists to bound: an attacker would simply keep
+    probing to keep writing. Swapping the two statements in ``_deny_audit_scope``
+    leaves every other assertion in this file green and fails here.
+    """
+    session_id = await _create_session(client)
+
+    with _meters(app, audit_proofs=_tight_meter(2)):
+        before = (await client.get("/audit/verify")).json()["length"]
+        answered = 0
+        for i in range(60):
+            probe = await client.get(
+                "/audit", params={"user_id": f"flood{i}", "session_id": session_id}
+            )
+            answered += probe.status_code == 200
+        after = (await client.get("/audit/verify")).json()["length"]
+
+    assert answered == 2, answered
+    assert after - before == 2, (
+        f"60 probes against a 2-token budget must write exactly 2 rows; wrote {after - before}. "
+        f"A throttled probe that still records turns the monitoring control into the "
+        f"disk-exhaustion primitive it was added alongside."
+    )
+
+
+async def test_every_mutating_route_is_metered_including_ones_added_later(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    """Enumerated from ``app.routes``, not from a hand-written list of paths.
+
+    The recurring defect in this codebase is a checker that shares a blind spot
+    with the thing it checks, so the write meter keys on the HTTP *method* and
+    this test asks the application's own route table which routes that has to
+    cover. Narrowing ``_RateLimit`` to an allow-list of paths -- the obvious
+    "safer" edit -- fails here for whichever route the list forgets, and so does
+    adding a new anonymous ``POST`` without thinking about it.
+
+    Driven over HTTP with an empty budget rather than inspected: the claim is
+    that the request is *refused*, and refused before it is read, which only the
+    wire can show. No route needs credentials to demonstrate it, because the
+    refusal happens in middleware, above the application entirely.
+    """
+    mutating = sorted(
+        {
+            (route.path, method)
+            for route in app.routes
+            if isinstance(route, APIRoute)
+            for method in route.methods
+            if method in {"POST", "PUT", "PATCH", "DELETE"}
+        }
+    )
+    # Pinned by value so that *adding* a mutating route is a deliberate act:
+    # the loop below then has to cover it, and this line is where someone
+    # notices. Both anonymous ones are here, and so is the irreversible logout.
+    assert mutating == [
+        ("/documents", "POST"),
+        ("/pipeline/run", "POST"),
+        ("/sessions", "POST"),
+        ("/sessions/{session_id}", "DELETE"),
+    ], mutating
+
+    with _meters(app, writes=_tight_meter(1)):
+        first = await client.post("/sessions", json={"user_id": OWNER})
+        assert first.status_code == 200, first.text  # the single token
+        for path, method in mutating:
+            url = re.sub(r"\{[^}]+\}", uuid.uuid4().hex, path)
+            response = await client.request(method, url, params={"user_id": OWNER})
+            assert response.status_code == 429, (method, url, response.status_code, response.text)
+            assert response.json()["code"] == "RATE_LIMITED", (method, url, response.text)
+            assert int(response.headers["retry-after"]) >= 1, (method, url, response.headers)
+            # The 429 never reaches the application, so it is the outermost
+            # middleware that must still stamp it -- an unframable, no-referrer
+            # error page is not a nicety when the UI is one click from erasure.
+            assert response.headers["content-security-policy"] == (
+                app_module.CONTENT_SECURITY_POLICY
+            ), (method, url, dict(response.headers))
+            assert response.headers["referrer-policy"] == "no-referrer", (method, url)
+
+        # Reads are deliberately NOT metered here: they write nothing durable,
+        # and /audit carries its own tighter failure meter.
+        assert (await client.get("/health")).status_code in (200, 503)
+
+
+async def test_anonymous_durable_writes_are_bounded_and_the_body_is_never_read(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    """``POST /sessions`` needs no credential and appends to an unprunable log.
+
+    Measured on the unmetered build: 3 000 anonymous session creations grew
+    ``audit.db`` by 1 716 bytes *each*, never reclaimed -- pruning is precisely
+    what tamper-evidence forbids -- and left 3 000 live sessions in memory for the
+    full TTL. That is ~583 k requests to a gigabyte of rows a compliance system
+    may not delete, and a full disk fails every later write for every user.
+
+    Two properties, and the second is the one that is easy to get wrong: the
+    refusal must happen *before* the body is read, or the cap describes the
+    answer rather than the allocation -- the same mistake ``MAX_BODY_BYTES``
+    exists to correct one layer down. The obvious implementation, a check at the
+    top of ``create_session``, has that defect and nothing else can see it:
+    FastAPI has already run ``await request.body()`` to build the model before a
+    handler's first statement executes, so the status code is identical and the
+    allocation is the caller's to choose. That is what the byte count below
+    pins, and the positive control immediately before it is what stops the count
+    from passing because nothing was ever sent.
+    """
+    pulled = [0]
+    payload = json.dumps({"user_id": OWNER}).encode("utf-8")
+
+    async def counting_body() -> Any:
+        pulled[0] += len(payload)
+        yield payload
+
+    with _meters(app, writes=_tight_meter(3)):
+        allowed = [
+            (
+                await client.post(
+                    "/sessions",
+                    content=counting_body(),
+                    headers={"content-type": "application/json"},
+                )
+            ).status_code
+            for _ in range(3)
+        ]
+        assert allowed == [200, 200, 200], allowed
+        # Positive control: an *accepted* request really does pull the body
+        # through this counter, so a zero below means "refused unread" rather
+        # than "the counter was never wired up".
+        assert pulled[0] == 3 * len(payload), (pulled[0], len(payload))
+
+        before_bytes = pulled[0]
+        refused = await client.post(
+            "/sessions",
+            content=counting_body(),
+            headers={"content-type": "application/json"},
+        )
+        assert refused.status_code == 429, refused.text
+        assert pulled[0] == before_bytes, (
+            "the throttled request's body was read before it was refused; a meter "
+            "that runs after the body is parsed still lets the caller choose the "
+            "allocation, which is the defect MAX_BODY_BYTES exists to remove"
+        )
+
+        # And a bogus-id DELETE -- no session, no credential, still a durable
+        # audit write on the unmetered build -- is refused too.
+        deleted = await client.delete(
+            f"/sessions/{uuid.uuid4().hex}", params={"user_id": INTRUDER}
+        )
+        assert deleted.status_code == 429, deleted.text
+
+
+async def test_the_shipped_meters_are_pinned_to_absolute_numbers(app: FastAPI) -> None:
+    """The budgets themselves, by value.
+
+    Every other assertion in this section installs its own meter, so all of them
+    stay green if the shipped constants are raised to a billion -- which is the
+    same "assert the control relative to the constant that expresses it" failure
+    the whole of section 15 exists to correct. These are the numbers that are
+    actually in front of an anonymous caller.
+    """
+    limits = app.state.rate_limits
+    assert isinstance(limits, app_module._RateLimits)
+
+    assert app_module.WRITE_BURST == 256, app_module.WRITE_BURST
+    assert app_module.WRITE_REFILL_PER_SECOND == 8.0, app_module.WRITE_REFILL_PER_SECOND
+    assert app_module.AUDIT_PROOF_BURST == 20, app_module.AUDIT_PROOF_BURST
+    assert app_module.AUDIT_PROOF_REFILL_PER_SECOND == 0.5, (
+        app_module.AUDIT_PROOF_REFILL_PER_SECOND
+    )
+    # The live app must actually be built from them.
+    assert (limits.writes.capacity, limits.writes.refill_per_second) == (256, 8.0)
+    assert (limits.audit_proofs.capacity, limits.audit_proofs.refill_per_second) == (20, 0.5)
+
+    # Sustained cost of the write budget, stated in the units the finding was
+    # measured in: 1 716 durable bytes per anonymous POST /sessions.
+    bytes_per_second = app_module.WRITE_REFILL_PER_SECOND * 1_716
+    hours_to_a_gigabyte = (1024**3) / bytes_per_second / 3600
+    assert hours_to_a_gigabyte > 12, (
+        f"the write budget lets one caller add a gigabyte of unprunable audit rows in "
+        f"{hours_to_a_gigabyte:.1f} h; unmetered it was 0.2 h, and the log cannot be pruned"
+    )
+
+
+async def test_the_rate_limiter_refills_at_the_rate_it_claims() -> None:
+    """The bucket arithmetic, driven by an injected clock rather than by sleeping.
+
+    A meter tested by sleeping is a meter whose green depends on machine load,
+    and the two properties worth pinning are both exact: a spent bucket refuses
+    until enough time has passed, and it never accumulates past its capacity --
+    without the ceiling, an idle caller banks an unbounded burst and the "burst"
+    number stops meaning anything.
+    """
+    limiter = app_module._RateLimiter(capacity=3, refill_per_second=2.0)
+
+    assert [limiter.take("a", now=0.0) for _ in range(3)] == [0.0, 0.0, 0.0]
+    # Spent. The wait is exactly one token's worth at the declared rate.
+    assert limiter.take("a", now=0.0) == pytest.approx(0.5)
+    assert limiter.take("a", now=0.25) == pytest.approx(0.25)
+    assert limiter.take("a", now=0.5) == 0.0
+    # A different caller has its own budget.
+    assert limiter.take("b", now=0.5) == 0.0
+
+    # Idle for an hour: still capacity, not 7 200 tokens.
+    assert [limiter.take("a", now=3600.0) for _ in range(3)] == [0.0, 0.0, 0.0]
+    assert limiter.take("a", now=3600.0) > 0.0
+
+    # A clock that steps *backwards* must be a no-op, not a punishment. Without
+    # the clamp on ``elapsed`` the bucket goes negative by the size of the step,
+    # so a 50-second step back locks the caller out for 51 seconds -- and the
+    # failure scales with the step, which is the wrong direction for a control
+    # whose whole job is to be bounded. ``time.monotonic`` cannot step back
+    # today; the clamp is what keeps that from being load-bearing.
+    spent = app_module._RateLimiter(capacity=1, refill_per_second=1.0)
+    assert spent.take("c", now=100.0) == 0.0
+    assert spent.take("c", now=50.0) == pytest.approx(1.0), (
+        "a backwards clock step drove the bucket negative; the wait must be one "
+        "token's worth, not the size of the step"
+    )
+
+    # The map of callers is bounded, or the meter is the exhaustion primitive it
+    # exists to remove. Eviction is least-recently-seen and can only ever be
+    # generous -- a forgotten caller returns with a full bucket.
+    bounded = app_module._RateLimiter(capacity=1, refill_per_second=1.0, max_keys=4)
+    for i in range(1_000):
+        bounded.take(f"caller-{i}", now=0.0)
+    assert bounded.tracked() == 4, bounded.tracked()
+
+    for bad in ({"capacity": 0}, {"refill_per_second": 0.0}, {"max_keys": 0}):
+        kwargs: dict[str, Any] = {"capacity": 1, "refill_per_second": 1.0, **bad}
+        with pytest.raises(ValueError):
+            app_module._RateLimiter(**kwargs)
+
+
+async def test_resolving_an_audit_scope_costs_the_same_whether_the_run_exists(
+    client: AsyncClient, services: Services
+) -> None:
+    """Counted, not clocked: the wrong-user path must issue the same queries either way.
+
+    ``_resolve_audit_scope`` used to short-circuit -- one audit query for a
+    ``run_id`` that resolved to nothing, two for one that resolved -- so a real
+    ``run_id`` was measurably slower than a random one on the path that is
+    supposed to be indistinguishable. Measured on the short-circuiting build over
+    300 warmed pairs: median 947 us against 684 us, the real run slower in
+    289 of 300 pairs. After equalising: 1 007 us against 982 us, 197 of 300.
+
+    Asserted as a query *count* rather than as a duration, deliberately. A
+    wall-clock assertion on a 25 us difference is a flaky test, and the residual
+    difference is not this function's to remove -- it is SQLite returning a row
+    against returning none, which lives in ``AuditLogger.query``. What this pins
+    is the part that was a whole missing round trip through aiosqlite's worker
+    thread, which is the part that made the channel large enough to read.
+    """
+    session_id = await _create_session(client)
+    doc_id = await _upload(client)
+    run_id = (await _run(client, session_id, doc_id)).json()["run_id"]
+
+    calls: list[dict[str, Any]] = []
+    real_query = services.audit.query
+
+    async def counting_query(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return await real_query(**kwargs)
+
+    with mock.patch.object(services.audit, "query", counting_query):
+        calls.clear()
+        await app_module._resolve_audit_scope(services, session_id=None, run_id=run_id)
+        resolved = len(calls)
+
+        calls.clear()
+        await app_module._resolve_audit_scope(
+            services, session_id=None, run_id=uuid.uuid4().hex
+        )
+        absent = len(calls)
+
+    assert resolved == absent == 2, (
+        f"a run that resolves cost {resolved} queries and one that does not cost {absent}; "
+        f"the wrong-owner reply is byte-identical either way, so the clock must not "
+        f"say which one the caller holds"
+    )
+
+    # The unresolved probe must still be *answered* as unowned, not accidentally
+    # matched: the sentinel it queries cannot be a session ID.
+    assert len(app_module.UNRESOLVED_SCOPE) != 32 or not all(
+        char in "0123456789abcdef" for char in app_module.UNRESOLVED_SCOPE
+    ), "the sentinel must not be shaped like the uuid4 hex SessionRegistry mints"
+    scope = await app_module._resolve_audit_scope(
+        services, session_id=None, run_id=uuid.uuid4().hex
+    )
+    assert scope.owner is None and scope.session_id is None, scope
+
+
+def _dockerignore_match(pattern: str, path: str) -> bool:
+    """Docker's pattern rule: segment-wise, so ``*`` never crosses a ``/``.
+
+    Deliberately **not** :func:`fnmatch.fnmatch` over the whole string, which is
+    the intuitive spelling and the wrong one: it lets ``*`` swallow separators,
+    so ``data`` would appear to match ``a/b/data`` and this checker would agree
+    with a mistake instead of catching it. ``**`` is the only segment that spans
+    directories, exactly as ``filepath.Match`` plus moby's extension behaves.
+    """
+    pat = pattern.split("/")
+    seg = path.split("/")
+
+    def walk(i: int, j: int) -> bool:
+        if i == len(pat):
+            return j == len(seg)
+        if pat[i] == "**":
+            return any(walk(i + 1, k) for k in range(j, len(seg) + 1))
+        if j == len(seg):
+            return False
+        return fnmatch.fnmatchcase(seg[j], pat[i]) and walk(i + 1, j + 1)
+
+    return walk(0, 0)
+
+
+def _dockerignored(path: str, dockerignore: str) -> bool:
+    """Whether Docker would keep ``path`` out of the build context.
+
+    Patterns are relative to the context root, a later line wins, ``!`` negates,
+    and a pattern that matches a *parent directory* excludes everything beneath
+    it -- which is the whole reason ``data/`` removes ``data/store.db``.
+    """
+    parts = path.split("/")
+    prefixes = ["/".join(parts[: i + 1]) for i in range(len(parts))]
+    excluded = False
+    for raw in dockerignore.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        negate = line.startswith("!")
+        pattern = line.lstrip("!").strip().strip("/")
+        if pattern and any(_dockerignore_match(pattern, prefix) for prefix in prefixes):
+            excluded = not negate
+    return excluded
+
+
+async def test_the_dockerignore_matcher_agrees_with_a_real_docker_build() -> None:
+    """The checker below is only as good as this parse, so the parse is pinned.
+
+    Every expectation here was *measured* against the real daemon, not reasoned
+    about: a throwaway context carrying ``.env``, ``data/blob.enc`` and
+    ``secure_context_pipeline/detection/data/diagnoses.txt`` was built with this
+    repository's ``.dockerignore``, and the manifest of what actually reached the
+    image contained the gazetteer and neither of the other two.
+
+    The last case is the one that matters and the one that is easy to get
+    backwards. ``.gitignore`` and ``.dockerignore`` do **not** share a rule:
+    ``data/`` in ``.gitignore`` matches a directory called ``data`` at *any*
+    depth, while in ``.dockerignore`` it is anchored to the context root. A
+    checker that assumed either file's semantics for the other would be wrong in
+    one direction or the other, and the direction that hurts is treating the
+    gazetteers as shipped when they are not.
+    """
+    dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+
+    # Measured against the daemon: excluded.
+    assert _dockerignored(".env", dockerignore)
+    assert _dockerignored("data/blob.enc", dockerignore)
+    assert _dockerignored(".venv/lib/python3.11/site-packages/x.py", dockerignore)
+    assert _dockerignored("audit.db", dockerignore)
+    # Measured against the daemon: shipped.
+    assert not _dockerignored(
+        "secure_context_pipeline/detection/data/diagnoses.txt", dockerignore
+    )
+    assert not _dockerignored("entities.yaml", dockerignore)
+    assert not _dockerignored("secure_context_pipeline/api/app.py", dockerignore)
+
+    # And the matcher itself: `*` is segment-local, `**` is not.
+    assert _dockerignore_match("data", "data")
+    assert not _dockerignore_match("data", "a/data")
+    assert _dockerignore_match("**/data", "a/b/data")
+    assert _dockerignore_match("*.db", "audit.db")
+    assert not _dockerignore_match("*.db", "a/audit.db")
+
+
+async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image() -> None:
+    """``entities.yaml`` names gazetteer files, and ``load_registry`` fails closed.
+
+    This is not a hypothetical failure mode; it is a live one, one directory
+    over. ``.gitignore`` line 7 is ``data/``, which in git's grammar matches a
+    directory named ``data`` at *any* depth -- including
+    ``secure_context_pipeline/detection/data/``, where the gazetteers live. They
+    are therefore untracked, and a fresh ``git clone`` of this repository cannot
+    start: ``load_registry`` raises
+    ``ConfigError(reason='registry_gazetteer_missing', entity_type='DIAGNOSIS')``
+    before the lifespan finishes. Verified by cloning.
+
+    The image escapes that only because ``.dockerignore`` reads the same line
+    differently -- its patterns are anchored to the context root -- which is luck
+    rather than design, and luck is exactly what a test is for. What is asserted
+    here is the property the container depends on: every file the registry
+    requires exists, is under a path the Dockerfile copies, and is not filtered
+    out on the way in. Adding ``**/data/`` to ``.dockerignore`` -- the natural
+    "fix" if someone tries to make the two ignore files agree -- fails here.
+
+    Fixing the git half is one character (``data/`` -> ``/data/``), and is not
+    this file's to make: it leaves the runtime ``data/`` ignored and makes the
+    gazetteers trackable. Verified in a scratch clone.
+    """
+    dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    registry_text = (REPO_ROOT / "entities.yaml").read_text(encoding="utf-8")
+
+    needed = re.findall(r"^\s*gazetteer:\s*(\S+)\s*$", registry_text, flags=re.MULTILINE)
+    assert needed, "entities.yaml must name the gazetteers this test is about"
+
+    copied = {
+        source
+        for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+        if (stripped := line.strip()).startswith("COPY ")
+        for source in _copy_sources(stripped)
+    }
+
+    for filename in needed:
+        relative = f"secure_context_pipeline/detection/data/{filename}"
+        assert (REPO_ROOT / relative).is_file(), (
+            f"{relative} is required by entities.yaml and load_registry refuses to "
+            f"start without it, but it is not on disk"
+        )
+        assert any(
+            relative == source or relative.startswith(f"{source}/") for source in copied
+        ), f"no COPY in the Dockerfile brings {relative} into the image; copied={sorted(copied)}"
+        assert not _dockerignored(relative, dockerignore), (
+            f".dockerignore filters {relative} out of the build context, so the "
+            f"container starts and immediately fails registry validation"
+        )

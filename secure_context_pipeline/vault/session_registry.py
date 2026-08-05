@@ -33,7 +33,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable
-from typing import NamedTuple
+from dataclasses import dataclass, field
 
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import new_session_key
@@ -44,12 +44,49 @@ logger = logging.getLogger(__name__)
 __all__ = ["SessionRegistry"]
 
 
-class _Session(NamedTuple):
-    """One live session. ``key`` is the only copy and never leaves this module."""
+@dataclass(frozen=True, slots=True, repr=False)
+class _Session:
+    """One live session. ``key`` is the only copy and never leaves this module.
 
-    key: bytes
+    **This was a ``NamedTuple`` and that was the one gap in an otherwise uniform
+    pattern.** Every other key- or original-bearing object here masks its
+    ``__repr__`` on purpose -- :class:`SessionRegistry` renders ``active=N``,
+    ``_SessionCache`` renders ``entries=N``, ``StrategyContext`` declares
+    ``session_key`` as ``field(repr=False)``, ``Settings`` renders ``'***'``.
+    ``_Session`` did not, because it never had to be written: ``NamedTuple``
+    *generates* a ``__repr__`` that renders every field, so ``repr(entry)``
+    printed the raw 32-byte session key as a ``bytes`` literal.
+
+    The asymmetry is worth stating, because it is the opposite of the intuition
+    that makes the rest of the codebase safe by accident: a plain class's default
+    repr is ``<_Session object at 0x...>``, which hides its attributes, so
+    :class:`~secure_context_pipeline.store.document_store.EncryptedDocumentStore`
+    leaks nothing despite defining no ``__repr__`` at all. ``NamedTuple`` and
+    ``@dataclass`` do the reverse and expose them. Opting out is therefore not
+    belt-and-braces here, it is required.
+
+    No call site reprs a ``_Session`` today, so this closed a latent gap rather
+    than an active leak -- but "one accidental ``logger.debug("%r", entry)``
+    away" is exactly how a key reaches a log file, and the registry's own
+    docstring commits to the key never being rendered.
+
+    The dataclass form is also structurally tighter than a masked ``NamedTuple``
+    would have been: a ``NamedTuple`` *is* a ``tuple``, so ``tuple(entry)``,
+    ``entry[0]`` and iterable-unpacking all keep handing the key to a default
+    ``repr`` no matter what ``__repr__`` says. ``slots=True`` leaves no
+    ``__dict__`` for a generic object-dumper to walk either. Nothing relied on
+    the tuple protocol: the key is read as ``entry.key`` at every call site.
+    """
+
+    key: bytes = field(repr=False)
     expires_at: float
     user_id: str
+
+    def __repr__(self) -> str:
+        """Mask the key; the other two fields are already logged in the clear."""
+        return f"_Session(key='***', expires_at={self.expires_at!r}, user_id={self.user_id!r})"
+
+    __str__ = __repr__
 
 
 def _short(session_id: str) -> str:

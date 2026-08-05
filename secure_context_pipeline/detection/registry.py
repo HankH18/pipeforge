@@ -7,11 +7,14 @@ opaque string, which is what makes config-only extensibility real.
 
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+# Presidio's PatternRecognizer does ``import regex as re`` and evaluates every
+# ``patterns:`` entry with it. Validating with the standard library's ``re`` would be
+# checking a different language than the one that runs -- see ``_compilable``.
+import regex  # type: ignore[import-untyped]
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -60,10 +63,23 @@ class EntitySpec(BaseModel):
     @field_validator("patterns")
     @classmethod
     def _compilable(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        """Reject at load any pattern the engine that will run it cannot compile.
+
+        Compiled with ``regex``, not ``re``: ``regex`` is what
+        ``presidio_analyzer.pattern_recognizer`` imports, so it is what actually
+        evaluates every ``patterns:`` entry against document text. The two dialects
+        are not the same language -- ``regex`` accepts a variable-width lookbehind,
+        ``\\K`` and a possessive quantifier, and ``re`` raises on all three -- and
+        validating with the wrong one is the shape of mistake this codebase keeps
+        finding: a checker that does not share the semantics of the thing it checks.
+        It failed both ways. A pattern only the real engine understands was refused at
+        startup though it would have run correctly, and a pattern ``re`` accepts but
+        ``regex`` rejects would have passed load and raised inside a request instead.
+        """
         for pattern in v:
             try:
-                re.compile(pattern)
-            except re.error as exc:
+                regex.compile(pattern)
+            except regex.error as exc:
                 raise ValueError(f"uncompilable pattern: {exc}") from exc
         return v
 

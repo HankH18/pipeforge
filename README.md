@@ -106,17 +106,28 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1217 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
-                             #   115 leakage - 5 bench - rest unit + integration
+1483 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+                             #   120 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 39 source files
 ruff check .                 # clean, whole repo
+96% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
+                             #   4022 statements, 126 missed; 982 branches, 79 partial
 ```
+
+**On that coverage number.** It is reported because it was *not* measured for the first four
+review passes — `pytest-cov` was not installed — and the cost of that shows up in this
+document: every "deleting X left the suite green" finding here was found by hand, one mutation
+at a time, and at least one control was discovered untested only after it had already failed
+silently. The number itself is weak evidence (96% of lines executed says nothing about what was
+asserted); the *partial-branch list* is the useful artifact, and working it is what surfaced
+four untested branches in the audit writer's own error handling — including one where a
+transient fault would have wedged every subsequent write.
 
 **Leakage harness** (`pytest -m leakage`, 100 runs, both strategies alternating, varied seeds):
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2840 originals vaulted and scanned, 2410 surrogates round-tripped)
+          (2840 originals vaulted and scanned, 2412 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result and it does not move. The two tallies
@@ -130,12 +141,17 @@ rather than describing both as "reproducible":
   independent things move it. Within one commit it drifts by a few counts because session keys
   are `secrets.token_bytes(32)` and pseudonyms are seeded from `HMAC(session_key, …)`, so every
   pseudonymization run draws different fakes and which lines the mock provider echoes shifts
-  with them — the count is of surrogates *the model happened to mention*. A stable number here
-  would actually be evidence of a bug: it would mean session keys were not random. Across
-  commits it moves much further, because any change to obfuscation or restoration changes what
-  there is to mention; it was observed at **2,717** during one such change and back at **2,408**
-  after it. Do not treat any single reading as a regression signal — `ledger.leaks == 0` is the
-  assertion, and the tally is context.
+  with them — the count is of surrogates *the model happened to mention*. Eight consecutive runs
+  of the current build read **2,412 / 2,408 / 2,404 / 2,412 / 2,413 / 2,411 / 2,411 / 2,410**. A stable number here would
+  actually be evidence of a bug: it would mean session keys were not random. Across commits it
+  moves much further, because any change to obfuscation or restoration changes what there is to
+  mention; it was observed at **2,717** during one such change. Do not treat any single reading
+  as a regression signal — `ledger.leaks == 0` is the assertion, and the tally is context.
+
+  This is also why the round-trip rework below is reported with a *paired* measurement rather
+  than a before/after of the summary line: computed both ways inside one process over the same
+  100 runs, the old and new expectations agree exactly (2,410 vs 2,410). Two separate harness
+  invocations differ by a handful either way regardless of what changed.
 
 Read them as scale, not as a fingerprint.
 
@@ -159,12 +175,46 @@ And a rare false red on the headline assertion is worse than its frequency sugge
 teaches the reader to disbelieve the next one.
 
 All four now route through the gate's own rule, imported rather than restated, so a divergence
-is an `ImportError` instead of silence. Two tests hold the line:
+is an `ImportError` instead of silence. Three tests hold the line:
 `test_the_occurrence_rule_has_no_fourth_copy` checks that single definition against an
-independently written reference across 220 needle/haystack pairs, and
-`test_no_comparison_in_this_module_bypasses_the_shared_rule` fails if any bare membership test
-reappears in the file — catching the **class** rather than the four instances, which is the only
-thing that has actually worked on this bug.
+independently written reference across 220 needle/haystack pairs;
+`test_the_shared_occurrence_rule_agrees_with_the_reference_on_generated_input` does the same
+comparison over **2,000 hypothesis-generated pairs** drawn from an alphabet built out of the
+character classes the rule turns on, because every version of this bug so far was a case the
+hand-written corpus was extended for *after* the miss (30,000 examples over a wider alphabet
+including accents, a zero-width space, a combining mark and CJK found no disagreement either);
+and `test_no_leak_comparison_in_this_module_bypasses_the_shared_rule` fails if any bare
+membership test reappears in the file — catching the **class** rather than the four instances,
+which is the only thing that has actually worked on this bug.
+
+That last rule was itself only scanning the first two-thirds of the file. It excluded the
+region from its own snippet list onward, to stop the list matching itself — and the 100-run
+function is defined after that list, so three of the four historical bugs sat in a region the
+rule never looked at. Found by sabotage rather than by reading: putting
+`[o for o in originals if o in sent_payload]` back into the payload scan left the test green.
+The excluded region is now computed from the parsed module (the list and the test's own body,
+nothing else), and the test asserts that the 100-run function is inside what it scans.
+
+**One thing sharing the rule was actively wrong, and that is now split out.** "Never be laxer
+than the gate" is the correct rule for leak *detection*, and exactly the wrong rule for
+round-trip *completeness*, where the expectation must be able to disagree with the code it
+checks. The set of originals that must come back was built with `surrogates.extract_token_ids`
+(i.e. the production `TOKEN_RE`) and the gate's occurrence rule — both of which the **restorer**
+also uses. So if `TOKEN_RE` could not see a token the model emitted: the expectation dropped it,
+the restorer left it in the answer, and assertion 4's residual scan (also `TOKEN_RE`) could not
+see it either. All three agreed, and the only visible effect was that `round_trip_checked` got
+*smaller* — a shrinking denominator, which nobody reads as a failure. The user gets an answer
+with a dangling `1a2b3c4d` in it and the harness reports 100/100 clean.
+
+The expectation is now derived independently: the 8-hex ID as a plain case-insensitive substring
+of the model's own words, pseudonyms through the independently-written reference rule, and a
+hand-written surrogate parser instead of `STRICT_TOKEN_RE`.
+`test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots` enforces both halves
+— structurally over the parsed AST (none of those four names may be *used* by the completeness
+path, though they must still be discussable in a docstring) and behaviourally, by asserting that
+a bare ID the production grammar provably cannot match still lands in the expectation. The
+tally itself did not move: computed both ways over the same 100 runs in one process, old and new
+agree exactly (2,410 vs 2,410).
 
 **Three further holes were then found by attacking the harness instead of reading it**, and they
 matter more than the first four because none of them was a *disagreement* between copies — the
@@ -212,15 +262,36 @@ rather than a silent widening of the claim:
   are ordinary English words (`Brown`, `Rich`). So the honest form of the guarantee is *no whole
   vaulted value* reaches the payload, the audit log or the process log, and
   `test_a_partial_value_leak_is_outside_what_this_harness_claims` pins that boundary.
-- **A value glued into a longer word.** `xJohn Smithx` carries the original byte for byte and is
-  reported by neither. The occurrence rule asserts a word boundary on each side whose adjacent
-  needle character is alphanumeric — which is precisely what stops `Brown` matching inside
-  `Browning`. Relaxing it only for multi-word originals does not rescue it: `chronic low back
-  pains` contains `chronic low back pain`. What keeps the residual risk small is that the
-  pipeline cannot emit this shape — every surrogate and redaction marker ends in `]`, so a
-  splice that leaves an original beside our own output has a non-alphanumeric character between
-  them and *is* caught. Pinned by
+- **A value glued into a longer word — on the text channels only.** `xJohn Smithx` carries the
+  original byte for byte and is reported by neither the payload scan nor the gate. The occurrence
+  rule asserts a word boundary on each side whose adjacent needle character is alphanumeric —
+  which is precisely what stops `Brown` matching inside `Browning`. Relaxing it only for
+  multi-word originals does not rescue it: `chronic low back pains` contains `chronic low back
+  pain`. What keeps the residual risk small is that the pipeline cannot emit this shape — every
+  surrogate and redaction marker ends in `]`, so a splice that leaves an original beside our own
+  output has a non-alphanumeric character between them and *is* caught. Pinned by
   `test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`.
+
+  **On the audit database it applies to one of the two limbs, and that division of labour is now
+  pinned rather than assumed.** SQLite writes a record's column values end to end with no
+  delimiter, so an original in a label column sits in the *file* as
+  `…EGRESS_BLOCKMarguerite Vandenbergdeadbeef…` — alphanumeric on both sides. The **byte** limb
+  of assertion 2 is therefore blind to it (measured on a real `AuditLogger`, not reasoned about).
+  The **query** limb sees the same value as `"entity_type": "Marguerite Vandenberg"`, where JSON
+  quoting supplies the boundaries, and catches it — so the claim holds, on the other limb, and
+  the byte limb's unique contribution is bytes the query view cannot reach at all: freed pages,
+  WAL remnants, superseded row images.
+
+  Worth reporting because the obvious fix is wrong and was reverted before shipping. Loosening
+  the byte limb to plain containment so it could carry the label-column case alone re-opens the
+  exact false-positive class the anchoring exists for, with interest: `8.2` is an ordinary
+  vaulted lab value and every audit row carries an `elapsed_ms`, so `{"elapsed_ms":18.25}` reads
+  as a leak. On the assertion that carries the headline number, a rare false red is worse than
+  its frequency suggests. Both directions are pinned by
+  `test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`, and end to end
+  through the real writer by
+  `test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did`, which asserts
+  *which* limb caught it so the attribution cannot rot into "the scan handles it".
 - **A combining mark spliced into a value.** `normalize` is NFKC, which *composes* — so a
   decomposed rendering of `José` is caught, and that half is now asserted. What no
   normalisation form can do is remove a mark that was never in the vaulted value: `J` + U+0301 +
@@ -429,7 +500,7 @@ contradicts the offline premise of the whole design. `/openapi.json` is served l
 | **Vault database stolen at rest** | AES-256-GCM under a key derived from an in-memory-only session key. The session key is never persisted. | Live-process memory scraping. Session-lifetime plaintext lives in RAM by design (that is what makes a < 5 ms lookup possible). **Declared out of scope for this tier.** |
 | **Cross-session access, same user** | Per-session HKDF vault keys, AAD binding to `session_id:token_id`, non-deterministic token IDs across sessions | None identified. A row copied between sessions fails GCM authentication. |
 | **Log or audit exfiltration** (*reading* the log) | Length ceilings that make the log incapable of holding *content* (`detail` values 64 chars, label columns 128), enforced again at the write boundary; no call site that writes a value; and the leakage harness scanning the raw DB **bytes** on all 100 runs | **A short identifier would fit, and the schema cannot tell.** `detail={"v": "John Smith"}` validates — see below. The guarantee is "nothing writes one", measured, not "the schema forbids one". Plus traffic analysis of event counts and timings. |
-| **Audit tampering** (*writing* to the log) | SHA-256 hash chain over every event, plus a `sqlite_sequence` high-water check so deleting the newest rows is caught | **Bounded, and the bound is the interesting part.** The digests are **unkeyed**, so an attacker with write access to the DB file can rewrite the chain end to end and it will verify — demonstrated, not assumed. See §5 Q5. |
+| **Audit tampering** (*writing* to the log) | SHA-256 hash chain over every event, plus **two independent high-water marks** (`sqlite_sequence` and a trigger-guarded `audit_chain_meta`) so deleting the newest rows is caught — and `seq` allocated above the watermark, so the evidence does not expire | **Bounded, and the bound is the interesting part.** A silent truncation costs four statements, not one, and all four must land in step — measured as a ladder in §5 Q5. The digests are **unkeyed**, so an attacker who runs all four can rewrite the chain end to end and it will verify — demonstrated, not assumed. |
 | **Replay of Session A ciphertext into Session B** | AAD authentication failure | None identified. |
 | **Caller presents a session ID that is not theirs** | Sessions are **bound to the creating `user_id`**; `POST /pipeline/run` compares with `secrets.compare_digest` and answers the same `401 SESSION_EXPIRED` as an unknown session. `DELETE /sessions/{id}` requires the owner's `user_id` and returns an unconditional 204 either way. | The `user_id` is still an **asserted claim, not a proven one** — there is no real authentication at this tier. What the binding buys is that a leaked *session ID* is no longer sufficient on its own; what it does not buy is protection against a caller who simply asserts someone else's `user_id`. Real authn is the production item. |
 | **Anonymous enumeration of live session IDs** | `GET /audit` requires a `session_id`/`run_id` scope; `/health` reports a session *count*, never IDs | None identified for the enumeration path itself. This was a **live hole, not a hypothetical**: unscoped `GET /audit` published every active session ID, and `DELETE /sessions/{id}` then accepted them — full vault destruction with zero credentials. |
@@ -651,30 +722,61 @@ hospice plan — annotated *before* being run and never used to change a pattern
 
 | Over 366 values, none of which anything was tuned against | Tuned corpus | **Held-out** |
 |---|---|---|
-| Values **covered** by a detected span | 99% | **88.5%** |
-| Values covered **and correctly typed** | 99% | **87.4%** |
-| `MRN` covered | ~100% | **27% (4 of 15)** |
-| `MRN` correctly typed | ~100% | **13% (2 of 15)** |
+| Values **covered** by a detected span | 99% | **91%** |
+| Values covered **and correctly typed** | 99% | **90%** |
 
 Reproduce with `pytest tests/test_detection.py -k held_out -s`; the floors are asserted, not
 commented, so a regression fails the build.
 
-**Read the gap, not the average.** The 10.5-point drop is the ordinary cost of unseen shapes.
-`MRN` is not ordinary: it collapses because the registry recognises the field *labels* it was
-shown (`MRN:`, `Medical Record No.`) and unseen documents write `Rec #`, `Chart:`, or put the
-number in a table cell with no label at all. Two of the fifteen are absorbed by `DATE`, which is
-worse than a miss — a seven-digit record number is date-shifted and looks handled.
+**The average is the least useful number here. This is the per-entity breakdown, worst first:**
 
-**This is the honest bottom line of the whole submission.** Detection recall is the binding
-constraint (§7), and an entity the detector misses is not merely unblocked: it never enters the
-vault, so egress-gate pass 1 does not scan for it, pass 2 re-scans with the *same* detector and
-shares the miss exactly, and the 100-run leakage harness cannot see it either — the instrument
-that measures leaks is blind to precisely the leaks that matter most. `100/100 clean` is
-therefore a statement about values the detector found, not about all PII in the document. The
-architectural answer is that the gate is fail-closed over the vault (a defence in depth that
-does not depend on recall), and the engineering answer is a clinical NER model rather than a
-gazetteer plus label patterns. Neither answer makes 27% acceptable, and it is stated here rather
-than left for a reviewer to find.
+| Entity | N | Covered | Typed |
+|---|---|---|---|
+| `SETTLEMENT_TERM` | 2 | **0%** | **0%** |
+| `DATE` | 10 | **30%** | **30%** |
+| `NAME` | 58 | **81%** | **79%** |
+| `MRN` | 15 | 80% | 80% |
+| `INSURANCE_ID` | 5 | 80% | 80% |
+| `AMOUNT` | 25 | 84% | 84% |
+| `DOB` | 33 | 88% | 85% |
+| `CLIENT_IDENTITY` | 13 | 92% | 92% |
+| `ACCOUNT_NUMBER` | 19 | 95% | 95% |
+| `SSN`, `TAX_ID`, `PHONE`, `EMAIL`, `ADDRESS`, `CASE_ID`, `DIAGNOSIS`, `MEDICATION`, `LAB_RESULT` | 194 | 100% | 100% |
+
+**`NAME` is the weakest point of this whole submission, and it is not close.** Not because 81% is
+the lowest number — it is not — but because of the count and the consequence. It is 58 of the 366
+values, so it is the largest absolute quantity of PII left in the clear, and it is the entity the
+entire pseudonymization design rests on. A missed `NAME` is invisible to **all three** egress
+passes: it was never vaulted, so pass 1 has nothing to look for; `NAME` is not in
+`HIGH_SEVERITY_TYPES`, so pass 2's re-scan cannot block it; and `_INDEPENDENT_PATTERNS` has one
+entry (separated SSN), so pass 3 has no opinion. Demonstrated end to end, using one of the
+detector's own printed held-out misses:
+
+```
+POST /pipeline/run -> 200 ; egress_rescan_warnings: 0.0
+outbound payload: "…Specimen received from Ingeborg Vasquez-Lund, seen with [PII_NAME_aa096360].…"
+```
+
+A real surname in the clear, in the same sentence as a tokenized one, with the gate reporting
+zero warnings. `SETTLEMENT_TERM` at 0% and `DATE` at 30% are smaller in volume but have the same
+shape of failure.
+
+**This is the honest bottom line.** Detection recall is the binding constraint (§7), and an entity
+the detector misses is not merely unblocked: it never enters the vault, so pass 1 does not scan
+for it, pass 2 re-scans with the *same* detector and shares the miss exactly, and the 100-run
+leakage harness plants only values the detector found — so it cannot see the miss either. **The
+instrument that measures leaks is blind to precisely the leaks that matter most.** `100/100
+clean` is therefore a statement about values the detector found, not about all PII in the
+document, and §7 gap #1's parenthetical that "the gate makes misses safe" holds only for the four
+entity types in `HIGH_SEVERITY_TYPES`, or where the same value was vaulted from another
+occurrence. The architectural answer is that the gate is fail-closed over the vault — a defence
+in depth that does not depend on recall — and the engineering answer is a clinical NER model
+(scispaCy, Comprehend Medical) rather than spaCy plus gazetteers. Neither makes 81% on `NAME`
+acceptable, and it is stated here rather than left for a reviewer to find.
+
+*(An earlier revision of this table reported 88.5% / 87.4% with `MRN` at 27%/13%. `MRN`'s three
+literal label patterns were then replaced with a label-independent shape, taking it to 80%/80%
+and the total to 91%/90%. The figures above are from a fresh run of the command named above.)*
 
 What makes the fixes more credible than the number is that five of the six came from a
 **property** rather than a corpus row — Public Suffix List validation dropping internal
@@ -1113,13 +1215,40 @@ the shared store never holds anything usable on its own.
   isolated: deleting it in a scratch copy left all 100 audit tests green while this exact attack
   flipped from detected to undetected.
 
-  **The exact edge of the high-water defence, since it is easy to overstate.**
-  `sqlite_sequence` is an ordinary table in the same file, so an attacker who can run the
-  `DELETE` can run one more `UPDATE` and the truncation becomes invisible — demonstrated, and
-  pinned by `test_tail_truncation_is_only_caught_while_sqlite_sequence_is_intact`. It raises the
-  cost of a silent truncation from one statement to two; it does not make it impossible. That is
-  the same unkeyed-digest limit described below, reached by a shorter route than "rewrite the
-  whole chain".
+  **The exact edge of the high-water defence, since it is easy to overstate.** Measured as a
+  ladder rather than asserted as a property, because "how many statements does a silent
+  truncation cost" is the only honest way to state what an unkeyed in-file scheme buys. Each rung
+  is a real command run against a real audit DB, and all four are pinned by
+  `test_a_silent_tail_truncation_costs_four_statements_and_all_four_are_needed`:
+
+  | Attacker statements | Result |
+  |---|---|
+  | 1. `DELETE FROM audit_events WHERE seq >= 4` | **caught** — the watermark disagrees with the tail |
+  | 2. …+ `UPDATE sqlite_sequence SET seq = 3` | **caught** — `audit_chain_meta` holds the same mark in a table SQLite does not manage |
+  | 3. …+ `DELETE`/lowering `UPDATE` on `audit_chain_meta` | **refused by SQLite** — two triggers enforce "only ever grows" |
+  | 4. …+ `DROP TRIGGER` *then* the lowering `UPDATE` | **not caught** — the residual, and the reason the real fix is an off-box anchor |
+
+  Two of those rungs are new, and both closed a hole that the previous version of this section
+  described as "one more `UPDATE`" without noticing was worse than that:
+
+  - **The evidence used to erase itself.** `emit` allocated `seq = MAX(seq) + 1` over the
+    *surviving* rows, so a freed tail number was handed straight back out. Delete the newest
+    three events (`verify_chain` → `false`, correctly), then let three ordinary events flow
+    through the public API — the seqs become contiguous `1..N` again, the tail matches the
+    high-water mark, and `verify_chain` returns **`true`** with the original events permanently
+    gone. `length()` and `query()` agree, so the documented `len(page) == length()` completeness
+    check also reads clean: a reviewer sees a COMPLETE, VALID log. No second statement, no hash
+    work, and every existing tail test checked `verify_chain` immediately after the delete —
+    inside the window where the defence still worked. `seq` is now allocated above the
+    *watermark*, so the deleted numbers are never re-issued and the gap is permanent.
+  - **A missing bookkeeping row read as "no opinion".** A `NULL` in `sqlite_sequence` was tamper
+    evidence (and tested); a *deleted row* degraded to no-opinion and returned `true` (and was
+    not). The delete is the easier of the two — it needs no arithmetic, where the tested `UPDATE`
+    needs the survivor count. A log that still holds rows has certainly been written, so no mark
+    of any kind on a non-empty log is now `false`.
+
+  Rung 4 is the same unkeyed-digest limit described below, reached by a shorter route than
+  "rewrite the whole chain", and it is what the off-box anchor in *Production gaps* is for.
 - A per-call `EGRESS_PASS` record carrying entity counts and the **SHA-256 of the exact
   payload** that was released — proving the gate ran before every provider call, and proving
   *which* payload was released, without retaining the content. `LLM_CALL` carries the **same**
@@ -1185,6 +1314,10 @@ the shared store never holds anything usable on its own.
   write access to the file: it converts "edit one row in SQLite" into "replace the whole log",
   and it makes every *partial* tamper — the realistic case, including a database-level
   `UPDATE`, a mid-chain `DELETE`, an `INSERT`, a reorder, and a truncated tail — detectable.
+  For the truncated tail specifically the cost is now four statements that must all land in
+  step, and — the part that had been quietly missing — the evidence is **durable**: it used to
+  expire on its own as soon as ordinary traffic reused the freed `seq` numbers, so an attacker
+  needed only patience rather than a second statement. See the ladder in §5 Q5.
   Closing it properly requires the verifier to hold something the application host does not:
   an off-box append-only sink (S3 Object Lock, a WORM store, a managed audit service), or an
   HMAC key held by the auditor rather than the writer. Both are production changes, and neither
@@ -1512,11 +1645,11 @@ marked as such rather than quietly asserted.
 | **Core 4** — vault encrypted, deterministic in-session, purged on expiry/logout | `vault/session_vault.py`, `vault/session_registry.py` | `test_vault.py::test_within_session_determinism`, `::test_destroy_makes_tokens_unreadable`, `::test_destroy_surviving_row_is_undecryptable`, `::test_surviving_row_cannot_repopulate_a_destroyed_cache`; `integration/test_pipeline.py::test_expired_session` |
 | **Core 5** — context injector, chunking, pre-send check | `pipeline/context_injector.py`, `pipeline/egress_gate.py`, `detection/detector.py::chunk_text` | `test_context_injector.py::test_serialized_is_exactly_what_the_gate_scans`; `test_egress_gate.py::test_the_gate_runs_before_the_provider_on_the_happy_path`, `::test_the_provider_is_never_reached_when_the_gate_blocks`; `test_detection.py::test_entity_straddling_a_chunk_boundary_is_detected_whole` |
 | **Core 6** — restore, including mangled/paraphrased token forms | `deobfuscation/restorer.py`, `surrogates.py::TOKEN_RE` | `test_deobfuscation.py::test_mangled_token_forms_restore`, `::test_hint_is_ignored_for_lookup`, `::test_post_restore_assertion_fires_on_residual_token`; `integration/test_pipeline.py::test_vault_miss_on_deobfuscation` |
-| **Core 7** — audit: ts, session, type, token, action; queryable; zero originals | `audit/logger.py`, `models.py::AuditEvent` | `test_audit.py::test_persisted_rows_carry_no_free_text_columns`, `::test_detail_rejects_long_string_values`, `::test_truncating_the_tail_breaks_the_chain`, `::test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught`, `::test_erasing_a_whole_session_is_not_reported_as_that_session_being_clean`; leakage assertion 2 |
+| **Core 7** — audit: ts, session, type, token, action; queryable; zero originals | `audit/logger.py`, `models.py::AuditEvent` | `test_audit.py::test_persisted_rows_carry_no_free_text_columns`, `::test_detail_rejects_long_string_values`, `::test_truncating_the_tail_breaks_the_chain`, `::test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught`, `::test_erasing_a_whole_session_is_not_reported_as_that_session_being_clean`, `::test_a_truncated_tail_does_not_heal_when_the_log_advances`, `::test_a_silent_tail_truncation_costs_four_statements_and_all_four_are_needed`, `::test_deleting_the_sqlite_sequence_row_does_not_launder_a_truncation`, `::test_two_processes_sharing_one_audit_db_lose_no_events`; leakage assertion 2 and `leakage/test_leakage_harness.py::test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did` |
 | **Critical constraint** — reversible in-session, irreversible across | `crypto/keys.py::derive_token_id` (HMAC under an ephemeral key), key destruction | `test_crypto.py::test_token_id_deterministic_within_session`, `::test_token_id_non_deterministic_across_sessions`, `::test_token_id_is_irreversible_without_the_key`; `integration/test_pipeline.py::test_restoration_is_impossible_after_the_session_is_destroyed` |
 | **NFR** — config-only entity add | `entities.yaml`; `entity_type` opaque downstream | `test_extensibility.py::test_package_source_never_mentions_passport` (the grep **is** the proof), plus the three end-to-end cases beside it |
 | **NFR** — strategy swappable via config | strategy registry dict, `Settings.strategy` | `test_obfuscation.py::test_dummy_strategy_plugs_in_with_zero_engine_changes`, `::test_per_entity_strategy_override_is_config_only`; `test_llm.py::test_new_provider_name_is_selectable_with_zero_other_changes` |
-| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, two passes) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the four stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims`, `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`, `::test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`; `demo.py --dump-wire` for the literal HTTP body |
+| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, two passes) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the four stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims`, `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`, `::test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims` (the glued-word boundary applies to the byte limb of the audit scan too; the query limb is what catches a label-column original — see `::test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`); round-trip completeness is derived independently of the restorer, enforced by `::test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`; `demo.py --dump-wire` for the literal HTTP body |
 | **NFR** — vault isolation is cryptographic, cross-session | per-session HKDF vault keys, AAD `session_id:token_id` | `test_vault.py::test_aad_binding_across_sessions`, `::test_aad_binding_across_token_ids`; `integration/test_pipeline.py::test_concurrent_session_isolation` (50 interleaved ops) |
 | **NFR** — graceful degradation (never pass through raw) | engine threshold policy, `action: redact` | `test_obfuscation.py::test_mid_confidence_span_is_redacted_without_a_vault_entry`, `::test_case_strategy_is_force_redacted_in_both_modes`; `test_detection.py::test_below_floor_span_is_dropped` |
 | **NFR** — async pipeline, spaCy off the event loop | `detector.detect` (`asyncio.to_thread` behind `Semaphore(4)`), `aiosqlite`, `aiofiles` | `integration/test_pipeline.py::test_the_pipeline_never_blocks_the_event_loop`; `test_extraction.py::test_extraction_runs_off_the_event_loop_thread` |
@@ -1618,6 +1751,10 @@ pytest -m leakage -q # expect: 100/100 runs clean, 0 leaks
 pytest -m bench -q   # expect: 5 measurements, all inside budget
 mypy                 # expect: Success, 39 source files
 ruff check .         # expect: All checks passed!
+
+# The partial-branch list, which is the part worth reading:
+pytest --cov=secure_context_pipeline --cov-branch \
+       --cov-report=term-missing:skip-covered -q
 ```
 
 Paste the leakage summary line into §1 if it has drifted. The `100/100, 0 leaks` part does not

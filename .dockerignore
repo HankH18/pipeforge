@@ -11,7 +11,18 @@
 *.pem
 *.key
 
-# runtime data: encrypted blobs, the session vault, the audit chain
+# runtime data: encrypted blobs, the session vault, the audit chain.
+#
+# `data/` here is NOT the same rule as `data/` in `.gitignore`, and the
+# difference is load-bearing rather than trivia. Docker anchors every pattern to
+# the context root, so this line removes `./data` and nothing else. Git's
+# grammar makes the identical line match a directory called `data` at ANY depth
+# -- including `secure_context_pipeline/detection/data/`, where the gazetteers
+# `entities.yaml` requires live, and `load_registry` refuses to start without
+# them. Do not "harmonise" the two files by writing `**/data/` here: that ships
+# an image whose container boot-fails on registry validation. Pinned by
+# `test_every_runtime_asset_the_registry_needs_actually_reaches_the_image`, whose
+# expectations were measured against a real build rather than reasoned about.
 data/
 *.db
 *.db-wal

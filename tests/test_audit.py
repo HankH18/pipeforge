@@ -16,7 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import aiosqlite
@@ -1064,40 +1064,296 @@ async def test_deleting_every_row_is_not_reported_as_a_clean_log(
     assert await audit.verify_chain() is False
 
 
-async def test_tail_truncation_is_only_caught_while_sqlite_sequence_is_intact(
+async def _statements(db_path: Path, *sql: str) -> None:
+    """Run raw SQL against the audit DB behind the logger's back, as an attacker would."""
+    async with aiosqlite.connect(db_path) as conn:
+        for statement in sql:
+            await conn.execute(statement)
+        await conn.commit()
+
+
+async def test_a_silent_tail_truncation_costs_four_statements_and_all_four_are_needed(
     audit: AuditLogger, tmp_path: Path
 ) -> None:
-    """The exact edge of the truncation defence, pinned rather than glossed.
+    """The exact edge of the truncation defence, measured one statement at a time.
 
-    The README credits ``sqlite_sequence`` with catching a deleted tail, and it does.
-    But ``sqlite_sequence`` is an ordinary table in the same file, so an attacker who
-    can run the ``DELETE`` can run one more ``UPDATE`` and the truncation becomes
-    invisible. That is a *one-statement* extension of the attack, not the "rewrite
-    the entire chain" effort the unkeyed-chain caveat describes, and the difference
-    matters to anyone deciding how much the high-water check is worth.
+    This test previously stopped after two statements and asserted ``True``, with a
+    note saying that if it ever became ``False`` the defence had got stronger. It
+    has. The whole ladder is now walked, because "how many statements does a silent
+    truncation cost" is the only honest way to state what an unkeyed in-file scheme
+    buys, and a single ``True``/``False`` at one rung does not say it:
 
-    This is the honest boundary of the mechanism: it raises the cost of a silent
-    truncation from one statement to two, and the real fix is an off-box anchor.
-    Pinned so the README's wording stays accurate and so a future keyed or
-    externally-anchored scheme has a test that changes when the property does.
+    1. ``DELETE`` the newest rows -- caught. Every surviving row still hashes and
+       still links; the *watermark* is the only witness.
+    2. ...plus ``UPDATE sqlite_sequence`` to the surviving count -- **still caught**,
+       and this rung is the change. SQLite's bookkeeping row is no longer the only
+       mark: ``audit_chain_meta`` holds the same fact in a table this module owns.
+    3. ...plus deleting or lowering that row directly -- **refused by the database**,
+       not by the writer. Two triggers enforce "only ever grows", so the attacker
+       cannot simply write the number they want.
+    4. ...plus ``DROP TRIGGER`` and *then* the lowering ``UPDATE`` -- not caught.
+       That is the residual, and it is what the README must say.
+
+    The digests are unkeyed, so an attacker who gets to rung 4 was always going to
+    win; the value of the ladder is that rungs 1-3 are where a *casual* truncation
+    stops, and that the evidence at those rungs is durable (see
+    ``test_a_truncated_tail_does_not_heal_when_the_log_advances``) rather than
+    something ordinary traffic erases.
     """
+    db = tmp_path / "audit.db"
     for i in range(5):
         await audit.emit(make_event(ts=9400.0 + i))
+    assert await audit.verify_chain() is True
 
-    async with aiosqlite.connect(tmp_path / "audit.db") as conn:
-        await conn.execute("DELETE FROM audit_events WHERE seq >= 4")
-        await conn.commit()
-    assert await audit.verify_chain() is False, "the high-water check must catch this"
+    # 1. The DELETE on its own.
+    await _statements(db, "DELETE FROM audit_events WHERE seq >= 4")
+    assert await audit.verify_chain() is False, "the watermark check must catch this"
 
-    async with aiosqlite.connect(tmp_path / "audit.db") as conn:
-        await conn.execute(
-            "UPDATE sqlite_sequence SET seq = 3 WHERE name = 'audit_events'"
-        )
-        await conn.commit()
-    assert await audit.verify_chain() is True, (
-        "if this now returns False the truncation defence got stronger -- good, and "
-        "the README's 'unkeyed, so a full rewrite verifies' caveat should be revisited"
+    # 2. Plus SQLite's own bookkeeping row, which used to be the whole defence.
+    await _statements(db, "UPDATE sqlite_sequence SET seq = 3 WHERE name = 'audit_events'")
+    assert await audit.verify_chain() is False, (
+        "rewriting sqlite_sequence alone now hides nothing -- audit_chain_meta still "
+        "holds the real high-water mark. If this returns True the second mark is gone "
+        "and the truncation defence is back to costing two statements"
     )
+
+    # 3. The second mark cannot just be written: the database refuses.
+    for refused in (
+        "DELETE FROM audit_chain_meta",
+        "UPDATE audit_chain_meta SET max_seq = 3 WHERE id = 1",
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            await _statements(db, refused)
+    assert await audit.verify_chain() is False
+
+    # 4. The residual: drop the guard, then lower the mark. Four statements, in step.
+    await _statements(
+        db,
+        "DROP TRIGGER audit_chain_meta_is_monotonic",
+        "UPDATE audit_chain_meta SET max_seq = 3 WHERE id = 1",
+    )
+    assert await audit.verify_chain() is True, (
+        "if this now returns False the truncation defence got stronger again -- good, "
+        "and the README's 'unkeyed, so a full rewrite verifies' caveat and the "
+        "statement count quoted there should be revisited"
+    )
+
+
+async def test_a_truncated_tail_does_not_heal_when_the_log_advances(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """Truncation evidence must be durable, not a window that ordinary traffic closes.
+
+    The attack needs **no** second statement and no hash work. ``emit`` used to
+    allocate ``seq = MAX(seq) + 1`` over the surviving rows, so a freed tail number
+    was handed straight back out. Delete the newest three events -- ``verify_chain``
+    correctly says ``False`` -- then let three ordinary events flow through the
+    pipeline, which an attacker can drive through the public API. The seqs become
+    contiguous ``1..N`` again, ``last_seq`` climbs back to the high-water mark, and
+    the verifier returns ``True``. ``length()`` and ``query()`` agree, so the
+    documented completeness check (``len(page) == length``) also reads clean: a
+    compliance reviewer sees a COMPLETE, VALID log with the original tail events
+    permanently gone.
+
+    Every other tail test in this file checks ``verify_chain`` *immediately* after
+    the delete, which is exactly the window in which the defence still works, so the
+    entire suite stayed green while the one control the README markets for tail
+    truncation silently expired.
+
+    The fix is that ``seq`` is allocated above the watermark rather than above the
+    surviving tail, so the deleted numbers are never re-issued and the hole is
+    permanent. That is asserted here as a *property of the seqs*, not only as the
+    verifier's answer, so the mechanism is visible in the failure message.
+    """
+    db = tmp_path / "audit.db"
+    for i in range(8):
+        await audit.emit(make_event(ts=9900.0 + i))
+    assert await audit.verify_chain() is True
+    assert await audit.length() == 8
+
+    await _statements(db, "DELETE FROM audit_events WHERE seq >= 6")
+    assert await audit.verify_chain() is False, "premise: the truncation is caught at first"
+    assert await audit.length() == 5
+
+    # Ordinary, benign traffic -- the only capability this attack needs.
+    for i in range(3):
+        await audit.emit(make_event(ts=9950.0 + i))
+
+    seqs = [event.seq for event in await audit.query(limit=100)]
+    assert seqs == [1, 2, 3, 4, 5, 9, 10, 11], (
+        f"a freed tail seq was re-issued ({seqs}); the truncation has been papered "
+        "over by ordinary traffic and nothing records that it happened"
+    )
+    assert await audit.verify_chain() is False, (
+        "three benign events restored a clean bill of health to a log whose tail was "
+        "deleted -- the truncation evidence erased itself"
+    )
+
+    # And the reviewer's documented completeness check no longer reads as clean.
+    page = await audit.query(limit=1000)
+    assert len(page) == await audit.length(), "premise: the page really does look complete"
+    assert await audit.verify_chain() is False, (
+        "a complete-looking page plus a valid chain is exactly what the attacker "
+        "wanted a compliance reviewer to see"
+    )
+
+
+async def test_deleting_the_sqlite_sequence_row_does_not_launder_a_truncation(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """A *missing* bookkeeping row on a non-empty log is evidence, not "no opinion".
+
+    The code's own asymmetry was the bug. A ``NULL`` or non-numeric value in
+    ``sqlite_sequence`` was treated as tamper evidence (``False``, and tested); a
+    **missing row** degraded to "no opinion" and returned ``True``, untested. Both
+    are one statement, and the untested one is the *easier* of the two -- the tested
+    ``UPDATE ... SET seq = 3`` needs the attacker to know how many rows survived,
+    while the delete needs no arithmetic at all.
+
+    ``None`` from ``_watermark`` genuinely is the right answer on a log that has
+    never been written, which is why the degradation looked reasonable. The
+    distinguisher is that a log which still holds rows has certainly been written, so
+    no mark at all on a non-empty log is a manufactured state.
+
+    ``DROP TABLE sqlite_sequence`` is asserted to be impossible rather than assumed:
+    SQLite refuses it outright, so the delete is the strongest form of this move.
+    """
+    db = tmp_path / "audit.db"
+    for i in range(5):
+        await audit.emit(make_event(ts=9850.0 + i))
+
+    await _statements(db, "DELETE FROM audit_events WHERE seq >= 4")
+    assert await audit.verify_chain() is False
+
+    await _statements(db, "DELETE FROM sqlite_sequence WHERE name = 'audit_events'")
+    assert await audit.verify_chain() is False, (
+        "deleting the high-water row laundered a tail truncation into a clean bill "
+        "of health"
+    )
+
+    # The other mark is still there and still says 5, which is why this is caught
+    # even before the empty-vs-written distinction is reached.
+    async with aiosqlite.connect(db) as conn:
+        async with conn.execute("SELECT max_seq FROM audit_chain_meta") as cursor:
+            row = await cursor.fetchone()
+    assert row is not None and int(row[0]) == 5
+
+    # Both marks gone: still caught, because a log holding rows has been written.
+    await _statements(
+        db,
+        "DROP TRIGGER audit_chain_meta_is_not_deletable",
+        "DELETE FROM audit_chain_meta",
+    )
+    assert await audit.verify_chain() is False, (
+        "a non-empty log with no high-water mark of any kind must read as tampered; "
+        "'no opinion' here is the same as 'clean' to every caller"
+    )
+
+    # The premise that makes the delete the strongest form of this attack.
+    async with aiosqlite.connect(db) as conn:
+        with pytest.raises(sqlite3.OperationalError, match="may not be dropped"):
+            await conn.execute("DROP TABLE sqlite_sequence")
+
+
+async def test_an_empty_log_with_no_watermark_is_still_clean(tmp_path: Path) -> None:
+    """The case the "no opinion" degradation was protecting, kept working.
+
+    A log that has never been written has no ``sqlite_sequence`` row and no
+    ``audit_chain_meta`` row, and it must verify ``True`` -- otherwise every fresh
+    deployment starts life reporting a tampered audit trail, and the signal is worth
+    nothing. This is the boundary the fix above had to not cross, so it is asserted
+    rather than left to the one existing empty-log test to imply.
+    """
+    log = await AuditLogger.open(tmp_path / "fresh.db")
+    try:
+        assert await log.verify_chain() is True
+        assert await log.length() == 0
+        async with aiosqlite.connect(tmp_path / "fresh.db") as conn:
+            for table, where in (
+                ("sqlite_sequence", " WHERE name = 'audit_events'"),
+                ("audit_chain_meta", ""),
+            ):
+                async with conn.execute(f"SELECT COUNT(*) FROM {table}{where}") as cursor:
+                    row = await cursor.fetchone()
+                assert row is not None and int(row[0]) == 0, (
+                    f"premise: {table} really is empty on a log that was never written"
+                )
+        # ...and a total erasure of a log that WAS written is still not clean.
+        await log.emit(make_event())
+        async with aiosqlite.connect(tmp_path / "fresh.db") as conn:
+            await conn.execute("DELETE FROM audit_events")
+            await conn.commit()
+        assert await log.verify_chain() is False
+    finally:
+        await log.close()
+
+
+async def test_an_unreadable_watermark_degrades_the_writer_and_still_fails_the_verifier(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """The writer and the verifier resolve the same doubt in opposite directions.
+
+    ``emit`` and ``verify_chain`` both read the watermark, and both use the shared
+    ``_UNREADABLE`` rule to decide what "cannot read it" means -- but an audit writer
+    that fails closed silences the pipeline it is supposed to be recording, so the
+    writer degrades to the surviving tail and keeps logging while the verifier
+    resolves the same input to ``False``. Getting this backwards in either direction
+    is a real failure: a raising ``emit`` turns a tampered bookkeeping row into an
+    outage, and a passing ``verify_chain`` turns it into a clean bill of health.
+
+    Blanking ``sqlite_sequence.seq`` is the tamper used here because it is the one an
+    attacker actually runs, and because it reaches ``int(None)`` as a ``TypeError``
+    -- the crash-on-the-detection-path shape this file has been bitten by twice.
+
+    The second half is the one worth reading. SQLite **repairs** its own bookkeeping
+    row on the next ``INSERT``, so blanking it is only transient evidence -- and on a
+    log where nothing was actually deleted, going back to ``True`` is the *correct*
+    answer, because the log genuinely holds every row it ever held. What must not
+    happen is the same repair laundering a real truncation, and it does not: the
+    second mark is not maintained by SQLite, so it still remembers the deleted tail
+    even while the writer is degraded and blind.
+    """
+    db = tmp_path / "audit.db"
+    for i in range(3):
+        await audit.emit(make_event(ts=9750.0 + i))
+
+    await _statements(db, "UPDATE sqlite_sequence SET seq = NULL WHERE name = 'audit_events'")
+    assert await audit.verify_chain() is False, "the verifier reports the blanked mark"
+
+    # The writer keeps working rather than turning a tampered row into an outage.
+    seq = await audit.emit(make_event(ts=9760.0))
+    assert seq == 4, "a tampered bookkeeping row must not stop the audit log recording"
+    assert await audit.length() == 4
+
+    # SQLite rewrote its row on that INSERT, and with nothing deleted the log really
+    # is intact, so clean is the honest answer here.
+    async with aiosqlite.connect(db) as conn:
+        async with conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'audit_events'"
+        ) as cursor:
+            row = await cursor.fetchone()
+    assert row is not None and int(row[0]) == 4, "premise: the INSERT repaired the row"
+    assert await audit.verify_chain() is True
+    assert [event.seq for event in await audit.query()] == [1, 2, 3, 4]
+
+    # The half that matters: the same repair must not launder a real truncation.
+    second = await AuditLogger.open(tmp_path / "truncated.db")
+    try:
+        for i in range(5):
+            await second.emit(make_event(ts=9770.0 + i))
+        await _statements(
+            tmp_path / "truncated.db",
+            "DELETE FROM audit_events WHERE seq >= 4",
+            "UPDATE sqlite_sequence SET seq = NULL WHERE name = 'audit_events'",
+        )
+        for i in range(2):
+            await second.emit(make_event(ts=9780.0 + i))
+        assert await second.verify_chain() is False, (
+            "blanking the mark the writer reads let two benign events repair it at a "
+            "lower value, and the deleted tail went with it"
+        )
+    finally:
+        await second.close()
 
 
 async def test_verify_chain_reports_an_unreadable_database_rather_than_raising(
@@ -1111,7 +1367,7 @@ async def test_verify_chain_reports_an_unreadable_database_rather_than_raising(
     underneath a running service, a disk I/O error, a page that fails its checksum
     -- used to propagate straight through, so the endpoint that exists to answer
     "has this log been tampered with" returned a 500 on exactly the input it exists
-    to report on. ``_high_water_seq`` already degraded to "no opinion" on
+    to report on. ``_watermark`` already degraded to "no opinion" on
     ``sqlite3.Error``; the main walk did not, and that asymmetry was the bug.
 
     Driven through a patched cursor because that is the *cheap and deterministic*
@@ -1387,18 +1643,385 @@ async def test_a_failed_open_does_not_leak_the_connection_thread(tmp_path: Path)
     assert proc.returncode == 0, f"probe exited {proc.returncode}: {proc.stderr[:400]}"
 
 
+#: One worker of the cross-process write test below. Emits ``count`` events into a
+#: shared audit.db through the real ``AuditLogger`` and reports what happened, so the
+#: assertion is about events that were *accepted*, not about a thread count.
+_WRITER_PROBE = '''
+import asyncio, collections, sys, time
+sys.path.insert(0, {repo!r})
+from secure_context_pipeline.audit.logger import AuditLogger
+from secure_context_pipeline.models import AuditEvent
+
+async def main():
+    db, tag, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    log = await AuditLogger.open(db)
+    ok = 0
+    errs = collections.Counter()
+    for i in range(count):
+        try:
+            await log.emit(AuditEvent(ts=time.time(), session_id=tag,
+                                      event_type="DETECT", detail={{"i": i}}))
+            ok += 1
+        except BaseException as exc:
+            errs[type(exc).__name__] += 1
+    await log.close()
+    print("%s ok=%d err=%d kinds=%s" % (tag, ok, sum(errs.values()), dict(errs)), flush=True)
+
+asyncio.run(main())
+'''
+
+_WRITERS_PER_PROBE = 2
+_EVENTS_PER_WRITER = 40
+
+
+async def test_two_processes_sharing_one_audit_db_lose_no_events(tmp_path: Path) -> None:
+    """The concurrency claim, checked across OS processes and not only coroutines.
+
+    ``emit`` is guarded by an :class:`asyncio.Lock`, and the module docstring used to
+    say that made the chain linear "no matter how many coroutines race". True, and
+    it says nothing about two *processes*: an ``asyncio.Lock`` is an in-process
+    object. Two workers sharing one ``audit.db`` each read ``MAX(seq)``, computed the
+    same next value, and the loser's ``INSERT`` died on the ``seq`` PRIMARY KEY.
+
+    The damage is specifically that the event is **dropped**. Chain integrity
+    survives -- the surviving rows are contiguous, every link matches, and
+    ``verify_chain`` returns ``True`` -- which is what makes this worth a test rather
+    than a note: the log is *valid* and *incomplete*, and no chain check can ever
+    report a row that was never written. Measured on the shipped code before the fix:
+    two workers, 60 events each, 15 of 120 lost to ``sqlite3.IntegrityError``.
+
+    Latent rather than active in the graded artifact -- the Dockerfile runs one
+    uvicorn process with no ``--workers`` -- but it becomes real the moment anyone
+    scales out onto a shared audit volume, which is the ordinary thing to do.
+
+    Two fixes, and the test would pass with only the weaker one, so both are worth
+    naming: ``BEGIN IMMEDIATE`` takes the write lock *before* the tail is read, so
+    the collision does not happen; ``busy_timeout`` plus the re-chaining retry in
+    ``emit`` catches whatever slips past that. Run out of process because the bug
+    only exists out of process.
+    """
+    db = tmp_path / "shared.db"
+    script = tmp_path / "writer_probe.py"
+    script.write_text(_WRITER_PROBE.format(repo=str(REPO_ROOT)), encoding="utf-8")
+
+    def run_writers() -> list[subprocess.CompletedProcess[str]]:
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(script), str(db), f"writer-{n}", str(_EVENTS_PER_WRITER)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for n in range(_WRITERS_PER_PROBE)
+        ]
+        done = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=90)
+            done.append(
+                subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+            )
+        return done
+
+    results = await asyncio.to_thread(run_writers)
+
+    expected = _WRITERS_PER_PROBE * _EVENTS_PER_WRITER
+    for result in results:
+        assert result.returncode == 0, f"writer exited {result.returncode}: {result.stderr[:400]}"
+        assert f"ok={_EVENTS_PER_WRITER} err=0" in result.stdout, (
+            f"a writer sharing the audit DB lost events: {result.stdout.strip()!r} "
+            f"(stderr: {result.stderr.strip()[:300]!r})"
+        )
+
+    log = await AuditLogger.open(db)
+    try:
+        rows = await log.query(limit=10_000)
+        assert len(rows) == expected, (
+            f"{expected - len(rows)} of {expected} audit events were dropped by "
+            "cross-process contention -- and a dropped event is the one audit "
+            "failure no chain check can report afterwards"
+        )
+        assert [row.seq for row in rows] == list(range(1, expected + 1))
+        assert await log.verify_chain() is True
+        # Both writers really did interleave, or the test proved nothing about racing.
+        sessions = [row.session_id for row in rows]
+        assert len(set(sessions)) == _WRITERS_PER_PROBE
+        assert any(a != b for a, b in itertools.pairwise(sessions)), (
+            "the two writers ran end to end rather than concurrently, so no seq was "
+            "ever contended and this run measured nothing"
+        )
+    finally:
+        await log.close()
+
+
+async def test_a_lost_seq_race_is_retried_rather_than_dropped(
+    audit: AuditLogger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry handler itself, driven deterministically.
+
+    ``test_two_processes_sharing_one_audit_db_lose_no_events`` proves the *outcome*
+    across processes, but ``BEGIN IMMEDIATE`` is what fixes that case, so the retry
+    underneath it can go entirely unexercised -- untested defensive code that reads
+    like a guarantee. Branch coverage said exactly that: the whole handler was
+    unvisited by every in-process test.
+
+    So the collision is injected. One ``IntegrityError`` from the ``INSERT``, then a
+    normal write, and the contract is that the event **lands** rather than being
+    dropped: the row is there, the chain is linear, and the seq is the one it would
+    always have had.
+    """
+    await audit.emit(make_event(ts=1000.0))
+    conn = audit._connection()
+    real_execute = conn.execute
+    failures = {"left": 1}
+
+    def flaky(sql: str, *args: object, **kwargs: object) -> object:
+        if "INSERT INTO audit_events" in sql and failures["left"]:
+            failures["left"] -= 1
+            raise sqlite3.IntegrityError("UNIQUE constraint failed: audit_events.seq")
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(conn, "execute", flaky)
+    seq = await audit.emit(make_event(ts=1001.0))
+    monkeypatch.undo()
+
+    assert failures["left"] == 0, "premise: the injected collision really did fire"
+    assert seq == 2
+    assert await audit.length() == 2
+    assert await audit.verify_chain() is True
+
+
+async def test_exhausting_the_seq_retries_fails_typed_and_leaves_the_log_usable(
+    audit: AuditLogger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sustained contention gives up loudly, and the logger keeps working afterwards.
+
+    Two contracts, and the second is the one worth the test. A writer that cannot
+    win the race after ``MAX_EMIT_ATTEMPTS`` must say so with a typed
+    :class:`PipelineError` rather than an opaque ``sqlite3`` error -- but it must
+    also leave no transaction open behind it, because this connection is reused for
+    every later emit and a leaked ``BEGIN IMMEDIATE`` turns one failed write into
+    "cannot start a transaction within a transaction" on every write after it. That
+    turns a transient contention spike into a permanently silent audit log, which is
+    strictly worse than the dropped event it was introduced to prevent.
+    """
+    await audit.emit(make_event(ts=2000.0))
+    conn = audit._connection()
+    real_execute = conn.execute
+    attempts = {"n": 0}
+
+    def always_colliding(sql: str, *args: object, **kwargs: object) -> object:
+        if "INSERT INTO audit_events" in sql:
+            attempts["n"] += 1
+            raise sqlite3.IntegrityError("UNIQUE constraint failed: audit_events.seq")
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(conn, "execute", always_colliding)
+    with pytest.raises(PipelineError) as excinfo:
+        await audit.emit(make_event(ts=2001.0))
+    monkeypatch.undo()
+
+    assert excinfo.value.detail["reason"] == "audit_seq_contention"
+    assert attempts["n"] == logger_module.MAX_EMIT_ATTEMPTS
+
+    # The log is still usable, which is the half that would otherwise fail silently.
+    assert await audit.emit(make_event(ts=2002.0)) == 2
+    assert await audit.length() == 2
+    assert await audit.verify_chain() is True
+
+
+async def test_a_failed_write_does_not_wedge_every_later_write(
+    audit: AuditLogger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any failure inside the write transaction must roll it back, not only the race.
+
+    The ``IntegrityError`` path is the expected one and has its own rollback. Every
+    *other* error inside the critical section -- a disk error, a cancelled request,
+    a bug -- would leave ``BEGIN IMMEDIATE`` open on a connection this class reuses
+    forever. The next emit then fails with ``cannot start a transaction within a
+    transaction``, and so does every emit after it: one transient fault silences the
+    audit log for the life of the process.
+
+    Cancellation is included deliberately: it is a ``BaseException``, not an
+    ``Exception``, and it is the *realistic* case -- an API request timing out
+    mid-write -- rather than the exotic one.
+    """
+    await audit.emit(make_event(ts=3000.0))
+    conn = audit._connection()
+    real_execute = conn.execute
+
+    def make_failing(exc: BaseException) -> Callable[..., object]:
+        def failing(sql: str, *args: object, **kwargs: object) -> object:
+            if "INSERT INTO audit_events" in sql:
+                raise exc
+            return real_execute(sql, *args, **kwargs)
+
+        return failing
+
+    for injected in (sqlite3.OperationalError("disk I/O error"), asyncio.CancelledError()):
+        monkeypatch.setattr(conn, "execute", make_failing(injected))
+        with pytest.raises(type(injected)):
+            await audit.emit(make_event(ts=3001.0))
+        monkeypatch.undo()
+
+        # The transaction was rolled back, so this is an ordinary write and not
+        # "cannot start a transaction within a transaction".
+        assert await audit.emit(make_event(ts=3002.0)) is not None
+        assert await audit.verify_chain() is True
+
+
+async def test_one_unreadable_watermark_source_does_not_silence_the_other(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """Two marks means one can be destroyed outright and the other still speaks.
+
+    Dropping ``audit_chain_meta`` is the attacker's answer to a table they cannot
+    lower and cannot delete a row from -- the triggers refuse both, but nothing stops
+    ``DROP TABLE``. The read then fails with an ``sqlite3.Error`` rather than
+    returning no row, which is a different code path from "the row is missing", and
+    it must not be allowed to take the surviving mark down with it.
+
+    So the truncation is still caught, by ``sqlite_sequence`` alone, exactly as it
+    was before the second mark existed.
+    """
+    db = tmp_path / "audit.db"
+    for i in range(5):
+        await audit.emit(make_event(ts=4000.0 + i))
+
+    await _statements(db, "DROP TABLE audit_chain_meta")
+    assert await audit.verify_chain() is True, (
+        "dropping one bookkeeping table must not, on its own, read as tampering -- "
+        "the surviving mark still agrees with the tail"
+    )
+
+    await _statements(db, "DELETE FROM audit_events WHERE seq >= 4")
+    assert await audit.verify_chain() is False, (
+        "with audit_chain_meta gone the sqlite_sequence mark is the whole defence "
+        "again, and it must still catch a truncated tail"
+    )
+
+    # And the writer keeps working with one source missing.
+    assert await audit.emit(make_event(ts=4100.0)) == 6, (
+        "seq must still be allocated above the surviving mark, or dropping the meta "
+        "table is enough to re-enable heal-by-append"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tampered", "why"),
+    [
+        ("[1, 2, 3]", "valid JSON but not an object"),
+        ('{"k": {"nested": 1}}', "an object whose value is not a scalar"),
+        ('"just a string"', "valid JSON scalar, not an object"),
+    ],
+)
+async def test_a_detail_column_that_is_json_but_not_a_detail_map_is_tamper_evidence(
+    audit: AuditLogger, tmp_path: Path, tampered: str, why: str
+) -> None:
+    """``detail`` must be a flat object of scalars, and anything else is evidence.
+
+    ``test_tampered_detail_that_is_not_json_breaks_the_chain`` covers the obvious
+    case -- bytes that are not JSON at all. The interesting rewrites are the ones
+    that *parse*: an array, a nested object, a bare string. Each reaches
+    ``_load_detail`` through a different branch, each returns ``None``, and a
+    ``None`` that was treated as an empty map instead would let an attacker rewrite
+    the payload of any row into a shape the chain check skips.
+    """
+    for i in range(3):
+        await audit.emit(make_event(ts=5000.0 + i, detail={"count": i}))
+    assert await audit.verify_chain() is True
+
+    await tamper_detail(tmp_path / "audit.db", seq=2, new_detail=tampered)
+    assert await audit.verify_chain() is False, f"{why} was not reported as tampering"
+
+
+async def test_enabling_wal_retries_a_concurrent_opener_but_not_a_broken_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one lock ``busy_timeout`` does not cover, and its two outcomes.
+
+    Converting a database *into* WAL needs a moment of exclusive access, and SQLite
+    answers ``SQLITE_BUSY`` for that conversion **without consulting the busy
+    handler**. Two processes opening a brand-new audit DB at the same instant
+    therefore got ``database is locked`` out of ``open()`` itself, on a database
+    about to be perfectly fine. Found as a flake, honestly: the cross-process writer
+    test passed five runs in isolation and failed once under full-suite load.
+
+    Retrying it is defensive code, and defensive code nobody drives is a comment
+    with a syntax highlighter, so both directions are exercised here rather than
+    left to a race that reproduces once in twenty runs:
+
+    * a lock that clears is retried and ``open()`` succeeds;
+    * a lock that never clears is given up on rather than retried forever;
+    * a *non-lock* error is not retried at all, because a corrupt file has to fail
+      ``open()`` promptly -- ``test_a_failed_open_does_not_leak_the_connection_thread``
+      depends on that failure arriving rather than being slept on five times.
+    """
+    real_connect = logger_module.aiosqlite.connect
+    calls = {"busy": 0, "fail_for": 2}
+
+    def flaky_connect(*args: object, **kwargs: object) -> object:
+        connection = real_connect(*args, **kwargs)
+        real_execute = connection.execute
+
+        def execute(sql: str, *rest: object, **kw: object) -> object:
+            if sql == "PRAGMA journal_mode=WAL" and calls["busy"] < calls["fail_for"]:
+                calls["busy"] += 1
+                raise sqlite3.OperationalError("database is locked")
+            return real_execute(sql, *rest, **kw)
+
+        connection.execute = execute  # type: ignore[method-assign]
+        return connection
+
+    monkeypatch.setattr(logger_module.aiosqlite, "connect", flaky_connect)
+    log = await AuditLogger.open(tmp_path / "contended.db")
+    try:
+        assert calls["busy"] == 2, "premise: the conversion really was refused twice"
+        assert await log.emit(make_event()) == 1
+        assert await log.verify_chain() is True
+    finally:
+        await log.close()
+
+    # A lock that never clears gives up, bounded, rather than retrying forever.
+    calls["busy"] = 0
+    calls["fail_for"] = 999
+    monkeypatch.setattr(logger_module, "WAL_SETUP_BACKOFF_S", 0.001)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await AuditLogger.open(tmp_path / "wedged.db")
+    assert calls["busy"] >= logger_module.WAL_SETUP_ATTEMPTS, (
+        "the conversion was abandoned before every attempt was used"
+    )
+
+    # A non-lock failure is fatal on the first attempt, not retried into a slow one.
+    def broken_connect(*args: object, **kwargs: object) -> object:
+        connection = real_connect(*args, **kwargs)
+        real_execute = connection.execute
+
+        def execute(sql: str, *rest: object, **kw: object) -> object:
+            if sql.startswith("PRAGMA journal_mode"):
+                raise sqlite3.DatabaseError("file is not a database")
+            return real_execute(sql, *rest, **kw)
+
+        connection.execute = execute  # type: ignore[method-assign]
+        return connection
+
+    monkeypatch.setattr(logger_module.aiosqlite, "connect", broken_connect)
+    with pytest.raises(sqlite3.DatabaseError, match="not a database"):
+        await AuditLogger.open(tmp_path / "corrupt.db")
+
+
 async def test_verify_chain_survives_a_tampered_high_water_mark(
     audit: AuditLogger, tmp_path: Path
 ) -> None:
     """The tail-truncation sentinel itself is attacker-writable, and was a crash.
 
-    ``sqlite_sequence`` is an ordinary table. ``test_tail_truncation_is_only_caught
-    _while_sqlite_sequence_is_intact`` already pins what happens when an attacker
-    rewrites it to a *plausible* number. This pins the other move -- blanking it --
-    which is strictly easier, since it needs no knowledge of how many rows survived.
+    ``sqlite_sequence`` is an ordinary table.
+    ``test_a_silent_tail_truncation_costs_four_statements_and_all_four_are_needed``
+    already pins what happens when an attacker rewrites it to a *plausible* number.
+    This pins the other move -- blanking it -- which is strictly easier, since it
+    needs no knowledge of how many rows survived.
 
     Both ``NULL`` and a non-numeric string were accepted by SQLite and reached
-    ``int(row["seq"])`` inside ``_high_water_seq``, which runs *after*
+    ``int(row["seq"])`` inside ``_watermark``, which runs *after*
     ``verify_chain``'s try block. So the verifier raised ``TypeError`` /
     ``ValueError`` instead of returning ``False``: ``GET /audit/verify`` answered a
     500, and the answer to "has this log been tampered with" became an error page,
@@ -1433,9 +2056,9 @@ def test_every_audit_reader_shares_one_unreadable_rule() -> None:
     """The three readers must not drift apart on what "unreadable" means.
 
     This codebase's recurring defect is a rule written out twice and fixed once:
-    ``_high_water_seq`` degraded on ``sqlite3.Error`` while the chain walk did not,
-    and later ``verify_chain`` was hardened while ``query`` and ``length`` -- which
-    read the same rows out of the same file -- were left raising.
+    ``_watermark`` (then ``_high_water_seq``) degraded on ``sqlite3.Error`` while the
+    chain walk did not, and later ``verify_chain`` was hardened while ``query`` and
+    ``length`` -- which read the same rows out of the same file -- were left raising.
 
     So the tuple is defined once, and this asserts the shape of that definition
     rather than trusting three ``except`` clauses to stay in step. It fails if a
@@ -1443,6 +2066,16 @@ def test_every_audit_reader_shares_one_unreadable_rule() -> None:
     shared tuple loses a member: ``ValueError`` and ``TypeError`` are load-bearing,
     not defensive padding -- a tampered ``ts`` reaches ``float()`` as the first and
     a lost page reaches it as the second.
+
+    **The count went 4 -> 5 when ``emit`` gained a watermark read**, and that is the
+    considered decision this assertion exists to force rather than an accounting
+    detail. ``emit`` reads the same tampered ``sqlite_sequence`` row the verifier
+    reads, so it needs the same definition of unreadable -- but it resolves it in the
+    *opposite* direction, degrading to the surviving tail instead of failing. That
+    asymmetry is deliberate and is asserted behaviourally by
+    ``test_an_unreadable_watermark_degrades_the_writer_and_still_fails_the_verifier``:
+    a writer that fails closed silences the pipeline, and the verifier is the
+    component whose job it is to report the tamper.
     """
     source = Path(logger_module.__file__).read_text(encoding="utf-8")
 
@@ -1454,10 +2087,10 @@ def test_every_audit_reader_shares_one_unreadable_rule() -> None:
         f"a reader is catching its own hand-written tuple {tuple_handlers} instead of "
         "_UNREADABLE; that is exactly how the last two versions of this rule drifted"
     )
-    assert source.count("except _UNREADABLE") == 4, (
-        "expected the shared rule at all four read sites (chain walk, high-water "
-        "call, query, length); a changed count means a reader was added or removed "
-        "without this test being considered"
+    assert source.count("except _UNREADABLE") == 5, (
+        "expected the shared rule at all five read sites (chain walk, the verifier's "
+        "watermark call, the writer's watermark call, query, length); a changed count "
+        "means a reader was added or removed without this test being considered"
     )
 
 

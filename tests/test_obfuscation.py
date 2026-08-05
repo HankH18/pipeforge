@@ -50,8 +50,10 @@ from secure_context_pipeline.obfuscation.strategies.pseudonymization import (
     MAX_FAKE_ATTEMPTS,
     PseudonymizationStrategy,
     _structural_fake,
+    parse_source_date,
 )
 from secure_context_pipeline.pipeline import egress_gate
+from secure_context_pipeline.pipeline.orchestrator import _assert_surrogates_are_distinct
 from secure_context_pipeline.surrogates import (
     STRICT_TOKEN_RE,
     extract_token_ids,
@@ -1480,6 +1482,86 @@ async def test_a_shifted_date_that_renders_another_original_degrades(env: Env) -
         clean_id, second, [span(second, source_text, "DOB")], strategy="pseudonymization"
     )
     assert clean_result.tokens[0].surrogate == f"{clean_landed.day} {clean_landed:%B %Y}"
+
+
+async def test_two_dates_for_one_day_are_never_issued_the_same_surrogate(env: Env) -> None:
+    """Tier 2's fourth collision: the surrogate that carries no original at all.
+
+    The three tests above all ask "does this shifted date carry a **real value**?"
+    -- equal to one, equal to its own source, containing one. There is a fourth
+    question none of them reaches, because a duplicate surrogate carries no
+    original: **does this string already stand for a different original?**
+
+    Tier 2 is a many-to-one map by construction and that is the whole point of it:
+    the shift preserves the day and the renderer preserves the source's format. So
+    two spans naming the *same day in two formats* -- the ISO date in a header and
+    the spelled-out date in the prose beneath it -- both come back through the ISO
+    renderer (the second via ``_parse_fallback``, which has no format to preserve)
+    and produce the byte-identical string. Two distinct vault originals then own
+    one surrogate, and ``get_by_surrogate`` maps a string to exactly one record.
+
+    Tier 1 cannot reach this state: ``_fake_identifier`` tests ``_surrogate_taken``
+    and ``test_two_originals_are_never_issued_the_same_surrogate`` pins it. Tier 2
+    was never asked the question, so it answered wrong -- on a two-format document,
+    which is an ordinary document and not an attack.
+
+    What made it invisible is that the *outcome* looks safe. Nothing leaks: both
+    surrogates are fake dates, so the egress gate passes the payload. The
+    orchestrator's step 4b (``_assert_surrogates_are_distinct``) then catches the
+    duplicate and refuses the run before the provider is called -- correct, but it
+    refuses with ``PipelineError(reason='surrogate_collision')``, so an ordinary
+    document simply cannot be processed, and that function's docstring states the
+    opposite ("reaching this is a bug upstream, not a user input: the
+    pseudonymization strategy already rejects a candidate fake that any surrogate
+    in the session has taken"). This test makes that sentence true of Tier 2 too.
+
+    The decisive assertion is therefore asked of the *orchestrator's own* check
+    rather than restated here, and of the vault rather than of the strategy: every
+    surrogate on the wire resolves back to the original it stands for.
+    """
+    iso, spelled = "2024-01-05", "Friday, January 5, 2024"
+    text = f"Admitted {iso}. Discharge summary dated {spelled}."
+    detections = [span(text, iso, "DATE"), span(text, spelled, "DATE")]
+
+    strategy = build_strategy("pseudonymization", env.context())
+    assert isinstance(strategy, PseudonymizationStrategy)
+    shifted = (datetime(2024, 1, 5).date() + timedelta(days=strategy.shift_days)).isoformat()
+
+    # Premise, computed from the parsers rather than pinned: unguarded, these two
+    # really do render one string. If a renderer ever changes so that they do not,
+    # this test would pass for the wrong reason and must be re-pointed.
+    for source in (iso, spelled):
+        parsed = parse_source_date(source)
+        assert parsed is not None, source
+        rendered = parsed.render(parsed.value + timedelta(days=strategy.shift_days))
+        assert rendered == shifted, f"{source!r} renders {rendered!r}, not {shifted!r}"
+    assert normalize(iso) != normalize(spelled), "premise: two distinct originals"
+
+    result = await env.engine.obfuscate(
+        env.session_id, text, detections, strategy="pseudonymization"
+    )
+
+    # Two distinct originals, two vault rows, and -- the property -- two surrogates.
+    assert await env.vault.row_count(env.session_id) == 2
+    issued = [record.surrogate for record in result.tokens]
+    assert len(issued) == 2
+    assert len(set(issued)) == 2, "two originals were issued one surrogate"
+
+    # The degradation is the exception, not a disabled tier: the first mention keeps
+    # the session shift and only the duplicate falls back to a token.
+    assert issued[0] == shifted
+    assert STRICT_TOKEN_RE.fullmatch(issued[1]), issued[1]
+    assert result.obfuscated_text == f"Admitted {issued[0]}. Discharge summary dated {issued[1]}."
+
+    # Asked of the vault, not of the engine: each surrogate on the wire resolves
+    # back to the original it stands for, and to that one only.
+    assert await env.vault.get_by_surrogate(env.session_id, issued[0]) == iso
+    assert await env.vault.get_by_surrogate(env.session_id, issued[1]) == spelled
+
+    # And the run the orchestrator would refuse is now a run it accepts. This is the
+    # consequence the property exists for, so it is checked against the real
+    # function rather than re-derived here.
+    _assert_surrogates_are_distinct(result.tokens, env.session_id, "test-run")
 
 
 async def test_token_id_collision_is_re_derived_and_both_values_resolve(

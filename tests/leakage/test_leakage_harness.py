@@ -51,13 +51,26 @@ that closes one is a red rather than a silent widening of the headline claim:
   manufacture reds indistinguishable from the real thing. See
   :func:`test_a_partial_value_leak_is_outside_what_this_harness_claims`, which pins
   the boundary so it cannot be forgotten.
-* **A value glued into a longer word is out of scope.** ``xJohn Smithx`` carries the
-  original byte for byte and is not reported, because :func:`_occurs_as_a_unit`
-  asserts a word boundary on each side whose adjacent needle character is
-  alphanumeric. Removing that assertion is what makes ``Brown`` match inside
-  ``Browning``; restricting the relaxation to multi-word originals does not help
-  either, because ``chronic low back pains`` contains ``chronic low back pain``.
+* **A value glued into a longer word is out of scope -- on the text channels.**
+  ``xJohn Smithx`` carries the original byte for byte and is not reported by
+  :func:`find_in_text`, because :func:`_occurs_as_a_unit` asserts a word boundary on
+  each side whose adjacent needle character is alphanumeric. Removing that assertion
+  is what makes ``Brown`` match inside ``Browning``; restricting the relaxation to
+  multi-word originals does not help either, because ``chronic low back pains``
+  contains ``chronic low back pain``.
   See :func:`test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`.
+
+  It bites hardest on the audit *file*, where it is a boundary of one **limb** rather
+  than of the whole assertion. SQLite writes a record's column values end to end with
+  no delimiter, so an original in any label column is always glued between
+  alphanumerics -- ``...EGRESS_BLOCKMarguerite Vandenbergdeadbeef...`` -- and
+  :func:`find_in_bytes` reports a file containing the value byte for byte as clean.
+  :func:`find_in_text` over the *query* view of the same rows sees
+  ``"entity_type": "Marguerite Vandenberg"``, where JSON quoting supplies the
+  boundaries, and catches it; assertion 2 applies both. Loosening the byte limb so it
+  could carry the case alone was tried and reverted -- ``8.2`` is an ordinary vaulted
+  lab value and ``{"elapsed_ms":18.25}`` then reads as a leak. See
+  :func:`test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`.
 * **A combining mark spliced into a value is out of scope.** ``normalize`` is NFKC,
   which composes -- so a *decomposed* rendering of an accented original is caught,
   but a mark that was never in the vaulted value is not removable by any
@@ -93,6 +106,7 @@ component graph are built once for the module and every run gets a fresh session
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import logging
@@ -106,6 +120,8 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from fixtures import generator
 from secure_context_pipeline.audit.logger import EGRESS_BLOCK, AuditLogger, canonical_json
@@ -117,7 +133,13 @@ from secure_context_pipeline.detection.registry import EntityRegistry, load_regi
 from secure_context_pipeline.errors import EgressBlockedError
 from secure_context_pipeline.llm.base import LLMResponse
 from secure_context_pipeline.llm.mock_provider import MockProvider
-from secure_context_pipeline.models import PipelineResult
+from secure_context_pipeline.models import (
+    MAX_AUDIT_LABEL_LEN,
+    MAX_DETAIL_VALUE_LEN,
+    AuditEvent,
+    PipelineResult,
+    TokenRecord,
+)
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import (
@@ -127,7 +149,7 @@ from secure_context_pipeline.pipeline.egress_gate import (
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
-from secure_context_pipeline.surrogates import STRICT_TOKEN_RE, TOKEN_RE, extract_token_ids
+from secure_context_pipeline.surrogates import TOKEN_RE, extract_token_ids
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
 
@@ -552,9 +574,33 @@ def find_in_bytes(originals: frozenset[str], haystack: bytes) -> list[str]:
     path: three fixture originals are pure six-digit decimals (``382892``,
     ``390538``, ``364896``) and every audit row carries a 32-character hex
     ``run_id``, so a decimal original can appear *inside* a run ID by chance and be
-    reported as a leak. Roughly 1e-6 per run — but on this particular assertion a
+    reported as a leak. Roughly 1e-6 per run -- but on this particular assertion a
     one-in-a-million false red is worse than the arithmetic suggests, because the
     next genuine red gets waved away as "that flaky audit check".
+
+    **What this limb does and does not see, since it is the half that is easy to
+    overrate.** SQLite writes a record's column values end to end with no delimiter,
+    so an original in a label column sits in the file as
+    ``...EGRESS_BLOCKMarguerite Vandenbergdeadbeef...`` -- alphanumeric on both
+    edges, which is the "glued into a longer word" shape this module documents as
+    out of scope. Measured, not reasoned: emitting one event with a name in
+    ``entity_type`` produces exactly that layout and this function returns nothing.
+
+    That is a boundary and not a hole, because it is not the only limb.
+    :func:`find_in_text` over the **query view** of the same rows sees the identical
+    value as ``"entity_type": "Marguerite Vandenberg"``, where JSON quoting supplies
+    the boundaries, and the run below applies both -- so a label-column original is
+    caught, by the other half of assertion 2. What this limb uniquely covers is bytes
+    the query view cannot reach: freed pages, WAL remnants, superseded row images.
+    :func:`test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did`
+    pins the division of labour, so neither half can be quietly deleted on the
+    assumption that the other one is doing the work.
+
+    Loosening this limb to plain containment was tried and reverted: it re-opens the
+    exact false-positive class above with interest. A lab value like ``8.2`` is an
+    ordinary vaulted original and every audit row carries an ``elapsed_ms`` -- so
+    ``{"elapsed_ms":18.25}`` reports a leak that is not there. Measured before
+    shipping, not after.
 
     ``errors="replace"`` is what makes decoding safe here: an invalid byte becomes
     U+FFFD, which is not alphanumeric and therefore acts as a boundary, so binary
@@ -591,30 +637,100 @@ async def surrogate_map(harness: Harness, session_id: str, result: PipelineResul
     return mapping
 
 
-def expected_round_trip(result: PipelineResult, mapping: dict[str, str]) -> set[str]:
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def issued_token_id(surrogate: str) -> str | None:
+    """The 8-hex ID of a surrogate **we** issued, parsed without the production grammar.
+
+    Hand-written string surgery rather than ``STRICT_TOKEN_RE`` on purpose -- see
+    :func:`expected_round_trip` for why every predicate that decides *what must come
+    back* is derived independently of the code that puts it back. The input is our
+    own vault's key, not model output, so it needs no tolerance: strip the brackets,
+    drop the optional ``|hint``, take the last underscore-separated component, and
+    require exactly eight hex digits.
+
+    Returns ``None`` for a pseudonym, which carries no ID and is matched as a
+    literal instead.
+    """
+    if not (surrogate.startswith("[") and surrogate.endswith("]")):
+        return None
+    core = surrogate[1:-1].split("|", 1)[0]
+    tail = core.rsplit("_", 1)[-1]
+    if len(tail) == 8 and all(character in _HEX for character in tail):
+        return tail.lower()
+    return None
+
+
+def expected_round_trip(raw_llm_response: str, mapping: dict[str, str]) -> set[str]:
     """Originals that MUST be back in the restored text.
 
-    Derived from what the model actually said. A token survives the mock's
-    mangling (bolding, possessives, dropped brackets, upper-cased hash) only as
-    its 8-hex ID, so token-shaped surrogates are matched on the ID; pseudonyms
-    carry no ID and are matched as the literal string the mock echoed.
+    **This function deliberately shares no predicate with the restorer**, and that
+    is the entire point of it. Leak detection and round-trip completeness pull in
+    opposite directions, and this module used to run both through the same two
+    production predicates:
 
-    The pseudonym branch is boundary-anchored for the same reason everything else
-    in this module is: a short Faker surname sitting inside a longer ordinary word
-    is not the model *mentioning* that surrogate, and treating it as one puts an
-    original into ``expected`` that the restorer was never asked to produce --
-    which then fails the round-trip assertion for a value nobody referenced.
+    * ``extract_token_ids`` -- i.e. ``surrogates.TOKEN_RE``, which is also how the
+      restorer decides what to replace;
+    * ``_occurs_as_a_unit`` -- the egress gate's occurrence rule.
+
+    For **leak detection** sharing is correct and is enforced by
+    :func:`test_no_leak_comparison_in_this_module_bypasses_the_shared_rule`: a scan
+    laxer than the gate would report clean through a leak the gate blocks.
+
+    For **completeness** it is exactly wrong, because it makes the expectation
+    agree with the thing it is checking. If ``TOKEN_RE`` cannot see a token the
+    model emitted, then: ``expected`` silently omits the original, the restorer
+    silently leaves the token in the answer, assertion 4's residual scan (also
+    ``TOKEN_RE``) cannot see it either, all three agree, and the only visible
+    effect is that ``round_trip_checked`` in the summary line gets *smaller*. A
+    shrinking denominator is not a failure signal; nobody reads it as one. The
+    user gets an answer with a dangling ``1a2b3c4d`` in it and the harness reports
+    100/100 clean.
+
+    So the expectation is derived from an independent reading of the model's own
+    words: the 8-hex ID as a plain case-insensitive substring (:func:`_mentions`),
+    and pseudonyms through :func:`_reference_occurs_as_a_unit`, the
+    independently-written occurrence rule this module already keeps for
+    differential testing. Both are *at least as broad* as the production grammar,
+    which is the direction that makes a restorer miss a red instead of a rounding
+    error.
+
+    A bare ID substring cannot manufacture a false expectation in practice: the IDs
+    are ``sha256[:8]`` and the only place they appear in a response is inside the
+    token the payload carried. If one ever did collide, the resulting red is still
+    an answer with an unrestored ID in it.
+
+    The pseudonym branch stays boundary-anchored: a short Faker surname sitting
+    inside a longer ordinary word is not the model *mentioning* that surrogate, and
+    treating it as one puts an original into ``expected`` that the restorer was
+    never asked to produce.
+
+    Takes the response text rather than a :class:`PipelineResult` so it can be
+    exercised directly with hand-built model output -- which is what
+    :func:`test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`
+    does.
     """
-    ids_in_response = extract_token_ids(result.raw_llm_response)
     expected: set[str] = set()
     for surrogate, original in mapping.items():
-        token = STRICT_TOKEN_RE.fullmatch(surrogate)
-        if token is not None:
-            if token.group(3).lower() in ids_in_response:
+        token_id = issued_token_id(surrogate)
+        if token_id is not None:
+            if _mentions(token_id, raw_llm_response):
                 expected.add(original)
-        elif occurs_as_a_unit(surrogate, result.raw_llm_response):
+        elif _reference_occurs_as_a_unit(surrogate, raw_llm_response):
             expected.add(original)
     return expected
+
+
+def _mentions(token_id: str, raw_llm_response: str) -> bool:
+    """Did the model refer to this token ID at all? Decided without ``TOKEN_RE``.
+
+    Case-insensitive and unanchored, because the question is "did the model say
+    this ID", not "did it emit a well-formed token" -- the second question is the
+    restorer's, and asking the restorer's question here is what made the
+    expectation collapse whenever the restorer was wrong.
+    """
+    return token_id.lower() in raw_llm_response.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +843,59 @@ def test_the_byte_scan_does_not_invent_leaks_inside_run_ids() -> None:
     # Undecodable bytes become U+FFFD, which is a boundary rather than a letter,
     # so binary noise cannot glue itself to a needle and manufacture a match.
     assert find_in_bytes(frozenset({original}), b"\xff\xfe" + original.encode()) == [original]
+
+
+def test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things() -> None:
+    """Assertion 2 has two limbs and neither is redundant. Which is which, exactly.
+
+    SQLite writes a record's column values end to end with no delimiter, so an
+    original in a label column lands in the *file* as
+    ``…EGRESS_BLOCKMarguerite Vandenbergdeadbeef…`` -- alphanumeric on both edges,
+    which is the "glued into a longer word" shape the anchored rule deliberately does
+    not match. The **byte** limb is therefore blind to it. The **query** limb sees the
+    identical value as ``"entity_type": "Marguerite Vandenberg"``, where JSON quoting
+    supplies the boundaries, and catches it.
+
+    Both directions are asserted here because the tempting simplification is wrong in
+    both directions. Loosening the byte limb to plain containment so it could carry
+    this case alone was tried and reverted: ``8.2`` is an ordinary vaulted lab value
+    and every audit row carries an ``elapsed_ms``, so ``{"elapsed_ms":18.25}`` reports
+    a leak that is not there -- the same false-positive class the anchoring exists to
+    prevent, on a channel where a rare false red teaches the reader to disbelieve the
+    next genuine one. And deleting the byte limb because the query limb covers this
+    case is equally wrong: the byte limb is the only thing that sees bytes the query
+    view cannot reach -- freed pages, WAL remnants, superseded row images.
+
+    So the division of labour is pinned, rather than each limb being assumed to be
+    doing the other's job.
+    """
+    name = "Marguerite Vandenberg"
+    glued = b"sess-a1b2run-c3d4EGRESS_BLOCK" + name.encode() + b"deadbeef{\"count\":1}"
+    quoted = json.dumps([{"entity_type": name, "detail": {"count": 1}}], ensure_ascii=False)
+
+    assert name.encode() in glued, "premise: the value really is in the file, verbatim"
+    assert not find_in_bytes(frozenset({name}), glued), (
+        "if this now fires the byte limb gained glued-word detection -- good, but the "
+        "false-positive path below must be re-measured before it ships"
+    )
+    assert find_in_text(frozenset({name}), quoted) == [name], (
+        "the query limb is what actually catches a label-column original; if this "
+        "stops firing, assertion 2 is blind to it on both limbs"
+    )
+
+    # The false positive that reverted the obvious "just loosen the byte limb" fix.
+    latency_row = b'detail{"elapsed_ms":18.25,"count":3}'
+    assert b"8.2" in latency_row, "premise: an ordinary latency contains this lab value"
+    assert not find_in_bytes(frozenset({"8.2"}), latency_row), (
+        "a vaulted lab value of 8.2 is being reported as a leak because an audit "
+        "latency happened to contain those three characters"
+    )
+
+    # ...and the hex-in-run_id false positive the anchoring was introduced for.
+    assert not find_in_bytes(
+        frozenset({"382892"}), b"\x02\x00run_id=a3f2382892c14e7b9d0e5a6182f4cc71"
+    )
+    assert find_in_bytes(frozenset({"4823910"}), b'detail{"v":"MRN 4823910"}') == ["4823910"]
 
 
 def test_the_scan_sees_an_invisible_character_bypass() -> None:
@@ -1101,6 +1270,43 @@ def test_the_occurrence_rule_has_no_fourth_copy() -> None:
     )
 
 
+#: A small alphabet with one character from each class the occurrence rule cares
+#: about: letters, a digit, an underscore (a regex ``\w`` that is *not* alphanumeric
+#: -- the exact character the original bug turned on), a space, and punctuation on
+#: both sides of a needle. Deliberately tiny so generated needles actually collide
+#: with generated haystacks; a wide alphabet makes every draw a trivial non-match.
+_FUZZ_ALPHABET = "ab1_ .[]$-"
+
+
+@given(
+    needle=st.text(alphabet=_FUZZ_ALPHABET, min_size=1, max_size=6),
+    haystack=st.text(alphabet=_FUZZ_ALPHABET, max_size=24),
+)
+@settings(max_examples=2_000, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_the_shared_occurrence_rule_agrees_with_the_reference_on_generated_input(
+    needle: str, haystack: str
+) -> None:
+    """The differential test, generalised past the 220 pairs somebody thought of.
+
+    :func:`test_the_occurrence_rule_has_no_fourth_copy` compares the shared rule
+    against :func:`_reference_occurs_as_a_unit` over a hand-written corpus. Hand-
+    written corpora encode the cases their author already knew about, and every
+    version of this bug so far has been a case nobody thought of -- ``_`` counting as
+    a word character, a needle whose first character is punctuation, an invisible
+    codepoint, a value glued between two SQLite column values. Four for four, the
+    corpus was extended *after* the miss.
+
+    So the same comparison is driven with generated input over an alphabet built from
+    the character classes the rule turns on. A disagreement means one of the two is
+    wrong and neither can be trusted until it is resolved; hypothesis shrinks it to a
+    minimal pair, which is the part a hand-written corpus cannot do at all.
+
+    This is the one place in the suite where the *shared* rule is checked rather than
+    merely shared, so it is worth the couple of seconds it costs.
+    """
+    assert occurs_as_a_unit(needle, haystack) == _reference_occurs_as_a_unit(needle, haystack)
+
+
 #: Membership tests this module must never contain again. Each is a bare ``in``
 #: against a string the pipeline produced, and every one of them was a real defect:
 #: two hid leaks by being stricter than the code, two invented leaks by being
@@ -1116,8 +1322,8 @@ _FORBIDDEN_MEMBERSHIP_SNIPPETS = (
 )
 
 
-def test_no_comparison_in_this_module_bypasses_the_shared_rule() -> None:
-    """No bare ``in`` decides whether a value occurs, anywhere in this file.
+def test_no_leak_comparison_in_this_module_bypasses_the_shared_rule() -> None:
+    """No bare ``in`` decides whether a value **leaked**, anywhere in this file.
 
     Four separate call sites here have now been wrong in exactly this way, in both
     directions, and each one sat directly underneath a headline assertion:
@@ -1132,16 +1338,58 @@ def test_no_comparison_in_this_module_bypasses_the_shared_rule() -> None:
 
     A behavioural test catches the *instance* it was written for. This catches the
     **class**, which is the only thing that has actually worked on this bug: every
-    occurrence decision in this module has to route through
-    :data:`occurs_as_a_unit`, so the next person to add a scan cannot quietly
-    invent a fifth convention that agrees with nothing.
+    *leak* decision in this module has to route through :data:`occurs_as_a_unit`,
+    so the next person to add a scan cannot quietly invent a fifth convention that
+    agrees with nothing.
 
-    ``not_restored`` is the deliberate exception in spirit -- it asks whether a
-    value is *absent* -- but it is written as ``not occurs_as_a_unit(...)`` for the
-    same reason, so there is no carve-out to remember.
+    **The scope of this rule is leak detection, and that is a narrowing rather than
+    a loophole.** It used to be stated as "no comparison anywhere in this module",
+    which sounded stronger and was actively harmful in one place: the round-trip
+    *expectation* must NOT share a predicate with the restorer, or it agrees with
+    the code it is checking and shrinks silently whenever that code is wrong. The
+    **It also used to scan only the first two-thirds of the file**, which is worth
+    naming because it made the rule vacuous exactly where it mattered. The scanned
+    region was ``source.split("_FORBIDDEN_MEMBERSHIP_SNIPPETS = (")[0]`` -- a way of
+    stopping the tuple below from matching itself -- and the 100-run function is
+    defined *after* that tuple. So three of the four historical bugs sat in a region
+    this rule never looked at. Measured, not spotted by reading: putting
+    ``[o for o in originals if o in sent_payload]`` back into the payload scan left
+    this test **green**. The exclusion is now computed from the parsed module, so the
+    only regions skipped are the tuple itself and this function's own body.
+
+    The two rules pull opposite ways, and pretending they were one rule is what kept
+    the expectation tied to ``TOKEN_RE``. The other direction is enforced by
+    :func:`test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`,
+    which fails if the completeness path starts using the shared rule again.
     """
     source = Path(__file__).read_text(encoding="utf-8")
-    body = source.split('_FORBIDDEN_MEMBERSHIP_SNIPPETS = (', 1)[0]
+    lines = source.splitlines()
+    tree = ast.parse(source)
+
+    # Everything except the snippet tuple and this function, which quote the
+    # forbidden text by construction. Computed from the parse, so the covered region
+    # cannot silently shrink again.
+    skip: set[int] = set()
+    for node in ast.walk(tree):
+        named_tuple = (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "_FORBIDDEN_MEMBERSHIP_SNIPPETS"
+                for t in node.targets
+            )
+        )
+        this_test = (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "test_no_leak_comparison_in_this_module_bypasses_the_shared_rule"
+        )
+        if (named_tuple or this_test) and node.end_lineno is not None:
+            skip.update(range(node.lineno, node.end_lineno + 1))
+    body = "\n".join(line for n, line in enumerate(lines, start=1) if n not in skip)
+
+    assert "async def test_no_original_ever_leaves_the_process" in body, (
+        "the scanned region no longer includes the 100-run function, which is where "
+        "three of the four historical bugs actually lived"
+    )
 
     offenders = [snippet for snippet in _FORBIDDEN_MEMBERSHIP_SNIPPETS if snippet in body]
     assert not offenders, (
@@ -1150,13 +1398,108 @@ def test_no_comparison_in_this_module_bypasses_the_shared_rule() -> None:
         "occurs_as_a_unit(needle, haystack) instead."
     )
 
-    # The rule really is the one thing in use: every scan helper calls it.
+    # The rule really is the one thing in use: every leak-scan helper calls it.
     for helper in ("def find_in_text", "def find_in_bytes"):
         start = body.index(helper)
         end = body.index("\ndef ", start + 1)
         assert "occurs_as_a_unit(" in body[start:end], (
             f"{helper} no longer routes through the shared occurrence rule"
         )
+
+    # Both limbs of the audit assertion must still be applied by the run. Loosening
+    # the byte limb so it could carry the label-column case alone was tried and
+    # reverted (see find_in_bytes); deleting either limb on the assumption that the
+    # other one covers it is the same mistake in the other direction.
+    run_start = source.index("async def test_no_original_ever_leaves_the_process")
+    for limb in ("find_in_text(originals, audit_json)", "find_in_bytes(originals, harness.audit_bytes())"):
+        assert limb in source[run_start:], (
+            f"the audit assertion no longer applies {limb} -- the two limbs see "
+            "different things and neither is redundant"
+        )
+
+
+#: Production predicates the round-trip *expectation* must never be built from.
+#: Each is a predicate the restorer itself uses, so an expectation phrased in terms
+#: of one cannot disagree with the restorer -- which is the only thing it is for.
+_RESTORER_PREDICATES = ("extract_token_ids", "STRICT_TOKEN_RE", "TOKEN_RE", "occurs_as_a_unit")
+
+
+def test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots() -> None:
+    """Completeness is checked against an *independent* reading of the model's words.
+
+    Two halves, and the behavioural one is the point.
+
+    **Structural.** ``expected_round_trip`` and ``issued_token_id`` must not *use*
+    any predicate the restorer uses. This is the direction the sibling rule above
+    deliberately does not cover. Checked over the parsed AST rather than the source
+    text, so the names can still be discussed in a docstring -- which they have to
+    be, since the reason they are forbidden is the whole content of this rule.
+
+    **Behavioural.** A token shape ``TOKEN_RE`` cannot match -- here the bare 8-hex
+    ID, which a model writes constantly when it paraphrases rather than quotes --
+    must still land in ``expected``. Under the old derivation it did not: the
+    expectation was built with ``extract_token_ids``, so a token the production
+    grammar could not see was dropped from the expectation, left alone by the
+    restorer, and missed by assertion 4's residual scan, all three agreeing. The
+    only trace was a smaller ``round_trip_checked`` in the summary line, and a
+    denominator quietly shrinking is not a signal anybody acts on.
+
+    Asserted with the production regex on the same input, so the premise -- that
+    this really is a shape ``TOKEN_RE`` misses -- is measured rather than claimed.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name not in ("expected_round_trip", "issued_token_id", "_mentions"):
+            continue
+        checked += 1
+        used = {inner.id for inner in ast.walk(node) if isinstance(inner, ast.Name)}
+        used |= {inner.attr for inner in ast.walk(node) if isinstance(inner, ast.Attribute)}
+        borrowed = sorted(used & set(_RESTORER_PREDICATES))
+        assert not borrowed, (
+            f"{node.name} is built from {borrowed}, which the restorer also uses -- so "
+            "the expectation cannot disagree with the restorer and a token the "
+            "production grammar misses will vanish from both at once"
+        )
+    assert checked == 3, (
+        f"expected to check 3 completeness helpers, found {checked} -- one was "
+        "renamed or removed without this rule being reconsidered"
+    )
+
+    surrogate = "[PHI_NAME_1a2b3c4d]"
+    original = "Marguerite Vandenberg"
+    mapping = {surrogate: original}
+
+    quoted = f"The record names {surrogate} as the patient."
+    assert expected_round_trip(quoted, mapping) == {original}
+
+    # The shape the production grammar cannot see, which a model does emit.
+    paraphrased = "The record names the patient (internal ref 1a2b3c4d) throughout."
+    assert not extract_token_ids(paraphrased), (
+        "premise: TOKEN_RE really is blind to a bare ID -- if it now matches, this "
+        "test needs a shape that is still outside the grammar"
+    )
+    assert expected_round_trip(paraphrased, mapping) == {original}, (
+        "the model referred to a token the restorer's grammar cannot see; if the "
+        "restorer leaves it, the answer carries a dangling hex ID and this harness "
+        "must report it rather than quietly expect less"
+    )
+
+    # Upper-cased, as the mock's own upper_hash mutation renders it.
+    assert expected_round_trip("ref 1A2B3C4D", mapping) == {original}
+
+    # And it does not invent expectations out of nothing.
+    assert expected_round_trip("The record names nobody in particular.", mapping) == set()
+    assert expected_round_trip("ref deadbeef", mapping) == set()
+
+    # A pseudonym carries no ID, so it is matched as a literal -- and still
+    # boundary-anchored, or a short Faker draw inside an ordinary word becomes an
+    # expectation the restorer was never asked to satisfy.
+    fake_map = {"Brown": "Vandenberg"}
+    assert expected_round_trip("Counsel Brown filed the motion.", fake_map) == {"Vandenberg"}
+    assert expected_round_trip("Counsel Browning filed the motion.", fake_map) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1272,13 +1615,19 @@ async def test_no_original_ever_leaves_the_process(
     )
 
     # --- 3. round-trip completeness ----------------------------------------
-    expected = expected_round_trip(result, mapping)
+    # Both predicates here are the INDEPENDENT ones -- see expected_round_trip.
+    # Leak detection above must never be laxer than the gate; completeness must
+    # never share a predicate with the restorer. Those are different rules, and
+    # running both through one shared helper is what let a token TOKEN_RE could
+    # not see disappear from the expectation, the answer and the residual scan at
+    # the same time.
+    expected = expected_round_trip(result.raw_llm_response, mapping)
     assert expected, (
         f"run {index}: the model referenced no surrogate at all, so the round-trip "
         f"assertion would be vacuous (kind={kind}, seed={seed})"
     )
     not_restored = sorted(
-        o for o in expected if not occurs_as_a_unit(o, result.restored_text)
+        o for o in expected if not _reference_occurs_as_a_unit(o, result.restored_text)
     )
     assert not not_restored, (
         f"run {index}: {len(not_restored)} of {len(expected)} referenced surrogate(s) were not "
@@ -1382,6 +1731,222 @@ async def test_unknown_shape_value_blocks_egress_and_the_call_never_fires(
     assert len(blocks) == 1, f"expected exactly one EGRESS_BLOCK event, got {len(blocks)}"
     assert blocks[0].detail["reason"] == "vault_original"
     assert UNKNOWN_SHAPE_VALUE not in json.dumps(blocks[0].model_dump(), default=str)
+
+
+#: Every shape ``surrogates.TOKEN_RE`` accepts, with the mutation class the mock
+#: uses to produce it -- or ``None`` where the mock never produces it at all.
+#: ``MockProvider`` defines six mutation classes and both the round-trip test and
+#: this harness were written against exactly those six, so the ``None`` rows are the
+#: tolerance nothing had ever exercised: the adversary was written by the defender.
+_TOKEN_SHAPES: tuple[tuple[str, str, str | None], ...] = (
+    ("canonical", "[PHI_NAME_1a2b3c4d]", "verbatim"),
+    ("upper_hash", "[PHI_NAME_1A2B3C4D]", "upper_hash"),
+    ("bracket_dropped", "PHI_NAME_1a2b3c4d", "bracket_dropped"),
+    ("brace_brackets", "{PHI_NAME_1a2b3c4d}", None),
+    ("paren_brackets", "(PHI_NAME_1a2b3c4d)", None),
+    ("hyphen_separators", "[PHI-NAME-1a2b3c4d]", None),
+    ("hyphen_no_brackets", "PHI-NAME-1a2b3c4d", None),
+    ("mismatched_brackets", "[PHI_NAME_1a2b3c4d}", None),
+    ("interior_whitespace", "[ PHI_NAME_1a2b3c4d ]", None),
+    ("mixed_case_hash", "[PHI_NAME_1A2b3C4d]", None),
+)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_every_token_shape_the_grammar_accepts_restores_not_just_the_six_the_mock_emits(
+    harness: Harness,
+) -> None:
+    """The surplus tolerance, exercised -- because the adversary was written by us.
+
+    ``MockProvider`` defines exactly six mutation classes, and the round-trip
+    assertion in this module was written against exactly those six. ``TOKEN_RE``
+    tolerates considerably more: ``{}`` and ``()`` brackets, ``-`` separators, a
+    mismatched bracket pair, up to four whitespace characters inside the token, and
+    any casing of the hash. Every one of those is something a real model does and the
+    mock never does, so the 100 runs say nothing about them -- the suite was grading
+    the pipeline against a mangler the pipeline's own author wrote.
+
+    That gap is not cosmetic. A shape the grammar advertises but the restorer fumbles
+    is a token that reaches the **user** un-restored, and the shape most likely to be
+    fumbled is exactly the one no test ever sent. So each shape goes through the real
+    :class:`Restorer` against a real vault record, with the mock removed from the
+    loop entirely.
+
+    Three things are asserted per shape, because "the original came back" is not the
+    whole contract: the original is present, the count says the restorer believes it
+    did the work, and nothing token-shaped survives -- a half-restored answer carrying
+    both is worse than either.
+    """
+    session_id, _expires_at = await harness.sessions.create("test-user")
+    original = "Marguerite Vandenberg"
+    surrogate = "[PHI_NAME_1a2b3c4d]"
+    await harness.vault.put(
+        session_id,
+        TokenRecord(
+            session_id=session_id,
+            token_id="1a2b3c4d",
+            entity_type="PHI_NAME",
+            category="PHI",
+            surrogate=surrogate,
+            created_at=1.0,
+        ),
+        original,
+    )
+    restorer = Restorer(vault=harness.vault, settings=harness.settings, audit=harness.audit)
+
+    unexercised = [name for name, _shape, mutation in _TOKEN_SHAPES if mutation is None]
+    assert len(unexercised) >= 6, (
+        "this table no longer describes any shape the mock cannot produce, so it has "
+        "stopped testing the surplus tolerance it exists for"
+    )
+
+    for name, shape, _mutation in _TOKEN_SHAPES:
+        assert TOKEN_RE.search(shape), (
+            f"premise: {name} is supposed to be inside the grammar -- if TOKEN_RE no "
+            "longer accepts it, the grammar narrowed and this table must say so"
+        )
+        text = f"The record names {shape} as the patient of record."
+        result = await restorer.restore(
+            session_id,
+            text,
+            strategy="tokenization",
+            surrogates={surrogate: original},
+            issued={"1a2b3c4d"},
+        )
+        assert original in result.text, (
+            f"{name} ({shape!r}) is accepted by TOKEN_RE and was NOT restored, so a "
+            "model emitting it hands the user a raw token"
+        )
+        assert result.restored_count == 1, (
+            f"{name}: restored_count is {result.restored_count}, so the answer is right "
+            "by accident rather than by the restorer having done the substitution"
+        )
+        assert not TOKEN_RE.search(result.text), (
+            f"{name}: something token-shaped survived into the answer alongside the "
+            f"restored original: {result.text!r}"
+        )
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The audit log CAN physically hold an original. This is what stops it.
+
+    Worth stating in a test because the claim is easy to overstate in a live review
+    and the overstatement is checkable in one line. The size ceilings -- 128
+    characters on the label columns, 64 on a ``detail`` value -- make the log
+    incapable of holding *content*, which is the bulk-exfiltration shape. They do not
+    and cannot make it incapable of holding a name or an MRN: ``"Marguerite
+    Vandenberg"`` is 21 characters and ``"MRN 4823910"`` is 11, so both pass the
+    write-boundary guard untouched and land verbatim in the raw SQLite bytes. That is
+    asserted here rather than argued, on a real ``AuditLogger`` and a real file.
+
+    What actually holds is narrower and is *measured*: no call site in the package
+    passes a value to ``emit`` -- every field is a token ID, a type name, a count, a
+    latency or a digest -- and assertion 2 scans both the query view of the rows and
+    the raw audit file, against every vaulted original, on all 100 runs. The half
+    nothing pinned was that the scan would **catch** such a write if a call site ever
+    started making one, which is the property the other 100 tests rely on and which
+    would fail silently if either limb were narrowed.
+
+    So the value is planted through the real writer and then hunted exactly the way
+    the run hunts it -- and the result is attributed to a limb rather than to "the
+    scan", because the two limbs do not see the same thing. The **query** limb catches
+    a label-column original (JSON quoting supplies the boundaries the anchored rule
+    needs); the **byte** limb does not, because SQLite stores column values with no
+    delimiter between them. Left unattributed, this test would read as evidence for a
+    property the byte limb does not have, and deleting the query limb would then look
+    safe. See
+    :func:`test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`.
+
+    The reverse is checked too: a log full of ordinary audit traffic must not report
+    a leak, or the instrument proves nothing by firing.
+    """
+    root = tmp_path_factory.mktemp("audit-value-probe")
+    db = root / "audit.db"
+    name = "Marguerite Vandenberg"
+    mrn = "MRN 4823910"
+
+    log = await AuditLogger.open(db)
+    try:
+        # Ordinary traffic first: the scan must be quiet on this.
+        for i in range(5):
+            await log.emit(
+                AuditEvent(
+                    ts=1_700_000_000.0 + i,
+                    session_id="sess-probe",
+                    run_id="run-probe",
+                    event_type=EGRESS_BLOCK,
+                    entity_type="PHI_NAME",
+                    token_id=f"{i:08x}",
+                    detail={"count": i, "elapsed_ms": 1.5},
+                )
+            )
+        clean = frozenset({name, mrn})
+        assert not find_in_bytes(clean, _audit_file_bytes(db)), (
+            "the byte scan fires on a log carrying nothing but token IDs and counts"
+        )
+
+        # Now the write the ceilings do not stop. This is the overclaim, disproven.
+        assert len(name) <= MAX_AUDIT_LABEL_LEN and len(mrn) <= MAX_DETAIL_VALUE_LEN
+        await log.emit(
+            AuditEvent(
+                ts=1_700_000_100.0,
+                session_id="sess-probe",
+                run_id="run-probe",
+                event_type=EGRESS_BLOCK,
+                entity_type=name,
+                token_id="deadbeef",
+                detail={"v": mrn},
+            )
+        )
+    finally:
+        await log.close()
+
+    blob = _audit_file_bytes(db)
+    assert name.encode("utf-8") in blob and mrn.encode("utf-8") in blob, (
+        "premise: a short original really does reach the file verbatim -- if this "
+        "fails the schema gained a guard and the README's wording should say so"
+    )
+
+    # Assertion 2 exactly as the run performs it: both limbs, unioned.
+    planted = frozenset({name, mrn})
+    reopened = await AuditLogger.open(db)
+    try:
+        events = await reopened.query(limit=10_000)
+        audit_json = json.dumps(
+            [event.model_dump() for event in events], default=str, ensure_ascii=False
+        )
+    finally:
+        await reopened.close()
+
+    query_limb = find_in_text(planted, audit_json)
+    byte_limb = find_in_bytes(planted, blob)
+    caught = sorted(set(query_limb) | set(byte_limb))
+    assert caught == sorted([mrn, name]), (
+        "an original written into the audit log was not reported by assertion 2 -- "
+        f"query limb saw {query_limb}, byte limb saw {byte_limb}"
+    )
+
+    # ...and which limb did the work, so the attribution cannot rot.
+    assert name in query_limb and name not in byte_limb, (
+        "the label-column case is the query limb's to catch; if the byte limb now "
+        "catches it too, check the elapsed_ms false positive before celebrating"
+    )
+    assert mrn in query_limb and mrn in byte_limb, (
+        "a detail value is JSON-quoted in both views, so both limbs must see it"
+    )
+
+
+def _audit_file_bytes(db: Path) -> bytes:
+    """The audit DB plus its WAL sidecar, as raw bytes. Mirrors ``Harness.audit_bytes``."""
+    blob = b""
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(db) + suffix)
+        if path.is_file():
+            blob += path.read_bytes()
+    return blob
 
 
 # ---------------------------------------------------------------------------

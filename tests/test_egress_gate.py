@@ -53,8 +53,11 @@ from secure_context_pipeline.pipeline.egress_gate import (
     AUDIT_EMIT_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
     HIGH_SEVERITY_TYPES,
+    MIN_IDENTIFIER_DIGITS,
     MIN_ORIGINAL_LEN,
     EgressGate,
+    _deaccent,
+    _identifier_needles,
     _occurs_as_a_unit,
     _strip_invisible,
 )
@@ -795,6 +798,251 @@ async def test_a_short_original_padded_with_whitespace_is_not_scanned_either(
 
 
 # ---------------------------------------------------------------------------
+# Pass 1 -- the two forms that are NOT occurrence-as-a-unit questions
+#
+# Everything above this line asks "does the value appear as a standalone run of
+# text?". The boundary rule that question rests on is right for a name and wrong
+# for an identifier, and it was for a long time the only rule pass 1 had. Both
+# leaks below were reproduced end-to-end through an ordinary uploaded document
+# before they were closed -- see tests/integration/test_pipeline.py for the live
+# halves, which is where the claim "an attacker can reach this" is actually made.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("original", "payload", "why"),
+    [
+        pytest.param(
+            "47-1234567",
+            "Internal routing tag: batch47-1234567Alpha must match the ledger.",
+            "a vaulted TAX_ID glued to word characters on BOTH sides",
+            id="tax-id-glued-both-sides",
+        ),
+        pytest.param(
+            "512-24-8710",
+            "Reference SSN512-24-8710 on the remittance stub.",
+            "no separator at all in front -- the shape the module docstring used "
+            "to name as a deliberate miss",
+            id="ssn-glued-left",
+        ),
+        pytest.param(
+            "MRN: 5567281",
+            "Chart cross-reference MRN5567281B was opened.",
+            "the vaulted span includes its own label, so the whole value never "
+            "appears -- but the digits, which are the secret, do",
+            id="mrn-digits-only",
+        ),
+        pytest.param(
+            "Account No. 100200300400",
+            "Confirmation reference: ledger row 100200300400 (do not alter).",
+            "label-inclusion again, this time with the digits standing alone",
+            id="account-digits-only",
+        ),
+        pytest.param(
+            "BCBS123456789",
+            "Prior claim filed under member 123456789 last quarter.",
+            "an alphanumeric identifier whose digit core is what carries it",
+            id="insurance-digit-core",
+        ),
+    ],
+)
+async def test_a_vaulted_identifier_blocks_whatever_it_is_glued_to(
+    tmp_path: Path, original: str, payload: str, why: str
+) -> None:
+    """A digit-carrying original discloses itself regardless of its neighbours.
+
+    ``_occurs_as_a_unit`` answers "is this a word?", and for ``Brown`` inside
+    ``Browning`` the answer is rightly no. Applied to ``47-1234567`` inside
+    ``batch47-1234567Alpha`` the same rule returns the same no, and that answer is
+    wrong: ``batch`` conceals nothing from a reader or from a model, the digits are
+    the taxpayer ID byte-for-byte, and the document body is written by whoever
+    uploads the file. Every probe here is a payload the gate used to pass.
+
+    The premise assertion is the load-bearing part: each payload genuinely does NOT
+    contain the value as a unit, so nothing above this line could have caught it and
+    a green here cannot be coming from the boundary rule.
+    """
+    assert not _occurs_as_a_unit(original, payload), f"premise for {why}"
+    assert not _occurs_as_a_unit(normalize(original), normalize(payload)), why
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({original}))
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] == "vault_original"
+    assert exc.value.detail["hit_count"] == 1
+    await audit.close()
+
+
+@pytest.mark.parametrize(
+    ("original", "payload"),
+    [
+        # A short date: six digits, one below the floor.
+        ("03/12/85", "Filed 03/12/850 in the archive index."),
+        # An amount: six digits, below the floor.
+        ("$1,234.56", "Line item $1,234.567 on the statement."),
+        # A docket number: five digits at most.
+        ("1:23-cv-04567", "See 1:23-cv-045678 for the companion matter."),
+        # A name: no digits at all, which is the Brown/Browning case.
+        ("Brightwater", "Dr Brightwaters reviewed the chart."),
+    ],
+)
+async def test_a_value_below_the_identifier_floor_keeps_the_boundary_rule(
+    tmp_path: Path, original: str, payload: str
+) -> None:
+    """The widening is bounded, or it would block on ordinary text.
+
+    Dropping the adjacency requirement for *every* original would make a vaulted
+    date block any longer numeral containing it and a vaulted surname block every
+    word containing it -- the false-positive class that makes pseudonymization
+    unusable, and a denial of service reachable from a document.
+    ``MIN_IDENTIFIER_DIGITS`` is what keeps the two apart, so these four values --
+    each a real registry shape, each carrying fewer than seven digits or none -- must
+    still be governed by the boundary rule.
+    """
+    assert not _occurs_as_a_unit(original, payload), "premise: not present as a unit"
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({original}))
+    report = await gate.check(payload, SESSION)
+    assert report.originals_scanned == 1
+    await audit.close()
+
+
+def test_the_identifier_forms_are_derived_from_the_value_and_nothing_else() -> None:
+    """The rule itself, stated where a reader can see it fail.
+
+    The two tests above exercise ``_identifier_needles`` through the gate, which
+    means a subtly wrong rule can still look right if no probe happens to separate
+    the halves. This asks the function directly: which needles does a value
+    contribute, and -- the half that matters for false blocks -- which values
+    contribute nothing at all.
+    """
+    assert _identifier_needles("47-1234567") == ("47-1234567", "1234567")
+    assert _identifier_needles("512-24-8710") == ("512-24-8710",)  # no run reaches 7
+    assert _identifier_needles("mrn: 5567281") == ("5567281",)  # letters: core only
+    assert _identifier_needles("account no. 100200300400") == ("100200300400",)
+    assert _identifier_needles("bcbs123456789") == ("123456789",)
+
+    for inert in ("john smith", "03/12/85", "$1,234.56", "1:23-cv-04567", "a1c 7.4"):
+        assert _identifier_needles(inert) == (), inert
+
+    # And the half that is wider than the word "identifier" suggests, pinned here so
+    # it is a decision rather than a surprise: a value made only of digits and
+    # separators is in scope once it reaches the floor, whatever it means. A date
+    # with a four-digit year carries eight digits and is a HIPAA identifier in a
+    # medical record; a glued neighbour discloses it exactly as completely as it
+    # discloses an SSN. This assertion is what makes that visible to the next reader.
+    assert _identifier_needles("03/12/1985") == ("03/12/1985",)
+    assert _identifier_needles("(415) 555-0123") == ("(415) 555-0123",)
+
+    # The floor is the constant, not a number retyped here: one digit short
+    # contributes nothing and the floor itself contributes the whole value.
+    assert _identifier_needles("9" * (MIN_IDENTIFIER_DIGITS - 1)) == ()
+    assert _identifier_needles("9" * MIN_IDENTIFIER_DIGITS) == ("9" * MIN_IDENTIFIER_DIGITS,)
+
+
+@pytest.mark.parametrize(
+    "position",
+    [
+        pytest.param(9, id="mark-between-the-two-names"),
+        pytest.param(3, id="mark-inside-the-first-token"),
+        pytest.param(20, id="mark-at-the-very-end"),
+    ],
+)
+async def test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider(
+    tmp_path: Path, position: int
+) -> None:
+    """The fourth form: the skeleton comparison, and the only thing that sees this.
+
+    ``_INVISIBLE_RE`` folds 145 format codepoints and deliberately stops at combining
+    diacritics. That is right about the *needle* -- ``José`` and ``Jose`` are two
+    people -- and it left the payload side wide open: one U+0301 anywhere inside a
+    vaulted name produces a string that is different from all three original forms
+    and identical to the original for every human and for the model.
+
+    NFKC makes it worse rather than better where it can compose: ``l`` + U+0301
+    becomes ``ĺ`` (U+013A), a different letter, so normalising harder was never the
+    answer. The mark position is parametrized because it decides whether spaCy still
+    recognises the token -- between the names it does not, which is how the value
+    ends up unvaulted and on the wire -- and the gate must not care either way.
+    """
+    original = "Nathaniel Brightwater"
+    mark = unicodedata.lookup("COMBINING ACUTE ACCENT")
+    mutated = f"{original[:position]}{mark}{original[position:]}"
+    payload = f"For continuity, direct questions to {mutated} at reception."
+
+    # Premise: this is genuinely a different string in every form that existed.
+    assert original not in payload
+    assert not _occurs_as_a_unit(normalize(original), normalize(payload))
+    assert not _occurs_as_a_unit(
+        _strip_invisible(normalize(original)), _strip_invisible(normalize(payload))
+    )
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({original}))
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] == "vault_original"
+    await audit.close()
+
+
+async def test_the_skeleton_form_does_not_collapse_jose_and_jose(tmp_path: Path) -> None:
+    """The asymmetry is the whole design, and this is what it buys.
+
+    Stripping marks from *both* sides would catch strictly more -- and would make
+    ``José`` in the vault match ``Jose`` on the wire, collapsing two genuinely
+    distinct originals into one. ``tests/leakage/test_leakage_harness.py`` names that
+    trade and refuses it, and a document carrying both spellings of a name is
+    ordinary in the records this system protects. So only the haystack is stripped.
+
+    The second half is the cost, stated rather than hidden: because the needle keeps
+    its accent, a vaulted value that itself carries a mark is not protected against a
+    second mark spliced into it. That is a smaller residual than the one this form
+    closes, and it is the same confusables-table problem as the homoglyph gap.
+    """
+    gate, audit = await _gate(tmp_path, vault=FakeVault({"José Ruiz"}))
+
+    # A different person, written without the accent: not a disclosure, no block.
+    report = await gate.check("The witness Jose Ruiz was deposed.", SESSION)
+    assert report.originals_scanned == 1
+
+    # The value itself still blocks, in the form it was vaulted in...
+    with pytest.raises(EgressBlockedError):
+        await gate.check("The witness José Ruiz was deposed.", SESSION)
+
+    # ...and in NFD, because normalisation composes before anything is stripped.
+    decomposed = unicodedata.normalize("NFD", "José Ruiz")
+    assert "José Ruiz" not in f"client {decomposed} signed"
+    with pytest.raises(EgressBlockedError):
+        await gate.check(f"client {decomposed} signed", SESSION)
+    await audit.close()
+
+
+async def test_the_skeleton_form_is_free_when_the_payload_carries_no_mark(
+    tmp_path: Path,
+) -> None:
+    """The fast path exists because pass 1 is on every request's critical path.
+
+    ``_deaccent`` returns its argument unchanged when decomposition finds no
+    combining character, so the common payload adds one NFD pass and no per-original
+    work at all. Asserting identity rather than equality is deliberate: an
+    implementation that rebuilt the string would still compare equal and would still
+    have cost a full copy plus a fourth comparison for every original in the session.
+    """
+    plain = "Ordinary ASCII prose with no marks in it at all."
+    assert _deaccent(plain) is plain
+
+    # And when there IS a mark, both spellings of it reduce to the same skeleton --
+    # which is the haystack-side behaviour the fourth form depends on.
+    assert _deaccent("José") == "Jose"
+    assert _deaccent(unicodedata.normalize("NFD", "José")) == "Jose"
+    assert _deaccent("Nathanieĺ Brightwater") == "Nathaniel Brightwater"
+
+    gate, audit = await _gate(tmp_path, vault=FakeVault({"Nathaniel Brightwater"}))
+    report = await gate.check(plain, SESSION)
+    assert report.originals_scanned == 1
+    await audit.close()
+
+
+# ---------------------------------------------------------------------------
 # Pass 2 -- detector re-scan and the skip-list
 # ---------------------------------------------------------------------------
 
@@ -986,11 +1234,227 @@ async def test_a_legitimate_hint_re_scanned_is_not_a_false_block(tmp_path: Path)
 
 
 async def test_below_threshold_rescan_hits_are_ignored(tmp_path: Path) -> None:
-    detector = FakeDetector([("SSN", "412-33-7891", 0.10)])
+    """A weak detector claim is not a block. Pass 2's threshold, and only that.
+
+    NOTE on the probe text. This test used to spell the weak hit ``412-33-7891``,
+    and that string is now blocked by pass 3 -- independently of the detector, on
+    the shape alone -- so the payload could no longer isolate the property this test
+    is named for. The claim under test is unchanged and the assertion is untouched;
+    only the string was moved off pass 3's pattern, and the case it used to cover is
+    now asserted with its correct expectation in
+    ``test_a_below_threshold_ssn_shape_still_blocks_on_the_independent_pass``
+    directly below, which uses the original probe verbatim. Nothing was dropped.
+    """
+    detector = FakeDetector([("SSN", "41233-7891", 0.10)])
     gate, audit = await _gate(tmp_path, detector=detector)
-    report = await gate.check("weak hit 412-33-7891", SESSION)
+    report = await gate.check("weak hit 41233-7891", SESSION)
     assert report.rescan_warnings == 0
     await audit.close()
+
+
+async def test_a_below_threshold_ssn_shape_still_blocks_on_the_independent_pass(
+    tmp_path: Path,
+) -> None:
+    """The probe the test above used to carry, under the expectation it now has.
+
+    The detector scoring ``412-33-7891`` at 0.10 is exactly the state pass 3 exists
+    for: a recogniser saying "probably nothing" about a string that is an SSN written
+    out in full, about to be handed to a third party. Pass 2 defers to the score --
+    correctly, or every low-confidence NER hit would block a run -- and pass 3 does
+    not consult it, because it is not asking the detector anything.
+    """
+    detector = FakeDetector([("SSN", "412-33-7891", 0.10)])
+    gate, audit = await _gate(tmp_path, detector=detector)
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check("weak hit 412-33-7891", SESSION, run_id="weak")
+    assert exc.value.detail["reason"] == "independent_pattern"
+    assert exc.value.detail["entity_types"] == "SSN"
+    assert exc.value.detail["hit_count"] == 1
+
+    # The block is on the record, and carries no payload text.
+    events = await audit.query(run_id="weak")
+    assert [e.event_type for e in events] == [EGRESS_BLOCK]
+    assert "412-33-7891" not in repr(events[0].detail)
+    await audit.close()
+
+
+# ---------------------------------------------------------------------------
+# Pass 3 -- recognisers the detector does not use
+#
+# The headline claim is that zero-PII-in-transit is an EGRESS property rather than
+# a detection property. Passes 1 and 2 do not deliver that on their own: pass 1
+# only knows what was vaulted, and pass 2 re-runs the same Detector, so a value the
+# detector misses is missed three times for one reason. These tests use the SHIPPED
+# detector, because the gap is a property of the real recogniser and a FakeDetector
+# would let the test invent the premise it needs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "ssn",
+    [
+        pytest.param("123-45-6789", id="canonical-example"),
+        pytest.param("987-65-4320", id="second-published-example"),
+        pytest.param("078-05-1120", id="the-woolworth-wallet-ssn"),
+        pytest.param("000-45-6789", id="never-issued-area-000"),
+        pytest.param("666-45-6789", id="never-issued-area-666"),
+        pytest.param("412-00-7891", id="all-zero-group"),
+        pytest.param("412-33-0000", id="all-zero-serial"),
+        pytest.param("111-11-1111", id="all-one-digit"),
+        pytest.param("412-33.7891", id="mismatched-delimiters"),
+        pytest.param("123 45 6789", id="canonical-example-with-spaces"),
+        pytest.param("078 05 1120", id="published-example-with-spaces"),
+        pytest.param("412 00 7891", id="all-zero-group-with-spaces"),
+    ],
+)
+async def test_an_ssn_the_shipped_detector_scores_at_zero_still_blocks(
+    real_detector: Detector, real_settings: Settings, ssn: str
+) -> None:
+    """Presidio's invalidation rules, read back as a list of values that used to leak.
+
+    ``UsSsnRecognizer.invalidate_result`` returns True -- a hard 0.0, not a low
+    score -- for every value below. That is defensible behaviour for a *detector*
+    (an example SSN in a training doc is not a person's SSN) and indefensible as the
+    last word before a third-party API call, because the pipeline cannot tell the
+    difference between an example and a real number that happens to look like one,
+    and neither can the provider.
+
+    The premise is measured rather than asserted: the shipped detector is run first
+    and must find nothing high-severity, so a block here can only be pass 3. Delete
+    ``_INDEPENDENT_PATTERNS`` and every one of these payloads reaches the provider
+    with the SSN in the clear, which is what happened before it existed.
+    """
+    payload = f"Member SSN {ssn} verified against records."
+    found = [
+        det
+        for det in await real_detector.detect(payload, None)
+        if det.entity_type in HIGH_SEVERITY_TYPES
+        and det.score >= real_settings.threshold_obfuscate
+    ]
+    assert not found, (
+        "premise gone: the shipped detector now finds this, so the payload no "
+        f"longer isolates pass 3 -- {found}"
+    )
+
+    gate = _real_gate(real_detector, real_settings, set())
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] == "independent_pattern"
+    assert exc.value.detail["entity_types"] == "SSN"
+
+
+async def test_pass_three_does_not_block_on_our_own_pseudonyms(
+    real_detector: Detector, real_settings: Settings
+) -> None:
+    """A fake SSN is SSN-shaped by design, and pass 3 must not block on it.
+
+    This is the false-positive that would make pass 3 unshippable: under
+    pseudonymization every run that touches an SSN emits a replacement of exactly the
+    shape pass 3 matches, so a pass that did not exempt our own output would block
+    100% of those runs. The exemption is by string equality against the surrogate set
+    the orchestrator hands over, not by grammar, so it cannot be widened by anything
+    in the document.
+
+    The second half is the one that makes the exemption safe to have: the *same*
+    string, with nothing declaring it ours, still blocks.
+    """
+    fake = "512-24-8710"
+    payload = f"The member SSN is {fake} on file."
+    gate = _real_gate(real_detector, real_settings, set())
+
+    report = await gate.check(payload, SESSION, surrogates=frozenset({fake}))
+    assert report.rescan_warnings == 0
+
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(payload, SESSION)
+    assert exc.value.detail["reason"] in {"detector_rescan", "independent_pattern"}
+
+
+async def test_pass_three_runs_after_pass_two_so_reason_codes_do_not_move(
+    real_detector: Detector, real_settings: Settings
+) -> None:
+    """A payload both passes object to keeps the reason code it has always had.
+
+    ``412-33-7891`` is a valid SSN to Presidio *and* matches the independent
+    pattern. Which pass reports it is not cosmetic: ``detector_rescan`` is what the
+    API's 422 body, the audit trail and every existing expectation say for this
+    shape, and a re-ordering that changed it would rewrite history for a class of
+    block that has not changed at all.
+    """
+    payload = "The subject SSN is 412-33-7891 on file."
+    found = {
+        det.entity_type
+        for det in await real_detector.detect(payload, None)
+        if det.entity_type in HIGH_SEVERITY_TYPES
+        and det.score >= real_settings.threshold_obfuscate
+    }
+    assert "SSN" in found, "premise: the detector does see this one"
+
+    with pytest.raises(EgressBlockedError) as exc:
+        await _real_gate(real_detector, real_settings, set()).check(payload, SESSION)
+    assert exc.value.detail["reason"] == "detector_rescan"
+
+
+async def test_pass_three_is_narrow_enough_to_ship(
+    real_detector: Detector, real_settings: Settings
+) -> None:
+    """The shapes pass 3 deliberately does NOT claim, because a block is a denial.
+
+    A gate that blocks ordinary documents protects nothing, so the pattern is
+    scoped to the separated SSN spelling and nothing else. Each probe below is a
+    numeral an ordinary record carries, and each would be caught by the tempting
+    widening -- a bare ``\\b[0-9]{9}\\b`` rule, which the registry itself rejects for
+    MRN because it fires on every zip+4 and order number in a document.
+
+    The one shape *not* probed as benign is the space-separated ``ddd dd dddd``
+    table row, and the reason is measured rather than assumed: the shipped detector
+    already scores ``100 25 1000`` as an ``SSN`` at 0.50, so pass 2 has always
+    blocked that row. Pass 3 accepting the space separator therefore adds no
+    false-positive class the pipeline did not already have -- see
+    ``test_the_space_separator_costs_pass_three_nothing_pass_two_did_not_already_cost``.
+    """
+    for benign in (
+        "Ship to 021440 and reference order 100200300 for the pallet.",
+        "Zip+4 on file is 940255551 for the mailing address.",
+        "Invoice 2024-01-1500 was reconciled on 03/12/1985.",
+        "Extension 415-555-0123 reaches the front desk.",
+    ):
+        report = await _real_gate(real_detector, real_settings, set()).check(benign, SESSION)
+        assert report.payload_chars == len(benign), benign
+
+
+async def test_the_space_separator_costs_pass_three_nothing_pass_two_did_not_already_cost(
+    real_detector: Detector, real_settings: Settings
+) -> None:
+    """The measurement that decided the separator class, kept where it can go stale.
+
+    Pass 3's pattern was first written ``[-.]``, excluding the space, to avoid
+    blocking a three-column numeric table. Running it showed that reasoning was
+    empty: Presidio's ``SSN5`` pattern claims the space spelling at 0.50, so that
+    table row already blocked via pass 2 -- while ``123 45 6789``, which Presidio
+    *invalidates*, sailed through. The exclusion bought no false-positive protection
+    and left the gate most permissive exactly where the detector had decided the
+    number was fake.
+
+    Both halves are asserted from the shipped detector, so if a future Presidio drops
+    ``SSN5`` or stops invalidating examples, this goes red and the separator class is
+    re-argued rather than inherited.
+    """
+    table_row = "Ledger row totals 100 25 1000 posted this quarter."
+    already = {
+        det.entity_type
+        for det in await real_detector.detect(table_row, None)
+        if det.entity_type in HIGH_SEVERITY_TYPES
+        and det.score >= real_settings.threshold_obfuscate
+    }
+    assert "SSN" in already, (
+        "the premise for accepting the space separator is gone: pass 2 no longer "
+        "claims a space-separated digit row, so pass 3 is now the only thing "
+        "blocking it and the trade must be re-argued"
+    )
+    with pytest.raises(EgressBlockedError) as exc:
+        await _real_gate(real_detector, real_settings, set()).check(table_row, SESSION)
+    assert exc.value.detail["reason"] == "detector_rescan"
 
 
 # ---------------------------------------------------------------------------

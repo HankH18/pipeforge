@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import secrets
 import sqlite3
 import threading
@@ -1750,6 +1751,88 @@ async def test_registry_never_reveals_keys_in_repr(session_registry: SessionRegi
     assert "active=1" in rendered
     assert await session_registry.destroy(session_id) is True
     assert await session_registry.destroy(session_id) is False
+
+
+def _log_render(fmt: str, value: object) -> str:
+    """Exactly what ``logger.debug(fmt, value)`` would write to a handler.
+
+    ``logging`` defers formatting to ``LogRecord.getMessage()``, so this is the
+    real interpolation path rather than a hand-rolled ``%`` that only resembles
+    it.
+    """
+    record = logging.LogRecord("t", logging.DEBUG, __file__, 0, fmt, (value,), None)
+    return record.getMessage()
+
+
+async def test_session_entry_itself_never_reveals_the_key_in_any_rendering(
+    session_registry: SessionRegistry,
+) -> None:
+    """The *entry* must mask too, not just the registry that holds it.
+
+    ``test_registry_never_reveals_keys_in_repr`` above pins
+    ``repr(SessionRegistry)``. That is the object a caller usually has, but it is
+    not the object a key escapes through. ``_Session`` was a ``NamedTuple``,
+    which *generates* a ``__repr__`` rendering every field, so ``repr(entry)``
+    -- and therefore ``repr`` of the ``_sessions`` dict, and therefore one
+    ``logger.debug("%r", self._sessions)`` -- printed the raw 32-byte session key
+    as a ``bytes`` literal. The registry's mask hid the map, so nothing observed
+    it: every other key-bearing object in the codebase opts out of its default
+    repr, and this was the single one that did not.
+
+    The assertions deliberately do **not** stop at ``key.hex()``. Python does not
+    print ``bytes`` as hex, so a test that greps only the hex form is a checker
+    carrying the same blind spot as the thing it checks -- the exact defect class
+    this project has hit repeatedly -- and it would pass while the key went to
+    disk. ``repr(key)`` and the escaped body are the renderings that actually
+    catch it.
+
+    The tuple check is the structural half. A masked ``__repr__`` on a
+    ``NamedTuple`` would satisfy every string assertion here and still leak,
+    because a ``NamedTuple`` *is* a ``tuple``: ``tuple(entry)``, ``entry[0]`` and
+    unpacking all route around ``__repr__`` and hand the key back to a default
+    renderer. Only the non-tuple form closes that.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    key = await session_registry.key(session_id)
+    entry = session_registry._sessions[session_id]
+
+    # The key is genuinely in there -- otherwise this test proves nothing.
+    assert entry.key == key
+    assert len(key) == 32
+
+    forbidden = {
+        "hex": key.hex(),
+        "bytes repr": repr(key),
+        "escaped body": repr(key)[2:-1],
+    }
+    # Every ordinary way an object reaches a log line or a traceback.
+    renderings = {
+        "repr(entry)": repr(entry),
+        "str(entry)": str(entry),
+        "f-string !r": f"{entry!r}",
+        "repr(_sessions)": repr(session_registry._sessions),
+        "inside a list": repr([entry]),
+        # The accident this guard exists for, driven through the real formatter
+        # rather than imitated: ``logger.debug("%r", entry)`` renders lazily via
+        # ``LogRecord.getMessage()``, which is where a key would actually reach a
+        # log file. Both the entry and the whole session map go through it.
+        "logging %r of the entry": _log_render("%r", entry),
+        "logging %s of the entry": _log_render("%s", entry),
+        "logging %r of the map": _log_render("%r", session_registry._sessions),
+    }
+    for how, rendered in renderings.items():
+        for form, secret in forbidden.items():
+            assert secret not in rendered, f"the session key leaked as {form} via {how}"
+
+    # Masked, not merely truncated: the non-secret fields still render, so the
+    # guard cannot be satisfied by an empty repr that hides a future field too.
+    assert "key='***'" in repr(entry)
+    assert "test-user" in repr(entry)
+
+    assert not isinstance(entry, tuple), (
+        "_Session must not be a tuple: the tuple protocol re-exposes the key "
+        "regardless of __repr__"
+    )
 
 
 async def test_concurrent_open_creates_exactly_one_connection(

@@ -143,29 +143,72 @@ entities:
     tier: 2
 
   # --- custom pattern recognizers -----------------------------------------
-  # Separators and the spelled-out label are widened past the build doc's
-  # '\bMRN[:#\s]*\d{6,10}\b'. That form is case-sensitive and only accepts colon,
-  # hash or whitespace, so it misses "MRN-4471902", "mrn 4471902" and
-  # "Medical Record Number: 4471902" -- ordinary chart-header spellings, and a
-  # miss here is an unobfuscated identifier, the one failure the system cannot
-  # recover from. The digit run still carries the specificity, so widening the
-  # label does not widen what can match.
+  # IDENTIFIER-POSITION RULE. Read this note once; MRN, ACCOUNT_NUMBER and CASE_ID
+  # below are all three instances of it.
   #
-  # What is still not covered, measured on a held-out corpus: every spelling that
-  # names the field without saying "MRN" or "medical record" -- "Patient ID 8814027",
-  # "Chart No. 2207731", "Subject record 4402198", and a bare seven-digit column in a
-  # CSV export. Closing those needs either another literal anchor per spelling or a
-  # bare-digit rule, and a bare-digit rule fires on every order number and zip+4 in
-  # the document. The gap is documented rather than closed, and nothing downstream
-  # closes it either: the egress gate's first pass scans for *vaulted* originals and
-  # its second re-runs this same detector, so a value neither pattern anchors on is
-  # invisible to both.
+  # A numeric identifier is not recognisable from its digits. A bare run of digits is
+  # equally an order count, a page reference, a sample size or a quantity, which is
+  # why "a bare-digit rule" is not an option: it fires on every one of those. What
+  # makes a digit run an identifier is its POSITION -- it is introduced by a noun
+  # phrase naming the thing being identified -- and across registers that noun phrase
+  # has one regular shape:
+  #
+  #     <artefact/subject noun> <sep> <digits>
+  #     <artefact/subject noun> <sep> <generic identifier word> <sep|copula> <digits>
+  #
+  #     artefact/subject noun   register vocabulary: record, chart, mrn, patient,
+  #                             subject, file / account, acct, a/c
+  #     generic identifier word register-independent: no., number, num, id, ident,
+  #                             ref, #
+  #     copula                  the link an English sentence uses in place of a colon
+  #
+  # The copula is admitted ONLY in the second form. "chart number is 4419307" has
+  # already said that a number is being named, so the "is" is a separator. "Records
+  # show 8814027 encounters" has not, and treating a verb as a separator there claims
+  # a quantity as an identifier -- measured on the dev corpus, that is exactly what
+  # the loose form did.
+  #
+  # THE SPAN IS THE IDENTIFIER, NOT THE LABEL. The label is matched inside a '\K',
+  # which drops everything before it from the reported span. This is a security
+  # property, not cosmetics. The engine vaults `detection.text`, and the egress gate's
+  # first pass scans the outbound payload for *vaulted originals*; if the vaulted
+  # original is "Account No. 100200300400" then the bare "100200300400" -- which is
+  # the entire secret, the label being boilerplate -- is not in the needle set, and a
+  # second mention of it ("ledger row 100200300400") went to the provider verbatim.
+  # Measured: it did. With '\K' the vaulted original IS the bare identifier, so pass 1
+  # protects every occurrence of it in the document, labelled or not.
+  #
+  # '\K' is a `regex`-module construct. That is the module Presidio's PatternRecognizer
+  # imports and therefore the engine these patterns actually run under; the registry
+  # loader validates `patterns:` with the same module for that reason.
+  #
+  # Separator runs are POSSESSIVE ('*+'), not plain '*'. Two plain unbounded
+  # whitespace quantifiers either side of an optional group can split one run of
+  # blanks between them n ways -- the quadratic backtracking the ACCOUNT_NUMBER note
+  # below records measuring at 4x per doubling. A possessive quantifier never gives
+  # characters back, so the split is unique and the scan is linear; measured on the
+  # ReDoS harness both patterns hold a flat 2.0x per doubling on every blank- and
+  # separator-run attack. Bounding the runs instead ({0,6}) also works and was tried
+  # first -- it silently broke every column-aligned chart header, where "MRN" and its
+  # value are twenty spaces apart. A real document shape must not cost recall to buy
+  # linearity when an unbounded possessive run buys both.
+  #
+  # Replaces the build doc's '\bMRN[:#\s]*\d{6,10}\b'. That form is case-sensitive,
+  # accepts only colon/hash/whitespace, and knows three literal labels, so it misses
+  # "MRN-4471902", "mrn 4471902", "Medical Record Number: 4471902", and every spelling
+  # that names the field some other way -- "Rec # 552140", "Patient number 4471902",
+  # "chart ref 4902118". A miss here is an unobfuscated identifier, the one failure
+  # the system cannot recover from: the egress gate's first pass scans for *vaulted*
+  # originals and its second re-runs this same detector, so a value no pattern anchors
+  # on is invisible to both.
+  #
+  # What is still not covered: a chart number in an unlabelled table or CSV column,
+  # where no noun introduces it at all. Nothing short of a bare-digit rule reaches
+  # that, and a bare-digit rule is the trade this whole note exists to refuse.
   MRN:
     category: PHI
     patterns:
-      - '(?i)\bmrn[\s:#.\-]*\d{6,10}\b'
-      - '(?i)\bmedical\s+record\s+(?:number|no\.?|#)[\s:#]*\d{6,10}\b'
-      - '(?i)\bmr\s*#\s*\d{6,10}\b'
+      - '(?i)\b(?:mrn|mr|medical\s+record|record|rec|chart|patient|subject|file)s?\.?[\s:#.\-/]*+(?:(?:number|num|no|ident|id|ref|#)\.?[\s:#.\-/]*+(?:(?:is|was)[\s:#.\-/]*+)?)?\K\d{6,10}\b'
     context: [medical, record, chart]
     tier: 1
 
@@ -210,20 +253,18 @@ entities:
     context: [lab, result]
     tier: 4
 
-  # Widened past the build doc's '\b(?:acct|account)[:#\s]*\d{8,17}\b', which is
-  # case-sensitive and allows no label between the word and the digits. It therefore
-  # misses "Account: ...", "Account No. ...", "Account Number: ..." and "Acct. ..."
-  # -- the four ways a statement or wire instruction actually writes it. The 8-17
-  # digit run is what makes the match specific; the label is only the anchor.
+  # The financial instance of the identifier-position rule above. Replaces the build
+  # doc's '\b(?:acct|account)[:#\s]*\d{8,17}\b', which is case-sensitive and allows no
+  # label between the word and the digits, so it misses "Account: ...", "Account No.
+  # ...", "Account Number: ..." and "Acct. ..." -- the four ways a statement or wire
+  # instruction actually writes it. The 8-17 digit run is what makes the match
+  # specific; the noun phrase is only the anchor, and '\K' keeps it out of the span.
   ACCOUNT_NUMBER:
     category: FIN
-    # The optional label keeps its own leading whitespace inside the group. Writing
-    # it as '\.?\s*(?:number|no\.?|#)?[\s:#]*' instead puts two whitespace-matching
-    # quantifiers either side of an optional group, and the two can split a run of
-    # spaces between them any number of ways -- quadratic backtracking on
-    # "account" followed by a long blank run (measured 0.28/1.1/4.4 ms at 200/400/800
-    # spaces, a clean 4x per doubling).
-    patterns: ['(?i)\b(?:acct|account|a/c)\.?(?:\s*(?:number|no\.?|#))?[\s:#]*\d{8,17}\b']
+    # Possessive separator runs, for the reason the shared note gives: this pattern is
+    # where the quadratic split was measured (0.28/1.1/4.4 ms at 200/400/800 spaces
+    # after "account", a clean 4x per doubling) when both runs were plain '*'.
+    patterns: ['(?i)\b(?:acct|account|a/c)s?\.?[\s:#.\-]*+(?:(?:number|num|no|ident|id|ref|#)\.?[\s:#.\-]*+(?:(?:is|was)[\s:#.\-]*+)?)?\K\d{8,17}\b']
     # "rout" is not a typo: it is what spaCy lemmatises the doc's "routing" to,
     # and the enhancer matches against the lemma (header note).
     context: [account, bank, rout]
@@ -254,18 +295,24 @@ entities:
   # ("filed in 1:23-cv-04567"), which is how the number is written everywhere in a
   # brief after the caption, and it misses "1:23-CV-04567". Worse than a miss: the
   # uppercase form fell through to the second pattern, which matched only
-  # "23-CV-04567" and left the district prefix "1:" in the clear. Pattern 2 below
-  # matches the docket shape on its own; the labelled pattern is kept because its
-  # longer span wins overlap resolution and takes the label with it. The third
-  # pattern stays case-SENSITIVE on purpose -- '\d{2}-[a-z]{1,4}-\d{3,6}' would
-  # match ordinary hyphenated prose.
+  # "23-CV-04567" and left the district prefix "1:" in the clear. Pattern 1 below
+  # matches the docket shape on its own, in either case, so it covers every labelled
+  # spelling too. The second pattern stays case-SENSITIVE on purpose --
+  # '\d{2}-[a-z]{1,4}-\d{3,6}' would match ordinary hyphenated prose.
+  #
+  # The doc's labelled pattern is GONE rather than rewritten. It was kept here for a
+  # while because its longer span won overlap resolution and took the label with it,
+  # and that turned out to be the defect, not the feature: the engine vaults
+  # `detection.text`, so the vaulted original became "Case No. 1:23-cv-04567" and the
+  # bare docket number in the next paragraph -- the identifier itself -- was a
+  # different string. Measured, the same docket got two different surrogates in one
+  # document. Once the label is excluded from the span (see the identifier-position
+  # note above MRN) the labelled pattern's match is character-for-character the bare
+  # pattern's, on every spelling in the suite, so it is dead config: a pattern nothing
+  # can distinguish from its own absence.
   CASE_ID:
     category: LEGAL
     patterns:
-      # '\s*[:#]?\s*' (as the build doc writes it) is the same quadratic shape as
-      # ACCOUNT_NUMBER's above: two whitespace quantifiers around an optional
-      # separator. One character class does the same job in linear time.
-      - '(?i)\b(?:case|docket)\s+no\.?[\s:#]*\d{1,2}:\d{2}-[a-z]{2,4}-\d{3,6}\b'
       - '(?i)\b\d{1,2}:\d{2}-[a-z]{2,4}-\d{3,6}\b'
       - '\b\d{2}-[A-Z]{1,4}-\d{3,6}\b'
     # "file" replaces the doc's "filed" (header note); it matches the lemma of

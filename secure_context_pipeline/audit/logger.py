@@ -35,11 +35,20 @@ the whole chain (it has to, to know each row's expected predecessor) but only
 asserts on rows belonging to that session, so it answers "is this session's
 slice intact" rather than "is the whole log intact".
 
-Concurrency: ``emit`` is safe under ``asyncio.gather``. Reading the previous
-hash, computing the new one, and inserting is one critical section guarded by an
-:class:`asyncio.Lock`, so the chain stays linear no matter how many coroutines
-race. All I/O is ``aiosqlite`` (WAL, one connection per instance); nothing here
-blocks the event loop.
+Concurrency, stated precisely because the previous wording was wrong. ``emit`` is
+safe under ``asyncio.gather``: reading the previous hash, computing the new one,
+and inserting is one critical section guarded by an :class:`asyncio.Lock`, so the
+chain stays linear no matter how many coroutines race **inside one event loop**.
+An :class:`asyncio.Lock` is an in-process object and serialises nothing across OS
+processes, so two workers sharing one ``audit.db`` used to compute the same
+``seq`` and the loser's ``INSERT`` died on the ``seq`` PRIMARY KEY -- a *dropped*
+audit event, which no chain check can notice because it was never written.
+:meth:`AuditLogger.emit` now sets ``busy_timeout`` and retries a lost race by
+re-reading the tail and re-chaining, so a second writer serialises instead of
+losing its event. The shipped container runs one uvicorn process, so this was
+latent rather than active; it stops being latent the moment anyone adds
+``--workers``. All I/O is ``aiosqlite`` (WAL, one connection per instance);
+nothing here blocks the event loop.
 """
 
 from __future__ import annotations
@@ -139,6 +148,24 @@ EVENT_TYPES: frozenset[str] = frozenset(
 
 DEFAULT_DB_FILENAME = "audit.db"
 
+#: How long SQLite waits for another *process*'s write lock before giving up.
+#: Only reachable when the audit DB is shared across workers or replicas, which
+#: the shipped single-process container does not do -- see the module docstring.
+BUSY_TIMEOUT_MS = 5_000
+
+#: How many times :meth:`AuditLogger.emit` re-reads the tail and re-chains after
+#: losing a ``seq`` race to another process. Small on purpose: each attempt costs a
+#: round trip, and if a writer loses this many in a row the contention is not
+#: transient and the caller should hear about it rather than wait.
+MAX_EMIT_ATTEMPTS = 5
+
+#: Attempts, and the linear backoff step, for putting a *new* database into WAL
+#: mode while another process is doing the same thing. See :func:`_enable_wal`:
+#: this is the one lock ``busy_timeout`` does not cover. Worst case here is
+#: 0.05 + 0.10 + 0.15 + 0.20 = 0.5 s before ``open()`` gives up and raises.
+WAL_SETUP_ATTEMPTS = 5
+WAL_SETUP_BACKOFF_S = 0.05
+
 #: ``prev_hash`` of the first row. Empty string, not NULL, so the hash input of
 #: the genesis entry is as well-defined as every other entry's.
 GENESIS_HASH = ""
@@ -146,8 +173,8 @@ GENESIS_HASH = ""
 #: What "this database is unreadable" looks like when raised from inside a row
 #: walk. **One definition, used by every reader**, because this codebase has
 #: already been bitten by a rule that was correct in one copy and stale in
-#: another: ``_high_water_seq`` degraded on ``sqlite3.Error`` while the main
-#: chain walk did not, and the asymmetry was the bug.
+#: another: ``_watermark`` (then named ``_high_water_seq``) degraded on
+#: ``sqlite3.Error`` while the main chain walk did not, and the asymmetry was the bug.
 #:
 #: ``ValueError``/``TypeError`` belong here alongside ``sqlite3.Error`` because a
 #: row is not trustworthy just because SQLite handed it over. A tampered ``ts``
@@ -170,6 +197,30 @@ CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events (session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_audit_run ON audit_events (run_id);
 CREATE INDEX IF NOT EXISTS idx_audit_event_type ON audit_events (event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events (ts);
+
+-- The second, independent high-water mark. See _watermark: sqlite_sequence alone
+-- was not enough, because a freed tail seq was handed out again by the next
+-- ordinary emit and the evidence of the truncation erased itself.
+CREATE TABLE IF NOT EXISTS audit_chain_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  max_seq INTEGER NOT NULL
+);
+-- "Only ever grows" is enforced by the database, not only by the writer, so a
+-- lowering UPDATE is refused rather than trusted not to happen. An attacker with
+-- file access can DROP these -- SQLite has no protected schema -- but that is one
+-- more statement they have to know to run, and the point of this whole mechanism
+-- is raising the number of statements a silent truncation costs.
+CREATE TRIGGER IF NOT EXISTS audit_chain_meta_is_monotonic
+BEFORE UPDATE ON audit_chain_meta
+WHEN NEW.max_seq < OLD.max_seq
+BEGIN
+  SELECT RAISE(ABORT, 'audit_chain_meta.max_seq may not decrease');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_chain_meta_is_not_deletable
+BEFORE DELETE ON audit_chain_meta
+BEGIN
+  SELECT RAISE(ABORT, 'audit_chain_meta may not be deleted');
+END;
 """
 
 _INSERT_SQL = """
@@ -185,6 +236,17 @@ _LAST_ENTRY_SQL = "SELECT seq, entry_hash FROM audit_events ORDER BY seq DESC LI
 # SQLite's own AUTOINCREMENT bookkeeping: the highest rowid ever allocated for this
 # table. DELETE does not lower it, which is what makes tail truncation visible.
 _HIGH_WATER_SQL = "SELECT seq FROM sqlite_sequence WHERE name = 'audit_events'"
+
+# Our own copy of the same fact, in a table SQLite does not manage. Two rows in two
+# tables have to be reset in step for a truncation to heal; see _watermark.
+_META_SQL = "SELECT max_seq FROM audit_chain_meta WHERE id = 1"
+
+# Raise the mark, never lower it. `max_seq` on the right is the stored value, so
+# this is a MAX and not an assignment even if a caller ever passes a stale seq.
+_META_BUMP_SQL = """
+INSERT INTO audit_chain_meta (id, max_seq) VALUES (1, :seq)
+ON CONFLICT(id) DO UPDATE SET max_seq = MAX(max_seq, excluded.max_seq)
+"""
 
 _CHAIN_SQL = """
 SELECT seq, ts, session_id, run_id, event_type, entity_type, token_id, detail, prev_hash, entry_hash
@@ -333,12 +395,31 @@ class AuditLogger:
         parent = self._db_path.parent
         if str(parent):
             await asyncio.to_thread(parent.mkdir, parents=True, exist_ok=True)
-        conn = await aiosqlite.connect(self._db_path)
+        # ``isolation_level=None`` puts this connection in SQLite's own autocommit
+        # mode and hands transaction control to us. ``emit`` needs it: the read of
+        # the chain tail and the insert that extends it have to be one transaction
+        # that holds the *write* lock from the start (``BEGIN IMMEDIATE``), or a
+        # second process reads the same tail and one of the two writes is lost.
+        # Python's implicit transactions are deferred, and a deferred transaction
+        # upgrading to a write lock in WAL mode fails immediately with
+        # SQLITE_BUSY_SNAPSHOT -- the busy handler is not even consulted -- so
+        # ``busy_timeout`` alone does not close this.
+        conn = await aiosqlite.connect(self._db_path, isolation_level=None)
         try:
             conn.row_factory = aiosqlite.Row
+            # FIRST, before any statement that can contend. Without it a second
+            # writer holding the write lock makes ours fail instantly with
+            # SQLITE_BUSY and the event is dropped -- and setting it after
+            # ``journal_mode`` is not "first enough": that pragma takes a lock of its
+            # own, so opening a log while another process was mid-write raised
+            # ``database is locked`` out of ``open()`` itself. Measured, not
+            # reasoned: two writers, one failed to open on 2 of 3 runs with the
+            # pragmas in the other order. Bounded, so a wedged writer cannot hang a
+            # request past the caller's own timeout.
+            await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             # WAL: concurrent readers (the API's /audit endpoints) never block the
             # single writer. NORMAL sync is the standard WAL durability trade.
-            await conn.execute("PRAGMA journal_mode=WAL")
+            await _enable_wal(conn)
             await conn.execute("PRAGMA synchronous=NORMAL")
             await conn.executescript(_SCHEMA)
             await conn.commit()
@@ -387,6 +468,24 @@ class AuditLogger:
         Raises :class:`PipelineError` if any string field exceeds its ceiling -- see
         :func:`_reject_content_sized_fields`, which re-checks at the write boundary
         because the schema's own validators are bypassable by assignment.
+
+        **``seq`` is allocated above the watermark, not above the surviving tail**,
+        and that one-word difference is what stops a truncation healing itself.
+        ``MAX(seq)+1`` over the surviving rows re-issues a *freed* number: delete the
+        newest three events and the next three ordinary emits land on 6, 7, 8 again,
+        ``last_seq`` climbs back to the high-water mark, and :meth:`verify_chain`
+        -- which was correctly reporting ``False`` a moment earlier -- goes back to
+        ``True`` with the original events permanently gone. The attacker needs no
+        second statement for that; they need only wait for traffic, which the public
+        API lets them generate. Allocating above the watermark turns the same
+        truncation into a permanent ``seq`` gap, which the continuity check reports
+        forever.
+
+        A watermark this method cannot read degrades to the old behaviour rather
+        than refusing to log: an audit writer that fails closed is an audit writer
+        that silences the pipeline, and the *verifier* already resolves an
+        unreadable watermark to ``False``, so the tamper is still reported by the
+        component whose job that is.
         """
         conn = self._connection()
         _reject_content_sized_fields(event)
@@ -394,43 +493,104 @@ class AuditLogger:
         detail_json = canonical_json(detail)
 
         async with self._lock:
-            async with conn.execute(_LAST_ENTRY_SQL) as cursor:
-                row = await cursor.fetchone()
-            if row is None:
-                seq = 1
-                prev_hash = GENESIS_HASH
-            else:
-                seq = int(row["seq"]) + 1
-                prev_hash = str(row["entry_hash"])
+            for attempt in range(MAX_EMIT_ATTEMPTS):
+                # The write lock is taken BEFORE the tail is read, so no other
+                # process can allocate the same seq in between. This is the line
+                # that makes the retry below a belt-and-braces path rather than the
+                # mechanism -- with a deferred transaction the read is unprotected
+                # and the collision is routine.
+                await conn.execute("BEGIN IMMEDIATE")
+                try:
+                    try:
+                        watermark = await self._watermark()
+                    except _UNREADABLE as exc:
+                        # Writer degrades, verifier does not. See the docstring.
+                        logger.warning(
+                            "audit watermark unreadable; falling back to the surviving tail",
+                            extra={"error": type(exc).__name__},
+                        )
+                        watermark = None
 
-            payload = chain_payload(
-                seq=seq,
-                ts=event.ts,
-                session_id=event.session_id,
-                run_id=event.run_id,
-                event_type=event.event_type,
-                entity_type=event.entity_type,
-                token_id=event.token_id,
-                detail=detail,
-            )
-            entry_hash = compute_entry_hash(prev_hash, payload)
+                    async with conn.execute(_LAST_ENTRY_SQL) as cursor:
+                        row = await cursor.fetchone()
+                    if row is None:
+                        last_seq = 0
+                        prev_hash = GENESIS_HASH
+                    else:
+                        last_seq = int(row["seq"])
+                        prev_hash = str(row["entry_hash"])
+                    seq = max(last_seq, 0 if watermark is None else watermark) + 1
 
-            await conn.execute(
-                _INSERT_SQL,
-                {
-                    "seq": seq,
-                    "ts": event.ts,
-                    "session_id": event.session_id,
-                    "run_id": event.run_id,
-                    "event_type": event.event_type,
-                    "entity_type": event.entity_type,
-                    "token_id": event.token_id,
-                    "detail": detail_json,
-                    "prev_hash": prev_hash,
-                    "entry_hash": entry_hash,
-                },
-            )
-            await conn.commit()
+                    payload = chain_payload(
+                        seq=seq,
+                        ts=event.ts,
+                        session_id=event.session_id,
+                        run_id=event.run_id,
+                        event_type=event.event_type,
+                        entity_type=event.entity_type,
+                        token_id=event.token_id,
+                        detail=detail,
+                    )
+                    entry_hash = compute_entry_hash(prev_hash, payload)
+
+                    await conn.execute(
+                        _INSERT_SQL,
+                        {
+                            "seq": seq,
+                            "ts": event.ts,
+                            "session_id": event.session_id,
+                            "run_id": event.run_id,
+                            "event_type": event.event_type,
+                            "entity_type": event.entity_type,
+                            "token_id": event.token_id,
+                            "detail": detail_json,
+                            "prev_hash": prev_hash,
+                            "entry_hash": entry_hash,
+                        },
+                    )
+                    try:
+                        await conn.execute(_META_BUMP_SQL, {"seq": seq})
+                    except sqlite3.Error as exc:
+                        # Best-effort, and deliberately so. If the second mark cannot
+                        # be advanced -- the table was dropped out from under this
+                        # connection, say -- the event itself still has to be
+                        # recorded: an audit writer that refuses to log because its
+                        # own bookkeeping is damaged converts a tampered mark into a
+                        # blind spot with no events in it at all, which is the
+                        # outcome the attacker wanted. sqlite_sequence still carries
+                        # a mark, and verify_chain still reads it.
+                        logger.warning(
+                            "audit watermark not advanced; the event was still recorded",
+                            extra={"audit_seq": seq, "error": type(exc).__name__},
+                        )
+                    await conn.commit()
+                except sqlite3.IntegrityError:
+                    # Another *process* took this seq between our read and our
+                    # insert; the asyncio lock above does not reach it. Roll back so
+                    # the next attempt reads a fresh snapshot, then re-chain onto the
+                    # tail they left. Dropping the event instead -- which is what this
+                    # did before -- is the one audit failure nothing can detect
+                    # afterwards, because the row was never written.
+                    await conn.rollback()
+                    if attempt == MAX_EMIT_ATTEMPTS - 1:
+                        raise PipelineError(
+                            reason="audit_seq_contention",
+                            attempts=MAX_EMIT_ATTEMPTS,
+                        ) from None
+                    logger.warning(
+                        "audit seq collided with another writer; re-chaining",
+                        extra={"audit_seq": seq, "attempt": attempt + 1},
+                    )
+                    continue
+                except BaseException:
+                    # Never leave the write transaction open: this connection is
+                    # reused for every later emit, and an open transaction turns one
+                    # failed write into "cannot start a transaction within a
+                    # transaction" on every write after it.
+                    with contextlib.suppress(Exception):
+                        await conn.rollback()
+                    raise
+                break
 
         # Token IDs and counts only -- never a value, never the detail payload's
         # provenance beyond its key count.
@@ -533,15 +693,36 @@ class AuditLogger:
           global, deleting every row of session X made ``verify_chain("X")`` return
           ``True`` -- erasure read as cleanliness.
 
-        Finally the tail is checked against SQLite's ``sqlite_sequence`` high-water
-        mark, which ``AUTOINCREMENT`` maintains and ``DELETE`` does not roll back.
-        Truncating the newest rows -- the obvious move for an attacker who wants the
-        incriminating events gone -- leaves the surviving chain internally perfect
-        and is otherwise undetectable. Like the rest of this scheme it is tamper
-        *evidence*, not tamper proofing: the digests are unkeyed, so anyone who can
-        write to the file can also rewrite the whole chain (and this row). Detecting
-        that needs an off-box anchor -- publishing the head hash, or an HMAC under a
-        key the app host does not hold -- and is listed as production work.
+        Finally the tail is checked against the **watermark** -- the highest ``seq``
+        ever allocated, according to two bookkeeping rows in two different tables
+        (:meth:`_watermark`). Truncating the newest rows is the obvious move for an
+        attacker who wants the incriminating events gone, and it leaves the
+        surviving chain internally perfect, so without a watermark it is
+        undetectable.
+
+        Two shapes of that attack are worth naming because both used to end in
+        ``True``:
+
+        * **A missing bookkeeping row is evidence, not silence.** ``None`` from
+          :meth:`_watermark` means "no mark at all", which is the truth on a log
+          that has never been written -- and was previously treated as "no opinion"
+          on every log. So an attacker who truncated the tail and then deleted the
+          bookkeeping row out of ``sqlite_sequence`` got a clean bill of health,
+          without touching a hash and without knowing how many rows had survived. A
+          written log always has a mark, so no mark **on a non-empty log** now
+          resolves to ``False``.
+        * **A deleted tail no longer heals itself.** See :meth:`emit`: ``seq`` is
+          allocated above the watermark, so the truncation leaves a permanent gap
+          instead of being papered over by the next few ordinary events.
+
+        Like the rest of this scheme it is tamper *evidence*, not tamper proofing:
+        the digests are unkeyed, so anyone who can write to the file can rewrite the
+        whole chain and both marks. What it buys is arithmetic on the attacker's
+        side -- a silent truncation now costs a ``DELETE``, a write to
+        ``sqlite_sequence``, a ``DROP TRIGGER`` and a write to ``audit_chain_meta``,
+        all four, in step. Detecting the attacker who runs all four needs an off-box
+        anchor -- publishing the head hash, or an HMAC under a key the app host does
+        not hold -- and is listed as production work.
 
         Returns ``False`` rather than raising: this is a health check, and the
         callers (``GET /audit/verify``, ``demo.py --verify``) report it as data.
@@ -553,7 +734,7 @@ class AuditLogger:
         method. The verifier that exists to answer "has this log been tampered
         with" therefore answered with a 500 from ``GET /audit/verify`` instead of
         ``{"valid": false}``, on an input that is *precisely* the tampering it is
-        meant to report. ``_high_water_seq`` already degraded gracefully on
+        meant to report. ``_watermark`` already degraded gracefully on
         ``sqlite3.Error``; the main walk did not, and the asymmetry was the bug.
 
         A database this method cannot read is not a database it can vouch for, so
@@ -616,20 +797,27 @@ class AuditLogger:
             _log_break(last_seq, f"chain_unreadable:{type(exc).__name__}")
             return False
 
-        # Outside the walk's try on purpose, so it needs its own. A high-water mark
-        # that is *present but not a number* is tamper evidence, not absence: the
-        # attacker who deletes the newest rows has every reason to blank this value
-        # too, because it is the only thing that notices. Letting it degrade to
-        # "no opinion" would hand them a clean bill of health, and letting it
-        # propagate would break "returns False rather than raising" -- turning
-        # GET /audit/verify into a 500 on precisely the tamper it exists to report,
+        # Outside the walk's try on purpose, so it needs its own. A watermark that is
+        # *present but not a number* is tamper evidence, not absence: the attacker
+        # who deletes the newest rows has every reason to blank this value too,
+        # because it is the only thing that notices. Letting it degrade to "no
+        # opinion" would hand them a clean bill of health, and letting it propagate
+        # would break "returns False rather than raising" -- turning GET
+        # /audit/verify into a 500 on precisely the tamper it exists to report,
         # which is the bug the walk above was already fixed for.
         try:
-            high_water = await self._high_water_seq()
+            watermark = await self._watermark()
         except _UNREADABLE as exc:
-            _log_break(last_seq, f"high_water_unreadable:{type(exc).__name__}")
+            _log_break(last_seq, f"watermark_unreadable:{type(exc).__name__}")
             return False
-        if high_water is not None and last_seq != high_water:
+        if watermark is None:
+            # No mark at all. True on a log that was never written; on a log that
+            # holds rows it means the bookkeeping was erased, which is the whole
+            # point of erasing it.
+            if last_seq > 0:
+                valid = False
+                _log_break(last_seq, "watermark_missing")
+        elif last_seq != watermark:
             valid = False
             _log_break(last_seq, "tail_truncated")
 
@@ -639,31 +827,56 @@ class AuditLogger:
             )
         return valid
 
-    async def _high_water_seq(self) -> int | None:
-        """Highest ``seq`` SQLite has ever handed out, or ``None`` if never written.
+    async def _watermark(self) -> int | None:
+        """Highest ``seq`` ever allocated, or ``None`` if there is no mark at all.
 
-        ``AUTOINCREMENT`` keeps this in the ``sqlite_sequence`` table and does not
-        lower it on ``DELETE``, which is exactly the property tail-truncation
-        detection needs. ``None`` on a log that has never been written to (the row
-        does not exist yet) and on any SQLite error, so a missing or unreadable
-        bookkeeping table degrades to "no opinion" rather than a false alarm.
+        Two independent sources, and the answer is the larger of the ones that
+        exist:
 
-        **A row that exists but does not hold an integer is a different case and
-        raises**, deliberately. ``sqlite_sequence`` is an ordinary writable table:
-        ``UPDATE sqlite_sequence SET seq = NULL`` is accepted by SQLite, and it is
-        the natural second move for an attacker who has just deleted the newest
-        rows, since this mark is the only thing that notices. Folding that into the
-        ``None`` above would make erasure read as cleanliness. :meth:`verify_chain`
-        catches it and returns ``False``; see
+        * ``sqlite_sequence`` -- SQLite's own ``AUTOINCREMENT`` bookkeeping, which
+          ``DELETE`` does not roll back. Free, and maintained by code an attacker
+          cannot patch out of this process.
+        * ``audit_chain_meta`` -- the same fact in a table this module owns, bumped
+          by :meth:`emit` and guarded by triggers that refuse a lowering ``UPDATE``
+          or a ``DELETE``.
+
+        One would be enough if either were tamper-proof; neither is, and their
+        weaknesses are not the same weakness, which is the point of keeping both.
+        ``sqlite_sequence`` is re-created automatically by the next ``INSERT``, so an
+        attacker who deletes that row has it silently restored -- at the *new*, lower
+        value -- by ordinary traffic. ``audit_chain_meta`` is not re-created behind
+        our back, and its triggers mean the attacker cannot lower it without
+        dropping them first. Taking the maximum means a truncation is hidden only if
+        **every** mark is reset in step, and a mark that is left behind at the old
+        value is permanent evidence.
+
+        ``None`` means neither row exists, which is the honest state of a log that
+        has never been written and the state an attacker has to manufacture.
+        :meth:`verify_chain` resolves it to ``False`` on any log that still holds
+        rows.
+
+        **A row that exists but does not hold an integer raises**, deliberately.
+        ``sqlite_sequence`` is an ordinary writable table: ``UPDATE sqlite_sequence
+        SET seq = NULL`` is accepted by SQLite, and it is the natural move for an
+        attacker who has just deleted the newest rows. Folding that into the ``None``
+        above would make erasure read as cleanliness. :meth:`verify_chain` catches it
+        and returns ``False``; see
         ``test_verify_chain_survives_a_tampered_high_water_mark``.
         """
         conn = self._connection()
-        try:
-            async with conn.execute(_HIGH_WATER_SQL) as cursor:
-                row = await cursor.fetchone()
-        except sqlite3.Error:
-            return None
-        return None if row is None else int(row["seq"])
+        marks: list[int] = []
+        for sql in (_HIGH_WATER_SQL, _META_SQL):
+            try:
+                async with conn.execute(sql) as cursor:
+                    row = await cursor.fetchone()
+            except sqlite3.Error:
+                # The bookkeeping table itself is gone or unreadable. Not an opinion
+                # on its own -- the other source may still have one, and a log with
+                # no source at all is resolved by the caller.
+                continue
+            if row is not None:
+                marks.append(int(row[0]))
+        return max(marks) if marks else None
 
     async def length(
         self,
@@ -720,6 +933,44 @@ class AuditLogger:
             raise PipelineError(
                 reason="audit_log_unreadable", error=type(exc).__name__
             ) from exc
+
+
+async def _enable_wal(conn: aiosqlite.Connection) -> None:
+    """Put the database into WAL mode, tolerating a concurrent opener.
+
+    ``busy_timeout`` does not cover this one. Converting a database *into* WAL needs
+    a moment of exclusive access, and SQLite returns ``SQLITE_BUSY`` for that
+    conversion **without consulting the busy handler** -- so two processes opening a
+    brand-new audit DB at the same instant produce ``database is locked`` out of
+    ``open()`` itself, on a database that is about to be perfectly fine. Observed as
+    a flake, not predicted: the cross-process writer test passed five runs in
+    isolation and failed once under full-suite load.
+
+    Two mitigations, in order:
+
+    * **Read before writing.** An already-WAL database answers ``PRAGMA
+      journal_mode`` without needing any lock at all, so the common path -- every
+      reopen of an existing log -- stops contending entirely.
+    * **Retry the conversion.** Only the very first connection converts, and the
+      window is one statement wide, so a few short waits cover it.
+
+    Errors other than a lock are re-raised on the first attempt: a corrupt file must
+    still fail ``open()`` promptly rather than being retried into a slow failure, and
+    ``test_a_failed_open_does_not_leak_the_connection_thread`` depends on that.
+    """
+    async with conn.execute("PRAGMA journal_mode") as cursor:
+        row = await cursor.fetchone()
+    if row is not None and str(row[0]).lower() == "wal":
+        return
+    for attempt in range(WAL_SETUP_ATTEMPTS):
+        try:
+            await conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            if attempt == WAL_SETUP_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(WAL_SETUP_BACKOFF_S * (attempt + 1))
+        else:
+            return
 
 
 def _log_break(seq: int, reason: str) -> None:

@@ -75,6 +75,11 @@
     } else if (e.code === 'SESSION_EXPIRED') {
       msg = 'Session key is gone — the vault cannot be read, so nothing can be obfuscated or restored. ' +
         'Create a new session to continue. ' + detail;
+    } else if (e.code === 'RATE_LIMITED') {
+      // Every route here is anonymous, so the meters are per source address:
+      // a shared address can spend a budget this browser never touched.
+      msg = 'Throttled — too many requests from this address. Writes and failed audit-scope ' +
+        'lookups are metered per caller. Wait and retry. ' + detail;
     }
     banner('err', e.code || 'ERROR', msg);
   }

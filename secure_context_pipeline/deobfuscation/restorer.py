@@ -25,6 +25,47 @@ reach a user silently. ``[UNRESOLVED_ENTITY]`` is the one legitimate residue: it
 carries no category prefix and no 8-hex tail, so the token grammar cannot match
 it (checked at import, below).
 
+``issued`` is load-bearing, not decoration
+------------------------------------------
+The token grammar is a *shape*, not a secret, and the model's answer is derived
+from a document we do not control. So a token-shaped run in the response is not
+evidence that this run minted it: ``Reference: FIN-ACCOUNT-40281993`` in an
+uploaded file is undetected, un-obfuscated, quoted back by the model verbatim --
+and matches ``CATEGORY[_-]TYPE[_-]8hex`` exactly. Resolving it against the vault
+had two outcomes, both silent and both wrong: the user's own reference code came
+back as ``[UNRESOLVED_ENTITY]`` with the audit blaming the model for text the model
+faithfully copied, and -- when those eight hex digits happened to equal a live
+token ID -- *another document's original* was spliced into an unrelated sentence
+with ``restored_count`` up, ``vault_misses`` at zero and outcome ``ok``.
+
+So ``issued`` now gates the substitution rather than merely labelling the miss:
+
+* an ID this run minted resolves exactly as before;
+* an ID it did not, written in a **bracketed** form, is the model inventing a
+  placeholder -- it degrades to ``[UNRESOLVED_ENTITY]`` and audits as
+  :data:`MISS_FABRICATED`, and the vault is never asked;
+* an ID it did not, written **without brackets**, is indistinguishable from
+  ordinary document text and is left byte-for-byte alone. It is counted
+  (``foreign_tokens``) and logged, never rewritten. Deleting a user's own
+  reference code is a data-integrity failure they cannot see; a token-shaped
+  string surviving verbatim is text they can read.
+
+Omitting ``issued`` keeps the old, ungated behaviour, and honestly: every miss is
+:data:`MISS_INDETERMINATE` and every token-shaped residue is fatal, because
+without the set there is no way to tell ours from theirs.
+
+Nothing this module wrote is ever re-read
+-----------------------------------------
+Under pseudonymization the surrogate pass runs first and splices **original
+values** into the string. The token pass used to scan that result, including the
+text the surrogate pass had just written, so the pipeline could manufacture a
+token out of its own output: an EHR line ``Record locator: PHI-MRN-48273910``
+leaves ``PHI-`` in the payload as prose, the surrogate pass restores
+``MRN-48273910`` behind it, and ``PHI-MRN-48273910`` is a valid token match that
+the model never wrote. The token pass is therefore handed the spans the surrogate
+pass wrote and skips any match overlapping one -- overlap, not containment,
+because the manufactured match straddles the seam by construction.
+
 Two kinds of vault miss, and they are not the same incident
 -----------------------------------------------------------
 ``[UNRESOLVED_ENTITY]`` is what the *user* sees for either, and deliberately so:
@@ -64,8 +105,9 @@ from __future__ import annotations
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import Collection, Iterable, Mapping
-from typing import NamedTuple, Protocol
+from typing import NamedTuple, NoReturn, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -153,6 +195,10 @@ _CLOSERS = "".join(_BRACKET_PAIRS.values())
 # sentence, which is a far worse outcome than leaving a visible remnant.
 _HINT_TAIL_RE = re.compile(r"[^\s\]\}\)]{0,48}")
 
+#: One run of whitespace. Compiled once: it is used per surrogate per call, both
+#: to build the matcher and to key the issued map back from a flexed match.
+_WS_RUN_RE = re.compile(r"\s+")
+
 #: Longest label copied out of untrusted text into an audit row. The type label
 #: is grammar-constrained to ``[A-Z][A-Z0-9_]*`` and so can never be an entity
 #: value; the cap is belt-and-braces against a pathological response.
@@ -194,6 +240,26 @@ class RestoreResult(BaseModel):
     did. Without ``issued`` both are empty while ``unresolved`` is not, and that
     combination *is* the :data:`MISS_INDETERMINATE` signal -- it is not a claim
     that nothing was fabricated and nothing was lost.
+
+    Three counters exist so that a *degraded* answer is distinguishable from a
+    correct one by the caller rather than only by reading this module:
+
+    ``foreign_tokens``
+        Token-shaped runs still in ``text`` whose ID this run never issued. Left
+        verbatim on purpose (see the module docstring); non-zero means the answer
+        contains something that looks like a token and is not one.
+    ``restored_collisions``
+        Token matches skipped because they overlapped a value the surrogate pass
+        had just restored -- i.e. text this module wrote, not text the model did.
+    ``surrogates_suspected_unrestored``
+        Case- and whitespace-variant fakes that survived in the model's own prose.
+        The matcher is deliberately case-sensitive (see
+        :func:`_compile_surrogate_pattern`), so a shouted or re-wrapped pseudonym
+        reaches the user *as the fake* with ``restored_count`` at zero and nothing
+        else to distinguish it from a correct answer. This is the missing signal,
+        and it is an upper bound, not a defect count: a fake drawn from ordinary
+        English (``Long``, ``Brown``, ``May``) matches its lowercase common-word
+        twin and is counted here. Non-zero means "look", never "fail".
     """
 
     model_config = ConfigDict(frozen=True)
@@ -208,6 +274,10 @@ class RestoreResult(BaseModel):
     surrogate_misses: int = 0
     tokens_seen: int = 0
     surrogates_seen: int = 0
+    surrogates_issued: int = 0
+    surrogates_suspected_unrestored: int = 0
+    foreign_tokens: int = 0
+    restored_collisions: int = 0
     elapsed_ms: float = 0.0
 
     def __repr__(self) -> str:
@@ -217,7 +287,12 @@ class RestoreResult(BaseModel):
             f"unresolved={self.unresolved!r}, fabricated={self.fabricated!r}, "
             f"lost={self.lost!r}, surrogate_misses={self.surrogate_misses}, "
             f"tokens_seen={self.tokens_seen}, "
-            f"surrogates_seen={self.surrogates_seen}, elapsed_ms={self.elapsed_ms:.3f})"
+            f"surrogates_seen={self.surrogates_seen}, "
+            f"surrogates_issued={self.surrogates_issued}, "
+            f"surrogates_suspected_unrestored={self.surrogates_suspected_unrestored}, "
+            f"foreign_tokens={self.foreign_tokens}, "
+            f"restored_collisions={self.restored_collisions}, "
+            f"elapsed_ms={self.elapsed_ms:.3f})"
         )
 
     __str__ = __repr__
@@ -233,6 +308,16 @@ class _TokenPass(NamedTuple):
     fabricated: tuple[str, ...]
     lost: tuple[str, ...]
     seen: int
+    #: Matches deliberately left verbatim: not issued by this run and not
+    #: bracketed, so indistinguishable from the uploaded document's own text.
+    foreign: int = 0
+    #: Matches deliberately left verbatim because they overlapped a span the
+    #: surrogate pass wrote -- text this module produced, not text the model did.
+    collisions: int = 0
+    #: ``protected``, re-expressed in the coordinates of ``text``. This pass never
+    #: rewrites a protected span, so its bytes survive intact and only its offsets
+    #: move; :meth:`Restorer._assert_no_tokens` needs them in output coordinates.
+    protected: tuple[tuple[int, int], ...] = ()
 
 
 class _SurrogatePass(NamedTuple):
@@ -299,14 +384,18 @@ class Restorer:
         way (build doc section 9.3), so one response can carry both shapes.
 
         ``issued`` is the set of token IDs this run minted (case-insensitive). It
-        changes no output text and no control flow; it exists only so a vault miss
-        can be *classified* -- see the module docstring. Omitting it is supported
-        and honest: every miss is then recorded :data:`MISS_INDETERMINATE`.
+        classifies every vault miss, and it *gates* substitution: an ID this run
+        did not mint is never resolved against the vault, and an unbracketed one is
+        left byte-for-byte alone rather than rewritten. See the module docstring
+        for why that is a correctness property and not a tolerance regression.
+        Omitting it is supported and honest: every miss is then recorded
+        :data:`MISS_INDETERMINATE` and every token-shaped residue is fatal, because
+        without the set our tokens and the document's own text are the same shape.
 
-        Raises :class:`PipelineError` if a token or a known surrogate survives
-        the pass. Returns normally with ``[UNRESOLVED_ENTITY]`` spliced in when a
-        token ID is simply absent from the vault: an unknown token degrades the
-        answer, it never fails the request.
+        Raises :class:`PipelineError` if a token this run issued, or a known
+        surrogate, survives the pass. Returns normally with ``[UNRESOLVED_ENTITY]``
+        spliced in when a token ID is simply absent from the vault: an unknown
+        token degrades the answer, it never fails the request.
         """
         started = time.perf_counter()
         if strategy not in _KNOWN_STRATEGIES:
@@ -318,6 +407,7 @@ class Restorer:
 
         working = text
         surrogate_pass = _SurrogatePass(working, 0, 0, 0, ())
+        suspected = 0
         if pattern is not None:
             surrogate_pass = await self._restore_surrogates(
                 session_id, working, pattern=pattern, supplied=supplied, run_id=run_id
@@ -334,12 +424,26 @@ class Restorer:
                 strategy=strategy,
                 run_id=run_id,
             )
+            suspected = _count_surrogate_near_misses(
+                working, supplied, spliced=surrogate_pass.spliced
+            )
 
         token_pass = await self._restore_tokens(
-            session_id, working, minted=minted, run_id=run_id
+            session_id,
+            working,
+            minted=minted,
+            protected=surrogate_pass.spliced,
+            run_id=run_id,
         )
         working = token_pass.text
-        await self._assert_no_tokens(session_id, working, strategy=strategy, run_id=run_id)
+        foreign = await self._assert_no_tokens(
+            session_id,
+            working,
+            minted=minted,
+            protected=token_pass.protected,
+            strategy=strategy,
+            run_id=run_id,
+        )
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         result = RestoreResult(
@@ -353,6 +457,10 @@ class Restorer:
             surrogate_misses=surrogate_pass.missed,
             tokens_seen=token_pass.seen,
             surrogates_seen=surrogate_pass.seen,
+            surrogates_issued=len(supplied),
+            surrogates_suspected_unrestored=suspected,
+            foreign_tokens=foreign,
+            restored_collisions=token_pass.collisions,
             elapsed_ms=elapsed_ms,
         )
         await self._emit(
@@ -371,6 +479,14 @@ class Restorer:
                 "unresolved_fabricated": len(result.fabricated),
                 "unresolved_lost": len(result.lost),
                 "surrogate_misses": result.surrogate_misses,
+                # Three ways an answer can be degraded without a single miss being
+                # recorded. Before these, an all-caps pseudonym reached the user as
+                # the fake with `outcome: ok, restored: 0, vault_misses: 0` and
+                # nothing anywhere said so.
+                "surrogates_issued": result.surrogates_issued,
+                "surrogates_suspected_unrestored": result.surrogates_suspected_unrestored,
+                "foreign_tokens": result.foreign_tokens,
+                "restored_collisions": result.restored_collisions,
                 "elapsed_ms": round(elapsed_ms, 3),
                 "outcome": "ok",
             },
@@ -392,26 +508,70 @@ class Restorer:
     # -- tokenization ------------------------------------------------------
 
     async def _restore_tokens(
-        self, session_id: str, text: str, *, minted: set[str] | None, run_id: str | None
+        self,
+        session_id: str,
+        text: str,
+        *,
+        minted: set[str] | None,
+        protected: tuple[tuple[int, int], ...],
+        run_id: str | None,
     ) -> _TokenPass:
-        """Resolve every token, then rebuild the string in one left-to-right pass.
+        """Resolve every *claimable* token, then rebuild in one left-to-right pass.
 
         Equivalent to replacing right-to-left, and safer: the output is assembled
         from slices of the *original* string, so an earlier splice can never
         shift a later match's offsets.
 
-        ``minted`` is the lowercased ``issued`` set, or ``None``; it only decides
-        how a miss is *labelled*, never what is written into the text.
+        Two filters decide what is claimable at all, and both exist because a
+        ``TOKEN_RE`` match is not proof that this pipeline put those bytes there:
+
+        ``protected``
+            Half-open spans the surrogate pass wrote -- original values. A match
+            *overlapping* one was manufactured out of our own output and is left
+            alone. Overlap rather than containment: the manufactured match
+            straddles the seam (``PHI-`` from the model, ``MRN-48273910`` from us).
+
+        ``minted``
+            The lowercased ``issued`` set, or ``None``. An ID outside it is never
+            sent to the vault. Bracketed, it degrades to ``[UNRESOLVED_ENTITY]``
+            (the model invented a placeholder); unbracketed, it is left verbatim,
+            because that is what an uploaded document's own reference code looks
+            like and destroying it is worse than showing it.
         """
         matches = list(TOKEN_RE.finditer(text))
         if not matches:
-            return _TokenPass(text, 0, 0, (), (), (), 0)
+            # `protected` is handed straight back rather than dropped: no splice
+            # happened, so no offset moved, and the assertion downstream must not
+            # depend on this branch having been taken.
+            return _TokenPass(text, 0, 0, (), (), (), 0, 0, 0, protected)
 
-        # Resolve each distinct token ID once. This cache is per call by design:
-        # one that outlived the call would outlive its session scope.
+        # Widen once, up front: the claim decision is about the span that would
+        # actually disappear, not about the bare regex match.
+        spans = [_span_and_suffix(text, match) for match in matches]
+        claimable: list[bool] = []
+        collisions = 0
+        foreign = 0
+        for match, (span_start, span_end, _suffix) in zip(matches, spans, strict=True):
+            if _overlaps(span_start, span_end, protected):
+                collisions += 1
+                claimable.append(False)
+            elif (
+                minted is not None
+                and match.group(3).lower() not in minted
+                and not _is_bracketed(match.group(0))
+            ):
+                foreign += 1
+                claimable.append(False)
+            else:
+                claimable.append(True)
+
+        # Resolve each distinct claimable token ID once. This cache is per call by
+        # design: one that outlived the call would outlive its session scope.
         order: list[str] = []
         labels: dict[str, str] = {}
-        for match in matches:
+        for match, claimed in zip(matches, claimable, strict=True):
+            if not claimed:
+                continue
             token_id = match.group(3).lower()
             if token_id not in labels:
                 labels[token_id] = f"{match.group(1)}_{match.group(2)}"[:_MAX_LABEL_LEN]
@@ -423,6 +583,11 @@ class Restorer:
         lost: list[str] = []
         for token_id in order:
             try:
+                if minted is not None and token_id not in minted:
+                    # Not ours. The vault is never asked -- asking is how a
+                    # coincidence became a substitution -- and the miss is a
+                    # statement of fact rather than a lookup result.
+                    raise VaultMissError(session_id=session_id, token_id=token_id)
                 resolved[token_id] = await self._vault.get_by_token(session_id, token_id)
             except VaultMissError:
                 # Spec-required path: an unknown token degrades, never crashes.
@@ -469,18 +634,26 @@ class Restorer:
         cursor = 0
         restored = 0
         missed = 0
-        for match in matches:
-            span_start, span_end, possessive = _span_and_suffix(text, match)
-            if span_end <= cursor:  # fully swallowed by the previous splice
+        # (input_start, input_end, replacement_length) per committed splice, in
+        # ascending order -- everything needed to move a protected span's offsets.
+        edits: list[tuple[int, int, int]] = []
+        for match, claimed, (span_start, span_end, possessive) in zip(
+            matches, claimable, spans, strict=True
+        ):
+            # Not claimed -> not touched, and the cursor does not move: the bytes
+            # are emitted by the next lead slice exactly as the model wrote them.
+            if not claimed or span_end <= cursor:  # swallowed by the previous splice
                 continue
             parts.append(text[cursor : max(span_start, cursor)])
             value = resolved.get(match.group(3).lower())
             if value is None:
-                parts.append(UNRESOLVED_ENTITY + possessive)
+                piece = UNRESOLVED_ENTITY + possessive
                 missed += 1
             else:
-                parts.append(value + possessive)
+                piece = value + possessive
                 restored += 1
+            parts.append(piece)
+            edits.append((max(span_start, cursor), span_end, len(piece)))
             cursor = span_end
         parts.append(text[cursor:])
         return _TokenPass(
@@ -491,6 +664,9 @@ class Restorer:
             tuple(fabricated),
             tuple(lost),
             len(matches),
+            foreign,
+            collisions,
+            _shift_spans(protected, edits),
         )
 
     # -- pseudonymization --------------------------------------------------
@@ -512,7 +688,10 @@ class Restorer:
         # The surrogate/possessive split is computed once per match and reused by
         # both loops below, so the two can never disagree about where the
         # surrogate ended.
-        split = [_split_surrogate_match(match.group(0), supplied) for match in matches]
+        canonical = _canonical_by_shape(supplied)
+        split = [
+            _split_surrogate_match(match.group(0), supplied, canonical) for match in matches
+        ]
 
         resolved: dict[str, str] = {}
         missing: set[str] = set()
@@ -584,29 +763,104 @@ class Restorer:
     # -- post-restore assertions ------------------------------------------
 
     async def _assert_no_tokens(
-        self, session_id: str, text: str, *, strategy: str, run_id: str | None
-    ) -> None:
-        """In-code guarantee, not just a test: nothing token-shaped reaches the user.
+        self,
+        session_id: str,
+        text: str,
+        *,
+        minted: set[str] | None,
+        protected: tuple[tuple[int, int], ...],
+        strategy: str,
+        run_id: str | None,
+    ) -> int:
+        """In-code guarantee: no token **this run issued** reaches the user.
 
         Scanned with the same matcher used to restore, so detection and
-        verification cannot drift apart. Nothing is excluded from this scan --
-        not even text that came out of the vault. The token grammar is a
+        verification cannot drift apart. Nothing is excluded by *position* -- not
+        even text that came out of the vault -- but the scan is scoped by
+        ``minted``, and that scoping is a correction, not a relaxation.
+
+        The previous wording of this docstring claimed "the token grammar is a
         synthetic high-entropy shape (``CATEGORY_TYPE_8hex``) that a real entity
-        value cannot accidentally take, so *any* occurrence in the final answer
-        is a leak, whatever produced it. ``[UNRESOLVED_ENTITY]`` is inert against
-        the grammar, so a legitimate vault miss does not trip this.
+        value cannot accidentally take". That is false, and cheaply so::
+
+            TOKEN_RE.search("FIN_ACCOUNT_12345678")   # matches
+
+        Any category literal in the document's own prose in front of an eight-hex
+        run does it -- an account reference, an EHR record locator ``PHI-MRN-
+        48273910``, a docket number. Treating those as leaks failed correct runs
+        *after* the provider had already been called and billed, and (before
+        :meth:`_fail` stopped copying bytes) wrote eight characters of the
+        patient's own MRN into the 500 body and into ``GET /audit``.
+
+        So the question the assertion actually asks is the one that matters: did a
+        token **we minted** survive un-restored? Those are the only strings with a
+        vault row behind them and therefore the only ones whose survival is a
+        failure of this stage. Token-shaped residue we did not mint is counted and
+        logged, and the count is returned so it reaches the caller and the audit
+        row rather than dying here. With no ``issued`` set the old, stricter rule
+        stands unchanged -- ours and theirs are indistinguishable without it, so
+        every occurrence is fatal.
+
+        ``protected`` excuses a residue lying **wholly inside** a value the
+        surrogate pass restored -- the same scope and the same reason as
+        :meth:`_assert_no_surrogates`: those bytes are the answer, not residue.
+        Note the deliberate asymmetry with :meth:`_restore_tokens`, which excludes
+        on *overlap*. Rewriting is the destructive act, so the pass is generous
+        about what it refuses to touch; excusing is the permissive one, so the
+        assertion is strict about what it lets go. A residue merely *touching* a
+        restored value is still reported.
+
+        ``[UNRESOLVED_ENTITY]`` is inert against the grammar (checked at import),
+        so a legitimate vault miss does not trip this.
         """
-        residue = TOKEN_RE.search(text)
-        if residue is None:
-            return
-        await self._fail(
-            session_id,
-            run_id=run_id,
-            strategy=strategy,
-            reason="residual_token_after_restore",
-            count=len(TOKEN_RE.findall(text)),
-            sample=residue.group(3).lower(),
-        )
+        # Containment is tested on the *core* -- ``start(1)`` (category) through
+        # ``end(3)`` (hash) -- not on the whole match. Both brackets and both
+        # whitespace runs are optional and greedy, so a match around a restored
+        # value routinely reaches one character past it on each side; testing the
+        # raw span would excuse nothing and the exclusion would be dead code. The
+        # core is the part that identifies a token, and it is still the model's
+        # prose that has to supply anything outside a restored value for a
+        # straddling residue (``PHI-`` + ``MRN-48273910``) to stay reported.
+        residues = [
+            match
+            for match in TOKEN_RE.finditer(text)
+            if not any(
+                start <= match.start(1) and match.end(3) <= end for start, end in protected
+            )
+        ]
+        if not residues:
+            return 0
+        if minted is None:
+            await self._fail(
+                session_id,
+                run_id=run_id,
+                strategy=strategy,
+                reason="residual_token_after_restore",
+                count=len(residues),
+            )
+        ours = [match for match in residues if match.group(3).lower() in minted]
+        if ours:
+            await self._fail(
+                session_id,
+                run_id=run_id,
+                strategy=strategy,
+                reason="residual_token_after_restore",
+                count=len(ours),
+            )
+        foreign = len(residues) - len(ours)
+        if foreign:
+            # Not fatal and not silent. Counts and a shape, never the bytes: the
+            # residue is by definition text we could not account for.
+            logger.warning(
+                "token-shaped text this run never issued survived restoration",
+                extra={
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "strategy": strategy,
+                    "foreign_tokens": foreign,
+                },
+            )
+        return foreign
 
     async def _assert_no_surrogates(
         self,
@@ -645,7 +899,6 @@ class Restorer:
                 strategy=strategy,
                 reason="residual_surrogate_after_restore",
                 count=len(pattern.findall(text)),
-                sample=None,
             )
 
     async def _fail(
@@ -656,17 +909,30 @@ class Restorer:
         strategy: str,
         reason: str,
         count: int,
-        sample: str | None,
-    ) -> None:
-        """Audit the violation, then raise. Never carries the offending text."""
+    ) -> NoReturn:
+        """Audit the violation, then raise. A count and a reason -- nothing else.
+
+        This used to copy ``residue.group(3)`` into ``detail['sample_token_id']``
+        and into the exception, under a docstring claiming it "never carries the
+        offending text". It did. When the residue was manufactured out of a value
+        the restorer had just put back -- the document's own ``PHI-`` in front of a
+        restored ``MRN-40281993`` -- those eight characters were eight digits of a
+        patient's MRN, and they travelled into the HTTP 500 body and into
+        ``GET /audit``, whose schema documents itself as safe to hand a compliance
+        reader. Build doc section 16 forbids embedding an original entity value in
+        any exception or log, including debug paths.
+
+        The residue is, by construction, text this stage could not account for.
+        That is exactly the text no sampling rule can promise is safe, so nothing
+        is sampled. If a sample is ever wanted for triage, hash it with a salt --
+        do not carry the bytes.
+        """
         detail: dict[str, int | float | str] = {
             "strategy": strategy,
             "outcome": "assertion_failed",
             "reason": reason,
             "residual": count,
         }
-        if sample is not None:
-            detail["sample_token_id"] = sample
         await self._emit(session_id, run_id=run_id, event_type=DEOBFUSCATE, detail=detail)
         logger.error(
             "post-restore assertion failed",
@@ -683,7 +949,6 @@ class Restorer:
             run_id=None if run_id is None else run_id[:_MAX_LABEL_LEN],
             strategy=strategy,
             residual=count,
-            sample_token_id=sample,
         )
 
     # -- audit -------------------------------------------------------------
@@ -832,7 +1097,129 @@ def _consume_unclosed_tail(text: str, match: re.Match[str]) -> int:
     return stop + len(closer)
 
 
-def _compile_surrogate_pattern(surrogates: Iterable[str]) -> re.Pattern[str] | None:
+def _overlaps(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    """Does ``[start, end)`` share any character with a half-open span in ``spans``?
+
+    ``spans`` is ascending and non-overlapping (the surrogate pass builds it that
+    way), but the scan is a plain walk rather than a bisection: the list is one
+    entry per restored value in a single response, and a linear pass that is
+    obviously correct beats a binary search that is nearly so.
+
+    *Overlap*, not containment. The case this exists for straddles the boundary by
+    construction: ``PHI-`` is the model's text and ``MRN-48273910`` is ours, and a
+    containment test would wave the manufactured token straight through.
+    """
+    return any(start < span_end and span_start < end for span_start, span_end in spans)
+
+
+def _shift_spans(
+    spans: tuple[tuple[int, int], ...], edits: list[tuple[int, int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """Move ``spans`` from input coordinates into the rebuilt string's coordinates.
+
+    ``edits`` are the ``(start, end, replacement_length)`` splices the token pass
+    committed, ascending and non-overlapping. A protected span never intersects an
+    edit -- that is what ``protected`` means -- so its own bytes are untouched and
+    only the drift accumulated by earlier edits applies. Both lists are ascending,
+    so one merge walk does it.
+    """
+    if not spans or not edits:
+        return spans
+    shifted: list[tuple[int, int]] = []
+    index = 0
+    delta = 0
+    for start, end in spans:
+        while index < len(edits) and edits[index][1] <= start:
+            edit_start, edit_end, length = edits[index]
+            delta += length - (edit_end - edit_start)
+            index += 1
+        shifted.append((start + delta, end + delta))
+    return tuple(shifted)
+
+
+def _is_bracketed(matched: str) -> bool:
+    """Did this token match carry a bracket on either side?
+
+    The discriminator between "the model invented a placeholder" and "the document
+    contained a reference code". Either side is enough: a dropped bracket is a
+    mutation class the mock models and the build doc lists (section 9.6), so
+    demanding both would push half of the model's own placeholders into the
+    left-alone branch. Both absent means nothing in the string says *we* wrote it.
+    """
+    stripped = matched.strip()
+    return bool(stripped) and (stripped[0] in _BRACKET_PAIRS or stripped[-1] in _CLOSERS)
+
+
+def _collapse_ws(text: str) -> str:
+    """Whitespace-insensitive key for a surrogate. See :func:`_canonical_by_shape`."""
+    return _WS_RUN_RE.sub(" ", text)
+
+
+def _canonical_by_shape(surrogates: Iterable[str]) -> dict[str, str]:
+    """Whitespace-collapsed form -> the surrogate that was actually issued.
+
+    :func:`_compile_surrogate_pattern` matches a multi-word fake across any
+    whitespace run, so the matched text may not be a key of the caller's map:
+    ``Sherri\\nLopez`` has to resolve as ``Sherri Lopez``. Without this the lookup
+    misses, the value degrades to ``[UNRESOLVED_ENTITY]`` and a ``VAULT_MISS``
+    audits as :data:`MISS_LOST` -- an integrity incident reported for a line break.
+
+    A shape claimed by two different surrogates is dropped rather than resolved
+    arbitrarily: guessing between two entities is the one outcome worse than not
+    matching, and the exact-match path still handles both.
+    """
+    claims: dict[str, set[str]] = {}
+    for surrogate in surrogates:
+        claims.setdefault(_collapse_ws(surrogate), set()).add(surrogate)
+    return {shape: next(iter(owners)) for shape, owners in claims.items() if len(owners) == 1}
+
+
+def _count_surrogate_near_misses(
+    text: str, surrogates: Iterable[str], *, spliced: tuple[tuple[int, int], ...]
+) -> int:
+    """Fakes that *nearly* matched, in the model's own prose. A signal, not a gate.
+
+    :func:`_compile_surrogate_pattern` is case-sensitive on purpose and that
+    decision is right (folding case splices a real original next to a sentence
+    about the common word ``long``). The cost is that an upper-cased heading, a
+    lower-cased mention or a pluralised surname reaches the user **as the fake**,
+    with ``restored_count`` 0, ``vault_misses`` 0, ``surrogates_seen`` 0 and
+    outcome ``ok``. Nothing in the answer or the audit row distinguished that from
+    a document that simply had no pseudonyms in it.
+
+    This scans once more, case-insensitively and NFKC-folded, and *counts*. It
+    never resolves and never rewrites, so the reason for case-sensitivity is
+    untouched -- a count cannot splice a name into a sentence. Spans the surrogate
+    pass wrote are excluded for the same reason
+    :meth:`Restorer._assert_no_surrogates` excludes them: a restored original
+    legitimately contains other entities' fakes.
+
+    Deliberately an upper bound. ``Long`` counts its lowercase common-word twin,
+    and that over-count is preferable to a signal that goes quiet exactly when the
+    fake is an ordinary word -- the case where a reader most needs to look.
+    """
+    # NFKC catches the equal-length compatibility forms (fullwidth Latin, ligature
+    # digraphs). Anything that changes the length has moved the spliced offsets,
+    # and a near-miss count is not worth mis-scoping the exclusion for, so that
+    # case scans the original text instead of guessing at a mapping.
+    folded = unicodedata.normalize("NFKC", text)
+    if len(folded) != len(text):
+        folded = text
+    pattern = _compile_surrogate_pattern(surrogates, fold=True)
+    if pattern is None:
+        return 0
+    return sum(
+        1
+        for match in pattern.finditer(folded)
+        if not any(
+            start <= match.start() and match.end() <= end for start, end in spliced
+        )
+    )
+
+
+def _compile_surrogate_pattern(
+    surrogates: Iterable[str], *, fold: bool = False
+) -> re.Pattern[str] | None:
     """One alternation, longest alternative first, boundary-guarded per side.
 
     Longest-first is the whole game. Python tries alternatives in written order
@@ -880,6 +1267,27 @@ def _compile_surrogate_pattern(surrogates: Iterable[str]) -> re.Pattern[str] | N
     character, and a shared first character puts them in the same group. So no
     partition can reorder two candidates that were ever in contention, and
     longest-first still decides between them.
+
+    **Internal whitespace is compiled as ``\\s+``, not as a literal space**, and
+    that is the difference between a correct answer and a person who does not
+    exist. Pseudonymization links name components, so one patient owns both
+    ``Sherri Lopez`` and ``Lopez``. Longest-first protects the pair only while the
+    model reproduces the long fake byte-for-byte; the moment it hard-wraps the
+    line, re-flows a paragraph, double-spaces or drops the name into a table cell,
+    the long alternative stops matching and the *surname* alternative wins alone.
+    The output is the fake given name welded to the **real** surname --
+    ``Sherri\\nTorres`` -- and every counter says the run went well:
+    ``restored_count`` goes *up*, ``surrogate_misses`` stays 0, and
+    :meth:`Restorer._assert_no_surrogates` cannot fire because ``Sherri`` on its
+    own is not an issued fake. ``\\s+`` keeps the long alternative matching, which
+    is the only place this can be fixed: once the pass has run, the hybrid is
+    indistinguishable from a correctly restored two-word original.
+    :func:`_canonical_by_shape` maps the flexed match back to the issued key.
+
+    ``fold=True`` compiles the same alternation case-insensitively. That form is
+    used **only** by :func:`_count_surrogate_near_misses` to count; nothing is
+    ever resolved through it, because the reason case-sensitivity exists is that
+    folding it turns ``long`` into a splice site.
     """
     ordered = sorted({s for s in surrogates if s}, key=lambda s: (-len(s), s))
     if not ordered:
@@ -892,7 +1300,7 @@ def _compile_surrogate_pattern(surrogates: Iterable[str]) -> re.Pattern[str] | N
     for surrogate in ordered:
         bare = f"(?!{_ALNUM})" if _ALNUM_RE.match(surrogate[-1]) else ""
         suffix = f"(?:{apostrophe}s(?!{_ALNUM})|{apostrophe}|{bare})"
-        branch = f"{re.escape(surrogate)}{suffix}"
+        branch = f"{_escape_ws_flexible(surrogate)}{suffix}"
         if _ALNUM_RE.match(surrogate[0]):
             guarded.append(branch)
         else:
@@ -903,10 +1311,25 @@ def _compile_surrogate_pattern(surrogates: Iterable[str]) -> re.Pattern[str] | N
         groups.append(f"(?<!{_ALNUM})(?:{'|'.join(guarded)})")
     if unguarded:
         groups.append(f"(?:{'|'.join(unguarded)})")
-    return re.compile("|".join(groups))
+    return re.compile("|".join(groups), re.IGNORECASE if fold else 0)
 
 
-def _split_surrogate_match(matched: str, known: Collection[str]) -> tuple[str, str]:
+def _escape_ws_flexible(surrogate: str) -> str:
+    """``re.escape`` the surrogate, but let every internal whitespace run flex.
+
+    Leading/trailing whitespace (a surrogate should not have any, but the caller's
+    map is untrusted input to this function) is escaped literally: only *internal*
+    runs become ``\\s+``, so the boundary guards still key on a real character.
+    """
+    parts = _WS_RUN_RE.split(surrogate)
+    if len(parts) == 1:
+        return re.escape(surrogate)
+    return r"\s+".join(re.escape(part) if part else "" for part in parts)
+
+
+def _split_surrogate_match(
+    matched: str, known: Collection[str], canonical: Mapping[str, str]
+) -> tuple[str, str]:
     """Split a match into ``(surrogate, possessive)``.
 
     The pattern above carries its boundary guards per alternative, which rules out
@@ -914,10 +1337,22 @@ def _split_surrogate_match(matched: str, known: Collection[str]) -> tuple[str, s
     It is exact rather than heuristic: the whole match is checked against the
     issued set *first*, so a surrogate that legitimately ends in an apostrophe is
     never mistaken for a shorter one wearing a possessive.
+
+    ``canonical`` (from :func:`_canonical_by_shape`) is consulted only after both
+    exact checks fail, so the whitespace-flexible matcher cannot change the answer
+    for any text that already matched exactly -- it only rescues the wrapped form.
     """
     if matched in known:
         return matched, ""
     for suffix in _POSSESSIVE_SUFFIXES:
         if matched.endswith(suffix) and matched[: -len(suffix)] in known:
             return matched[: -len(suffix)], suffix
+    shaped = canonical.get(_collapse_ws(matched))
+    if shaped is not None:
+        return shaped, ""
+    for suffix in _POSSESSIVE_SUFFIXES:
+        if matched.endswith(suffix):
+            shaped = canonical.get(_collapse_ws(matched[: -len(suffix)]))
+            if shaped is not None:
+                return shaped, suffix
     return matched, ""

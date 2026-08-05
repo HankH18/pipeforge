@@ -6,15 +6,27 @@ claim cannot rest on the detector having found everything. Instead, every byte
 that is about to leave the process is checked against the set of values we *know*
 are sensitive, and anything unexplained blocks the call.
 
-Two independent passes:
+Three passes, of which only the first two were ever independent of the detector:
 
 1. **Original-value scan.** The fully serialized outbound payload is searched for
-   every original in the session vault, in raw, normalised, and format-character-
-   folded form. This catches a splice bug, an un-obfuscated echo, or a value the
-   engine missed after detection found it.
+   every original in the session vault, in raw, normalised, format-character-folded
+   and combining-mark-folded form, plus -- for values whose disclosure is carried by
+   a long digit run -- with no word-boundary requirement at all
+   (:func:`_identifier_needles`). This catches a splice bug, an un-obfuscated echo,
+   or a value the engine missed after detection found it.
 2. **Detector re-scan**, skipping spans that are our own surrogates. This catches
    values the detector found *this* time but the engine never vaulted -- and, in
    the adversarial test, values planted directly into the originals set.
+3. **Independent-pattern scan** (:data:`_INDEPENDENT_PATTERNS`), over the same
+   unprotected text pass 2 examines but with recognisers the detector does not use.
+   Pass 2 alone is not a second opinion -- it re-runs the *same* Detector, so a value
+   the detector misses is invisible to it for the same reason it was invisible at
+   detect time, and pass 1 never learned about it either. Measured, not argued:
+   Presidio's ``UsSsnRecognizer.invalidate_result`` scores the canonical example SSNs
+   (``123-45-6789``, ``987-65-4320``, ``078-05-1120``), every ``000``/``666`` area
+   number, every all-zero group and every mismatched-delimiter spelling at **0.0**, so
+   ``Member SSN 123-45-6789`` was never vaulted, never obfuscated, and reached the
+   provider in the clear with all three passes silent.
 
 The skip-list in pass 2 is load-bearing. Pseudonyms are PII-shaped *by design*: a
 fake name is still a name. Without the skip-list every pseudonymization run would
@@ -75,23 +87,42 @@ carries payload bytes:
 
 **What pass 1 does and does not promise**, stated as residual risk rather than
 implied by omission. It blocks whenever a vaulted original appears in the payload
-as a standalone run of text, in any of the three compared forms -- including next
+as a standalone run of text, in any of the compared forms -- including next
 to punctuation, markdown, brackets and currency symbols, and including a value
 interrupted by any character that renders as nothing: every Unicode format (``Cf``)
 codepoint and every default-ignorable, from the zero-width space to the tag block
-that carries the ASCII-smuggling vector (see :data:`_INVISIBLE_RE`). Three gaps
-remain:
+that carries the ASCII-smuggling vector (see :data:`_INVISIBLE_RE`). It *also*
+blocks two shapes that used to walk through, each of which was reachable from an
+ordinary uploaded document and each of which was reproduced end-to-end before being
+closed:
 
-1. *Embedded in a longer alphanumeric run.* ``Brown`` inside ``Browning`` is not
-   an occurrence of ``Brown``, and treating it as one blocks every
-   pseudonymization run on its own well-formed output. The same rule means
-   ``SSN412-33-7891`` (no separator at all) is not flagged either. This is the
-   deliberate trade, it is the same rule the engine's residual sweep applies, and
-   the two agreeing is what stops a value being swept everywhere and still
-   reported present.
-2. *Homoglyph substitution.* Cyrillic U+043E for Latin ``o`` is different bytes;
-   catching it needs a confusables table, not another normalisation form.
-3. *A lossy or re-writing encoding layer* (base64, percent-encoding, a
+1. *An identifier glued into a longer alphanumeric run.* ``Brown`` inside
+   ``Browning`` is still not an occurrence of ``Brown`` -- treating it as one blocks
+   every pseudonymization run on its own well-formed output -- but that boundary rule
+   was for years the **only** occurrence test, and the document body is
+   attacker-controlled. A vaulted ``TAX_ID`` of ``47-1234567``, detected and
+   tokenized from its clean mention, rode out to the provider byte-for-byte inside
+   ``batch47-1234567Alpha``; ``MRN: 5567281`` did the same inside ``MRN5567281B``.
+   The false-positive trade that justifies the boundary rule is a *name* argument
+   (``Brown``/``Browning``), and it does not transfer to a nine-digit identifier, so
+   :func:`_identifier_needles` now scans digit-carrying values with no adjacency
+   requirement at all. See that function for the exact rule and its cost.
+2. *A combining mark spliced into a value.* ``Nathaniel Brightwater`` was vaulted
+   from its clean mention and reached the provider as ``Nathaniél
+   Brightwater`` -- a different string to every one of the three original forms, and
+   identical to ``Nathaniel Brightwater`` for a human reader and for the model. The
+   *payload* is now compared in a mark-stripped skeleton form as well
+   (:func:`_deaccent`); the needle is deliberately not stripped, which is what keeps
+   ``José`` and ``Jose`` distinct values. See :func:`_deaccent`.
+
+Two gaps remain:
+
+1. *Homoglyph substitution.* Cyrillic U+043E for Latin ``o`` is different bytes;
+   catching it needs a confusables table, not another normalisation form. This is
+   the same class as the combining mark above and is the obvious next thing to
+   close; the difference is that a UTS-39 confusables table is data this project
+   does not ship, while ``unicodedata`` already knows what a combining mark is.
+2. *A lossy or re-writing encoding layer* (base64, percent-encoding, a
    summarizer) applied to outbound text. This pipeline applies none -- the payload
    is assembled from the obfuscated document verbatim -- so this is reachable only
    if some future stage adds one, which would have to bring the gate with it. The
@@ -103,8 +134,17 @@ remain:
    body is parsed back out of ``httpx.MockTransport`` and compared to the strings
    handed to the provider.
 
-All three are detection-recall and upstream-integrity questions rather than
-scan-form questions; pass 2 and the vault are what cover them.
+Both are detection-recall and upstream-integrity questions rather than scan-form
+questions; passes 2 and 3 and the vault are what cover them.
+
+**What the guarantee is, stated so it cannot be read as more than it is.** Pass 1
+backstops every value the pipeline *vaulted*, whatever the detector's recall was on
+the rest of the document. Passes 2 and 3 backstop high-severity pattern shapes,
+whether or not anything vaulted them. What no pass can backstop is a value that is
+neither vaulted nor of a shape any recogniser here knows: "zero PII in transit" is
+an egress property with respect to the vault, and a recall property with respect to
+everything else. Pass 3 exists because the difference between those two sentences
+was, until it was added, the whole distance between the headline claim and the code.
 """
 
 from __future__ import annotations
@@ -114,6 +154,7 @@ import hashlib
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import Iterable, Sequence
 from typing import Final, Protocol
 
@@ -128,6 +169,7 @@ __all__ = [
     "AUDIT_EMIT_TIMEOUT_S",
     "DEFAULT_TIMEOUT_S",
     "HIGH_SEVERITY_TYPES",
+    "MIN_IDENTIFIER_DIGITS",
     "MIN_ORIGINAL_LEN",
     "EgressGate",
 ]
@@ -151,6 +193,23 @@ HIGH_SEVERITY_TYPES = frozenset({"SSN", "MRN", "ACCOUNT_NUMBER", "TAX_ID"})
 # such payload. On each derived form it is measured raw, because normalising and
 # folding both shrink a needle and can drop it below the floor after the fact.
 MIN_ORIGINAL_LEN = 3
+
+#: How many ASCII digits a vaulted value must carry before pass 1 scans it with the
+#: word-boundary rule switched **off** -- see :func:`_identifier_needles` for the
+#: rule and :func:`_occurs_as_a_unit` for what is being switched off.
+#:
+#: Seven rather than six, and the difference is arithmetic rather than taste. The
+#: needle is compared as a bare substring, so it can land inside a run of characters
+#: this pipeline emitted itself, and the only such run made of ``[0-9a-f]`` is an
+#: 8-hex token ID. A specific 6-digit needle appears somewhere in a random 8-hex ID
+#: with probability ~3x16^-6 = 1.8e-7; at seven digits it is ~2x16^-7 = 7.5e-9. A
+#: run carries tens of tokens and a session carries thousands of originals, so the
+#: first number is a flake a long CI history would eventually see and the second is
+#: not. What seven costs is a six-digit MRN core (the registry's ``\\d{6,10}`` allows
+#: one): that value is still scanned in all four bounded forms, just not as a bare
+#: substring. Fixture MRNs are seven digits, which is also the shortest an MRN
+#: actually written by the chart systems this models tends to be.
+MIN_IDENTIFIER_DIGITS: Final = 7
 
 #: Wall-clock budget for one whole ``check()``. Exceeding it blocks, because a
 #: detector that never returns is indistinguishable from one that has not finished
@@ -302,8 +361,14 @@ class EgressGate:
                 run_id=None if run_id is None else _clamp(run_id),
             )
 
+        # The spans that are our own output. Computed once and handed to both of the
+        # payload-side passes: they ask different questions of the same text, and a
+        # hole in one that is not a hole in the other would be a bug in the harder
+        # direction to see.
+        protected = self._protected_spans(payload, surrogates)
+
         # --- pass 2: detector re-scan, minus our own surrogates ------------
-        blocked_types, warnings = await self._rescan(payload, surrogates)
+        blocked_types, warnings = await self._rescan(payload, protected)
         if blocked_types:
             types = _clamp(",".join(sorted(set(blocked_types))))
             await self._emit_block(
@@ -317,6 +382,27 @@ class EgressGate:
                 session_id=_clamp(session_id),
                 reason="detector_rescan",
                 hit_count=len(blocked_types),
+                entity_types=types,
+                run_id=None if run_id is None else _clamp(run_id),
+            )
+
+        # --- pass 3: recognisers the detector does not use -----------------
+        # Deliberately last, so a payload both passes object to keeps the pass-2
+        # reason code it has always had and no existing expectation moves.
+        independent = _independent_hits(payload, protected)
+        if independent:
+            types = _clamp(",".join(sorted(set(independent))))
+            await self._emit_block(
+                session_id,
+                run_id,
+                reason="independent_pattern",
+                hit_count=len(independent),
+                entity_types=types,
+            )
+            raise EgressBlockedError(
+                session_id=_clamp(session_id),
+                reason="independent_pattern",
+                hit_count=len(independent),
                 entity_types=types,
                 run_id=None if run_id is None else _clamp(run_id),
             )
@@ -346,8 +432,8 @@ class EgressGate:
         strict here. Pass 2 keeps its skip-list because a *detector* re-hit on a
         well-formed fake is a different question from a byte-exact original.
 
-        Each original is compared in three forms, and any one of them counts as a
-        hit. Each additional form only ever *widens* the scan:
+        Each original is compared in four bounded forms, and any one of them counts
+        as a hit. Each additional form only ever *widens* the scan:
 
         1. **raw** -- the byte-exact value;
         2. **normalised** -- NFKC, whitespace collapsed, casefolded, so a splice bug
@@ -357,18 +443,32 @@ class EgressGate:
            human reader and to the model, so ``Joh<U+200B>n Smith`` on the wire
            discloses exactly what ``John Smith`` discloses. Without this form, one
            zero-width space is a complete bypass of pass 1.
+        4. **skeleton** -- the folded needle against a folded payload with every
+           combining mark removed (:func:`_deaccent`), which is what catches a mark
+           spliced into a value. Asymmetric on purpose: only the *haystack* is
+           stripped, so ``José`` in the vault still does not match ``Jose`` on the
+           wire. Skipped outright when the payload carries no combining mark at all,
+           which is the common case and makes this form free there.
 
-        The three are **not** redundant, and assuming they were is how the middle one
-        nearly disappeared unnoticed: on text with no invisible characters, folded and
-        normalised are the same needle against the same haystack, so a suite whose
-        probes all satisfy two forms at once cannot see the third leave. Each now has
-        a payload only it can catch, named in a test of its own -- raw:
+        The first three are **not** redundant, and assuming they were is how the
+        middle one nearly disappeared unnoticed: on text with no invisible characters,
+        folded and normalised are the same needle against the same haystack, so a
+        suite whose probes all satisfy two forms at once cannot see the third leave.
+        Each has a payload only it can catch, named in a test of its own -- raw:
         ``test_the_raw_form_is_the_only_thing_that_sees_some_leaks`` (``Dr Smith℠``,
         where NFKC expands the symbol and glues an alphanumeric onto the needle in
         both derived forms); normalised:
         ``test_the_normalised_form_is_the_only_thing_that_sees_some_leaks`` (case
         changed, zero-width spaces on both sides, so folding glues the neighbours on);
-        folded: the zero-width and default-ignorable parametrizations.
+        folded: the zero-width and default-ignorable parametrizations; skeleton:
+        ``test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider``.
+
+        Then, and only for a value that failed all four, the **unbounded identifier
+        forms** (:func:`_identifier_needles`): a bare substring test with no adjacency
+        requirement, for the digit runs whose disclosure a neighbouring character
+        cannot undo. That is a separate step rather than a fifth entry in ``forms``
+        because it is the one comparison that is *not* an occurrence-as-a-unit
+        question, and writing it as one would hide that.
 
         O(payload x entities), with a C-level substring pre-filter in
         :func:`_occurs_as_a_unit` doing the rejecting; the scale answer is an
@@ -376,28 +476,50 @@ class EgressGate:
         """
         payload_norm = normalize(payload)
         payload_folded = _strip_invisible(payload_norm)
+        payload_skeleton = _deaccent(payload_folded)
+        marked = payload_skeleton != payload_folded
         hits = 0
         for original in originals:
             if len(original.strip()) < MIN_ORIGINAL_LEN:
                 continue
             normalized = normalize(original)
             folded = _strip_invisible(normalized)
-            forms = (
+            forms = [
                 (original, payload),
                 (normalized, payload_norm),
                 (folded, payload_folded),
-            )
+            ]
+            if marked:
+                forms.append((folded, payload_skeleton))
             if any(
                 len(needle) >= MIN_ORIGINAL_LEN and _occurs_as_a_unit(needle, haystack)
                 for needle, haystack in forms
             ):
                 hits += 1
+                continue
+            if any(needle in payload_skeleton for needle in _identifier_needles(folded)):
+                hits += 1
         return hits
 
     async def _rescan(
-        self, payload: str, surrogates: frozenset[str]
+        self, payload: str, protected: list[tuple[int, int]]
     ) -> tuple[list[str], int]:
         """Re-detect on the payload, ignoring spans that are our own output.
+
+        Takes the protected spans rather than the surrogate set because pass 3 needs
+        the same list, and computing it twice would let the two passes disagree about
+        what our own output is -- the exact class of divergence this module keeps
+        finding in itself.
+
+        **This pass is not an independent opinion, and that is why pass 3 exists.**
+        It runs the same ``Detector`` that ran at detect time, over text derived from
+        the same document, so every blind spot it had then it has again here: a value
+        no recogniser anchors on is invisible to detection, never vaulted, therefore
+        invisible to pass 1, and invisible here for the third time. That is not a
+        hypothetical -- see :data:`_INDEPENDENT_PATTERNS`. What this pass genuinely
+        adds is a verdict on text the detector never saw in that arrangement: the
+        assembled payload, where obfuscation, splicing and the system prompt have
+        moved things around.
 
         Two properties of this pass are easy to misread, so both are stated here.
 
@@ -442,7 +564,6 @@ class EgressGate:
         unbroken word run, so a value straddling its edge would have to be one the
         detector reads *through* our bracket or our category literal.
         """
-        protected = self._protected_spans(payload, surrogates)
         detections = await self._detector.detect(payload, None)
 
         blocked: list[str] = []
@@ -740,6 +861,205 @@ def _strip_invisible(value: str) -> str:
     return _INVISIBLE_RE.sub("", value)
 
 
+def _deaccent(value: str) -> str:
+    """``value`` with every combining mark removed. Applied to the HAYSTACK only.
+
+    :data:`_INVISIBLE_RE` folds characters that render as nothing and deliberately
+    stops short of combining diacritics, because a diacritic is *visible* and
+    ``José`` and ``Jose`` are two different people. That reasoning is right about the
+    needle and wrong about the haystack, and the gap it left was reproduced
+    end-to-end rather than argued about: ``Nathaniel Brightwater`` was detected and
+    vaulted from a clean mention, a second mention carrying one U+0301 between the
+    two names was missed by NER (so never independently vaulted), and it reached the
+    provider reading identically to ``Nathaniel Brightwater`` for any human and for
+    the model. NFKC does not help -- it *composes*, so ``l`` + U+0301 becomes ``ĺ``,
+    which is simply a different letter.
+
+    Stripping only the payload is what makes this safe to add. The comparison
+    ``needle in deaccent(payload)`` fires when a mark was spliced into a mark-free
+    vaulted value -- the demonstrated attack -- and does not fire when the payload
+    legitimately says ``Jose`` and the vault holds ``José``, because the needle keeps
+    its accent and ``josé`` is not a substring of ``jose``. Stripping both sides
+    would collapse those two into one value and manufacture false blocks on any
+    document carrying both spellings, which is the trade
+    ``tests/leakage/test_leakage_harness.py`` names and refuses.
+
+    What the asymmetry costs, said plainly: a vaulted value that *itself* carries a
+    mark (``José Ruiz``) is not protected against a second mark being spliced into
+    it, because the needle is never stripped. That is a strictly smaller residual
+    than the one it replaces, and closing it needs the same confusables table the
+    homoglyph gap needs.
+
+    NFD-then-strip-then-NFC rather than a character class: the mark can arrive
+    precomposed (``ĺ``, U+013A) or as a base plus U+0301, and only decomposition
+    makes those the same question. The fast path returns ``value`` unchanged when
+    decomposition finds no mark at all, which is every payload that is not carrying
+    one -- and every ASCII payload without touching NFC.
+    """
+    decomposed = unicodedata.normalize("NFD", value)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    if len(stripped) == len(decomposed):
+        return value
+    return unicodedata.normalize("NFC", stripped)
+
+
+#: One maximal run of ASCII digits long enough to be an identifier on its own.
+_DIGIT_RUN_RE = re.compile(rf"[0-9]{{{MIN_IDENTIFIER_DIGITS},}}")
+_ANY_DIGIT_RE = re.compile(r"[0-9]")
+
+
+def _identifier_needles(value: str) -> tuple[str, ...]:
+    """Forms of ``value`` that disclose it **whatever they are glued to**.
+
+    :func:`_occurs_as_a_unit` refuses to call ``Brown`` inside ``Browning`` an
+    occurrence, and it is right to: a generated fake that contains a real surname is
+    not a leak, and blocking on it makes pseudonymization unusable. But that argument
+    is about *names*, and for years it was the only occurrence test pass 1 had. It
+    does not survive contact with a nine-digit identifier, and the document body is
+    written by whoever uploads the file:
+
+        The taxpayer EIN 47-1234567 is on file.
+        Internal routing tag: batch47-1234567Alpha must match the ledger.
+
+    ``47-1234567`` is detected and tokenized out of line 1, and rides out to the
+    provider byte-for-byte in line 2 -- neither swept (the engine's residual sweep
+    applies the same boundary rule) nor blocked (pass 1 did too) nor re-detected
+    (``TAX_ID``'s pattern anchors on ``\\b``, which ``batch`` denies it). ``batch`` in
+    front of it conceals nothing from a reader and nothing from the model.
+
+    So a value that carries at least :data:`MIN_IDENTIFIER_DIGITS` digits is also
+    compared as a bare substring, in two shapes:
+
+    * **the whole value**, when it contains no letter at all -- ``512-24-8710``,
+      ``47-1234567``, ``(415) 555-0123``. The separators are part of what is
+      disclosed, so the needle keeps them.
+    * **each long digit run inside it**, whatever else the value contains. This is
+      the half that matters for a vaulted span that includes its own label:
+      ``MRN: 5567281`` never appears in ``MRN5567281B``, but ``5567281`` does, and
+      the digits are the secret. It also covers ``Account No. 100200300400`` against
+      a bare ``100200300400`` elsewhere in the document, and ``BCBS123456789``
+      against a bare ``123456789``.
+
+    The false-positive risk this accepts is the one the boundary rule was avoiding,
+    and it is a different size here. For a name it is ordinary -- Brown/Browning is a
+    word list away. For a seven-digit run it needs another number in the payload that
+    contains those exact digits contiguously; the arithmetic on the one such run this
+    pipeline emits itself (an 8-hex token ID) is in :data:`MIN_IDENTIFIER_DIGITS`.
+    Where it does fire on something innocent the result is a blocked request, which
+    is the direction this gate is allowed to be wrong in.
+
+    What is in scope is worth stating exactly, because the first draft of this
+    docstring said "identifiers" and meant it, and the code says something broader
+    and simpler. A value contributes a whole-value needle whenever it is made of
+    digits and separators alone and carries seven of them -- which is true of a date
+    with a four-digit year (``03/12/1985``, eight digits), of a phone number
+    (``(415) 555-0123``), and of an amount over ``$99,999.99``. Those are all values
+    a glued neighbour discloses just as completely as it discloses an SSN, and every
+    one of them is a HIPAA identifier in a medical record, so the wider rule is the
+    right one; it is documented here rather than narrowed because the narrowing
+    would have to be a list of shapes, and a list of shapes is the thing this module
+    keeps finding it got wrong.
+
+    Values that contribute nothing at all and keep exactly the four bounded forms:
+    every name and every value with no digits; short dates (``03/12/85``, six
+    digits); amounts below seven digits (``$1,234.56``); docket numbers
+    (``1:23-cv-04567`` -- letters, and no run reaches seven); lab values
+    (``A1C 7.4``).
+    """
+    if not _ANY_DIGIT_RE.search(value):
+        return ()
+    stripped = value.strip()
+    needles: list[str] = []
+    if (
+        sum(1 for ch in stripped if "0" <= ch <= "9") >= MIN_IDENTIFIER_DIGITS
+        and not any(ch.isalpha() for ch in stripped)
+        and len(stripped) >= MIN_ORIGINAL_LEN
+    ):
+        needles.append(stripped)
+    needles.extend(_DIGIT_RUN_RE.findall(stripped))
+    return tuple(dict.fromkeys(needles))
+
+
+#: Pass 3's recognisers: high-severity shapes matched by patterns the **detector does
+#: not use**, so that a detector miss is not automatically a gate miss.
+#:
+#: Pass 2 re-runs the same ``Detector`` that ran at detect time. That makes it a
+#: second *look*, not a second *opinion*, and the difference is measurable. Presidio's
+#: ``UsSsnRecognizer`` scores every candidate through ``invalidate_result``, which
+#: returns True -- a hard 0.0, not a low score -- for::
+#:
+#:     123-45-6789   987-65-4320   078-05-1120     (published example SSNs)
+#:     000-xx-xxxx   666-xx-xxxx                   (never-issued area numbers)
+#:     xxx-00-xxxx   xxx-xx-0000                   (all-zero group or serial)
+#:     111-11-1111                                 (all one digit)
+#:     123-45.6789                                 (mismatched delimiters)
+#:
+#: ``Member SSN 123-45-6789 verified against records.`` therefore reached the provider
+#: fully in the clear: never detected, so never vaulted, so nothing for pass 1 to look
+#: for, and pass 2 asked the recogniser that had already said no. The registry's own
+#: MRN comment admits the general shape of this ("a value neither pattern anchors on
+#: is invisible to both"); this constant is the part that stops it being true of the
+#: *egress* gate as well as of detection.
+#:
+#: Scope is deliberately narrow, because pass 3 blocks and a block is a denial:
+#:
+#: * The **separated** SSN spelling only. A bare ``\\b[0-9]{9}\\b`` rule would fire on
+#:   every zip+4, order number and invoice ID in an ordinary document -- the registry
+#:   rejects a bare-digit MRN rule for exactly that reason -- and it would fire on
+#:   text this pipeline had already handled correctly.
+#: * The separator class is ``[-. ]``: Presidio's own, deliberately, because the job
+#:   here is to remove Presidio's *validation* blind spot rather than to invent
+#:   shapes it never claimed. A spelling outside that class (``123/45/6789``) is not
+#:   claimed and is named as residual rather than left to be discovered.
+#: * Mismatched separators *are* matched, because rejecting them is one of Presidio's
+#:   invalidation rules and therefore one of its blind spots.
+#:
+#: The space separator was left out of the first version of this constant, on the
+#: reasoning that ``100 25 1000`` is a table row and blocking it would be a denial
+#: reachable from an ordinary financial document. That reasoning was wrong, and it
+#: was wrong in a way worth recording because it is the same mistake this module
+#: keeps making -- reasoning about a checker without running the thing it checks.
+#: Measured on the shipped detector::
+#:
+#:     'Ledger row totals 100 25 1000 posted this quarter.'  -> SSN:0.50, BLOCKED
+#:     'Member SSN 123 45 6789 verified against records.'    -> nothing,   PASSED
+#:
+#: Presidio's ``SSN5`` pattern already claims the space spelling at 0.5, so a
+#: space-separated table row that is a *valid* SSN has always blocked this pipeline
+#: via pass 2. Excluding spaces here therefore bought no false-positive protection at
+#: all; all it did was leave the **invalidated** subset -- exactly the example SSNs
+#: pass 3 exists for -- able to leave the process, and leave the gate more permissive
+#: precisely where Presidio had decided the number was fake. The residual false
+#: positives the space class adds are the rows Presidio invalidates and nothing else:
+#: an all-zero middle column (``100 00 1000``), an all-zero tail, or a row of one
+#: repeated digit.
+#:
+#: Our own output is exempt by span (:meth:`EgressGate._protected_spans`), which is
+#: what keeps a pseudonymized fake SSN -- SSN-shaped by design -- from blocking every
+#: run that produces one.
+_INDEPENDENT_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("SSN", re.compile(r"\b[0-9]{3}[-. ][0-9]{2}[-. ][0-9]{4}\b")),
+)
+
+
+def _independent_hits(payload: str, protected: list[tuple[int, int]]) -> list[str]:
+    """Entity types found by :data:`_INDEPENDENT_PATTERNS` outside our own spans.
+
+    Runs on the raw payload rather than a normalised form because the protected
+    spans are raw offsets, and a pass that could not tell our own output apart would
+    block every pseudonymization run. The cost is that an SSN split by a zero-width
+    character is not seen here; pass 1 sees that one for any value that was vaulted,
+    and a value that was neither vaulted nor plainly written is the residual this
+    pass narrows rather than closes.
+    """
+    hits: list[str] = []
+    for entity_type, pattern in _INDEPENDENT_PATTERNS:
+        for match in pattern.finditer(payload):
+            if not _overlaps(match.start(), match.end(), protected):
+                hits.append(entity_type)
+    return hits
+
+
 def _occurs_as_a_unit(needle: str, haystack: str) -> bool:
     """Whether ``needle`` appears in ``haystack`` as a unit rather than inside a word.
 
@@ -763,6 +1083,16 @@ def _occurs_as_a_unit(needle: str, haystack: str) -> bool:
 
     Underscore counts as a boundary (see :data:`_ALNUM`), which is what makes the
     markdown form ``_John Smith_`` block.
+
+    **This is no longer the only occurrence test pass 1 applies**, and the difference
+    matters to anyone reading this function as the definition of a leak. It is the
+    right rule for a name and the wrong one for an identifier, because the
+    false-positive argument above is a word-list argument: ``Browning`` is a real
+    word containing ``Brown``, while ``batch47-1234567Alpha`` is not a real anything
+    containing a taxpayer ID. :func:`_identifier_needles` scans digit-carrying values
+    without this rule for that reason; the engine's residual sweep still applies it,
+    so the two now disagree on purpose -- the gate blocks a shape the sweep leaves
+    behind, which is the safe direction for them to differ in.
 
     Because every match requires the literal needle to be present, ``needle in
     haystack`` is an exact pre-filter, not an approximation. It is roughly 40x

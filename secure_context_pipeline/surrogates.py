@@ -16,20 +16,43 @@ It accepts wrong or missing brackets, stray whitespace, and a case-mangled hash.
 Restore keys on the 8-hex hash alone, so a dropped or corrupted hint still restores.
 
 **Every quantifier here is bounded, and that is a security property, not style.**
-``TOKEN_RE`` runs on two pieces of fully untrusted text -- the outbound payload
-(derived from an uploaded document) and the raw LLM response -- and in the egress
-gate it decides which spans are *skipped* by the detector re-scan
-(``EgressGate._protected_spans``). Two things follow:
+``TOKEN_RE`` runs on fully untrusted text -- the raw LLM response, in
+:mod:`~secure_context_pipeline.deobfuscation.restorer` -- and its *match extent*
+decides which characters the restorer deletes from the user's answer. Three
+things follow, and each one was a real defect:
 
 * An unbounded ``\\s*``/``[A-Z0-9_]*`` gives quadratic backtracking. A payload of
   128 000 spaces took **94 seconds** in one ``TOKEN_RE.search`` before these bounds
-  were added -- a denial of service on the security centerpiece, reachable from an
-  ordinary document upload.
-* An unbounded hint group is a *confidentiality* hole, not just a slow one. The
-  hint alphabet ``[a-z0-9-]`` covers an SSN (``123-45-6789``), an EIN, and a phone
-  number, so ``[PHI_NAME_deadbeef|123-45-6789]`` matched as one token and the gate
-  skipped the SSN inside it. The bound is now exactly :data:`HINT_RE`'s, so the
-  matcher's tolerance can never exceed what :func:`format_surrogate` can emit.
+  were added -- a denial of service reachable from an ordinary document upload.
+* An unbounded hint group was a *confidentiality* hole while the egress gate still
+  skipped detector hits inside a ``TOKEN_RE`` span: the hint alphabet
+  ``[a-z0-9-]`` covers an SSN (``123-45-6789``), an EIN, and a phone number, so
+  ``[PHI_NAME_deadbeef|123-45-6789]`` matched as one token and the gate skipped the
+  SSN inside it. The gate now builds its skip-list from :data:`STRICT_TOKEN_RE` and
+  stops at ``end(3)`` -- the hash -- so no hint is protected there any more; the
+  bound stays because a matcher must never out-run what :func:`format_surrogate`
+  can emit.
+* **A hint is only recognised when a closing bracket follows it.** Without that
+  guard the group ``(?:\\s{0,4}\\|\\s{0,4}([a-z0-9-]{1,24}))?`` absorbed a pipe and
+  the next lowercase word of the model's *own prose* into the match, and the
+  restorer replaces the whole match span -- so ``[PHI_NAME_1a2b3c4d| was reviewed``
+  restored with ``was`` deleted, and an ordinary markdown row
+  ``| PII_NAME_3328d30c | active | reviewed |`` lost its ``active`` cell and shifted
+  every later cell one column left. The user cannot see a word that is not there.
+  A hint the model mangled past recognition is handled downstream by
+  ``restorer._consume_unclosed_tail``, under the same four guards; the matcher must
+  never be *more* permissive than the mop-up that cleans up after it.
+
+**The validators are anchored with ``\\A``/``\\Z``, never ``^``/``$``.** ``$``
+matches before a trailing newline, so ``ENTITY_TYPE_RE.match("NAME\\n")`` succeeded
+and :func:`format_surrogate` emitted ``[PII_NAME\\n_deadbeef]`` -- a string neither
+:data:`TOKEN_RE` nor :data:`STRICT_TOKEN_RE` matches, i.e. unrestorable *and*
+absent from the gate's skip-list, the exact outcome these validators exist to
+prevent. ``load_registry`` accepts an ``entities.yaml`` whose entity key carries a
+trailing newline, so this was reachable from config alone. Both formatters now also
+check their own output against the matcher that has to read it back
+(:func:`_emitted`), because an anchor is a claim about a regex and the backstop is
+a claim about the string.
 """
 
 from __future__ import annotations
@@ -70,12 +93,29 @@ _WS = f"\\s{{0,{_MAX_TOKEN_WS}}}"
 #: entry like ``2FA_CODE`` or ``MedicalId`` would otherwise emit a token that
 #: :data:`TOKEN_RE` cannot match -- unrestorable *and* invisible to the egress
 #: gate's skip-list. Fail loudly instead.
-ENTITY_TYPE_RE = re.compile(f"^{_TYPE_BODY}$")
+#:
+#: Anchored ``\A``/``\Z`` rather than ``^``/``$`` so that a trailing newline is
+#: rejected however the caller invokes it -- ``.match``, ``.search`` or
+#: ``.fullmatch``. See the module docstring.
+ENTITY_TYPE_RE = re.compile(rf"\A{_TYPE_BODY}\Z")
+
+#: The closers a hint must be followed by to be read as a hint at all. Written as
+#: its own constant because the *whole* discriminator between "an annotated token"
+#: and "a pipe in the model's prose" is whether one of these characters comes next.
+_CLOSER_CLASS = r"[\]\}\)]"
 
 # Tolerant matcher -- see module docstring. Groups: (category, entity_type, hash, hint)
+#
+# The hint group ends in `(?={_CLOSER_CLASS})`: a lookahead, so the closer stays
+# available to the trailing optional-closer term and the match extent is unchanged
+# for every well-formed token. Making the hint conditional this way is what stops
+# the group from eating the model's prose (module docstring, third bullet) while
+# leaving match *existence* untouched -- the group is optional, so nothing that
+# matched before stops matching; only over-long matches get shorter.
 TOKEN_RE = re.compile(
     rf"[\[\{{\(]?{_WS}({_CATEGORY_ALT})[_\-]({_TYPE_BODY})[_\-]([0-9a-fA-F]{{8}})"
-    rf"(?:{_WS}\|{_WS}([a-z0-9\-]{{1,{MAX_HINT_LEN}}}))?{_WS}[\]\}}\)]?"
+    rf"(?:{_WS}\|{_WS}([a-z0-9\-]{{1,{MAX_HINT_LEN}}}){_WS}(?={_CLOSER_CLASS}))?"
+    rf"{_WS}{_CLOSER_CLASS}?"
 )
 
 # Exactly what we emit -- used to assert our own output shape, never to match LLM text.
@@ -84,12 +124,33 @@ STRICT_TOKEN_RE = re.compile(
     rf"(?:\|([a-z0-9\-]{{1,{MAX_HINT_LEN}}}))?\]"
 )
 
-HINT_RE = re.compile(rf"^[a-z0-9\-]{{1,{MAX_HINT_LEN}}}$")
+HINT_RE = re.compile(rf"\A[a-z0-9\-]{{1,{MAX_HINT_LEN}}}\Z")
 
 REDACTION_RE = re.compile(rf"\[REDACTED_({_TYPE_BODY})\]")
 
 # `derive_token_id` returns `hexdigest()[:8]` -- always lowercase, always 8 chars.
-_TOKEN_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+_TOKEN_ID_RE = re.compile(r"\A[0-9a-f]{8}\Z")
+
+
+def _emitted(marker: str, matcher: re.Pattern[str], reason: str) -> str:
+    """Return ``marker`` once the matcher that must read it back accepts it whole.
+
+    The validators above are claims about a *regex*; this is a claim about the
+    *string*, checked on the one path that puts markers into a document. They are
+    not the same claim, and the gap between them was a live hole: ``$`` matches
+    before a trailing newline, so every validator passed while the emitted marker
+    was unmatchable by :data:`TOKEN_RE` -- and therefore unrestorable, and absent
+    from the egress gate's skip-list. Anchoring the validators closed that
+    instance; this closes the *class*, because any future field, separator or
+    anchor mistake shows up here as a loud ``ConfigError`` at emit time rather than
+    as a token the user can never get back.
+
+    ``fullmatch``, not ``match``: a marker with anything appended is exactly the
+    failure being guarded against.
+    """
+    if matcher.fullmatch(marker) is None:  # pragma: no cover - emitter invariant
+        raise ConfigError(reason=reason, length=len(marker))
+    return marker
 
 
 def validate_entity_type(entity_type: str) -> str:
@@ -98,8 +159,12 @@ def validate_entity_type(entity_type: str) -> str:
     Raises :class:`ConfigError` otherwise. Call this when *loading* the registry to
     fail at startup rather than mid-run; the formatters below call it as a
     backstop so a bad type can never silently produce an unmatchable token.
+
+    ``fullmatch`` rather than ``match``, and belt-and-braces with the ``\\A``/``\\Z``
+    anchors: ``ENTITY_TYPE_RE`` is exported, and a caller reaching for ``.match``
+    on a ``^...$`` pattern is precisely how ``"NAME\\n"`` was accepted.
     """
-    if not ENTITY_TYPE_RE.match(entity_type):
+    if not ENTITY_TYPE_RE.fullmatch(entity_type):
         raise ConfigError(
             reason="entity_type_not_in_surrogate_grammar",
             entity_type=entity_type[:MAX_ENTITY_TYPE_LEN],
@@ -127,18 +192,26 @@ def format_surrogate(
     if category not in CATEGORIES:
         raise ConfigError(reason="unknown_surrogate_category", category=category[:32])
     validate_entity_type(entity_type)
-    if not _TOKEN_ID_RE.match(token_id):
+    if not _TOKEN_ID_RE.fullmatch(token_id):
         raise ConfigError(reason="malformed_token_id", length=len(token_id))
     core = f"{category}_{entity_type}_{token_id}"
-    if hint and HINT_RE.match(hint):
-        return f"[{core}|{hint}]"
-    return f"[{core}]"
+    if hint and HINT_RE.fullmatch(hint):
+        return _emitted(f"[{core}|{hint}]", STRICT_TOKEN_RE, "emitted_token_is_unmatchable")
+    return _emitted(f"[{core}]", STRICT_TOKEN_RE, "emitted_token_is_unmatchable")
 
 
 def format_redaction(entity_type: str) -> str:
-    """``[REDACTED_<TYPE>]`` -- irreversible by design, no vault entry."""
+    """``[REDACTED_<TYPE>]`` -- irreversible by design, no vault entry.
+
+    Held to the same emitter/matcher backstop as :func:`format_surrogate`: the
+    egress gate protects a redaction marker by :data:`REDACTION_RE`, so a marker
+    that regex cannot read back is a span the gate will re-scan as ordinary
+    document text.
+    """
     validate_entity_type(entity_type)
-    return f"[REDACTED_{entity_type}]"
+    return _emitted(
+        f"[REDACTED_{entity_type}]", REDACTION_RE, "emitted_redaction_is_unmatchable"
+    )
 
 
 def extract_token_ids(text: str) -> set[str]:

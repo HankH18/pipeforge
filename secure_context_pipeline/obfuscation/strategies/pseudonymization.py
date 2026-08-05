@@ -98,7 +98,11 @@ bijection, so varying it per date to dodge a collision would break the interval
 property that is the entire reason the tier exists. It still has to be guarded,
 because a shifted date is a *rendered string* and can carry a real original --
 either by equalling one or by containing one, as ``29 April 2024`` contains the
-separately vaulted ``April 2024``. The single colliding date therefore degrades to
+separately vaulted ``April 2024``. It must also not *duplicate* a surrogate the
+session already issued: Tier 2 is many-to-one by construction, so ``2024-01-05``
+and ``Friday, January 5, 2024`` shift to the same day and render to the same
+string, and two originals sharing one surrogate is the one collision restoration
+cannot undo. The single colliding date therefore degrades to
 a plain token and loses only its own temporal relation; every other date in the
 document keeps the shared shift. See :meth:`PseudonymizationStrategy._shift_date`.
 
@@ -545,7 +549,7 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         if tier == TIER_IDENTIFIER:
             return await self._fake_identifier(detection, token_id, vault, session_id)
         if tier == TIER_TEMPORAL:
-            return self._shift_date(detection, token_id, vault, session_id)
+            return await self._shift_date(detection, token_id, vault, session_id)
         if tier == TIER_CONTENT:
             return self.plain_token(detection, token_id, self.hint_for(detection))
         return self.plain_token(detection, token_id)
@@ -826,7 +830,7 @@ class PseudonymizationStrategy(ObfuscationStrategy):
 
     # -- Tier 2 ------------------------------------------------------------
 
-    def _shift_date(
+    async def _shift_date(
         self, detection: Detection, token_id: str, vault: SessionVault, session_id: str
     ) -> str:
         """Shift by the session delta and re-render in the source's format.
@@ -887,6 +891,41 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         handful. The haystack is a date, so it is tens of characters rather than a
         payload; this is the same shape as the gate's own pass 1 and inherits the
         same answer at scale (an incremental Aho-Corasick automaton, README Q1).
+
+        **A shifted date must also not duplicate a surrogate the session already
+        issued**, and that is a wholly separate collision from the two above. Those
+        ask "does this surrogate carry a real value?"; this one asks "does this
+        surrogate already stand for a *different* original?". Nothing about the
+        originals set can answer it, because a duplicate carries no original at all.
+
+        It is reachable from ordinary input, which is what makes it worth a guard
+        rather than an assumption. Tier 2 is a *many-to-one* map by construction:
+        the shift preserves the date and the renderer preserves the source's
+        format, so two spans denoting the same day in two formats -- ``2024-01-05``
+        in a header and ``Friday, January 5, 2024`` in the prose beneath it -- both
+        render through the ISO renderer (the second via :func:`_parse_fallback`)
+        and produce the byte-identical string. Two distinct vault originals then
+        own one surrogate. Tier 1 cannot reach this state because
+        :meth:`_fake_identifier` already tests :meth:`_surrogate_taken`; Tier 2 was
+        simply never asked the question.
+
+        The consequence was not a leak and not a silent mis-restore -- the
+        orchestrator's step 4b
+        (``_assert_surrogates_are_distinct``) catches the duplicate and refuses the
+        run before the provider is called, which is the right backstop. But it
+        refuses it with ``PipelineError(reason='surrogate_collision')``, so a
+        perfectly ordinary two-format document became unprocessable, and that
+        function's own docstring asserts the opposite -- "reaching this is a bug
+        upstream, not a user input: the pseudonymization strategy already rejects a
+        candidate fake that any surrogate in the session has taken". That sentence
+        is true of Tier 1 only. Making it true of Tier 2 as well is this check.
+
+        The colliding date degrades to a plain token, exactly as it does for the
+        two collisions above: it keeps referential integrity and loses only its own
+        temporal relation, while every other date in the document keeps the shared
+        shift. Regenerating is not an option here for the same reason it is not
+        above -- the shift is one constant per session and varying it is what the
+        tier exists not to do.
         """
         raw = detection.text
         stripped = raw.strip()
@@ -908,6 +947,16 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         ):
             logger.info(
                 "shifted date collides with an original; emitting a plain token",
+                extra={"entity_type": detection.entity_type, "token_id": token_id},
+            )
+            return self.plain_token(detection, token_id)
+        # Exact string, not the normalised one: the vault indexes a surrogate by the
+        # bytes it stores, so that is the only comparison that predicts what
+        # ``get_by_surrogate`` -- and the orchestrator's step-4b duplicate check --
+        # will actually see.
+        if await self._surrogate_taken(vault, session_id, shifted):
+            logger.info(
+                "shifted date duplicates a surrogate already issued; emitting a plain token",
                 extra={"entity_type": detection.entity_type, "token_id": token_id},
             )
             return self.plain_token(detection, token_id)

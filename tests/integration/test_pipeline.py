@@ -54,7 +54,12 @@ from secure_context_pipeline.crypto.keys import build_key_provider, normalize
 from secure_context_pipeline.deobfuscation.restorer import UNRESOLVED_ENTITY, Restorer
 from secure_context_pipeline.detection.detector import Detector
 from secure_context_pipeline.detection.registry import EntityRegistry, load_registry
-from secure_context_pipeline.errors import CryptoAuthError, SessionExpiredError, VaultMissError
+from secure_context_pipeline.errors import (
+    CryptoAuthError,
+    EgressBlockedError,
+    SessionExpiredError,
+    VaultMissError,
+)
 from secure_context_pipeline.llm.base import LLMResponse, estimate_tokens
 from secure_context_pipeline.llm.mock_provider import MockProvider
 from secure_context_pipeline.models import Detection, EntityAction, EntityCategory
@@ -989,3 +994,302 @@ async def test_the_pipeline_never_blocks_the_event_loop(
         f"stage took {detect_ms:.1f} ms -- that is the signature of spaCy running on "
         f"the loop instead of in a worker thread ({len(gaps)} heartbeats observed)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 10. Egress leaks that were reachable from an ordinary uploaded document
+#
+# Every gate property below is also asserted as a unit in tests/test_egress_gate.py,
+# against a FakeVault holding a value the test put there. That is the right shape for
+# checking the rule and the wrong shape for checking the *claim*, which is about an
+# attacker: each of these three values reached the provider through this pipeline,
+# from a file, with real detection, real obfuscation and the real gate in the path.
+# The unit tests would all have stayed green while it happened -- they did.
+#
+# Each test asserts the block AND that the provider was never called, because "the
+# gate objected" and "nothing was sent" are different statements and only the second
+# one is the guarantee.
+# ---------------------------------------------------------------------------
+
+
+async def _blocked_run(harness: Harness, document: str, category: str) -> EgressBlockedError:
+    """Upload, run, and require the gate to refuse before the provider is reached."""
+    doc_id = await harness.upload(document, category, "leak_probe.txt")
+    session_id, _expires_at = await harness.sessions.create("test-user")
+    calls_before = harness.provider.calls
+    with pytest.raises(EgressBlockedError) as exc:
+        await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+    assert harness.provider.calls == calls_before, "the provider was called anyway"
+    return exc.value
+
+
+async def test_a_vaulted_identifier_glued_into_a_word_never_reaches_the_provider(
+    make_harness: HarnessFactory,
+) -> None:
+    """The document body is attacker-controlled, and that is the whole finding.
+
+    ``47-1234567`` is detected as a ``TAX_ID`` from its clean mention, vaulted, and
+    tokenized. The second mention is glued to word characters on both sides, so:
+    the engine's residual sweep does not sweep it (word-boundary rule), the gate's
+    pass 1 did not block it (the same word-boundary rule), and pass 2 does not
+    re-detect it (``TAX_ID``'s pattern anchors on ``\\b``, which ``batch`` denies).
+    Three independent-looking checks, one shared blind spot, and the taxpayer ID
+    went to the provider byte-for-byte inside ``batch47-1234567Alpha``.
+
+    The residual-risk note in ``egress_gate.py`` used to argue this was acceptable
+    because "the shapes the pipeline can actually emit do not land here". That
+    argument only ever covered *our* output; the payload also carries the uploaded
+    document verbatim, and an uploader chooses what is next to what.
+    """
+    harness: Harness = await make_harness()
+    document = (
+        "TAXPAYER STATEMENT\n\n"
+        "The taxpayer EIN 47-1234567 is on file.\n\n"
+        "Internal routing tag: batch47-1234567Alpha must match the ledger.\n"
+    )
+    error = await _blocked_run(harness, document, "financial")
+    assert error.detail["reason"] == "vault_original"
+
+
+async def test_a_combining_mark_spliced_into_a_name_never_reaches_the_provider(
+    make_harness: HarnessFactory,
+) -> None:
+    """Reproduced through NER rather than asserted about, which is why it is here.
+
+    The first mention of ``Nathaniel Brightwater`` is found by spaCy and vaulted.
+    The second carries one U+0301 between the two names -- a position spaCy does not
+    recognise, so it is never independently detected and never vaulted -- and the
+    resulting string matched none of the three forms pass 1 compared. It reads
+    identically to the real name for a human and for the model.
+
+    The mark position matters and is the reason this is an integration test: with the
+    mark inside a token, NER often still finds the name and re-vaults it, so the leak
+    closes itself and a unit test choosing that position proves nothing.
+    """
+    harness: Harness = await make_harness()
+    mark = "́"
+    document = (
+        "REFERRAL LETTER\n\n"
+        "The primary contact is Nathaniel Brightwater, the coordinator.\n\n"
+        f"For continuity, direct questions to Nathaniel{mark} Brightwater at reception.\n"
+    )
+    error = await _blocked_run(harness, document, "medical")
+    assert error.detail["reason"] == "vault_original"
+
+
+async def test_an_ssn_the_detector_scores_at_zero_never_reaches_the_provider(
+    make_harness: HarnessFactory,
+) -> None:
+    """The headline claim, tested where it is actually made.
+
+    "No original entity value ever reaches the provider, enforced as an egress
+    property rather than a detection property" -- but pass 1 only knows what
+    detection vaulted, and pass 2 re-runs the same detector. Presidio's
+    ``UsSsnRecognizer`` hard-invalidates the published example SSNs, so
+    ``123-45-6789`` was never detected, never vaulted, never obfuscated, and left
+    this pipeline in the clear with all passes silent. Pass 3 is the only thing in
+    the process that has an opinion the detector did not supply.
+
+    The premise is asserted from the vault rather than assumed: nothing at all was
+    vaulted from this document, so a block here cannot be pass 1.
+    """
+    harness: Harness = await make_harness()
+    document = "STATEMENT\n\nMember SSN 123-45-6789 verified against records.\n"
+
+    doc_id = await harness.upload(document, "financial", "example_ssn.txt")
+    session_id, _expires_at = await harness.sessions.create("test-user")
+    with pytest.raises(EgressBlockedError) as exc:
+        await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+    assert exc.value.detail["reason"] == "independent_pattern"
+    assert exc.value.detail["entity_types"] == "SSN"
+    assert harness.provider.calls == 0
+    assert harness.vault.originals_for_session(session_id) == frozenset(), (
+        "premise gone: the detector now vaults something from this document, so the "
+        "block could be pass 1 and this test no longer isolates pass 3"
+    )
+
+
+async def test_a_realistic_ssn_is_obfuscated_rather_than_blocked(
+    make_harness: HarnessFactory,
+) -> None:
+    """The control the three tests above need: fail-closed must not mean fail-always.
+
+    A gate that blocks everything is trivially leak-free and completely useless, so
+    the same document shape with an SSN Presidio *does* recognise has to go all the
+    way through: detected, vaulted, tokenized, sent, restored. Without this, every
+    assertion above is satisfied by a gate that raises unconditionally.
+    """
+    harness: Harness = await make_harness()
+    document = "STATEMENT\n\nMember SSN 512-24-8710 verified against records.\n"
+    doc_id = await harness.upload(document, "financial", "real_ssn.txt")
+    session_id, _expires_at = await harness.sessions.create("test-user")
+
+    result = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+
+    assert harness.provider.calls == 1
+    assert "512-24-8710" in harness.vault.originals_for_session(session_id)
+    assert "512-24-8710" not in result.obfuscated_payload
+    assert "512-24-8710" in result.restored_text
+
+
+# ---------------------------------------------------------------------------
+# 11. The pipeline under concurrency
+#
+# This ships as a uvicorn ASGI app serving concurrent requests on one event loop,
+# and until this test nothing had ever run two `orchestrator.run` calls at the same
+# time: every call site above is awaited serially and the 100-case leakage harness is
+# sequential. That is a gap in the evidence rather than in the code, and it is the
+# expensive kind: a race here is a wrong VALUE in a clinical answer, not a crash.
+#
+# The window is real and it is narrow. `ObfuscationEngine._resolve_groups` checks the
+# vault for a value, and only if it is absent derives a token ID, renders a surrogate
+# around it and writes the row -- three awaits later. Two runs that both pass the
+# check before either writes are the ordinary case and are harmless (the second put
+# is a no-op and the read-back returns the first record). The interesting order is
+# the narrow one: run B's check happens before run A's write and B's ID derivation
+# happens after it, so B sees its own ID already taken, re-derives with a counter,
+# and ends up with a surrogate built around an ID whose row belongs to nobody. The
+# read-back repair is what saves it, and a hand-built single-collision unit test was
+# the only evidence that repair worked.
+#
+# Measured with the documents below, 16 runs, five rounds each way:
+#
+#     CONCURRENT: (collision_re_derived, read_back_mismatch) = [(3,3),(0,0),(0,0),(0,0),(0,0)]
+#     SERIAL:                                                = [(0,0),(0,0),(0,0),(0,0),(0,0)]
+#
+# So this reaches the repair path where nothing else in the suite does, and reaches
+# it in a minority of rounds -- which is why the assertions below are invariants that
+# must hold in every round rather than an expectation that the warning fires.
+# ---------------------------------------------------------------------------
+
+#: Sixteen rather than four: the window above is a few awaits wide, and at low
+#: concurrency the runs finish detection far enough apart that their obfuscation
+#: phases never overlap at all.
+CONCURRENT_RUNS = 16
+
+
+def _contended_documents(count: int) -> list[str]:
+    """Identical records but for the MRN: maximum contention, detectable crossover.
+
+    Every value except the MRN is shared, and a shared value is what creates the
+    race -- identical normalised text in one session derives the identical token ID,
+    so all sixteen runs go for the same vault row at once. Eight shared values rather
+    than two because the window is per-value: with one shared value the runs have a
+    single chance each to interleave inside it, and five rounds of sixteen runs
+    produced zero. The unique MRN is what makes misattribution *detectable* --
+    without it every run would restore to the same values and a thoroughly crossed
+    set of rows would still look correct.
+    """
+    return [
+        (
+            f"CLINIC NOTE {index}\n\n"
+            f"MRN: {4471900 + index * 7}\n"
+            "DOB: 03/12/1985\n"
+            "Contact phone: (415) 555-0142\n"
+            "Attending physician: Dr Harriet Vance.\n"
+            "Referred by Dr Marcus Ellery of Northgate Clinic.\n"
+            "Coverage on file is BCBS448193027.\n"
+            "Emergency contact: Priya Raghunathan.\n"
+            "Billing reference EIN 47-1234567.\n"
+            "Patient reviewed in clinic today and discharged in stable condition.\n"
+        )
+        for index in range(count)
+    ]
+
+
+async def test_concurrent_runs_on_one_session_do_not_cross_wires(
+    make_harness: HarnessFactory,
+) -> None:
+    """Sixteen concurrent runs, one session: no dangling token, no loss, no crossover.
+
+    Three failures are possible on this path and only the third is loud on its own:
+
+    * **a dangling token** -- a surrogate spliced into a payload whose vault row the
+      losing side of a race never wrote. The model quotes it back, the restorer finds
+      nothing, and the caller reads ``[UNRESOLVED_ENTITY]`` where a value belongs.
+    * **misattribution** -- two originals resolving through one token ID, so one
+      patient's identifier is printed in another's note. Nothing in the output says
+      so; under pseudonymization the wrong answer reads exactly like the right one.
+    * **a dedupe failure** -- one value ending up behind two token IDs, which is the
+      visible shadow of the re-derivation path the engine takes on an ID collision.
+
+    Each is asserted directly rather than inferred from "no exception was raised".
+    The token IDs are read out of the *document* section of each payload, not the
+    whole payload, because the tokenization system prompt quotes a token of its own
+    that belongs to no run and resolves to nothing by design.
+
+    What this does NOT assert is that the warnings never fire: re-deriving an ID on a
+    collision is the repair working, not the bug. What must hold is that the repair
+    leaves no observable damage, which is what the three checks below measure.
+
+    **How much this test is worth, measured rather than claimed.** With the read-back
+    repair removed -- ``_resolve_groups`` trusting the surrogate it just rendered
+    instead of the record the vault holds, which is the exact failure the repair
+    exists to prevent -- this test goes red in roughly one run in seven (4 of 28
+    measured), with ``VaultMissError(token_id=...)`` from check 1: a token in the
+    payload that no vault row backs. Stated plainly because it is the property a
+    reader needs: one green run is weak evidence and a red run is strong evidence.
+    That asymmetry is inherent to racing a few-await window, not a defect in the
+    probe, and it is still the only evidence in this suite that the repair works at
+    all -- the alternative was a hand-built single-collision unit test that never
+    ran two coroutines.
+    """
+    harness: Harness = await make_harness()
+    session_id, _expires_at = await harness.sessions.create("test-user")
+    documents = _contended_documents(CONCURRENT_RUNS)
+    doc_ids = [
+        await harness.upload(text, "medical", f"chart{index}.txt")
+        for index, text in enumerate(documents)
+    ]
+
+    results = await asyncio.gather(
+        *(
+            harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+            for doc_id in doc_ids
+        )
+    )
+    assert len(results) == CONCURRENT_RUNS
+
+    mrns = [f"MRN: {4471900 + index * 7}" for index in range(CONCURRENT_RUNS)]
+    resolved: dict[str, str] = {}
+
+    for index, result in enumerate(results):
+        body = document_section(result.obfuscated_payload)
+        token_ids = {match.group(3) for match in STRICT_TOKEN_RE.finditer(body)}
+        assert token_ids, f"run {index} issued no tokens; it cannot detect anything"
+
+        # 1. Every token in the payload resolves. A dangling one is a lost vault row.
+        for token_id in token_ids:
+            value = await harness.vault.get_by_token(session_id, token_id)
+            previous = resolved.setdefault(token_id, value)
+            assert previous == value, (
+                f"token {token_id} resolved to two different originals across "
+                "concurrent runs -- one entity's value would print as another's"
+            )
+
+        # 2. Nothing was lost on the way back.
+        assert UNRESOLVED_ENTITY not in result.restored_text, f"run {index} lost a token"
+        assert result.stats["unresolved_lost"] == 0.0
+        assert result.stats["vault_misses"] == 0.0
+
+        # 3. No other document's identifier appears in this run's answer.
+        for other, mrn in enumerate(mrns):
+            if other == index:
+                continue
+            assert mrn not in result.restored_text, (
+                f"run {index} restored chart {other}'s MRN -- concurrent runs crossed"
+            )
+
+    # 4. One value, one token ID. The engine re-derives an ID on a collision; if that
+    #    repair ever ran on a value that already had a row, the same original would
+    #    come back under two IDs and dedupe would be silently gone.
+    assert len(set(resolved.values())) == len(resolved), (
+        "an original is behind more than one token ID after concurrent obfuscation"
+    )
+
+    # And the session really did hold the shared values once each, not once per run.
+    originals = harness.vault.originals_for_session(session_id)
+    assert "03/12/1985" in originals
+    assert await harness.vault.row_count(session_id) == len(originals)

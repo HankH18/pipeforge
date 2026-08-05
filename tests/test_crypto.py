@@ -19,19 +19,27 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import importlib
+import inspect
 import json
+import pkgutil
 import re
 import secrets
+import sys
+import typing
+from collections.abc import Iterator
 
 import pytest
 from pydantic import ValidationError
 
+from secure_context_pipeline.api.schemas import MAX_ID_LEN
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto import aead, keys
 from secure_context_pipeline.errors import ConfigError, CryptoAuthError, PipelineError
 from secure_context_pipeline.models import (
     MASK,
     MAX_AUDIT_LABEL_LEN,
+    MAX_DETAIL_VALUE_LEN,
     AuditEvent,
     Detection,
     EntityCategory,
@@ -46,6 +54,21 @@ from secure_context_pipeline.models import (
 from secure_context_pipeline.store.document_store import _DOC_ID_RE as DOC_ID_RE
 
 HEX8 = re.compile(r"^[0-9a-f]{8}$")
+
+#: A string far longer than any machine code, distinctive enough that a substring
+#: match in an error rendering cannot be a coincidence.
+OVERSIZED_DETAIL = "Zelphinia-Quarrowmont" + "q" * 5_000
+#: The subclasses ``errors.py`` defines itself. Used only to anchor the discovery
+#: walk below -- the ceiling itself is asserted over whatever the walk finds.
+ERRORS_PY_SUBCLASSES = (
+    "ConfigError",
+    "CryptoAuthError",
+    "DetectionError",
+    "EgressBlockedError",
+    "SessionExpiredError",
+    "StoreAuthError",
+    "VaultMissError",
+)
 
 
 def _settings(**over: object) -> Settings:
@@ -137,6 +160,91 @@ def test_doc_and_vault_keys_are_the_section_8_hkdf_formulas() -> None:
             session_key, b"scp-v1", b"vault:" + session_id.encode(), 32
         )
         assert keys.derive_vault_key(session_key, session_id) == expected, session_id
+
+
+#: Identifiers chosen to attack the two things per-user isolation rests on: that
+#: ``b"doc:" + user_id`` is injective, and that it cannot be steered into another
+#: HKDF domain. ``user_id`` is the entire auth claim at this tier and is fully
+#: attacker-chosen, so "no two of these produce the same key" has to be measured.
+ADVERSARIAL_USER_IDS = (
+    "alice",
+    "Alice",  # case
+    "alice ",  # trailing space
+    " alice",  # leading space
+    "alice\x00",  # trailing NUL -- the byte that frames the HMAC message space
+    "al\u0131ce",  # LATIN SMALL LETTER DOTLESS I -- confusable with "alice"
+    "alice\u0301",  # a trailing COMBINING ACUTE ACCENT -- NFC-equal to "alic\u00e9"
+    "doc:alice",  # the derivation's own prefix, replayed
+    "vault:alice",  # another domain's prefix
+    "kms-wrap",  # the wrapping key's whole info string
+    "alice:bob",  # a colon, as in the AAD framing
+    "ALICE\u212a",  # KELVIN SIGN -- NFKC+casefold maps it onto "alice k"
+)
+
+
+def test_doc_keys_are_injective_in_user_id_under_adversarial_identifiers() -> None:
+    """Per-user isolation is exactly as strong as ``user_id -> key`` being injective.
+
+    A red-team pass confirmed the crypto holds and could force no collision; this
+    pins that result so a later "normalize the user_id" convenience -- casefolding,
+    NFKC, or trimming, all of which ``keys.normalize`` already does for *values* --
+    cannot silently merge two accounts onto one document key. The expectation is
+    recomputed from RFC 5869 rather than from ``keys._hkdf``, so agreeing with a
+    changed implementation is not sufficient to pass.
+
+    Note the KELVIN SIGN entry: NFKC + casefold (what ``normalize`` applies to entity
+    values) maps it onto ``alice k``. Applying that pipeline to identifiers is the
+    concrete way this property would get broken by an otherwise reasonable change.
+    """
+    settings = _settings()
+    master = settings.master_key_bytes()
+    provider = keys.EnvKeyProvider(settings)
+
+    derived: dict[str, bytes] = {}
+    for user_id in ADVERSARIAL_USER_IDS:
+        key = provider.doc_key(user_id)
+        expected = _hkdf_sha256_rfc5869(master, b"scp-v1", b"doc:" + user_id.encode(), 32)
+        assert key == expected, f"{user_id!r} is not the section 8 formula"
+        derived[user_id] = key
+
+    assert len(set(derived.values())) == len(ADVERSARIAL_USER_IDS), (
+        "two distinct user_ids share a document key: "
+        f"{sorted(u for u in derived if list(derived.values()).count(derived[u]) > 1)}"
+    )
+
+
+def test_no_identifier_can_steer_one_hkdf_derivation_into_another() -> None:
+    """``keys.py``'s domain-separation argument, measured on the actual info bytes.
+
+    The docstring argues that each ``info`` carries a purpose prefix before the
+    variable part, so no two purposes can collide. That is an argument about the
+    *bytes*, and it must hold even for a ``user_id`` or ``session_id`` that is
+    itself another domain's prefix -- which is why the identifier list above
+    includes ``"vault:alice"`` and ``"kms-wrap"``.
+
+    Asserted on the info strings rather than on the derived keys on purpose: the
+    two derivations also use different input keying material, and that second
+    reason would mask a broken ``info`` scheme if the keys alone were compared.
+    """
+    infos: dict[bytes, str] = {keys.MockKMSKeyProvider.WRAP_INFO: "kms wrapping key"}
+    for identifier in ADVERSARIAL_USER_IDS:
+        for prefix, purpose in ((b"doc:", "document key"), (b"vault:", "vault key")):
+            info = prefix + identifier.encode("utf-8")
+            assert info not in infos, (
+                f"HKDF info collision: {purpose} for {identifier!r} reuses the info of "
+                f"{infos[info]} -- the domain separation in keys.py is not injective"
+            )
+            infos[info] = f"{purpose} for {identifier!r}"
+
+    # And the shipped derivations really are built from those bytes.
+    settings = _settings()
+    session_key = keys.new_session_key()
+    assert keys.EnvKeyProvider(settings).doc_key("vault:alice") == _hkdf_sha256_rfc5869(
+        settings.master_key_bytes(), b"scp-v1", b"doc:vault:alice", 32
+    )
+    assert keys.derive_vault_key(session_key, "doc:alice") == _hkdf_sha256_rfc5869(
+        session_key, b"scp-v1", b"vault:doc:alice", 32
+    )
 
 
 def test_aead_framing_matches_the_gcm_specifications_own_test_vector() -> None:
@@ -1124,3 +1232,142 @@ def test_pipeline_error_rejects_content_sized_detail() -> None:
     """No exception may carry an original value (build doc section 16)."""
     with pytest.raises(ValueError, match="must not carry content"):
         PipelineError(reason="A" * 65)
+
+
+def test_the_content_ceilings_are_the_numbers_they_are_documented_to_be() -> None:
+    """Pin the two ceilings to literals, because every other test imports them.
+
+    This is the shared-blind-spot failure in its purest form. ``errors.py``,
+    ``models.py``, ``api/schemas.py`` and every assertion about them all read the
+    same two constants, so raising ``MAX_DETAIL_VALUE_LEN`` from 64 to 5 000 keeps
+    the entire suite green -- including the tests whose names promise that an
+    audit detail cannot hold content -- while a 5 000-character original fits in
+    one. A checker that recomputes its expectation from the value under test
+    proves only self-consistency.
+
+    64 and 128 are the numbers ``errors.py`` and ``models.py`` document, chosen so
+    no original value can hide in a field (a uuid4 hex is 32, an entity type is
+    <= 20, a token ID is 8, a sha256 hexdigest is 64). Changing either is a
+    security decision and must be an explicit edit here, not a silent widening.
+    """
+    assert MAX_DETAIL_VALUE_LEN == 64
+    assert MAX_AUDIT_LABEL_LEN == 128
+    assert MAX_ID_LEN <= MAX_DETAIL_VALUE_LEN, (
+        "the API accepts identifiers longer than an error detail can hold; an "
+        "over-long ID would raise ValueError from inside an exception constructor"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The detail ceiling, quantified over every error class in the package
+# ---------------------------------------------------------------------------
+
+
+def _all_pipeline_error_subclasses() -> list[type[PipelineError]]:
+    """Every :class:`PipelineError` subclass, found by importing the whole package.
+
+    ``errors.py`` claims the 64-character ceiling "applies uniformly across all of
+    them" and then names the three subpackages that define their own subclasses.
+    That is a hand-written list in a docstring: it covers the classes its author
+    remembered on the day it was written, and a subclass added to a fourth module
+    inherits the claim without inheriting the check. Walking ``__subclasses__``
+    after importing every module is the version of the claim that stays true.
+    """
+    importlib.import_module("secure_context_pipeline")
+    package = sys.modules["secure_context_pipeline"]
+    for module in pkgutil.walk_packages(package.__path__, f"{package.__name__}."):
+        importlib.import_module(module.name)
+
+    def walk(cls: type[PipelineError]) -> Iterator[type[PipelineError]]:
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from walk(sub)
+
+    found = sorted(set(walk(PipelineError)), key=lambda cls: f"{cls.__module__}.{cls.__name__}")
+    assert len(found) >= 13, f"subclass discovery found only {len(found)} -- the walk is broken"
+    return found
+
+
+def _oversized_cases(cls: type[PipelineError]) -> list[tuple[str, dict[str, object]]]:
+    """One constructor call per string-typed parameter, that parameter oversized."""
+    signature = inspect.signature(cls.__init__)
+    hints = typing.get_type_hints(cls.__init__)
+    if any(p.kind is p.VAR_KEYWORD for p in signature.parameters.values()):
+        # `PipelineError.__init__(**detail)`, inherited unchanged.
+        return [("detail", {"probe": OVERSIZED_DETAIL})]
+
+    baseline: dict[str, object] = {}
+    for name, param in signature.parameters.items():
+        if name == "self":
+            continue
+        annotation = hints.get(name, str)
+        if param.default is not inspect.Parameter.empty:
+            baseline[name] = param.default
+        elif annotation is int or int in typing.get_args(annotation):
+            baseline[name] = 0
+        else:
+            baseline[name] = "x"
+
+    cases: list[tuple[str, dict[str, object]]] = []
+    for name in signature.parameters:
+        if name == "self":
+            continue
+        annotation = hints.get(name, str)
+        if annotation is str or str in typing.get_args(annotation):
+            cases.append((name, {**baseline, name: OVERSIZED_DETAIL}))
+    assert cases, f"{cls.__name__} has no string parameter -- check the signature reader"
+    return cases
+
+
+@pytest.mark.parametrize(
+    "cls", _all_pipeline_error_subclasses(), ids=lambda cls: f"{cls.__module__}.{cls.__name__}"
+)
+def test_every_error_subclass_enforces_the_detail_ceiling(cls: type[PipelineError]) -> None:
+    """No subclass may carry a content-sized string, however it builds its detail.
+
+    Two implementations are both acceptable and both appear in the package: the
+    base class *rejects* an oversized value, and ``llm/base.py`` *truncates* with
+    its own ``_bounded`` helper before calling ``super().__init__``. The property
+    that matters to section 16 is the same either way and is what is asserted --
+    the full value never lands in ``detail``, in ``str(exc)``, or in ``repr(exc)``.
+
+    A subclass that builds ``detail`` without going through ``PipelineError``'s
+    guard would pass every existing test in this file (they only ever construct
+    the base class) and fail here.
+    """
+    for parameter, kwargs in _oversized_cases(cls):
+        try:
+            error = cls(**kwargs)  # type: ignore[arg-type]
+        except ValueError:
+            continue  # rejected outright -- the base class guard
+        for key, value in error.detail.items():
+            assert not isinstance(value, str) or len(value) <= MAX_DETAIL_VALUE_LEN, (
+                f"{cls.__name__}({parameter}=...) stored {len(str(value))} chars in "
+                f"detail[{key!r}]; the ceiling is {MAX_DETAIL_VALUE_LEN}"
+            )
+        for how, rendered in (("str", str(error)), ("repr", repr(error))):
+            assert OVERSIZED_DETAIL not in rendered, (
+                f"{cls.__name__}({parameter}=...) rendered the full value through {how}()"
+            )
+
+
+def test_the_error_subclass_walk_sees_the_classes_errors_py_documents() -> None:
+    """Anchor the discovery, so a broken walk cannot report a vacuous pass.
+
+    ``test_every_error_subclass_enforces_the_detail_ceiling`` is parametrized over
+    whatever the walk returns. If the walk silently returned an empty (or
+    truncated) list, pytest would report green over nothing at all -- the failure
+    mode this repository keeps rediscovering. These are the classes ``errors.py``
+    names in prose; the walk must contain them *and* the ones it does not name.
+    """
+    found = {f"{cls.__module__}.{cls.__name__}" for cls in _all_pipeline_error_subclasses()}
+    documented_elsewhere = {
+        "secure_context_pipeline.llm.base.LLMError",
+        "secure_context_pipeline.llm.base.LLMRefusalError",
+        "secure_context_pipeline.llm.base.LLMTransportError",
+        "secure_context_pipeline.llm.base.LLMResponseError",
+        "secure_context_pipeline.store.document_store.InvalidCategoryError",
+        "secure_context_pipeline.detection.detector.DetectionInvariantError",
+    }
+    assert documented_elsewhere <= found, sorted(documented_elsewhere - found)
+    assert {f"secure_context_pipeline.errors.{name}" for name in ERRORS_PY_SUBCLASSES} <= found

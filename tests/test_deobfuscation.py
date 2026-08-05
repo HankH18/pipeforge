@@ -380,37 +380,84 @@ async def test_adjacent_tokens_keep_their_separators(restorer: Restorer) -> None
     assert result.text == "John Smith takes Metformin daily."
 
 
-# Everything after a token is the model's own prose. The mangled-hint mop-up may
-# not delete any of it: a silently shortened answer is a correctness failure the
-# user cannot even see, while a visible "|MANGLED HINT]" remnant is cosmetic.
+# Everything after a token is the model's own prose. NOTHING may delete any of it:
+# a silently shortened answer is a correctness failure the user cannot even see,
+# while a visible "|MANGLED HINT]" remnant is cosmetic.
+#
+# The second element is the FULL expected output, not a fragment that must survive.
+# That is the whole point of this table and it is why the table was rewritten:
+# every `must_survive` string used to begin one word AFTER the word that was in
+# fact being deleted, so the two cases below that lost "and" and "note" passed
+# green for as long as they existed. A substring assertion cannot see a deletion
+# that happens before the substring starts; an equality assertion cannot miss one.
 PROSE_AFTER_A_MANGLED_HINT = [
     (
         "Take [PHI_NAME_1a2b3c4d| and call the doctor about it] now.",
-        "call the doctor about it",
+        "Take John Smith| and call the doctor about it] now.",
     ),
-    ("See [PHI_NAME_1a2b3c4d|note (about the case) here] end.", "(about the case) here"),
+    (
+        "See [PHI_NAME_1a2b3c4d|note (about the case) here] end.",
+        "See John Smith|note (about the case) here] end.",
+    ),
     # A ')' from an unrelated parenthetical must not close a '['-opened token.
     (
         "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic (see note) daily.",
-        "(see note) daily.",
+        "Take Metformin|oral-antidiabetic (see note) daily.",
     ),
     # A second token can never be swallowed by the first one's tail.
-    ("Give [PHI_NAME_1a2b3c4d|[PHI_MEDICATION_2f4a1b3c]] today.", "Metformin"),
+    (
+        "Give [PHI_NAME_1a2b3c4d|[PHI_MEDICATION_2f4a1b3c]] today.",
+        "Give John Smith|Metformin] today.",
+    ),
+    # An unclosed token followed by an ordinary lowercase word: the shape that
+    # made `TOKEN_RE`'s hint group eat "was" out of the answer.
+    (
+        "[PHI_NAME_1a2b3c4d| was reviewed by Dr. Lee.",
+        "John Smith| was reviewed by Dr. Lee.",
+    ),
+    # A markdown table row -- what a model emits when asked to summarise a chart,
+    # combined with the `bracket_dropped` mutation the MockProvider models. The
+    # hint group used to claim " | active " and the Status cell vanished, shifting
+    # every later cell one column left under the wrong header.
+    (
+        "| PHI_NAME_1a2b3c4d | active | reviewed |",
+        "| John Smith | active | reviewed |",
+    ),
+    (
+        "Patients: PHI_NAME_1a2b3c4d | stable, discharged.",
+        "Patients: John Smith | stable, discharged.",
+    ),
+    # And the shape a real hint still has to keep absorbing: closer present.
+    (
+        "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic] daily.",
+        "Take Metformin daily.",
+    ),
 ]
 
 
 @pytest.mark.parametrize(
-    ("text", "must_survive"),
+    ("text", "expected"),
     PROSE_AFTER_A_MANGLED_HINT,
     ids=[case[0][:40] for case in PROSE_AFTER_A_MANGLED_HINT],
 )
 async def test_mangled_hint_mopup_never_eats_the_models_prose(
-    restorer: Restorer, text: str, must_survive: str
+    restorer: Restorer, text: str, expected: str
 ) -> None:
+    """Exact output, so an over-consumed span cannot hide behind a substring check."""
     result = await restorer.restore(SESSION, text, strategy=TOKENIZATION)
 
-    assert must_survive in result.text, result.text
+    assert result.text == expected
     assert TOKEN_RE.search(result.text) is None
+    # Stated independently of the hand-written expectation above, so a future
+    # entry cannot smuggle a deletion past a table nobody re-derived. An emitted
+    # hint is `HINT_RE` -- a single unbroken run touching the '|' -- so if the
+    # pipe is followed by whitespace there is no hint and NOTHING may go; if it is
+    # not, only that first run is eligible and every word after it is prose.
+    after = text.split("|", 1)[1] if "|" in text else ""
+    prose = after.split() if after[:1].isspace() else after.split()[1:]
+    for word in prose:
+        if TOKEN_RE.search(word) is None:
+            assert word in result.text, (word, result.text)
 
 
 # --------------------------------------------------------------------------
@@ -641,7 +688,20 @@ async def test_a_surrogate_miss_is_always_a_lost_one(
 async def test_classification_never_changes_what_the_user_reads(
     settings: Settings,
 ) -> None:
-    """``issued`` is diagnostics. It must not touch a single character of output."""
+    """For tokens THIS RUN OWNS, ``issued`` changes only the diagnosis.
+
+    This docstring used to read "``issued`` is diagnostics. It must not touch a
+    single character of output", and that is no longer the contract -- it is the
+    bug. Supplying the set is now what lets the restorer tell its own tokens from
+    a reference code the uploaded document happened to contain, so it *does*
+    change output, in exactly one direction: an unbracketed ID this run never
+    minted is left alone instead of being overwritten. See
+    ``test_document_text_that_merely_looks_like_a_token_survives_verbatim``.
+
+    The narrower property below is the one that still has to hold, and it is the
+    one this test always exercised: for a bracketed token, and for any token the
+    run did mint, the answer is byte-identical with and without ``issued``.
+    """
     text = "[PHI_NAME_1a2b3c4d] and [PHI_NAME_deadbeef] and Torres."
     surrogates = {"Torres": "Nguyen"}
 
@@ -676,6 +736,256 @@ async def test_unresolved_carries_token_ids_only(restorer: Restorer) -> None:
 
 
 # --------------------------------------------------------------------------
+# `issued` gates the substitution. A token-shaped run in the model's answer is
+# not evidence that this run minted it -- the answer is derived from a document
+# nobody here controls, and `CATEGORY[_-]TYPE[_-]8hex` is a shape, not a secret.
+# --------------------------------------------------------------------------
+
+#: Token-shaped strings that occur in ordinary documents. None of these is a
+#: token this pipeline issued; every one of them matches ``TOKEN_RE``.
+DOCUMENT_TEXT_THAT_LOOKS_LIKE_A_TOKEN = [
+    "Reference: FIN-ACCOUNT-40281993 is disputed.",
+    "Record locator: PHI-MRN-48273910 in the EHR.",
+    "Filed under docket LEGAL-CASE-9e59e5af for routing.",
+    "Ticket PII_NAME_deadbeef was closed.",
+]
+
+
+@pytest.mark.parametrize(
+    "text",
+    DOCUMENT_TEXT_THAT_LOOKS_LIKE_A_TOKEN,
+    ids=[case[:32] for case in DOCUMENT_TEXT_THAT_LOOKS_LIKE_A_TOKEN],
+)
+async def test_document_text_that_merely_looks_like_a_token_survives_verbatim(
+    settings: Settings, audit: AuditLogger, text: str
+) -> None:
+    """The user's own reference codes come back byte-for-byte.
+
+    Un-gated, every one of these was resolved against the vault: the code was
+    replaced by ``[UNRESOLVED_ENTITY]`` and a ``VAULT_MISS`` row blamed the model
+    for text the model had faithfully copied. Silent destruction of the user's own
+    data, needing no attacker and no unusual document.
+
+    Left alone is the right outcome and the *visible* one -- the answer still reads
+    correctly and the count says something odd was in it.
+    """
+    restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued=[NAME_ID, MED_ID], run_id=RUN
+    )
+
+    assert result.text == text
+    assert result.vault_misses == 0
+    assert result.unresolved == ()
+    assert await audit.query(session_id=SESSION, event_type=VAULT_MISS) == []
+    # Counted, not hidden.
+    assert result.foreign_tokens == 1
+
+
+async def test_the_vault_is_never_asked_about_an_id_this_run_did_not_issue(
+    settings: Settings,
+) -> None:
+    """The lookup itself is the vulnerability, so it must not happen.
+
+    A document containing a *live* token ID in the token shape made the restorer
+    splice a different document's original into an unrelated sentence:
+    ``Filed under docket PII-NAME-ebe9133d`` came back as ``Filed under docket
+    Maria Torres``, with ``restored_count`` 1, ``vault_misses`` 0 and outcome
+    ``ok``. Asserting on ``token_calls`` pins the mechanism rather than one
+    symptom: no lookup, no substitution, whatever the vault happens to hold.
+    """
+    vault = FakeVault(tokens={"ebe9133d": "Maria Torres"})
+    restorer = Restorer(vault=vault, settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Filed under docket PII-NAME-ebe9133d for internal routing.",
+        strategy=TOKENIZATION,
+        issued=[],  # this run minted nothing
+    )
+
+    assert result.text == "Filed under docket PII-NAME-ebe9133d for internal routing."
+    assert vault.token_calls == []
+    assert "Maria Torres" not in result.text
+
+
+async def test_a_bracketed_id_this_run_never_issued_is_not_resolved_either(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """The gate is on the LOOKUP, not only on the bracket test.
+
+    Brackets decide what is *replaced*; ``issued`` decides what may be *resolved*,
+    and the two are separate layers because this case needs the second one alone.
+    The ID here is bracketed -- so it is claimed and does become
+    ``[UNRESOLVED_ENTITY]`` -- and the vault happens to hold it, because a token ID
+    is a deterministic HMAC and the same value in another of this session's
+    documents mints the same one. Without the lookup gate the restorer hands the
+    user that other document's original in a sentence it has nothing to do with,
+    with ``restored_count`` 1, ``vault_misses`` 0 and outcome ``ok``.
+    """
+    vault = FakeVault(tokens={"ebe9133d": "Maria Torres"})
+    restorer = Restorer(vault=vault, settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION,
+        "Cross-reference [PII_NAME_ebe9133d] in the appendix.",
+        strategy=TOKENIZATION,
+        issued=[NAME_ID],  # this run minted something else entirely
+        run_id=RUN,
+    )
+
+    assert result.text == f"Cross-reference {UNRESOLVED_ENTITY} in the appendix."
+    assert "Maria Torres" not in result.text
+    assert vault.token_calls == []
+    assert result.fabricated == ("ebe9133d",)
+    misses = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    assert [event.detail["classification"] for event in misses] == [MISS_FABRICATED]
+
+
+async def test_a_bracketed_token_the_model_invented_still_degrades(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """Gating must not cost the spec-mandated degradation (build doc section 10.6).
+
+    Brackets are the discriminator: they are ours to emit and prose does not wear
+    them, so a bracketed unknown ID is the model inventing a placeholder and still
+    becomes ``[UNRESOLVED_ENTITY]`` with a ``fabricated`` audit row -- while the
+    unbracketed form above is left alone.
+    """
+    restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION,
+        "Contact [PHI_NAME_1a2b3c4d] about [PHI_NAME_deadbeef] and PHI-NAME-deadbeef.",
+        strategy=TOKENIZATION,
+        issued=[NAME_ID],
+        run_id=RUN,
+    )
+
+    assert result.text == (
+        f"Contact John Smith about {UNRESOLVED_ENTITY} and PHI-NAME-deadbeef."
+    )
+    assert result.fabricated == ("deadbeef",)
+    assert result.foreign_tokens == 1
+    misses = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    assert [event.detail["classification"] for event in misses] == [MISS_FABRICATED]
+
+
+async def test_without_issued_the_old_stricter_rule_still_applies(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """Omitting ``issued`` must not silently buy the tolerant behaviour.
+
+    Without the set, ours and the document's are the same shape and there is
+    nothing to reason with -- so every token-shaped run is claimed and every
+    residue is fatal, exactly as before. The gate is opt-in by supplying evidence,
+    never by default.
+    """
+    restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION, "Reference: FIN-ACCOUNT-40281993 is disputed.", strategy=TOKENIZATION, run_id=RUN
+    )
+
+    assert result.text == f"Reference: {UNRESOLVED_ENTITY} is disputed."
+    assert result.vault_misses == 1
+    misses = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    assert misses[0].detail["classification"] == MISS_INDETERMINATE
+
+
+# --------------------------------------------------------------------------
+# Chained restoration: nothing this module wrote is ever re-read
+# --------------------------------------------------------------------------
+
+
+async def test_a_restored_value_is_never_re_read_by_the_token_pass(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """The pipeline must not manufacture a token out of its own output.
+
+    Under pseudonymization the surrogate pass splices ORIGINALS in, and the token
+    pass then scanned that result. An EHR record locator is enough: the MRN
+    pattern vaults ``MRN-48273910``, the document's ``PHI-`` prefix rides through
+    the payload as prose, and restoration reassembles ``PHI-MRN-48273910`` -- a
+    valid token match the model never wrote. The patient's own record locator came
+    back as ``[UNRESOLVED_ENTITY]`` and the audit said ``fabricated``: the wrong
+    story about the wrong component.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+    surrogates = {"MRN-43261190": "MRN-48273910", "Kimberly Johnson": "Maria Torres"}
+
+    result = await restorer.restore(
+        SESSION,
+        "PATIENT CHART\nRecord locator: PHI-MRN-43261190\nThe patient, Kimberly Johnson.",
+        strategy=PSEUDONYMIZATION,
+        surrogates=surrogates,
+        issued=[],
+        run_id=RUN,
+    )
+
+    assert result.text == (
+        "PATIENT CHART\nRecord locator: PHI-MRN-48273910\nThe patient, Maria Torres."
+    )
+    assert result.restored_count == 2
+    assert result.vault_misses == 0
+    assert UNRESOLVED_ENTITY not in result.text
+    assert await audit.query(session_id=SESSION, event_type=VAULT_MISS) == []
+    # The collision was seen and skipped rather than not noticed.
+    assert result.restored_collisions == 1
+
+
+async def test_a_token_id_colliding_with_a_restored_value_never_substitutes(
+    settings: Settings,
+) -> None:
+    """The wrong-value half of the same defect, with the collision forced.
+
+    An eight-hex run inside a restored original that equals a LIVE token ID used
+    to splice a second entity's value into the sentence -- ``restored_count`` 2,
+    ``vault_misses`` 0, no error. The span is this module's own output, so it is
+    out of the token pass's scope whatever it happens to contain.
+    """
+    vault = FakeVault(tokens={"12345678": "Dr. Evelyn Reyes"})
+    restorer = Restorer(vault=vault, settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "The account of record is FIN-ACCOUNT-58382910 (verified).",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"FIN-ACCOUNT-58382910": "FIN-ACCOUNT-12345678"},
+        issued=["12345678"],
+    )
+
+    assert result.text == "The account of record is FIN-ACCOUNT-12345678 (verified)."
+    assert "Dr. Evelyn Reyes" not in result.text
+    assert vault.token_calls == []
+    assert result.restored_count == 1
+
+
+async def test_a_token_the_model_wrote_next_to_a_restored_fake_still_restores(
+    settings: Settings,
+) -> None:
+    """Scoping by span must not cost the mixed-tier case its token pass.
+
+    Pseudonymization emits fakes and tokens in one payload, so the exclusion has
+    to be narrow: only the characters the surrogate pass actually wrote.
+    """
+    restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Torres was prescribed [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic] by [PHI_NAME_1a2b3c4d].",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"Torres": "Smith"},
+        issued=[MED_ID, NAME_ID],
+    )
+
+    assert result.text == "Smith was prescribed Metformin by John Smith."
+    assert result.restored_count == 3
+    assert result.restored_collisions == 0
+
+
+# --------------------------------------------------------------------------
 # Post-restore assertions -- in code, not just in tests
 # --------------------------------------------------------------------------
 
@@ -693,11 +1003,27 @@ async def test_post_restore_assertion_fires_on_residual_token(
 
     assert excinfo.value.detail["reason"] == "residual_token_after_restore"
     assert excinfo.value.detail["residual"] == 1
-    assert excinfo.value.detail["sample_token_id"] == "5e6f7a8b"
+    # REPLACED ASSERTION. This used to read
+    #     assert excinfo.value.detail["sample_token_id"] == "5e6f7a8b"
+    # which pinned as the contract a field that copies eight characters straight
+    # out of post-restore text. That text is by definition what this stage could
+    # not account for: when the residue was manufactured from a restored value
+    # (the document's own "PHI-" in front of a restored "MRN-40281993") the field
+    # carried eight digits of a patient's MRN into the HTTP 500 body and into
+    # GET /audit -- see test_the_failure_detail_cannot_carry_a_restored_original
+    # below, which reproduces exactly that and goes red if the field returns.
+    # Build doc section 16: never embed an original entity value in an exception,
+    # anywhere, including debug paths. So the contract asserted here is the
+    # stronger one -- there is no sample at all.
+    assert "sample_token_id" not in excinfo.value.detail
+    assert set(excinfo.value.detail) == {
+        "reason", "session_id", "run_id", "strategy", "residual",
+    }
 
     events = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
     assert [event.detail["outcome"] for event in events] == ["assertion_failed"]
     assert events[0].detail["reason"] == "residual_token_after_restore"
+    assert "sample_token_id" not in events[0].detail
 
 
 async def test_post_restore_assertion_fires_on_residual_surrogate(
@@ -740,6 +1066,100 @@ async def test_assertion_message_carries_no_original(settings: Settings) -> None
     rendered = f"{excinfo.value}{excinfo.value!r}"
     for original in TOKENS.values():
         assert original not in rendered
+
+
+async def test_the_failure_detail_cannot_carry_a_restored_original(
+    settings: Settings, audit: AuditLogger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The assertion's own detail must not disclose the thing it fired about.
+
+    The residue is a token match assembled *after* restoration, so it can be made
+    of a value the restorer just put back. Here the document's own ``PHI-`` prefix
+    sits in front of a restored MRN, and ``PHI-MRN-40281993`` matches the grammar.
+    Copying ``group(3)`` into ``detail`` published eight digits of the patient's
+    MRN in the exception, in the HTTP 500 body, and in ``GET /audit`` -- whose
+    schema documents itself as safe to hand a compliance reader. Build doc section
+    16 forbids it. Restoring the ``sample=residue.group(3)`` argument turns this
+    red on the first assertion.
+    """
+    mrn = "MRN-40281993"
+    restorer = Restorer(
+        vault=FakeVault(tokens={MRN_ID: mrn}), settings=settings, audit=audit
+    )
+    caplog.set_level(logging.DEBUG, logger="secure_context_pipeline.deobfuscation.restorer")
+
+    with pytest.raises(PipelineError) as excinfo:
+        # No `issued`: the un-gated path, where any residue is fatal.
+        await restorer.restore(
+            SESSION, f"Record locator: PHI-[PHI_MRN_{MRN_ID}]", strategy=TOKENIZATION, run_id=RUN
+        )
+
+    assert excinfo.value.detail["reason"] == "residual_token_after_restore"
+    rendered = f"{excinfo.value}{excinfo.value!r}{excinfo.value.detail}"
+    assert "40281993" not in rendered, rendered
+    assert mrn not in rendered
+
+    events = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert "40281993" not in json.dumps([event.model_dump() for event in events])
+    assert "40281993" not in caplog.text
+
+
+async def test_a_token_shaped_original_does_not_fail_the_run_it_belongs_to(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """``_assert_no_tokens`` used to claim a real value cannot take the token shape.
+
+    It can -- ``TOKEN_RE.search("FIN_ACCOUNT_12345678")`` matches -- and any
+    category literal in the document's own prose in front of an eight-hex run
+    reproduces it. The old un-scoped scan therefore failed a run whose answer was
+    perfectly restored, *after* the provider had been called and billed. Scoped to
+    the IDs this run issued, the same output is correct and the run completes.
+    """
+    assert TOKEN_RE.search("FIN_ACCOUNT_12345678") is not None, "premise: the shape is takeable"
+
+    restorer = Restorer(
+        vault=FakeVault(tokens={MRN_ID: "MRN-40281993"}), settings=settings, audit=audit
+    )
+
+    result = await restorer.restore(
+        SESSION,
+        f"Record locator: PHI-[PHI_MRN_{MRN_ID}] reviewed.",
+        strategy=TOKENIZATION,
+        issued=[MRN_ID],
+        run_id=RUN,
+    )
+
+    assert result.text == "Record locator: PHI-MRN-40281993 reviewed."
+    assert result.restored_count == 1
+    assert result.vault_misses == 0
+    # Not silent about it: the manufactured shape is counted and audited.
+    assert result.foreign_tokens == 1
+    summary = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert summary[0].detail["foreign_tokens"] == 1
+    assert summary[0].detail["outcome"] == "ok"
+
+
+async def test_a_token_this_run_did_issue_still_fails_loudly(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """Scoping the residue scan must not blunt it where it matters.
+
+    A vault that hands back a live token is the incident the assertion exists for,
+    and ``issued`` must not become a way to slip past it.
+    """
+    restorer = Restorer(vault=LeakyVault(tokens=TOKENS), settings=settings, audit=audit)
+
+    with pytest.raises(PipelineError) as excinfo:
+        await restorer.restore(
+            SESSION,
+            "Seen by [PHI_NAME_1a2b3c4d].",
+            strategy=TOKENIZATION,
+            issued=[NAME_ID, "5e6f7a8b"],  # the value the broken vault re-emits
+            run_id=RUN,
+        )
+
+    assert excinfo.value.detail["reason"] == "residual_token_after_restore"
+    assert excinfo.value.detail["residual"] == 1
 
 
 async def test_unknown_strategy_is_rejected(restorer: Restorer) -> None:
@@ -1107,11 +1527,21 @@ async def test_a_case_or_number_variant_fake_is_left_alone(
 
     A model that upper-cases a name in a heading, lower-cases it, or pluralises it
     produces a string the matcher does not claim -- so the *fake* reaches the user
-    in place of the original. The answer is degraded, never wrong about anything
-    else and never a disclosure (a fake is what the model saw, and the original was
-    never exposed to it), but it is a real gap and it is silent: the residue
-    assertion re-scans with this same pattern, so it cannot see what the matcher
-    could not.
+    in place of the original.
+
+    Never a **disclosure**: a fake is what the model saw, and the original was
+    never exposed to it. But the older wording here -- "never wrong about anything
+    else" -- was too kind, and the correction matters. A Tier-1 fake is a
+    *realistic* substitute, so an un-restored one is not a visible placeholder: an
+    all-caps header hands a clinician a plausible name and a plausible MRN
+    presented as this patient's, and both are fabricated. Wrong, not merely
+    degraded.
+
+    It also used to be entirely silent, because the residue assertion re-scans
+    with this same pattern and so shares its blind spot exactly. That half is now
+    fixed: ``surrogates_suspected_unrestored`` counts these without restoring them
+    (see ``test_a_shouted_pseudonym_is_reported_even_though_it_is_not_restored``).
+    The matcher's case-sensitivity is unchanged and the test below is why.
     """
     restorer = Restorer(vault=FakeVault(), settings=settings)
 
@@ -1120,6 +1550,183 @@ async def test_a_case_or_number_variant_fake_is_left_alone(
     )
 
     assert result.text == expected
+
+
+# A model re-flows text. It hard-wraps a long line, double-spaces after a period,
+# drops a name into a table cell, pastes from a PDF with a non-breaking space.
+# Pseudonymization links name components, so the same person owns "Sherri Lopez"
+# AND "Lopez" -- and the moment the long fake's internal whitespace changes, the
+# long alternative stops matching and the SURNAME alternative wins alone. What the
+# user is then handed is the fake given name welded to the REAL surname: a person
+# who does not exist, in a clinical record, with every counter reading green.
+REFLOWED_TWO_WORD_FAKE = [
+    "Seen by Angela\nWhitfield today.",
+    "Seen by Angela  Whitfield today.",
+    "Seen by Angela\tWhitfield today.",
+    "Seen by Angela \n Whitfield today.",
+    "| Angela\nWhitfield | active |",
+]
+
+
+@pytest.mark.parametrize("text", REFLOWED_TWO_WORD_FAKE, ids=[repr(t) for t in REFLOWED_TWO_WORD_FAKE])
+async def test_a_reflowed_two_word_fake_never_yields_a_half_real_name(
+    settings: Settings, text: str
+) -> None:
+    """Strictly worse than the documented case-variant gap, and not covered by it.
+
+    ``restored_count`` goes UP (the surname really was restored), ``vault_misses``
+    and ``surrogate_misses`` stay 0, and ``_assert_no_surrogates`` cannot fire
+    because the residue "Angela" is not itself an issued surrogate. Nothing in the
+    result or the audit row separates this from a correct restore.
+
+    ``CASE_VARIANT_FAKES`` below pins only SINGLE-word fakes, where the failure is
+    benign ("the fake survives"). Multi-word fakes with component linking are the
+    normal case in this pipeline. Compiling internal whitespace as ``\\s+`` is the
+    only place this can be fixed -- after the pass, a hybrid is indistinguishable
+    from a correctly restored two-word original.
+    """
+    surrogates = {"Angela Whitfield": "Maria Torres", "Whitfield": "Torres"}
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates
+    )
+
+    # The half-real hybrid, named explicitly: this is the string that must never exist.
+    assert "Angela" not in result.text, result.text
+    assert "Maria Torres" in result.text
+    assert result.restored_count == 1
+    assert result.vault_misses == 0
+    assert result.surrogate_misses == 0
+
+
+async def test_a_reflowed_fake_resolves_through_the_vault_too(settings: Settings) -> None:
+    """The flexed match has to be mapped back to the key that was issued.
+
+    ``Angela\\nWhitfield`` is not a key of anything, so without
+    ``_canonical_by_shape`` the lookup misses, the value degrades to
+    ``[UNRESOLVED_ENTITY]`` and a ``VAULT_MISS`` audits as ``vault_lost`` -- an
+    integrity incident reported for a line break.
+    """
+    vault = FakeVault(surrogates={"Angela Whitfield": "Maria Torres"})
+    restorer = Restorer(vault=vault, settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Seen by Angela\nWhitfield's team today.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"Angela Whitfield": ""},
+    )
+
+    assert result.text == "Seen by Maria Torres's team today."
+    assert vault.surrogate_calls == ["Angela Whitfield"]
+    assert result.vault_misses == 0
+
+
+async def test_two_fakes_that_differ_only_in_whitespace_are_never_guessed_between(
+    settings: Settings,
+) -> None:
+    """Ambiguity must not be resolved arbitrarily -- guessing splices a wrong name.
+
+    ``_canonical_by_shape`` drops a collapsed shape claimed by more than one
+    surrogate, so both fall back to exact matching rather than one silently
+    standing in for the other.
+    """
+    surrogates = {"Ana Lopez": "Maria Torres", "Ana\tLopez": "Priya Raman"}
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Ana Lopez and Ana\tLopez are different people.",
+        strategy=PSEUDONYMIZATION,
+        surrogates=surrogates,
+    )
+
+    assert result.text == "Maria Torres and Priya Raman are different people."
+
+
+async def test_a_shouted_pseudonym_is_reported_even_though_it_is_not_restored(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """The known case-variant gap must at least be VISIBLE to a caller.
+
+    An ALL-CAPS summary header is utterly ordinary, and it hands the user a
+    fabricated name and a fabricated MRN presented as the patient's own -- with
+    ``restored_count`` 0, ``vault_misses`` 0, ``surrogates_seen`` 0 and outcome
+    ``ok``. A clinician cannot tell that from a correct answer, and until now
+    ``RestoreResult`` carried no field that could.
+
+    The matcher stays case-sensitive (see the test below for why folding it is
+    worse). What is added is a count, and a count cannot splice a name into a
+    sentence.
+    """
+    surrogates = {"Christine Taylor": "Maria Torres", "3713909": "4827391"}
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION,
+        "PATIENT SUMMARY\nPATIENT: CHRISTINE TAYLOR. MEDICAL RECORD NUMBER: 3713909.",
+        strategy=PSEUDONYMIZATION,
+        surrogates=surrogates,
+        run_id=RUN,
+    )
+
+    # The gap itself is unchanged and still honest about being a gap.
+    assert "CHRISTINE TAYLOR" in result.text
+    assert result.restored_count == 1  # the MRN is case-free and does restore
+    # The signal that was missing.
+    assert result.surrogates_suspected_unrestored >= 1
+    assert result.surrogates_issued == 2
+    summary = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert summary[0].detail["surrogates_suspected_unrestored"] >= 1
+    assert summary[0].detail["surrogates_issued"] == 2
+
+
+async def test_the_near_miss_count_is_an_upper_bound_and_says_so(
+    settings: Settings,
+) -> None:
+    """Stated as a property, not left for a reader to discover.
+
+    A fake drawn from ordinary English matches its lowercase common-word twin, so
+    the counter over-reports. That is the deliberate direction: a signal that goes
+    quiet exactly when the fake is an ordinary word would be worst at the moment a
+    reader most needs to look. It is never used to fail a run.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "The patient has a long history of care; Long counter-signed.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"Long": "Okafor"},
+    )
+
+    # Restored correctly; the common word is untouched in the answer...
+    assert result.text == "The patient has a long history of care; Okafor counter-signed."
+    # ...and counted as a near miss, which is the documented over-count.
+    assert result.surrogates_suspected_unrestored == 1
+
+
+async def test_a_clean_pseudonymization_run_reports_no_near_misses(
+    settings: Settings,
+) -> None:
+    """The counter must be zero on a correct run, or it is noise rather than signal."""
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Jane Alderton was seen at Riverbend Clinic on 11/27/2019.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={
+            "Jane Alderton": "Marisol Ferraro",
+            "Riverbend Clinic": "Northgate Family Medicine",
+            "11/27/2019": "04/11/2019",
+        },
+    )
+
+    assert result.restored_count == 3
+    assert result.surrogates_suspected_unrestored == 0
+    assert result.surrogates_issued == 3
 
 
 def test_case_insensitive_matching_would_splice_an_original_into_prose() -> None:

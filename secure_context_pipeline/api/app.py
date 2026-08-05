@@ -81,6 +81,32 @@ username to complete the chain, where before they were handed it. Closing the
 rest of the gap needs authentication, not a better check here -- the check has no
 secret to verify -- which is why it heads the production list below.
 
+**So the window before that lands is metered and loud, which is the half that
+was missing.** A failed scope proof is charged against a per-caller budget
+(:data:`AUDIT_PROOF_BURST`, refilled at
+:data:`AUDIT_PROOF_REFILL_PER_SECOND`) and, if it is within budget, writes an
+:data:`AUDIT_ACCESS_DENIED` row naming the claimed ``user_id`` -- filed under
+the session the scope resolved to, so the *owner* reads their own intruders out
+of the same endpoint the intruder is attacking. The meter is charged before the
+row is written, so throttling cannot be turned into unbounded log growth. A
+correct owner is never metered: only failures cost. This does not make the
+``user_id`` a credential; it makes guessing it slow and permanently recorded
+instead of free and invisible.
+
+**Anonymous writes are metered too, by method rather than by path.** Every
+state-changing request is charged against a second per-caller budget
+(:data:`WRITE_BURST`) by :class:`_RateLimit`, before the body is read.
+``POST /sessions`` and ``DELETE /sessions/{id}`` take no credential and both
+append to a log that is append-only and unprunable *by construction*: measured,
+3 000 anonymous session creations grew ``audit.db`` by 1 716 bytes each and the
+in-memory registry by one live session each, and a full disk fails every later
+write for every user. Metering by method rather than by a list of paths is
+deliberate -- a path list is a checker that shares a blind spot with the routes
+it checks -- and ``tests/test_api.py`` walks ``app.routes`` to prove no mutating
+route escapes it. It bounds one caller; bounding the *log* needs rotation with
+each segment's head hash anchored off-box, and bounding concurrency needs the
+reverse proxy this process cannot be.
+
 **A session belongs to one user.** ``POST /sessions`` records the creating
 ``user_id``, and every endpoint that takes both a session and a ``user_id``
 checks that they agree -- answering the same ``401 SESSION_EXPIRED`` as an
@@ -119,6 +145,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -187,14 +214,20 @@ from secure_context_pipeline.vault.session_vault import (
 from secure_context_pipeline.vault.session_vault import SessionVault
 
 __all__ = [
+    "AUDIT_ACCESS_DENIED",
+    "AUDIT_PROOF_BURST",
+    "AUDIT_PROOF_REFILL_PER_SECOND",
     "CONTENT_SECURITY_POLICY",
     "DEFAULT_AUDIT_PAGE",
     "MAX_AUDIT_PAGE",
     "MAX_BODY_BYTES",
     "MAX_UPLOAD_BYTES",
+    "METERED_METHODS",
     "SECURITY_HEADERS",
     "UI_DIRNAME",
     "UPLOAD_CHUNK_BYTES",
+    "WRITE_BURST",
+    "WRITE_REFILL_PER_SECOND",
     "ApiError",
     "Services",
     "create_app",
@@ -302,6 +335,208 @@ SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
 #: ``fastapi.status`` constant.
 HTTP_413_TOO_LARGE = 413
 HTTP_422_UNPROCESSABLE = 422
+HTTP_429_TOO_MANY_REQUESTS = 429
+
+#: Written to the hash-chained log every time an audit-scope ownership proof
+#: fails -- see :func:`_deny_audit_scope`.
+#:
+#: The proof at ``GET /audit`` compares a claimed ``user_id`` against the owner
+#: recorded at ``SESSION_CREATE``. That check is correct and it is also, on its
+#: own, a **silent** right/wrong oracle for a value that is not a secret:
+#: measured on this build, 500 wrong guesses against one real ``run_id`` returned
+#: an identical empty page each time, cost 0.86 ms each, and wrote **zero** rows
+#: to the tamper-evident log they were attacking. The interim window before real
+#: authentication lands was therefore not merely open, it was unobservable.
+#:
+#: A denied proof now leaves a record naming the claimed ``user_id`` and the
+#: scope it was claimed against, filed -- when the scope resolves to a session at
+#: all -- under *that session*, so the storm is visible to the victim through the
+#: very endpoint it is aimed at (``GET /audit?session_id=...``) and to an
+#: operator through the chain. Nothing in the record is content: a ``user_id`` is
+#: an actor, which ``SESSION_CREATE`` already records, and both halves are clamped
+#: by :func:`_clamp` (build doc section 16).
+#:
+#: **Not in** :data:`~secure_context_pipeline.audit.logger.EVENT_TYPES`, which is
+#: the build doc's fixed twelve and is asserted by count in ``tests/test_audit.py``.
+#: :meth:`AuditLogger.emit` does not restrict the column, so the row is written and
+#: chained like any other; promoting the constant into that module is a one-line
+#: change that belongs to whoever owns the audit package.
+AUDIT_ACCESS_DENIED = "AUDIT_ACCESS_DENIED"
+
+#: Recorded as the ``session_id`` of a deny row whose scope named only a
+#: ``run_id`` that resolved to nothing -- there is no session to file it under.
+#: Cannot collide with a real session: :meth:`SessionRegistry.create` mints
+#: ``uuid.uuid4().hex``, 32 lowercase hex characters.
+UNRESOLVED_SCOPE = "<unresolved-audit-scope>"
+
+#: Per-caller budget for **failed** audit-scope ownership proofs: a burst of
+#: :data:`AUDIT_PROOF_BURST`, refilled at :data:`AUDIT_PROOF_REFILL_PER_SECOND`.
+#:
+#: Deliberately metering *failures only*. A caller that proves its scope is never
+#: throttled, so no legitimate traffic is affected, while a username-guessing
+#: storm is throttled from the first request -- it fails by construction until it
+#: hits. At these numbers a 10 000-name dictionary against one held ``run_id``
+#: goes from ~9 s of silence to ~5.5 h that writes ~10 000 rows into the log.
+#:
+#: The throttle answers ``429 RATE_LIMITED`` rather than the empty page. That is
+#: not a new oracle: a caller only reaches the metered path by having *already*
+#: been told, by the empty page, that its guess was wrong -- 429 and the empty
+#: page carry the same one bit, and the correct owner never sees either.
+#:
+#: Order matters, and it is tested: the meter is charged **before** the deny row
+#: is written, so a throttled request writes nothing. Recording the failure is
+#: itself a durable anonymous write, and a monitoring control that an attacker
+#: can turn into unbounded disk growth is a trade, not a fix.
+AUDIT_PROOF_BURST = 20
+AUDIT_PROOF_REFILL_PER_SECOND = 0.5
+
+#: Per-caller budget for every state-changing request, enforced by
+#: :class:`_RateLimit` before the body is read.
+#:
+#: ``POST /sessions`` and ``DELETE /sessions/{id}`` need no session and no
+#: credential, and both append to a hash-chained log that is append-only and
+#: unprunable *by construction* -- pruning is what tamper-evidence forbids.
+#: Measured on this build: 3 000 anonymous ``POST /sessions`` grew ``audit.db`` by
+#: 1 716 bytes per request and the in-memory registry by one live session per
+#: request (held for ``session_ttl_seconds``, 3 600 by default); 1 000 anonymous
+#: ``DELETE`` calls with a bogus id grew it by 356 bytes each. Unmetered, that is
+#: ~583 k requests to a gigabyte of unprunable rows, and a full disk fails every
+#: later write for every user.
+#:
+#: The predicate is the HTTP **method**, not a list of paths, and that is the
+#: point rather than laziness: a path allow-list is a checker that shares a blind
+#: spot with the thing it checks, and it goes stale the moment a route is added.
+#: ``tests/test_api.py`` enumerates ``app.routes`` and asserts every mutating
+#: method on every registered route is metered, so a narrowing of this rule is
+#: caught by the app's own route table.
+#:
+#: This bounds one caller. It does not bound the *log*: rotation with each
+#: segment's head hash anchored off-box is the other half, and it lives in the
+#: audit package. Nor does it replace a reverse proxy -- concurrency is a limit
+#: this process cannot impose on itself.
+WRITE_BURST = 256
+WRITE_REFILL_PER_SECOND = 8.0
+
+#: Distinct callers a :class:`_RateLimiter` will track. The limiter must not
+#: become the exhaustion primitive it exists to remove, so the map is bounded and
+#: evicts least-recently-seen. Eviction is safe in the direction that matters: a
+#: forgotten key returns as a full bucket, which is exactly how an unseen caller
+#: starts, and reaching the ceiling at all takes 4 096 distinct source addresses.
+RATE_LIMIT_MAX_KEYS = 4_096
+
+#: The methods :class:`_RateLimit` meters. ``GET``/``HEAD``/``OPTIONS`` are left
+#: alone: they write nothing durable, and ``GET /audit`` has its own, tighter
+#: failure meter above.
+METERED_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+# ---------------------------------------------------------------------------
+# Per-caller metering
+# ---------------------------------------------------------------------------
+class _RateLimiter:
+    """A token bucket per caller. Synchronous, in-process, and deliberately dumb.
+
+    ``take()`` either consumes a token and returns ``0.0``, or consumes nothing
+    and returns the seconds until one is free. No sleeping, no locking: the whole
+    operation is a few arithmetic steps between two ``await`` points, so it cannot
+    interleave with itself on one event loop, and a second process would need a
+    shared store anyway -- which is the reverse proxy's job, not this one's.
+
+    **Bounded by construction.** ``_buckets`` is keyed by caller, so an unbounded
+    map would hand an attacker the memory-growth primitive the limiter is partly
+    there to remove. Every access re-inserts its key, which makes the dict's
+    insertion order a recency order, and the oldest entry is evicted past
+    :data:`RATE_LIMIT_MAX_KEYS`. Evicting is safe in the only direction it can go
+    wrong: a forgotten caller comes back with a *full* bucket, which is how an
+    unseen caller starts -- eviction can never turn an allowed request into a
+    denied one, only the reverse, and reaching the ceiling needs 4 096 distinct
+    addresses in one window.
+
+    ``time.monotonic``, never ``time.time``: a clock step backwards would
+    otherwise mint tokens (negative elapsed is clamped anyway) or freeze the
+    bucket for the length of the step.
+    """
+
+    __slots__ = ("_buckets", "capacity", "max_keys", "refill_per_second")
+
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        refill_per_second: float,
+        max_keys: int = RATE_LIMIT_MAX_KEYS,
+    ) -> None:
+        if capacity < 1:
+            raise ValueError(f"rate limiter capacity must be >= 1, got {capacity}")
+        if refill_per_second <= 0.0:
+            raise ValueError(f"rate limiter refill must be > 0, got {refill_per_second}")
+        if max_keys < 1:
+            raise ValueError(f"rate limiter max_keys must be >= 1, got {max_keys}")
+        self.capacity = capacity
+        self.refill_per_second = refill_per_second
+        self.max_keys = max_keys
+        self._buckets: dict[str, tuple[float, float]] = {}
+
+    def take(self, key: str, *, now: float | None = None) -> float:
+        """Spend one token for ``key``. ``0.0`` if allowed, else seconds to wait.
+
+        ``now`` is injectable so a test can drive refill deterministically rather
+        than by sleeping -- the alternative is a test whose green depends on how
+        loaded the machine is.
+        """
+        moment = time.monotonic() if now is None else now
+        tokens, last = self._buckets.pop(key, (float(self.capacity), moment))
+        elapsed = max(0.0, moment - last)
+        tokens = min(float(self.capacity), tokens + elapsed * self.refill_per_second)
+        if tokens >= 1.0:
+            tokens -= 1.0
+            wait = 0.0
+        else:
+            wait = (1.0 - tokens) / self.refill_per_second
+        self._buckets[key] = (tokens, moment)
+        while len(self._buckets) > self.max_keys:
+            self._buckets.pop(next(iter(self._buckets)))
+        return wait
+
+    def tracked(self) -> int:
+        """How many callers are currently held. For assertions about the bound."""
+        return len(self._buckets)
+
+
+@dataclass(slots=True)
+class _RateLimits:
+    """The app's meters. Held on ``app.state`` so a test can substitute a tight one.
+
+    Reached through ``scope["app"]`` rather than captured at construction, for
+    exactly that reason: Starlette sets ``scope["app"]`` before the middleware
+    stack runs, so :class:`_RateLimit` reads whatever is installed *now*, and a
+    test can swap in a two-token bucket without rebuilding the application (which
+    would mean loading spaCy again).
+    """
+
+    writes: _RateLimiter
+    audit_proofs: _RateLimiter
+
+
+def _caller_key(scope: Scope) -> str:
+    """Who to meter. The peer address, and nothing a request can choose.
+
+    Not ``X-Forwarded-For``: that header is attacker-supplied, so keying on it
+    would let one caller mint a fresh budget per request and the meter would read
+    as enforced while metering nothing. A deployment behind a proxy therefore
+    meters *the proxy* here and must do per-client limiting at the edge, or
+    populate ``scope["client"]`` from a trusted hop (``--proxy-headers`` with
+    ``--forwarded-allow-ips``) so this key is the real peer again.
+    """
+    client = scope.get("client")
+    if isinstance(client, (tuple, list)) and client:
+        return str(client[0])
+    return "-"
+
+
+def _limits(app_state: object) -> _RateLimits | None:
+    limits = getattr(app_state, "rate_limits", None)
+    return limits if isinstance(limits, _RateLimits) else None
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +821,27 @@ def _clamp(value: str) -> str:
     return value[:MAX_DETAIL_VALUE_LEN]
 
 
-async def _audit_scope_owner(
+@dataclass(frozen=True, slots=True)
+class _AuditScope:
+    """What a ``session_id``/``run_id`` pair resolved to.
+
+    ``session_id`` is the session the scope names (directly, or the one the run
+    belongs to) or ``None`` if it named nothing. ``owner`` is the ``user_id``
+    recorded at that session's ``SESSION_CREATE``, or ``None`` when the scope is
+    unreadable -- which callers must treat exactly like a wrong owner.
+
+    Both halves are needed, not just the owner: the owner decides the answer, and
+    the session decides where a *denied* attempt gets filed, so that the victim
+    can see it in their own scope.
+    """
+
+    session_id: str | None
+    owner: str | None
+
+
+async def _resolve_audit_scope(
     services: Services, *, session_id: str | None, run_id: str | None
-) -> str | None:
+) -> _AuditScope:
     """The ``user_id`` that owns an audit scope, read out of the log itself.
 
     The log is the authority here, not :class:`SessionRegistry`, and that is
@@ -616,20 +869,91 @@ async def _audit_scope_owner(
     existence oracle. ``test_an_audit_scope_with_no_recorded_owner_reads_as_empty``
     covers it, and proves the row is really in the log first, so an empty page
     cannot pass for the wrong reason.
+
+    **The two steps are always both taken.** Short-circuiting the second query
+    when the run resolved to nothing made a *real* ``run_id`` measurably slower
+    than an absent one on the wrong-owner path -- one audit query against two,
+    each a round trip through aiosqlite's worker thread. Measured before the fix,
+    300 warmed pairs: median 736 us for a real run against 528 us for a random
+    ``uuid4`` hex, +208 us, consistently. The responses are byte-identical by
+    design; the clock was not, so a caller holding a ``run_id`` it did not own
+    could still confirm the run existed. An unresolved scope now runs the same
+    second query against :data:`UNRESOLVED_SCOPE`, which no session can equal --
+    ``SessionRegistry.create`` mints 32 hex characters -- so it returns nothing
+    and the shape of the work is the same either way.
     """
     target = session_id
     if not target:
         seen = await services.audit.query(run_id=run_id, limit=1)
-        if not seen:
-            return None
-        target = seen[0].session_id
+        target = seen[0].session_id if seen else None
     created = await services.audit.query(
-        session_id=target, event_type=SESSION_CREATE, limit=1
+        session_id=UNRESOLVED_SCOPE if target is None else target,
+        event_type=SESSION_CREATE,
+        limit=1,
     )
-    if not created:
-        return None
+    if target is None or not created:
+        return _AuditScope(session_id=target, owner=None)
     owner = created[0].detail.get("user_id")
-    return owner if isinstance(owner, str) else None
+    return _AuditScope(session_id=target, owner=owner if isinstance(owner, str) else None)
+
+
+async def _deny_audit_scope(
+    request: Request,
+    services: Services,
+    scope: _AuditScope,
+    *,
+    user_id: str,
+    run_id: str | None,
+) -> None:
+    """Meter a failed audit-scope proof and record it. Raises 429 when metered out.
+
+    Two controls, in this order and only in this order.
+
+    **The meter first.** Recording the failure is a durable, anonymous write, so
+    doing it unconditionally would trade a silent oracle for the unbounded
+    ``audit.db`` growth described at :data:`WRITE_BURST`. A throttled request is
+    refused here and leaves nothing behind, which bounds the rows a guessing
+    storm can add to :data:`AUDIT_PROOF_REFILL_PER_SECOND` per caller per second.
+    ``test_a_throttled_audit_probe_writes_no_row`` pins the ordering.
+
+    **Then the record.** Every guess that gets an *answer* costs a row, and the
+    row names the claimed ``user_id`` and the scope it was claimed against. Filed
+    under the session the scope resolved to whenever there is one, so the owner
+    reads their own intruders out of ``GET /audit?session_id=...``; under
+    :data:`UNRESOLVED_SCOPE` when the scope named nothing, where only an operator
+    with the database (or ``/audit/verify``'s total length) sees it.
+
+    An attacker can therefore write rows into a victim's scope, bounded by the
+    meter. That is the intended direction: the rows *are* the intrusion record,
+    and the alternative -- filing them nowhere the victim can look -- is the
+    silence this exists to end.
+
+    Nothing here can carry content. ``user_id`` is an actor, which
+    ``SESSION_CREATE`` already records, and the scope identifiers are values the
+    caller supplied; both are clamped to :data:`MAX_DETAIL_VALUE_LEN`.
+    """
+    limits = _limits(request.app.state)
+    if limits is not None:
+        wait = limits.audit_proofs.take(_caller_key(request.scope))
+        if wait > 0.0:
+            raise ApiError(
+                HTTP_429_TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                {"retry_after_seconds": round(wait, 1)},
+            )
+    await services.audit.emit(
+        AuditEvent(
+            ts=time.time(),
+            session_id=_clamp(scope.session_id or UNRESOLVED_SCOPE),
+            run_id=_clamp(run_id) if run_id else None,
+            event_type=AUDIT_ACCESS_DENIED,
+            detail={
+                "route": request.url.path[:MAX_DETAIL_VALUE_LEN],
+                "claimed_user_id": _clamp(user_id),
+                "scope_resolved": int(scope.session_id is not None),
+            },
+        )
+    )
 
 
 async def _read_capped(file: UploadFile) -> bytes:
@@ -820,6 +1144,7 @@ _ERRORS: dict[int | str, dict[str, object]] = {
     401: {"model": ErrorResponse},
     404: {"model": ErrorResponse},
     422: {"model": ErrorResponse},
+    429: {"model": ErrorResponse},
     500: {"model": ErrorResponse},
     502: {"model": ErrorResponse},
     503: {"model": ErrorResponse},
@@ -1020,6 +1345,7 @@ def _register_routes(app: FastAPI) -> None:
         summary="Query the hash-chained audit log",
     )
     async def query_audit(
+        request: Request,
         services: ServicesDep,
         user_id: UserIdQuery,
         session_id: OptionalIdQuery = None,
@@ -1054,10 +1380,20 @@ def _register_routes(app: FastAPI) -> None:
 
         So the scope must be *proved*, not merely quoted: the claimed ``user_id``
         is checked, in constant time, against the owner recorded in the log at
-        ``SESSION_CREATE`` (see :func:`_audit_scope_owner`). An unproved scope
+        ``SESSION_CREATE`` (see :func:`_resolve_audit_scope`). An unproved scope
         returns an **empty page**, byte-identical to a scope that does not exist
         or a window that matched nothing -- answering 403 would restore the
         existence oracle the uniform reply exists to deny.
+
+        **And a failed proof is metered and recorded** (:func:`_deny_audit_scope`).
+        The proof has no secret to verify -- ``POST /sessions`` mints a session
+        for any ``user_id`` asked for -- so it is a right/wrong oracle on a
+        human-readable name, and until now a free and invisible one: 500 wrong
+        guesses against a real ``run_id`` cost 0.86 ms each, triggered no lockout
+        and wrote nothing. Guessing is now throttled per caller and every answered
+        guess leaves a row in the chain it is attacking. Neither replaces
+        authentication; both close the interim window's *silence*, which is the
+        part that made the gap unmonitorable rather than merely open.
 
         Liveness is deliberately *not* checked, and the ownership proof reads the
         log rather than the registry for exactly that reason: the trail must stay
@@ -1070,8 +1406,9 @@ def _register_routes(app: FastAPI) -> None:
                 "AUDIT_SCOPE_REQUIRED",
                 {"reason": "session_id_or_run_id_required"},
             )
-        owner = await _audit_scope_owner(services, session_id=session_id, run_id=run_id)
-        if owner is None or not _same_id(user_id, owner):
+        scope = await _resolve_audit_scope(services, session_id=session_id, run_id=run_id)
+        if scope.owner is None or not _same_id(user_id, scope.owner):
+            await _deny_audit_scope(request, services, scope, user_id=user_id, run_id=run_id)
             return AuditQueryResponse(events=[], returned=0, limit=limit, offset=offset)
         events = await services.audit.query(
             session_id=session_id,
@@ -1092,6 +1429,7 @@ def _register_routes(app: FastAPI) -> None:
         summary="Verify the audit hash chain",
     )
     async def verify_audit(
+        request: Request,
         services: ServicesDep,
         session_id: OptionalIdQuery = None,
         user_id: OptionalIdQuery = None,
@@ -1111,7 +1449,10 @@ def _register_routes(app: FastAPI) -> None:
         session, ``length`` is an existence oracle -- zero versus non-zero says
         whether that session ID was ever real -- so it is gated exactly like the
         query it mirrors, and an unproved scope gets ``valid=True, length=0``,
-        indistinguishable from a session that never existed.
+        indistinguishable from a session that never existed. Metered and recorded
+        exactly like the query it mirrors, too: this route answers the same
+        right/wrong question about ``user_id``, so leaving it unmetered would
+        just move the oracle one URL over.
         """
         if session_id:
             if not user_id:
@@ -1120,8 +1461,9 @@ def _register_routes(app: FastAPI) -> None:
                     "AUDIT_SCOPE_REQUIRED",
                     {"reason": "user_id_required_with_session_id"},
                 )
-            owner = await _audit_scope_owner(services, session_id=session_id, run_id=None)
-            if owner is None or not _same_id(user_id, owner):
+            scope = await _resolve_audit_scope(services, session_id=session_id, run_id=None)
+            if scope.owner is None or not _same_id(user_id, scope.owner):
+                await _deny_audit_scope(request, services, scope, user_id=user_id, run_id=None)
                 return AuditVerifyResponse(valid=True, length=0, session_id=session_id)
         valid = await services.audit.verify_chain(session_id)
         length = await services.audit.length(session_id)
@@ -1221,6 +1563,93 @@ async def _send_too_large(send: Send, *, limit: int, received: int) -> None:
         }
     )
     await send({"type": "http.response.body", "body": payload})
+
+
+async def _send_rate_limited(send: Send, *, retry_after: float) -> None:
+    """Emit ``429 RATE_LIMITED`` straight onto the ASGI channel.
+
+    Same reasoning as :func:`_send_too_large`: :class:`_RateLimit` runs outside
+    the exception middleware and cannot raise its way to :func:`_json`, so the
+    body is built from :class:`ErrorResponse` to keep the ``{code, detail}``
+    contract true on this path too. ``Retry-After`` is whole seconds because the
+    header's grammar says so, rounded *up* so a client that obeys it is never
+    refused twice for the same reason.
+    """
+    seconds = max(1, math.ceil(retry_after))
+    payload = json.dumps(
+        ErrorResponse(
+            code="RATE_LIMITED",
+            detail={"retry_after_seconds": seconds},
+        ).model_dump(mode="json")
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": HTTP_429_TOO_MANY_REQUESTS,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+                (b"retry-after", str(seconds).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})
+
+
+class _RateLimit:
+    """Meter every state-changing request per caller, before its body is read.
+
+    **In middleware, not in a handler, and that is the load-bearing part.** By
+    the time a route function's first statement runs, FastAPI has already awaited
+    ``request.body()`` to build the model, so a check there answers 429 *after*
+    the caller has chosen the allocation -- the identical status code with the
+    defect :data:`MAX_BODY_BYTES` exists to remove. Measured: with the meter
+    moved into ``create_session`` the refused request's body is read in full;
+    from here, zero bytes are pulled off the stream.
+
+    Its position relative to :class:`_BodyLimit` is *not* load-bearing, which is
+    worth saying because it looks as though it should be. Measured both ways: a
+    throttled caller reads zero bytes under either order, because neither
+    middleware pulls the stream itself. What the order decides is only which
+    refusal a request that trips both is told -- 429 here, 413 if ``_BodyLimit``
+    were outside -- and the throttle is the more actionable of the two, since the
+    caller's problem is not this particular body.
+
+    The predicate is :data:`METERED_METHODS`, a *method* rule rather than a path
+    list. A path list is the failure mode this codebase keeps rediscovering: a
+    checker that shares a blind spot with the thing it checks, going stale the
+    moment someone adds a route. ``GET`` is not metered here because it writes
+    nothing durable; the one ``GET`` that can be turned into a write --
+    ``/audit`` and its deny record -- carries its own tighter meter.
+
+    Reads the limiter from ``scope["app"].state`` on each request rather than
+    capturing it, so a test can install a two-token bucket on a live app. If no
+    meter is installed the request passes: this middleware must never be the
+    reason a correctly built app refuses traffic.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or str(scope.get("method", "")).upper() not in METERED_METHODS:
+            await self.app(scope, receive, send)
+            return
+        limits = _limits(getattr(scope.get("app"), "state", None))
+        if limits is not None:
+            wait = limits.writes.take(_caller_key(scope))
+            if wait > 0.0:
+                logger.warning(
+                    "request throttled",
+                    extra={
+                        "route": str(scope.get("path", "")),
+                        "error_code": "RATE_LIMITED",
+                        "status_code": HTTP_429_TOO_MANY_REQUESTS,
+                    },
+                )
+                await _send_rate_limited(send, retry_after=wait)
+                return
+        await self.app(scope, receive, send)
 
 
 class _BodyLimit:
@@ -1379,11 +1808,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=None,
         redoc_url=None,
     )
+    # The meters, before the routes so ``scope["app"].state`` already has them on
+    # the very first request. Two buckets rather than one because they answer
+    # different questions: ``writes`` bounds durable growth from anonymous
+    # mutations, ``audit_proofs`` bounds guessing at the audit-scope proof and is
+    # charged only when a proof *fails*, so it never touches legitimate traffic.
+    app.state.rate_limits = _RateLimits(
+        writes=_RateLimiter(capacity=WRITE_BURST, refill_per_second=WRITE_REFILL_PER_SECOND),
+        audit_proofs=_RateLimiter(
+            capacity=AUDIT_PROOF_BURST, refill_per_second=AUDIT_PROOF_REFILL_PER_SECOND
+        ),
+    )
     # Order matters, and it is the reverse of the call order: the last
     # ``add_middleware`` wins the outermost position. ``_SecurityHeaders`` has to
-    # be outside ``_BodyLimit`` so the 413 that never reaches the application is
-    # still stamped with the CSP and ``nosniff`` every other response carries.
+    # be outside everything so the 413 and the 429 that never reach the
+    # application are still stamped with the CSP and ``nosniff`` every other
+    # response carries. Between the other two the order is a choice of *answer*,
+    # not of protection -- measured, a throttled caller reads zero bytes either
+    # way -- and 429 is the more actionable reply for a request that trips both.
     app.add_middleware(_BodyLimit)
+    app.add_middleware(_RateLimit)
     app.add_middleware(_SecurityHeaders)
     _register_handlers(app)
     _register_routes(app)

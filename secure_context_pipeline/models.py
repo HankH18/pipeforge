@@ -8,8 +8,29 @@ zero-PII-in-logs requirement:
    length-capped, so the claim is enforced by the schema rather than by convention.
    The check quantifies over ``model_fields`` rather than over a list of column
    names, because a list only ever covers the columns its author remembered.
-2. ``Detection`` and ``TokenRecord`` mask their sensitive fields in ``__repr__``
-   and ``__str__``, so an accidental ``f"{detection}"`` in a log line cannot leak.
+2. **Every model in this module is classified for both exits, and the
+   classification is quantified over ``model_fields`` for the same reason point 1
+   is.** The two exits are ``repr()``/``str()`` -- what an accidental
+   ``f"{result}"`` in a log line emits -- and ``model_dump_json()`` -- what
+   reaches an HTTP response or a JSON log line. They need *different* rules,
+   because a field can be forbidden on one and mandatory on the other::
+
+       repr   masks originals AND surrogates: a log reader cannot tell a
+              pseudonymized fake from a real value, so both are '***'.
+       dump   masks originals on the PROVIDER-ward path only: the user-ward
+              product (``PipelineResult.restored_text``) has to serialize -- it
+              is the answer the caller asked for.
+
+   The masked-in-``repr`` set is declared per class as
+   :attr:`_MaskedRepr.REPR_MASKED` and rendered by one shared ``__repr__`` that
+   walks ``model_fields``, so a newly added field is *printed* by default and a
+   newly added **sensitive** field fails ``tests/test_models.py`` until someone
+   classifies it. Hand-written ``__repr__`` bodies had the opposite failure mode:
+   they silently dropped new fields, which hid the leak the test was looking for.
+   This was not a hypothetical -- ``SpanOut.surrogate`` (the same field
+   ``TokenRecord`` masks, in the object the API returns) and
+   ``PipelineResult.restored_text`` (originals by construction) both rendered in
+   full before the quantified test existed.
 3. ``Detection.text`` is *also* masked on serialization. ``repr`` masking alone is
    a leak waiting to happen: ``model_dump_json()`` bypasses ``__repr__`` entirely,
    and it is the form that reaches HTTP responses and JSON log lines. ``text`` is
@@ -18,9 +39,11 @@ zero-PII-in-logs requirement:
    ``Detection.text`` is the only original value on the *provider-ward* path --
    the models that flow toward obfuscation and egress. It is not the only original
    value in the package: :class:`PipelineResult` carries ``restored_text``, which
-   is originals by construction. That one is user-ward and never serialized toward
-   a provider, which is why it is unmasked; the distinction is the point, so the
-   two must not be conflated.
+   is originals by construction. That one is user-ward and is the documented
+   response body (``api/schemas.py`` rule 1), which is why it still *serializes* --
+   but it is masked in ``repr`` like every other original, because a log line is
+   not a response body. The distinction is the point, so the two must not be
+   conflated.
 """
 
 from __future__ import annotations
@@ -28,7 +51,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated
+from typing import Annotated, ClassVar
 
 from pydantic import (
     BaseModel,
@@ -103,7 +126,37 @@ def _check_span_order(start: int, end: int) -> None:
         raise ValueError(f"span end {end} precedes start {start}")
 
 
-class Detection(BaseModel):
+class _MaskedRepr(BaseModel):
+    """Base for models with a field that must never render into a log line.
+
+    Subclasses name the fields in :attr:`REPR_MASKED`; ``__repr__`` walks
+    ``model_fields`` and substitutes :data:`MASK` for those, printing every other
+    field normally. Declaring the *masked* set rather than writing the whole
+    ``repr`` by hand is the load-bearing part: a hand-written body omits any field
+    added after it was written, so the field never appears in ``repr()`` and the
+    leak test that greps ``repr()`` for a canary can never see it. Here a new field
+    prints by default, so ``tests/test_models.py`` sees the canary and fails until
+    the field is classified as printable or masked.
+
+    This class declares no fields of its own, so it contributes nothing to any
+    subclass's schema or serialization -- it changes ``repr``/``str`` only.
+    """
+
+    #: Field names replaced with :data:`MASK` in ``repr()`` and ``str()``.
+    REPR_MASKED: ClassVar[frozenset[str]] = frozenset()
+
+    def __repr__(self) -> str:
+        cls = type(self)
+        rendered = ", ".join(
+            f"{name}={(MASK if name in cls.REPR_MASKED else getattr(self, name))!r}"
+            for name in cls.model_fields
+        )
+        return f"{cls.__name__}({rendered})"
+
+    __str__ = __repr__
+
+
+class Detection(_MaskedRepr):
     """A detected span. ``text`` is an ORIGINAL VALUE -- memory only, never logged.
 
     ``text`` is masked in ``repr``/``str`` *and* on serialization; see the module
@@ -111,6 +164,8 @@ class Detection(BaseModel):
     """
 
     model_config = ConfigDict(frozen=True)
+
+    REPR_MASKED: ClassVar[frozenset[str]] = frozenset({"text"})
 
     entity_type: str
     category: EntityCategory
@@ -129,16 +184,8 @@ class Detection(BaseModel):
     def _mask_text(value: str) -> str:
         return MASK
 
-    def __repr__(self) -> str:
-        return (
-            f"Detection(entity_type={self.entity_type!r}, category={self.category!r}, "
-            f"start={self.start}, end={self.end}, text={MASK!r}, score={self.score})"
-        )
 
-    __str__ = __repr__
-
-
-class TokenRecord(BaseModel):
+class TokenRecord(_MaskedRepr):
     """Vault-side record for one obfuscated entity.
 
     ``surrogate`` is masked in repr: under pseudonymization it is a realistic
@@ -156,21 +203,14 @@ class TokenRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    REPR_MASKED: ClassVar[frozenset[str]] = frozenset({"surrogate"})
+
     session_id: str
     token_id: str
     entity_type: str
     category: EntityCategory
     surrogate: str
     created_at: float
-
-    def __repr__(self) -> str:
-        return (
-            f"TokenRecord(session_id={self.session_id!r}, token_id={self.token_id!r}, "
-            f"entity_type={self.entity_type!r}, category={self.category!r}, "
-            f"surrogate={MASK!r}, created_at={self.created_at})"
-        )
-
-    __str__ = __repr__
 
 
 class RedactionRecord(BaseModel):
@@ -189,8 +229,21 @@ class RedactionRecord(BaseModel):
         return self
 
 
-class SpanOut(BaseModel):
-    """UI/API-safe span: offsets into the original document, no original-value field."""
+class SpanOut(_MaskedRepr):
+    """UI/API-safe span: offsets into the original document, no original-value field.
+
+    ``surrogate`` is the *same value* :class:`TokenRecord` carries, so it is masked
+    in ``repr`` for the same reason: under pseudonymization it is a realistic fake
+    a log reader could not distinguish from a real value. It was unmasked here
+    while ``TokenRecord`` masked it -- and this is the object the API returns and
+    the UI renders, so it is the copy far more likely to reach a log line.
+
+    Masked in ``repr`` only. ``surrogate`` still **serializes**: the UI's highlight
+    panel needs it to show which fake stands for which span, and it is a value the
+    provider already saw.
+    """
+
+    REPR_MASKED: ClassVar[frozenset[str]] = frozenset({"surrogate"})
 
     entity_type: str
     category: EntityCategory
@@ -303,7 +356,7 @@ class EgressReport(BaseModel):
     elapsed_ms: float = 0.0
 
 
-class PipelineResult(BaseModel):
+class PipelineResult(_MaskedRepr):
     """One end-to-end run. Every field here is user-ward: nothing on this model is
     ever sent to a provider.
 
@@ -314,7 +367,28 @@ class PipelineResult(BaseModel):
     string the egress gate cleared. ``raw_llm_response`` is untrusted provider
     output and is treated as such everywhere -- it is displayed, and it is scanned
     for token IDs by the restorer; it is never parsed for control flow.
+
+    ``restored_text`` is **originals by construction** -- restoration is the step
+    that puts them back -- so it is masked in ``repr``/``str``. User-ward is an
+    argument about the *response body*, not about ``f"{result}"`` in a log line,
+    and section 16 forbids the latter for any original regardless of direction.
+    :class:`~secure_context_pipeline.deobfuscation.restorer.RestoreResult` already
+    masks the same text one stage earlier; this model was the copy that did not,
+    which made the final object the weakest link in the chain.
+
+    It still **serializes** in full: it is the documented response body
+    (``api/schemas.py`` rule 1) and the answer the caller asked for. ``repr`` and
+    ``model_dump_json`` are classified separately for exactly this case; see the
+    module docstring.
+
+    The other two text fields are deliberately *not* masked in ``repr``:
+    ``obfuscated_payload`` is byte-for-byte what the egress gate cleared for the
+    provider and ``raw_llm_response`` is what the provider sent back, so both are
+    provider-visible by construction. Masking them would suggest a log line is a
+    worse exposure than the network call that already happened.
     """
+
+    REPR_MASKED: ClassVar[frozenset[str]] = frozenset({"restored_text"})
 
     run_id: str
     restored_text: str
