@@ -3887,7 +3887,7 @@ async def test_a_homoglyph_substitution_is_outside_what_the_scan_claims(
     ("vaulted", "spelling"),
     [
         ("José Ruiz", "Patient José-Ruiz was seen."),
-        ("José Ruiz", "Patient José​Ruiz was seen."),
+        ("Jos\u00e9 Ruiz", "Patient Jos\u00e9\u200bRuiz was seen."),
         ("Renée Ashford", "Countersigned: Renée_Ashford RN"),
         ("Nguyễn Thi Lan", "Referred by Nguyễn.Thi.Lan today."),
     ],
@@ -4000,12 +4000,16 @@ async def test_a_high_severity_hit_in_the_redact_band_blocks(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     "spelling",
     [
-        "Countersigned: Marguerite​Vandenberg RN",   # zero-width space
-        "Countersigned: Marguerite-Vandenberg RN",         # hyphen
-        "Countersigned: Marguerite_Vandenberg RN",         # underscore
-        "Countersigned: Marguerite.Vandenberg RN",         # period
-        "Countersigned: MargueriteVandenberg RN",          # deleted entirely
-        "Countersigned: Marguerite Vandenberg RN",    # non-breaking space
+        # Written as escapes, not literals: an invisible or look-alike character
+        # pasted into this file is indistinguishable from a plain space to the next
+        # reader of the very test that distinguishes them -- the same rule
+        # `_INVISIBLE_RE` states about its own source.
+        "Countersigned: Marguerite\u200bVandenberg RN",   # zero-width space
+        "Countersigned: Marguerite-Vandenberg RN",        # hyphen
+        "Countersigned: Marguerite_Vandenberg RN",        # underscore
+        "Countersigned: Marguerite.Vandenberg RN",        # period
+        "Countersigned: MargueriteVandenberg RN",         # deleted entirely
+        "Countersigned: Marguerite\u00a0Vandenberg RN",   # non-breaking space
     ],
 )
 async def test_the_separator_limb_blocks_plain_ascii_variance(
