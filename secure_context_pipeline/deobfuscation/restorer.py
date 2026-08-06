@@ -119,6 +119,7 @@ from secure_context_pipeline.surrogates import TOKEN_RE
 from secure_context_pipeline.textrules import (
     LEFT_GUARD,
     RIGHT_GUARD,
+    escape_ws_flexible,
     guards_left,
     guards_right,
 )
@@ -1357,17 +1358,12 @@ def _compile_surrogate_pattern(
     return re.compile("|".join(groups), re.IGNORECASE if fold else 0)
 
 
-def _escape_ws_flexible(surrogate: str) -> str:
-    """``re.escape`` the surrogate, but let every internal whitespace run flex.
-
-    Leading/trailing whitespace (a surrogate should not have any, but the caller's
-    map is untrusted input to this function) is escaped literally: only *internal*
-    runs become ``\\s+``, so the boundary guards still key on a real character.
-    """
-    parts = _WS_RUN_RE.split(surrogate)
-    if len(parts) == 1:
-        return re.escape(surrogate)
-    return r"\s+".join(re.escape(part) if part else "" for part in parts)
+# Moved to `textrules`, which owns the "does this value occur here" decision for
+# all four consumers. It lived here because this module needed it first, and while
+# it did, the engine's residual sweep answered the whitespace question differently
+# -- the divergence `textrules` exists to prevent. Aliased rather than renamed at
+# every call site so the local name keeps reading naturally.
+_escape_ws_flexible = escape_ws_flexible
 
 
 def _split_surrogate_match(

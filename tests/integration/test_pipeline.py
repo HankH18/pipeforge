@@ -1459,3 +1459,42 @@ async def test_a_hard_wrapped_document_leaks_no_name_tail_to_the_provider(
     assert payload, "premise: the provider was called"
     for _head, tail in dropped:
         assert not re.search(rf"\b{re.escape(tail)}\b", payload)
+
+
+@pytest.mark.parametrize("width", [62, 50, 40])
+async def test_a_hard_wrapped_document_is_processable_at_all(
+    make_harness: HarnessFactory, width: int
+) -> None:
+    """A wrapped document must not be an unconditional EGRESS_BLOCKED.
+
+    The residual sweep matched originals whitespace-EXACTLY (`re.escape`, so a
+    literal space could not match a newline plus an indent) while pass 1 compares
+    normalised forms, which COLLAPSE whitespace. Of the components `textrules`
+    exists to keep in agreement, the sweep was the only whitespace-exact one, so a
+    vaulted value recurring across a line break was left in the payload by the
+    sweep and then blocked by the gate.
+
+    Fail-closed -- nothing leaked -- but every hard-wrapped document was
+    unprocessable, and Deviation 32 says every document reaching the detector has
+    been through `extraction.py` and arrives hard-wrapped. `.pdf` and `.docx` are
+    accepted inputs, so this was the normal case. The four committed fixtures are
+    the only unwrapped documents in the repo (mean line lengths 52 / 161 / 61 /
+    527 characters), which is exactly why the suite could not see it.
+
+    It also falsified Deviation 13 in writing, which claimed the boundary rule
+    "makes the gate agree with the engine's residual sweep about what counts as an
+    occurrence -- previously they disagreed, which is exactly how a value could be
+    swept everywhere and still be reported present".
+    """
+    harness: Harness = await make_harness()
+    source = generator.generate(SEED, "medical")
+    wrapped = "\n".join(textwrap.fill(p, width=width) for p in source.split("\n\n"))
+    assert max(len(line) for line in wrapped.split("\n")) <= width + 20, "premise: wrapped"
+
+    doc_id = await harness.upload(wrapped, "medical", "wrapped.txt")
+    session_id, _ = await harness.sessions.create("test-user")
+
+    # The assertion is simply that it completes. A block here is the defect.
+    result = await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+    assert harness.provider.calls == 1
+    assert result.restored_text

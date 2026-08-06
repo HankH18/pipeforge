@@ -72,6 +72,7 @@ __all__ = [
     "RIGHT_GUARD",
     "boundary_guards",
     "delimited_parts",
+    "escape_ws_flexible",
     "guards_left",
     "guards_right",
     "match_case",
@@ -129,17 +130,64 @@ def boundary_guards(value: str) -> tuple[str, str]:
     )
 
 
+_WS_RUN = re.compile(r"\s+")
+
+
+def escape_ws_flexible(value: str) -> str:
+    """``re.escape(value)``, but with every INTERNAL whitespace run as ``\\s+``.
+
+    Leading and trailing whitespace is escaped literally -- only internal runs
+    flex -- so the boundary guards still key on a real character.
+
+    This lived privately in ``deobfuscation/restorer.py``, which is the module that
+    needed it first and the wrong place for it to stay. The rule "does this value
+    occur here" has four consumers and this module exists so they answer it
+    identically; a whitespace decision made in one of them is the same divergence
+    in miniature, and it cost exactly what such divergences cost here. See
+    :func:`word_bounded_pattern`.
+    """
+    parts = _WS_RUN.split(value)
+    if len(parts) == 1:
+        return re.escape(value)
+    return r"\s+".join(re.escape(part) if part else "" for part in parts)
+
+
 def word_bounded_pattern(value: str) -> str:
-    """``value`` as a literal pattern that cannot match inside a longer word.
+    """``value`` as a pattern that cannot match inside a longer word.
 
     An empty value gets a pattern that never matches rather than one that matches
     everywhere -- the difference between a no-op and a catastrophe, since callers
     substitute on what this matches.
+
+    **Internal whitespace flexes** (:func:`escape_ws_flexible`), and that is a
+    correctness requirement rather than a convenience. This was ``re.escape(value)``
+    outright, so a literal space could not match a newline plus an indent -- while
+    the EgressGate compares ``normalize(original)`` against ``normalize(payload)``,
+    which COLLAPSES whitespace, and the restorer already flexed. Of the components
+    this module exists to keep in agreement, the sweep was the only one that was
+    whitespace-exact.
+
+    The consequence was a document that could not be processed at all. A vaulted
+    value recurring across a line break was left in the payload by the sweep and
+    then blocked by pass 1 -- fail-closed, so nothing leaked, but every hard-wrapped
+    document was an unconditional ``EGRESS_BLOCKED``. Measured: 6 of 20 generated
+    fixtures re-wrapped at 62 columns blocked, 0 of 20 unwrapped ones did, and the
+    four committed fixtures are all stored unwrapped (mean line lengths 52, 161, 61
+    and 527 characters), which is exactly why 1630 green tests could not see it.
+    Deviation 32 states that every document reaching the detector has been through
+    ``extraction.py`` and arrives **hard-wrapped**, and ``.pdf``/``.docx`` are
+    accepted inputs, so this was the normal case rather than an edge one.
+
+    It also falsified README Deviation 13 in writing, which claimed the boundary
+    rule "makes the gate agree with the engine's residual sweep about what counts
+    as an occurrence -- previously they disagreed, which is exactly how a value
+    could be swept everywhere and still be reported present". They still disagreed,
+    on whitespace, with precisely that consequence.
     """
     if not value:
         return r"(?!)"
     left, right = boundary_guards(value)
-    return left + re.escape(value) + right
+    return left + escape_ws_flexible(value) + right
 
 
 def occurs_as_a_unit(needle: str, haystack: str) -> bool:
