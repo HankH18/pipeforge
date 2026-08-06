@@ -608,11 +608,26 @@ async def test_both_kinds_of_miss_are_separated_in_one_response(
     assert result.lost == (NAME_ID,)
     assert result.fabricated == ("deadbeef",)
 
-    by_token = {
-        event.token_id: event.detail["classification"]
-        for event in await audit.query(session_id=SESSION, event_type=VAULT_MISS)
-    }
-    assert by_token == {NAME_ID: MISS_LOST, "deadbeef": MISS_FABRICATED}
+    rows = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    assert sorted(str(event.detail["classification"]) for event in rows) == sorted(
+        [MISS_LOST, MISS_FABRICATED]
+    )
+
+    # Which token is named, and which is deliberately not. A LOST ID was minted by
+    # this session, so the row carries it and it is the whole diagnostic. A
+    # FABRICATED one is eight characters taken from the model's own bytes, and
+    # `Restorer._fail` already records why that must not reach `GET /audit`: the
+    # document's own "PHI-" in front of a restored "MRN-40281993" makes those eight
+    # characters eight digits of a patient's MRN. This is the sibling path that fix
+    # missed. The caller still gets the ID in `result.fabricated` above -- it is the
+    # persisted, queryable row that stops carrying it.
+    by_classification = {str(event.detail["classification"]): event for event in rows}
+    assert by_classification[MISS_LOST].token_id == NAME_ID
+    assert by_classification[MISS_FABRICATED].token_id is None
+    # The type label is grammar-constrained (`[A-Z][A-Z0-9_]*`) and clamped, so it
+    # stays on both rows -- see
+    # `test_the_entity_type_label_copied_from_untrusted_text_is_bounded`.
+    assert by_classification[MISS_FABRICATED].entity_type == "PHI_NAME"
 
 
 async def test_issued_matches_a_case_mangled_hash(
@@ -2068,3 +2083,48 @@ async def test_500_token_response_restores_under_500ms(
     assert TOKEN_RE.search(result.text) is None
     # Generous margin against the 500 ms budget; typical run is ~5 ms.
     assert elapsed_ms < 500.0, f"restore took {elapsed_ms:.1f} ms for {token_count} tokens"
+
+
+async def test_a_document_reference_the_model_echoes_never_reaches_the_audit_log(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """The realistic trigger for the leak `_fail`'s docstring describes, in its sibling.
+
+    Nothing adversarial is required. A clinical document that cites its own record
+    reference -- ``(PHI-MRN-40281993)`` -- is a `TOKEN_RE` match: group 1 is a
+    category literal, group 2 is ``MRN``, and group 3 is eight characters of valid
+    hex that are also eight digits of a patient's medical record number. When the
+    model echoes that reference, the restorer classifies it FABRICATED (we minted no
+    such ID) and used to copy group 3 into the `token_id` column -- into the hash
+    chain, and out through `GET /audit`, whose schema documents itself as safe to
+    hand a compliance reader.
+
+    `Restorer._fail` records this exact incident and fixed it for the residue path.
+    This is the same bug one branch over.
+    """
+    mrn_digits = "40281993"
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION,
+        f"See the chart reference (PHI-MRN-{mrn_digits}) for details.",
+        strategy=TOKENIZATION,
+        issued=[NAME_ID],  # the production path always supplies this
+        run_id=RUN,
+    )
+
+    assert result.fabricated == (mrn_digits,), "premise: it really is classified fabricated"
+
+    rows = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    assert len(rows) == 1
+    assert rows[0].detail["classification"] == MISS_FABRICATED
+    assert rows[0].token_id is None
+
+    # The digits must not appear anywhere in the persisted row -- not in the label
+    # column, not in any detail value. Checked as a whole-row sweep rather than
+    # field by field, because the next field added is the one a per-field list
+    # forgets.
+    serialised = rows[0].model_dump_json()
+    assert mrn_digits not in serialised, (
+        f"eight digits of an MRN reached the audit row: {serialised}"
+    )

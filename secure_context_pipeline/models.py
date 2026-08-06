@@ -367,6 +367,18 @@ class AuditEvent(BaseModel):
     @classmethod
     def _reject_long_values(cls, v: DetailMap) -> DetailMap:
         for key, value in v.items():
+            # The KEY is checked as well as the value, and it was not. Both halves
+            # of a dict entry are attacker-reachable in principle and both are
+            # serialised into the row, so a ceiling on one of them is not a ceiling:
+            # a 3,000-character key validated, INSERTed, kept `verify_chain()` true
+            # and came back out of `query()`. No shipped call site builds a dynamic
+            # key, so this closes a hardening gap rather than a live leak -- which
+            # is exactly the kind that survives, because nothing exercises it.
+            if len(key) > MAX_DETAIL_VALUE_LEN:
+                raise ValueError(
+                    f"audit detail key exceeds {MAX_DETAIL_VALUE_LEN} chars; "
+                    "audit records must not carry content"
+                )
             if isinstance(value, str) and len(value) > MAX_DETAIL_VALUE_LEN:
                 raise ValueError(
                     f"audit detail {key!r} exceeds {MAX_DETAIL_VALUE_LEN} chars; "

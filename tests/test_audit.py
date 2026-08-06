@@ -2175,3 +2175,81 @@ async def test_operations_on_a_closed_logger_raise(tmp_path: Path) -> None:
         await log.query()
     with pytest.raises(PipelineError):
         await log.verify_chain()
+
+
+# ---------------------------------------------------------------------------
+# Golden vectors -- the one check in this file that does not import the thing
+# it is checking.
+# ---------------------------------------------------------------------------
+
+#: `sha256(prev_hash + canonical_json(event_without_hashes))`, computed by hand from
+#: the build doc's section 9.8 formula and pasted here as literals.
+#:
+#: Every other hash assertion in this file builds its expectation by calling
+#: `compute_entry_hash`/`chain_payload` -- the same functions under test -- so the
+#: expectation moves with the implementation and the pair agrees no matter what the
+#: implementation does. That is not a hypothetical weakness. Deleting `prev_hash +`
+#: from `compute_entry_hash` leaves 88 audit tests, 164 broader tests and `demo.py`
+#: 20/20 GREEN, while reducing a mid-chain forgery from re-writing every following
+#: row to two UPDATE statements -- and `verify_chain()` still returns True. Dropping
+#: `seq` from `chain_payload` is green the same way.
+#:
+#: These literals are the fixed point that cannot move with the code. If this test
+#: fails, either the hash construction changed (and every previously published chain
+#: is now unverifiable, which is a decision, not a refactor) or something is wrong.
+_GENESIS_HASH = "ac56c5d58eed16433b8f0246c624febbf49b2b678c0e9df12641479fe241a062"
+_SECOND_HASH = "f72105f8937439d0cec68297d7962f9afbce80d6ce2147bf4ca57a4f2e37846e"
+
+
+def test_the_entry_hash_matches_a_hand_computed_golden_vector() -> None:
+    """Pins the published formula against literals, not against itself."""
+    payload = chain_payload(
+        seq=1,
+        ts=1700000000.5,
+        session_id="sess-golden",
+        run_id="run-golden",
+        event_type="EGRESS_PASS",
+        entity_type=None,
+        token_id=None,
+        detail={"payload_chars": 42, "reason": "ok"},
+    )
+    assert compute_entry_hash("", payload) == _GENESIS_HASH
+
+    second = chain_payload(
+        seq=2,
+        ts=1700000000.5,
+        session_id="sess-golden",
+        run_id="run-golden",
+        event_type="LLM_CALL",
+        entity_type=None,
+        token_id=None,
+        detail={"payload_chars": 42, "reason": "ok"},
+    )
+    # The link itself: the second digest is a function of the FIRST one. This is the
+    # assertion that dies when `prev_hash +` is deleted.
+    assert compute_entry_hash(_GENESIS_HASH, second) == _SECOND_HASH
+
+
+def test_the_chain_covers_prev_hash_and_seq_behaviourally() -> None:
+    """The same two properties as an attack, so neither can be argued away.
+
+    A digest that ignores `prev_hash` is not a chain -- it is a per-row checksum, and
+    every row's digest is then independent of its position and of every row before
+    it. The observable consequence is the one an auditor cares about: an attacker who
+    can write to the database can alter a row in the middle and repair the log by
+    touching only that row.
+    """
+    base = dict(
+        ts=1700000000.5,
+        session_id="sess-golden",
+        run_id=None,
+        event_type="DETECT",
+        entity_type=None,
+        token_id=None,
+        detail={"n": 1},
+    )
+    first = compute_entry_hash("", chain_payload(seq=1, **base))
+    # Same event content, different predecessor -> must be a different digest.
+    assert compute_entry_hash("deadbeef", chain_payload(seq=1, **base)) != first
+    # Same event content and predecessor, different position -> likewise.
+    assert compute_entry_hash("", chain_payload(seq=2, **base)) != first

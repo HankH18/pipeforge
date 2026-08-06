@@ -605,12 +605,42 @@ class Restorer:
                 else:
                     classification = MISS_FABRICATED
                     fabricated.append(token_id)
+                # `token_id` is recorded only when the ID is one we MINTED.
+                #
+                # The two fields are not the same risk, and treating them as one was
+                # the first version of this fix. `entity_type` is `TOKEN_RE`'s groups
+                # 1 and 2, which the grammar constrains to a category literal and
+                # `[A-Z][A-Z0-9_]*` -- a type label, not a value -- and it is clamped
+                # to `_MAX_LABEL_LEN` by the deliberate defence
+                # `test_the_entity_type_label_copied_from_untrusted_text_is_bounded`
+                # exists to check. `token_id` is group 3, eight characters of
+                # unconstrained hex taken straight from the model's bytes, and it is
+                # the one that carries a value.
+                #
+                # The trigger is not adversarial. An ordinary document reference the
+                # model echoes, `(PHI-MRN-40281993)`, is a `TOKEN_RE` match whose
+                # group 3 is eight digits of a real MRN -- and it landed in the
+                # `token_id` column, in the hash chain, and in `GET /audit`. That is
+                # the outcome build doc section 16 forbids unconditionally. For a
+                # FABRICATED miss the ID is by definition not ours -- `minted` was
+                # supplied and this ID is not in it -- so the classification is the
+                # diagnosis and the ID adds nothing a reader can act on.
+                #
+                # INDETERMINATE deliberately keeps it, and the line is drawn there
+                # rather than at "anything we cannot prove is ours" because of where
+                # each case can occur. The orchestrator always supplies `issued`
+                # (see `orchestrator.py`), so the shipped pipeline can only ever
+                # produce LOST or FABRICATED, and the demonstrated leak is
+                # FABRICATED. INDETERMINATE means a library caller opted out of
+                # classification entirely, and on that path the ID is the only
+                # signal the row has at all.
+                ours = classification != MISS_FABRICATED
                 await self._emit(
                     session_id,
                     run_id=run_id,
                     event_type=VAULT_MISS,
                     entity_type=labels[token_id],
-                    token_id=token_id,
+                    token_id=token_id if ours else None,
                     detail={
                         "stage": "deobfuscate",
                         # Kept stable: it names the *observation*. `classification`
@@ -629,7 +659,9 @@ class Restorer:
                     extra={
                         "session_id": session_id,
                         "run_id": run_id,
-                        "token_id": token_id,
+                        # Same rule as the audit row above: the process log is a
+                        # channel too, and section 16 carves out no exception for it.
+                        "token_id": token_id if ours else None,
                         "entity_type": labels[token_id],
                         "classification": classification,
                     },

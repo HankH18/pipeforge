@@ -5,6 +5,21 @@ services:
     env_file: .env
     ports:
       - "8000:8000"
+    # Who the container writes as. The image builds a uid 10001 and chowns /app to
+    # it, and for everything inside the image that is enough -- but a BIND MOUNT
+    # masks the directory it covers, so the build-time chown of /app/data never
+    # applies to what is actually mounted there. On Linux the daemon creates a
+    # missing host ./data as root:root 0755, uid 10001 cannot write it, and the
+    # FIRST sqlite open (the audit log) fails with "unable to open database file";
+    # `restart: unless-stopped` then turns that into a crash loop. A fresh clone has
+    # no ./data -- it is gitignored -- so this is the default path for a reviewer on
+    # Linux, and it is invisible on macOS and Docker Desktop, where virtiofs/gRPC-FUSE
+    # remap ownership to the calling user.
+    #
+    # Overriding the uid is what makes the mount writable without a sudo chown:
+    #   SCP_UID=$(id -u) SCP_GID=$(id -g) docker compose up --build
+    # The default keeps the image's own user for hosts that do not need it.
+    user: "${SCP_UID:-10001}:${SCP_GID:-10001}"
     volumes:
       # Encrypted blobs + SQLite. Ciphertext only -- no plaintext ever lands here.
       - ./data:/app/data

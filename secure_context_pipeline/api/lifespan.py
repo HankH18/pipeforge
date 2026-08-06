@@ -66,8 +66,14 @@ async def _build_services(settings: Settings) -> Services:
     and, because aiosqlite's worker threads are not daemons, the interpreter can
     no longer exit at all, so the process hangs instead of reporting the failure.
     The realistic trigger is not exotic: ``docker-compose`` bind-mounts ``./data``
-    from the host, the container runs as uid 10001, and a root-owned host
-    directory makes the *second* open fail while the first has already succeeded.
+    from the host, the container runs as uid 10001, and a root-owned host directory
+    makes the opens fail. Which one fails is worth stating correctly, because this
+    docstring said "the *second*" and that is wrong in the direction that matters --
+    it implies a partially-built startup is the common case, when in fact the
+    **first** open (``AuditLogger``, below) is what dies, before any connection
+    exists to leak. The unwind path is still load-bearing for every other partial
+    failure; it is simply not what this particular trigger exercises. See
+    ``docker-compose.yml``'s ``user:`` mapping for the fix.
     """
     started = time.perf_counter()
     data_dir = Path(settings.data_dir)

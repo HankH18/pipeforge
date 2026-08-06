@@ -1012,6 +1012,17 @@ def _reject_content_sized_fields(event: AuditEvent) -> None:
                 reason="audit_field_exceeds_ceiling", field=field, length=len(value)
             )
     for key, detail_value in event.detail.items():
+        # The key is bounded here as well as in `AuditEvent`'s validator, and the
+        # duplication is the point: this is the last check before the row is written,
+        # and a caller can reach it with an event built by `model_construct` (which
+        # skips validators entirely). A ceiling enforced in only one of two places is
+        # a ceiling the other path does not have.
+        if len(key) > MAX_DETAIL_VALUE_LEN:
+            raise PipelineError(
+                reason="audit_detail_key_exceeds_ceiling",
+                field=key[:MAX_DETAIL_VALUE_LEN],
+                length=len(key),
+            )
         if isinstance(detail_value, str) and len(detail_value) > MAX_DETAIL_VALUE_LEN:
             raise PipelineError(
                 reason="audit_detail_exceeds_ceiling",

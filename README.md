@@ -66,8 +66,26 @@ cp .env.example .env
 # generate the master key and paste it into SCP_MASTER_KEY
 python -c "import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())"
 
+mkdir -p data                  # see the note below if you are on Linux
 docker compose up --build      # UI at http://localhost:8000
 ```
+
+**On Linux, run it as yourself instead:**
+
+```bash
+SCP_UID=$(id -u) SCP_GID=$(id -g) docker compose up --build
+```
+
+This is the one setup step that differs by host, and it is worth a sentence because
+the failure is a crash loop rather than an error. `data/` is gitignored, so a fresh
+clone does not have it; the Linux daemon then creates the bind-mount source as
+`root:root`, and a **bind mount masks the directory it covers** — so the image's
+build-time `chown` of `/app/data` to uid 10001 does not apply to what is actually
+mounted there. The first SQLite open (the audit log) fails with `unable to open
+database file`, startup aborts, and `restart: unless-stopped` retries it forever.
+It is invisible on macOS and Docker Desktop, where the file-sharing layer remaps
+ownership to the calling user — which is exactly why it survived this long: every
+local run here was clean.
 
 The spaCy `en_core_web_lg` model (~590 MB) is baked in at **build** time, not fetched at
 runtime. That is deliberate: the premise of this system is that detection happens locally and
