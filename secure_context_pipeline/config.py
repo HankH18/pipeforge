@@ -80,7 +80,23 @@ class Settings(BaseSettings):
     )
 
     # --- llm -----------------------------------------------------------------
-    llm_provider: Literal["mock", "anthropic"] = "mock"
+    # `str`, not `Literal["mock", "anthropic"]`, and the difference is the
+    # difference between the extensibility claim being true and being nearly true.
+    # Build doc section 9.6: "Provider selection by settings string. Adding OpenAI
+    # later = one class + one registry entry." With a closed Literal that was false
+    # -- a third-party or plugin provider registered via `@register_provider` could
+    # never be *selected*, because `SCP_LLM_PROVIDER=openai` failed validation
+    # before `build_provider` ever saw it. `llm/base.py`'s module docstring even
+    # says "one line, in this file, and the only edit outside the new module",
+    # which was a second edit short.
+    #
+    # Nothing is loosened by this. An unknown name still fails closed, and still at
+    # startup: `build_provider` raises `ConfigError(reason="unknown_llm_provider")`
+    # when the registry has no factory for it, and the lifespan builds the provider
+    # during startup. The check simply moved to the layer that actually knows what
+    # is registered -- which `config` cannot import without a cycle, since
+    # `llm/base.py` imports `Settings` from here.
+    llm_provider: str = "mock"
     llm_model: str = "claude-opus-5"
     llm_timeout_s: float = 60.0
     llm_max_retries: int = 3

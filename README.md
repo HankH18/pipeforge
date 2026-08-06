@@ -663,6 +663,31 @@ The library is the product; this is a thin layer over it. Four of these endpoint
 the build specification's table, and every difference is a closed hole rather than a
 preference — Deviations 16–19.
 
+**Three controls this layer ships that the specification's table does not describe, and that
+nothing above used to mention.** They were built, they are tested, and they were invisible to
+anyone reading this document — which for the strongest work in the API layer is the wrong way
+round:
+
+- **`GET /audit` proves ownership, it does not merely scope.** The documented call
+  `/audit?session_id=X` returns **422**: `user_id` is mandatory, and the route checks it against
+  the owner recorded in the log at `SESSION_CREATE`. A wrong owner gets a byte-identical empty
+  page rather than a distinguishable error, so the endpoint cannot be used to confirm that a
+  session ID is real. Without this the log handed any anonymous holder of a `run_id` the
+  `session_id`, `doc_id` and `user_id` of that run — i.e. both credential pairs needed to read
+  the original document and to erase the vault. `routes/audit.py` calls the previous behaviour
+  "a live, complete break", which is accurate.
+- **Failed ownership proofs are metered and audited.** ~20 failures from one caller earns
+  `429`, and each one writes an `AUDIT_ACCESS_DENIED` event — a **13th** event type, which is
+  why Deviation 26's "the twelve" is now out of date. Writes (`POST /sessions`,
+  `POST /documents`, `DELETE /sessions/{id}`) are metered on the same mechanism.
+- **Uploads are capped** (`REQUEST_TOO_LARGE`) and read in bounded chunks, so an unbounded body
+  cannot be streamed into memory.
+
+The meter keys on the **source address**, because that is the only caller identifier this tier
+has. Behind a proxy or a shared NAT that is one bucket for many callers, which is a real
+limitation and is why "per-caller rate limiting keyed to a proven identity" is still on the
+production list rather than crossed off it.
+
 | Method & path | Purpose | Notes |
 |---|---|---|
 | `POST /sessions` | create session | `{user_id}` → `{session_id, expires_at}`. The session is **bound to that `user_id`**. |
@@ -1736,6 +1761,21 @@ see them. See §7 gap 1 and `SessionVault.note_unrestorable`.
 ## 7. Known gaps & next day
 
 **Stated honestly, in rough priority order:**
+
+- **`ADDRESS` is among the weakest entities here, and the recall table's 100% does not mean
+  what it looks like.** `ADDRESS` rides Presidio's `LOCATION` recognizer, so what it actually
+  detects is bare place names — on `financial_disclosure.txt` the only two ADDRESS spans are
+  `Florida` and `Illinois`. A street line, a house number and a postcode are not covered by an
+  ADDRESS span, and the held-out corpus's ADDRESS annotations are all bare city names with no
+  digit and no comma, so the measured figure is reporting success on the easy half of the
+  entity. Closing it needs street/postcode annotations in the held-out set first, so the
+  number stops being a corpus artifact, and then a pattern recognizer beside the NER one.
+- **No test attributes an event-loop stall to the stage that caused it.** The integration
+  guard's bound scales with `detect_ms`, so it can only really catch the *detector* going back
+  on the loop; a 464 ms stall in the residual sweep sat under it, green, until it was measured
+  by hand. An absolute ceiling was tried and removed rather than tuned, because the heartbeat
+  also contends with spaCy in its own worker thread and the number it reads cannot distinguish
+  the two. Per-stage attribution is the real fix.
 
 1. **Detection recall is the binding constraint on the whole system.** The egress gate makes
    misses *safe* (it blocks), but it cannot make them *invisible* — a missed entity that

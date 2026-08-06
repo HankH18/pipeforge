@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 import os
+import secrets
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -498,7 +499,18 @@ def test_new_provider_name_is_selectable_with_zero_other_changes(
 
     registry["dummy"] = Dummy
 
-    settings = Settings.model_construct(llm_provider="dummy")
+    # Built through the VALIDATED constructor, from the environment variable a
+    # deployer would actually set. `Settings.model_construct(...)` is pydantic's
+    # validation-BYPASS path, and using it here meant this test could not observe
+    # the one thing it exists to prove: `llm_provider` was a closed
+    # `Literal["mock", "anthropic"]`, so `SCP_LLM_PROVIDER=dummy` raised
+    # `literal_error` and a third-party provider was registrable but never
+    # selectable. The test asserted "zero other changes" while stepping around the
+    # change that was required.
+    settings = Settings(
+        master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        llm_provider="dummy",
+    )
     provider = build_provider(settings)
     assert isinstance(provider, Dummy)
     assert isinstance(provider, DetailedLLMProvider)

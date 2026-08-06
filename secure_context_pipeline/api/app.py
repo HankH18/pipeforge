@@ -134,9 +134,12 @@ assumption the rest of this docstring leans on -- the audit-scope proof, logout'
 owner check and ``/documents/{doc_id}/text`` all compare against a string the
 caller asserts about itself. **Production work, in priority order:** real
 authentication (OIDC/mTLS) so the ``user_id`` is proven rather than asserted;
-per-caller rate limiting, since every route here is anonymous and unmetered and
-three of them (``POST /sessions``, ``POST /documents``, ``DELETE /sessions/{id}``)
-write durably on each call; CSRF protection for the browser client; and a signed,
+per-caller rate limiting *keyed to an identity* -- the meter installed below is
+real and unconditional, but it keys on the source address, which is the only
+caller identifier this tier has; behind a proxy or a shared NAT that is one
+bucket for many callers, and it is not a substitute for metering a *principal*.
+(This sentence used to say every route was "anonymous and unmetered", forty
+lines after documenting the meter and installing it.) CSRF protection for the browser client; and a signed,
 ``HttpOnly`` session cookie in place of the ``X-Session-Id`` header.
 """
 
