@@ -473,9 +473,26 @@ def resolve_overlaps(
 # Detector
 # ---------------------------------------------------------------------------
 #: A field label the detector may safely cut an NER span back to: a short run of
-#: letters and spaces, immediately followed by a colon in the surrounding text.
-#: Bounded, because it is matched against document text.
-_FIELD_LABEL_TAIL_RE = re.compile(r"[A-Za-z][A-Za-z ]{0,20}\Z")
+#: letters and spaces carrying **no lowercase letter**, immediately followed by a
+#: colon in the surrounding text. Bounded, because it is matched against document
+#: text.
+#:
+#: The no-lowercase requirement is what separates a label from a surname, and it was
+#: not there at first. ``[A-Za-z][A-Za-z ]{0,20}`` accepts ``Whitfield`` exactly as
+#: readily as ``DOB``, so a wrapped person name whose surname happened to be
+#: followed by a colon -- a transcript speaker line, a contact line, a name
+#: introducing a quote -- was cut back to the given name and the surname was never
+#: vaulted. It then reached the provider in the clear, and the gate did not object:
+#: ``NAME``/``CLIENT_IDENTITY`` are not high-severity, so pass 2 logs a warning and
+#: passes. Under pseudonymization the payload read ``Stone\nWhitfield`` -- an
+#: invented given name glued to the real surname.
+#:
+#: Field labels in these documents are written ``DOB``, ``MRN``, ``SSN``, ``NPI``;
+#: surnames are not. The rule is deliberately narrow because the two directions cost
+#: different things: failing to trim a real label masks it as part of the name,
+#: which is cosmetic, while trimming a real name drops a value nobody then vaults.
+#: Only one of those is a disclosure.
+_FIELD_LABEL_TAIL_RE = re.compile(r"[A-Z][A-Z ]{0,20}\Z")
 
 
 def _is_field_label_tail(text: str, newline: int, end: int) -> bool:

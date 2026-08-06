@@ -182,7 +182,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1633 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1637 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo

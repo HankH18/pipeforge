@@ -1274,11 +1274,18 @@ def _separator_needles(value: str) -> tuple[str, ...]:
       exclude for prefix collisions (``1:23-cv-045678`` no longer threatens
       ``1:23-cv-04567``).
 
-    **What it catches beyond the demonstrated case**, all measured: a vaulted
-    ``512-24-8710`` against a bare ``512248710``; ``5,567,281`` against ``5567281``;
-    ``MRN: 5567281`` against ``MRN 5567281``. Those are separator *variants* of an
-    identifier, which :func:`_identifier_needles` covers only when a single contiguous
-    run already clears its floor.
+    **What it catches beyond the demonstrated case**, re-measured rather than
+    asserted: a vaulted ``512-24-8710`` against a bare ``512248710`` (9 joined
+    characters), and ``MRN: 5567281`` against ``MRN 5567281`` (10). Those are
+    separator *variants* of an identifier, which :func:`_identifier_needles` covers
+    only when a single contiguous run already clears its floor.
+
+    This list previously also claimed ``5,567,281`` against ``5567281``, and that one
+    is **false**: it joins to seven characters, one below
+    :data:`MIN_JOINED_ALNUM_LEN`, so this limb produces no needle for it at all. It
+    is covered instead by :func:`_identifier_needles`, whose digit-run floor is six.
+    An example that does not do what the paragraph says it does is worse than no
+    example, because it is the sentence a reader checks the behaviour against.
 
     Returns a **pattern source string**, not a literal, because "any separator or
     none" is not expressible as a substring. It is the one needle in pass 1 with no

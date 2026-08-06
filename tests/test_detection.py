@@ -4685,3 +4685,52 @@ async def test_no_detection_spans_a_line_break(
         f"{len(offenders)} detection(s) in {fixture} cross a line break or carry "
         f"trailing whitespace; the first is {offenders[0] if offenders else None!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("tail_punctuation", "expected_whole"),
+    [(":", True), (",", True), (" who", True)],
+)
+async def test_a_wrapped_surname_is_never_mistaken_for_a_field_label(
+    registry: EntityRegistry, settings: Settings, tail_punctuation: str, expected_whole: bool
+) -> None:
+    """A colon after a wrapped surname must not make it a label.
+
+    The first narrowing accepted any short letters-and-spaces tail followed by a
+    colon, which `Whitfield:` satisfies exactly -- a transcript speaker line, a
+    contact line, a name introducing a quote. The span was cut to the given name,
+    the surname was never vaulted, and it reached the provider in the clear. The
+    gate does not object: NAME/CLIENT_IDENTITY are not high-severity, so pass 2
+    logs a warning and passes. Under pseudonymization the payload read an invented
+    given name glued to the real surname.
+
+    Field labels in these documents are written `DOB`, `MRN`, `SSN`; surnames are
+    not. The rule now requires the tail to carry no lowercase letter, which is a
+    shape a surname cannot have -- and the two directions cost different things:
+    failing to trim a label masks it as part of the name (cosmetic), while
+    trimming a name drops a value nobody then vaults (a disclosure).
+    """
+    detector = Detector(registry, settings)
+    text = (
+        "MEMORANDUM\n\nThe declaration of record was executed by the client Margaret\n"
+        f"Whitfield{tail_punctuation} she attests that the parties reached agreement.\n"
+    )
+    people = [
+        d.text
+        for d in await detector.detect(text, "legal")
+        if d.entity_type in {"NAME", "CLIENT_IDENTITY"}
+    ]
+    assert people, "premise: the wrapped name is detected at all"
+    assert any("Whitfield" in p for p in people) is expected_whole, (
+        f"the surname was dropped from the vaultable span: {people}"
+    )
+
+
+async def test_an_all_caps_field_label_is_still_trimmed(
+    registry: EntityRegistry, settings: Settings
+) -> None:
+    """The case the trim exists for keeps working."""
+    detector = Detector(registry, settings)
+    text = "Patient name: David Ochoa\n    DOB: 1974-03-02\n"
+    names = [d.text for d in await detector.detect(text, "medical") if d.entity_type == "NAME"]
+    assert names == ["David Ochoa"], names
