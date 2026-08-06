@@ -57,6 +57,7 @@ module: only entity types, token IDs, counts, and scores.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -353,7 +354,6 @@ class ObfuscationEngine:
             )
         prior = await self._add_prior_session_surfaces(session_id, text, surfaces)
 
-        swept = 0
         # Insertion-ordered, so the returned records follow sweep order and the
         # ``tokens`` list stays deterministic.
         used: dict[str, None] = {}
@@ -370,29 +370,64 @@ class ObfuscationEngine:
         # first. The same document would then mask a different span depending on which
         # call vaulted the value. Ordering on the surface itself makes the outcome a
         # function of the surface set and nothing else.
-        for surface in sorted(surfaces, key=lambda value: (-len(value), value)):
-            if len(surface.strip()) < MIN_SWEEP_LEN:
-                continue
-            surrogate, entity_type, category, score = surfaces[surface]
-            for match in re.finditer(_word_bounded(surface), text, re.IGNORECASE):
-                start, end = match.span()
-                if any(start < c_end and end > c_start for c_start, c_end in covered):
+        def scan() -> int:
+            """The surface sweep, off the event loop.
+
+            Offloaded for the same reason ``EgressGate._scan_originals`` is, and it
+            is a concurrency-correctness point rather than a latency one. This limb
+            is ``O(surfaces x len(text))`` of synchronous regex with no ``await`` in
+            it, so on an ASGI app it is head-of-line blocking for *every* concurrent
+            request, not merely a slow response for this one.
+
+            Measured on ``fixtures/legal_brief_large.txt``, worst gap observed by an
+            unrelated 5 ms heartbeat during one ``obfuscate``: **464 ms inline, 46 ms
+            offloaded.** The engine docstring's O(entities) claim describes the vault
+            and the splice; this limb is O(entities x document), which is why it is
+            the one that shows up.
+
+            **The GIL does not make this a no-op, and measuring it wrongly says it
+            does.** A first attempt at the A/B cancelled the heartbeat as soon as the
+            call returned, so the heartbeat never resumed to *observe* the gap and
+            reported 39 ms for both arms -- the identical mistake
+            ``test_a_long_pass_one_does_not_stall_unrelated_coroutines`` warns about
+            in its own docstring. ``re`` holds the GIL, so the thread does not run in
+            parallel; what it does is let the interpreter switch every few
+            milliseconds instead of not at all, which turns one uninterruptible
+            block into slices the loop can run between.
+
+            Pure and self-contained: it reads ``text`` and ``surfaces``, both already
+            built, and appends to lists no other coroutine can reach until it
+            returns. A thread cannot be cancelled mid-scan, so a cancelled request
+            discards the work rather than interrupting it -- the same trade the
+            gate's pass 1 makes.
+            """
+            found = 0
+            for surface in sorted(surfaces, key=lambda value: (-len(value), value)):
+                if len(surface.strip()) < MIN_SWEEP_LEN:
                     continue
-                replacements.append(_Replacement(start, end, surrogate))
-                covered.append((start, end))
-                spans.append(
-                    SpanOut(
-                        entity_type=entity_type,
-                        category=category,
-                        start=start,
-                        end=end,
-                        score=score,
-                        action=EntityAction.OBFUSCATED,
-                        surrogate=surrogate,
+                surrogate, entity_type, category, score = surfaces[surface]
+                for match in re.finditer(_word_bounded(surface), text, re.IGNORECASE):
+                    start, end = match.span()
+                    if any(start < c_end and end > c_start for c_start, c_end in covered):
+                        continue
+                    replacements.append(_Replacement(start, end, surrogate))
+                    covered.append((start, end))
+                    spans.append(
+                        SpanOut(
+                            entity_type=entity_type,
+                            category=category,
+                            start=start,
+                            end=end,
+                            score=score,
+                            action=EntityAction.OBFUSCATED,
+                            surrogate=surrogate,
+                        )
                     )
-                )
-                swept += 1
-                used.setdefault(surface, None)
+                    found += 1
+                    used.setdefault(surface, None)
+            return found
+
+        swept = await asyncio.to_thread(scan)
 
         if swept:
             logger.info("residual occurrences swept", extra={"swept": swept})
@@ -479,9 +514,38 @@ class ObfuscationEngine:
         pattern_types = frozenset(
             name for name, spec in entities.items() if spec.patterns or spec.gazetteer
         )
+        surviving = resolve_overlaps(text, candidates, policy_types, pattern_types)
+        # One value, one band. `_classify` reads a single span's score, so the same
+        # value detected twice at different confidences was banded twice: tokenized
+        # at the site that scored above `threshold_obfuscate` and irreversibly
+        # `[REDACTED_<TYPE>]` at the site that scored below it, in the SAME payload.
+        # Live on `fixtures/medical_note.txt`, where one phone number scores 0.75 in
+        # a labelled line and 0.40 in bare prose.
+        #
+        # It fails safe -- neither mask discloses the value -- but it contradicts
+        # this module's own headline claim ("one vault row, one token, five splices
+        # -- which is what makes the payload internally consistent"), and the
+        # inconsistency is visible to the model, which sees two different referents
+        # for one entity. It also costs a restoration the user was entitled to.
+        #
+        # The band is therefore decided once per `(entity_type, normalized value)`
+        # on the group's MAXIMUM score. Max rather than min or mean because the
+        # question is "is this value sensitive", and the most confident sighting is
+        # the best evidence available; taking the minimum would let one weak mention
+        # downgrade a value the detector was certain about elsewhere. Policy actions
+        # (`action: strip`/`redact`) are unaffected -- `_classify` applies those
+        # before any confidence test.
+        best: dict[tuple[str, str], float] = {}
+        for detection in surviving:
+            key = (detection.entity_type, normalize(detection.text))
+            best[key] = max(best.get(key, 0.0), detection.score)
         planned = [
-            self._classify(detection)
-            for detection in resolve_overlaps(text, candidates, policy_types, pattern_types)
+            self._classify(
+                detection.model_copy(
+                    update={"score": best[(detection.entity_type, normalize(detection.text))]}
+                )
+            )
+            for detection in surviving
         ]
         return [item for item in planned if item is not None]
 

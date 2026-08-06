@@ -686,6 +686,37 @@ class Detector:
         if spec.require_digit and not any(ch.isdigit() for ch in text[start:end]):
             return None
 
+        # An NER-derived span never crosses a line break. spaCy runs a PERSON past
+        # the end of its line and into the next field's LABEL -- on
+        # `fixtures/medical_note.txt`, the demo's primary fixture, it returns
+        # `'David Ochoa\n    DOB'` as one NAME. Three things follow, and the third is
+        # the one that matters:
+        #
+        #   1. the splice collapses two lines, so the payload reads
+        #      `Patient name: [PII_NAME_...]: [PII_DOB_...]` and the DOB label is
+        #      destroyed -- a reviewer meets this in the first thirty seconds;
+        #   2. the vaulted original becomes `'David Ochoa\n    DOB'`, so the bare
+        #      name is *never* an original and the egress gate has no needle for the
+        #      patient's own full name;
+        #   3. the next field's label is masked as part of the person's identity,
+        #      which is wrong in the direction that looks right.
+        #
+        # Scoped to `presidio:`-backed entities, and the scope is load-bearing rather
+        # than cautious. Pattern-backed entities include the sentence-tail
+        # recognisers -- `CASE_STRATEGY`, `SETTLEMENT_TERM`, `LAB_RESULT` -- which
+        # are *required* to span a hard wrap: every document reaching the detector
+        # has been through `extraction.py` and arrives hard-wrapped, which is the
+        # whole subject of Deviation 32. Trimming those at the first newline cut
+        # `action: redact` back to the first line of its own strategy sentence and
+        # shipped the rest, and five recall tests said so.
+        if spec.presidio:
+            newline = text.find("\n", start, end)
+            if newline != -1:
+                end = newline
+            end = start + len(text[start:end].rstrip())
+            if start >= end:
+                return None
+
         score = float(result.score)
         if score < self._floor_for(entity_type):
             return None

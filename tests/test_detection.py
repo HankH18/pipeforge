@@ -11,6 +11,7 @@ sample-value invalidation does not silently swallow them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.config
 import re
@@ -4616,3 +4617,56 @@ async def test_zz_reset_analyzer_cache_forces_a_rebuild(settings: Settings) -> N
     after = get_analyzer(settings.spacy_model)
     assert before is not after
     assert after is get_analyzer(settings.spacy_model)
+
+
+def _read_fixture(name: str) -> str:
+    """Fixture text. Module-level and sync so the pathlib call is off the loop."""
+    return (Path(__file__).resolve().parent.parent / "fixtures" / name).read_text(
+        encoding="utf-8"
+    )
+
+@pytest.mark.parametrize(
+    ("fixture", "category"),
+    [
+        ("medical_note.txt", "medical"),
+        ("legal_memo.txt", "legal"),
+        ("financial_disclosure.txt", "financial"),
+        ("legal_brief_large.txt", "legal"),
+    ],
+)
+async def test_no_detection_spans_a_line_break(
+    registry: EntityRegistry, settings: Settings, fixture: str, category: str
+) -> None:
+    """A span stops at the end of its line, and carries no trailing whitespace.
+
+    spaCy's NER runs a PERSON past its line and into the next field's LABEL:
+    `'David Ochoa\\n    DOB'` was one NAME on the demo's own primary fixture. The
+    splice then collapsed two lines, destroying the DOB label in the payload -- and,
+    worse, the vaulted original became `'David Ochoa\\n    DOB'`, so the bare name
+    was never an original and the egress gate had no needle for the patient's own
+    full name.
+
+    Asserted over the shipped fixtures rather than a synthetic string, because the
+    failing case was in a committed fixture the demo prints on every run and nothing
+    looked at it.
+    """
+    detector = Detector(registry, settings)
+    # Read off the event loop: ASYNC240 forbids blocking pathlib inside an async
+    # test, and the rule is right -- this file is small, but a fixture read is disk
+    # I/O either way.
+    text = await asyncio.to_thread(_read_fixture, fixture)
+
+    # Scoped to `presidio:`-backed entities. The pattern-backed sentence-tail
+    # recognisers (`CASE_STRATEGY`, `SETTLEMENT_TERM`, `LAB_RESULT`) are *required*
+    # to span a hard wrap -- see Deviation 32 -- so asserting this over all of them
+    # is asserting the opposite of the spec, which is what a first version did.
+    ner_backed = {n for n, spec in registry.entities.items() if spec.presidio}
+    offenders = [
+        (d.entity_type, d.text)
+        for d in await detector.detect(text, category)
+        if d.entity_type in ner_backed and ("\n" in d.text or d.text != d.text.rstrip())
+    ]
+    assert offenders == [], (
+        f"{len(offenders)} detection(s) in {fixture} cross a line break or carry "
+        f"trailing whitespace; the first is {offenders[0] if offenders else None!r}"
+    )

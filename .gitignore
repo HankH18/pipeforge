@@ -44,5 +44,10 @@ htmlcov/
 # demo artifacts
 wire_dump*.txt
 
+# CodeGraph index -- local developer tooling, not part of the submission.
+# Anchored for the same reason `/data/` is: an unanchored rule would also match a
+# `.codegraph` directory at any depth.
+/.codegraph/
+
 # os
 .DS_Store

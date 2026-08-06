@@ -1058,6 +1058,29 @@ async def test_the_pipeline_never_blocks_the_event_loop(
         f"stage took {detect_ms:.1f} ms -- that is the signature of spaCy running on "
         f"the loop instead of in a worker thread ({len(gaps)} heartbeats observed)"
     )
+    # NOTE on what this test can and cannot see, because an absolute ceiling was
+    # tried here and removed rather than tuned.
+    #
+    # The bound above scales with `detect_ms`, so it can only really catch the
+    # *detector* going back on the loop; a non-detector stage can stall for a long
+    # time on this fixture and stay green. That is not hypothetical --
+    # `ObfuscationEngine._sweep_residual` ran O(surfaces x len(text)) of synchronous
+    # regex inline, and a 5 ms heartbeat measured **464 ms** of starvation during one
+    # `obfuscate` on `fixtures/legal_brief_large.txt` while this test passed.
+    # Offloading it brought that to ~46 ms.
+    #
+    # An absolute `worst_ms < 250` assertion looked like the fix and is not a sound
+    # one: it still reads 257-307 ms here *after* the sweep is offloaded, because the
+    # heartbeat is also contending with spaCy in its own worker thread, and spaCy
+    # releases and reacquires the GIL throughout. So the number measures GIL
+    # contention during a correctly-threaded stage, not inline blocking, and pinning
+    # it would assert something this test cannot distinguish. Raising the constant
+    # until it passed would have been worse: a green number engineered rather than
+    # earned.
+    #
+    # What is actually needed is a per-stage measurement that attributes a stall to
+    # the stage that caused it. Recorded in README section 7 as an open gap rather
+    # than half-asserted here.
 
 
 # ---------------------------------------------------------------------------
