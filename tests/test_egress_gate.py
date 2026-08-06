@@ -3940,3 +3940,95 @@ async def test_the_separator_limb_keeps_jose_and_jose_distinct(tmp_path: Path) -
     )
     report = await gate.check("Patient Jose Ruiz was seen.", "sess-accent")
     assert report.originals_scanned == 1, "premise: the accented original was in scope"
+
+
+async def test_a_high_severity_hit_in_the_redact_band_blocks(tmp_path: Path) -> None:
+    """Pass 2 floors high-severity types at `threshold_redact`, not `threshold_obfuscate`.
+
+    The name `egress_gate._rescan` cites, and which did not exist until now -- so the
+    floor it documents was pinned by nothing. Reverting `_rescan` to band every type
+    at `threshold_obfuscate` left the full suite green while the exact payload the
+    fix was written for went from blocked to released.
+
+    Why the two floors differ: `threshold_obfuscate` is the number the ENGINE bands
+    on, so using it here made the two blind spots coincide -- a value scoring in
+    [redact, obfuscate) is redacted (hence never vaulted, so pass 1 has no needle)
+    and was then dropped here for the same numeric reason. Presidio scores a bare
+    nine-digit run at 0.05 and the context enhancer floors a context-boosted hit at
+    0.40, so `Member SSN 452189376 verified against payer records.` is typed
+    SSN@0.40: the more clearly the document labelled it, the less protected it was.
+    """
+    settings = _settings(tmp_path)
+    assert settings.threshold_redact < settings.threshold_obfuscate, "premise"
+
+    # Scored inside the band: above redact, below obfuscate.
+    band_score = (settings.threshold_redact + settings.threshold_obfuscate) / 2
+    gate = EgressGate(
+        vault=FakeVault(),
+        detector=FakeDetector([("SSN", "452189376", band_score)]),
+        settings=settings,
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check("Member SSN 452189376 verified against payer records.", "sess-band")
+    assert raised.value.detail["reason"] == "detector_rescan"
+
+    # And the floor is a floor, not "block on anything": an unlabelled nine-digit run
+    # scores 0.05, where the detector is not claiming it is an SSN at all. Blocking
+    # there would deny every payload containing an invoice or part number.
+    below = EgressGate(
+        vault=FakeVault(),
+        detector=FakeDetector([("SSN", "452189376", settings.threshold_redact / 2)]),
+        settings=settings,
+        audit=None,
+    )
+    report = await below.check("Reference 452189376 on the parts list.", "sess-band")
+    assert report.rescan_warnings == 0
+
+    # A NON-high-severity type keeps the obfuscate floor -- blocking on NER re-hits
+    # would make pseudonymization unusable without improving the guarantee.
+    ner = EgressGate(
+        vault=FakeVault(),
+        detector=FakeDetector([("NAME", "Rosalind Thornton", band_score)]),
+        settings=settings,
+        audit=None,
+    )
+    ok = await ner.check("Countersigned: Rosalind Thornton RN", "sess-band")
+    assert ok.rescan_warnings == 0, "a band-scored NER hit is neither blocked nor warned"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "Countersigned: Marguerite​Vandenberg RN",   # zero-width space
+        "Countersigned: Marguerite-Vandenberg RN",         # hyphen
+        "Countersigned: Marguerite_Vandenberg RN",         # underscore
+        "Countersigned: Marguerite.Vandenberg RN",         # period
+        "Countersigned: MargueriteVandenberg RN",          # deleted entirely
+        "Countersigned: Marguerite Vandenberg RN",    # non-breaking space
+    ],
+)
+async def test_the_separator_limb_blocks_plain_ascii_variance(
+    tmp_path: Path, spelling: str
+) -> None:
+    """The limb's TRUE-POSITIVE direction, which nothing pinned.
+
+    Making `_separator_needles` return `()` -- i.e. deleting the entire fix -- left
+    the full suite green, including all 128 leakage tests. Two causes: the leakage
+    harness imports the gate's own helper, so gate and harness lose the limb in
+    lockstep and "never weaker than the gate" is satisfied trivially; and no unit
+    test asserted the limb ever blocks anything.
+
+    Each spelling below reads as the vaulted name to a human and to the model, and
+    every one of them defeats all four bounded forms, because those keep the
+    separator in the needle.
+    """
+    gate = EgressGate(
+        vault=FakeVault({"Marguerite Vandenberg"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(spelling, "sess-sep")
+    assert raised.value.detail["reason"] == "vault_original"

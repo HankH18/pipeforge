@@ -182,12 +182,12 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1608 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1615 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 96% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   4306 statements, 124 missed; 1052 branches, 80 partial
+                             #   4360 statements, 127 missed; 1070 branches, 81 partial
 ```
 
 **On the scope of that mypy line, because "clean" is doing less work than it looks.**
@@ -227,7 +227,7 @@ transient fault would have wedged every subsequent write.
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2979 originals vaulted and scanned, 2431 surrogates round-tripped)
+          (2979 originals vaulted and scanned, 2422 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the
@@ -244,7 +244,7 @@ the assertion and the denominator as the thing that proves the assertion was act
 The two tallies beside it behave differently from each other, and the difference is worth stating
 precisely rather than describing both as "reproducible":
 
-- **2,850 originals** is stable for a given commit. Document seeds are fixed, so the same 100
+- **2,979 originals** is stable for a given commit. Document seeds are fixed, so the same 100
   documents carry the same values, and this number only moves when detection changes. Observed
   identical on every run of the current build.
 - **The surrogate round-trip count is not stable and is not a fingerprint of the build.** Two
@@ -252,7 +252,7 @@ precisely rather than describing both as "reproducible":
   are `secrets.token_bytes(32)` and pseudonyms are seeded from `HMAC(session_key, …)`, so every
   pseudonymization run draws different fakes and which lines the mock provider echoes shifts
   with them — the count is of surrogates *the model happened to mention*. Three consecutive runs
-  of the current build read **2,394 / 2,398 / 2,412**, with 2,850 originals identical in all
+  of the current build read **2,422 / 2,424 / 2,427**, with 2,979 originals identical in all
   three. A stable number in the second column would
   actually be evidence of a bug: it would mean session keys were not random. Across commits it
   moves much further, because any change to obfuscation or restoration changes what there is to
@@ -587,7 +587,7 @@ Full pipeline detail, mock provider, analyzer already warm (median of three runs
 | Document | Size | Spans | Distinct entities vaulted | End to end |
 |---|---|---|---|---|
 | `legal_brief_large.txt` | 12,062 words | 739 (647 obfuscated, 64 redacted, 28 stripped) | 251 | **7.16 s** (budget 15 s) |
-| `medical_note.txt` | 393 words | 52 (50 obfuscated, 2 redacted, 0 stripped) | 32 | **0.28 s** |
+| `medical_note.txt` | 393 words | 52 (51 obfuscated, 1 redacted, 0 stripped) | 32 | **0.28 s** |
 
 (Counts are **engine-level** — what `PipelineResult.detections` carries and what `demo.py` prints
 — not detector-level. The distinction is the whole reason this row was wrong twice. The detector
@@ -1732,6 +1732,20 @@ is where a value is destroyed rather than masked:
 | `>= SCP_THRESHOLD_REDACT` (0.3), below obfuscate | replaced with `[REDACTED_<TYPE>]` | **no** | **no — permanently** |
 | below `SCP_THRESHOLD_REDACT` | left alone | no | n/a |
 
+**The band is decided once per value, on its highest-scoring sighting.** A value the detector
+sees twice at different confidences would otherwise be banded twice — tokenized where it scored
+above the obfuscate threshold and irreversibly `[REDACTED_<TYPE>]` where it scored below, in the
+same payload. That fails safe, but it contradicts the engine's own rule (one vault row, one
+token, N splices), shows the model two referents for one entity, and costs a restoration the
+user was entitled to. Maximum rather than minimum because the question is *is this value
+sensitive*, and the most confident sighting is the best evidence available.
+
+It is visible in the numbers: `medical_note.txt`'s `704-555-0151` scores 0.75 at its labelled
+mention and 0.40 in bare prose, so it is now obfuscated at both sites. **18 of 23 PHONE
+*detections* across the four fixtures still score in the band** — that is a property of the
+detector — but a detection whose value scores higher elsewhere is lifted out of it, which is why
+the medical note now reports 1 redaction rather than 2.
+
 The middle row is the requirement that low-confidence detections are **redacted, never passed
 through raw** — a detector that is unsure must not be allowed to leak. The consequence is worth
 stating plainly rather than leaving to be discovered: a redacted span has no vault entry, so
@@ -1739,11 +1753,12 @@ stating plainly rather than leaving to be discovered: a redacted span has no vau
 marker where the original stood. That is a deliberate trade — an unrecoverable value is
 preferable to a leaked one — but it is a real loss of utility and it is not rare.
 
-**Measured on the four committed fixtures: 18 of 23 `PHONE` detections (78%) land in this
-band**, and they are the only entity type that does. Presidio's `PhoneRecognizer` bases at 0.40
+**Measured on the four committed fixtures: 18 of 23 `PHONE` detections (78%) score in this
+band**, and they are the only entity type that does — though the per-value banding above lifts
+any of them that also appears with a higher score, so fewer than 18 are actually redacted. Presidio's `PhoneRecognizer` bases at 0.40
 and context lifts it to 0.75, so a phone number written without a nearby context word scores
-0.40 and is destroyed. The *"2 redacted"* figure printed for `medical_note.txt` is both of
-that fixture's phone numbers — there is no policy-redacted entity in it to explain them. So
+0.40 and is destroyed. The single redaction `medical_note.txt` reports is a phone number
+— there is no policy-redacted entity in that fixture to explain it. So
 the first question a reviewer is likely to ask after a demo run — *"why did the phone number
 come back redacted?"* — has this as its answer, and the fix is a per-entity `threshold:`
 override in `entities.yaml` rather than a code change.

@@ -157,6 +157,10 @@ class SessionRegistry:
         self._clock = clock
         # The single copy of every live session key. Never persisted, never logged.
         self._sessions: dict[str, _Session] = {}
+        #: Sessions whose key has been dropped but whose vault rows, cache and
+        #: VAULT_DESTROY event are still outstanding. Populated by every sweep,
+        #: whoever triggered it; drained by :meth:`sweep`. See `_sweep_locked`.
+        self._unreaped: set[str] = set()
         self._lock = asyncio.Lock()
 
     # -- mutation ----------------------------------------------------------
@@ -226,7 +230,11 @@ class SessionRegistry:
         rows, ``VAULT_DESTROY`` audit event) -- the registry owns keys only.
         """
         async with self._lock:
-            return self._sweep_locked()
+            self._sweep_locked()
+            # Returns everything awaiting destruction, not merely what THIS call
+            # observed. Any of the six other accessors may have swept the session
+            # first; the caller of this method is the only one that finishes the job.
+            return self._drain_unreaped_locked()
 
     # -- read --------------------------------------------------------------
 
@@ -310,17 +318,43 @@ class SessionRegistry:
     # -- internals ---------------------------------------------------------
 
     def _sweep_locked(self) -> list[str]:
-        """Remove expired entries. Caller must hold ``self._lock``."""
+        """Remove expired entries. Caller must hold ``self._lock``.
+
+        Every ID dropped here is also recorded in :attr:`_unreaped`, and that is what
+        makes the rest of the destruction path reachable. **Six accessors call this
+        and throw the return value away** -- ``create``, ``key``, ``expires_at``,
+        ``owner``, ``active_ids`` and ``belongs_to`` -- so whichever of them happened
+        to observe an expiry first removed the ID permanently, and
+        ``deps.reap_expired_sessions`` (the one caller that *uses* the list) could
+        never see it again. The vault rows and the decrypted cache then survived to
+        process exit, which is exactly the state the reaper was added to prevent.
+
+        It is not a rare race. The shipped ``Dockerfile`` polls ``GET /health`` every
+        30 seconds, and that route calls ``active_ids`` -- so in the container the
+        reaper was disarmed for essentially every session.
+
+        Recording rather than reaping here is deliberate: this runs under the lock
+        and must stay synchronous, while destruction needs to await SQLite and the
+        audit log. So the knowledge is kept and ``sweep()`` hands it to a caller that
+        can act on it.
+        """
         now = self._clock()
         expired = [sid for sid, entry in self._sessions.items() if entry.expires_at <= now]
         for session_id in expired:
             self._sessions.pop(session_id, None)
+            self._unreaped.add(session_id)
         if expired:
             logger.info(
                 "expired sessions swept",
                 extra={"expired_count": len(expired), "active": len(self._sessions)},
             )
         return expired
+
+    def _drain_unreaped_locked(self) -> list[str]:
+        """Take the IDs awaiting destruction. Caller must hold ``self._lock``."""
+        drained = sorted(self._unreaped)
+        self._unreaped.clear()
+        return drained
 
     def __repr__(self) -> str:
         """Counts only -- a key must never reach a log line, a traceback, or a REPL."""
