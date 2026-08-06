@@ -9,6 +9,7 @@ without standing up the application.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from secure_context_pipeline.api.constants import (
 )
 from secure_context_pipeline.api.middleware import _caller_key, _limits
 from secure_context_pipeline.api.schemas import MAX_ID_LEN, ErrorResponse
-from secure_context_pipeline.audit.logger import SESSION_CREATE, AuditLogger
+from secure_context_pipeline.audit.logger import SESSION_CREATE, VAULT_DESTROY, AuditLogger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.detection.detector import Detector
 from secure_context_pipeline.detection.registry import EntityRegistry
@@ -40,6 +41,9 @@ from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
+
+logger = logging.getLogger(__name__)
+
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +143,53 @@ def _same_id(claimed: str, actual: str) -> bool:
     return secrets.compare_digest(claimed.encode("utf-8"), actual.encode("utf-8"))
 
 
+async def reap_expired_sessions(services: Services) -> list[str]:
+    """Finish the destruction path for sessions the TTL has expired.
+
+    Build doc section 4 step 10 and section 9.4 both say TTL expiry runs the *same*
+    destruction path as logout: key popped, vault rows deleted, ``VAULT_DESTROY``
+    audited. Only the first of those happened. ``SessionRegistry._sweep_locked``
+    drops the dict entry -- correctly, and lazily, on access -- and its own
+    ``sweep()`` docstring says "the caller is responsible for the rest"; there was
+    no caller. ``sweep()`` appeared exactly once in the tree, in a test.
+
+    So an expired session left its AES-GCM rows in ``vault.db`` and its decrypted
+    ``_SessionCache`` resident in RAM until process exit. Confidentiality held --
+    the key is gone, so the rows are undecryptable and every cache accessor calls
+    ``registry.key()`` first -- but "plaintext lives exactly as long as the process
+    holds a live session" was false, and the rows were **unreclaimable**: the API's
+    own ``DELETE /sessions`` gates on ``_owns_session``, which calls
+    ``sessions.owner()``, which raises for an expired session and returns ``False``,
+    so ``vault.destroy`` was skipped. Nothing short of a restart cleared them.
+
+    Called from the request path rather than a timer: expiry is *discovered* on
+    access, so the moment a request sweeps the registry is the moment there is
+    something to reap. That keeps the process single-threaded in its own bookkeeping
+    and adds no background task to reason about.
+
+    Best-effort by construction -- it returns the IDs it reaped and raises nothing.
+    A failure to tidy up must not fail the request that happened to notice.
+    """
+    expired = await services.sessions.sweep()
+    for session_id in expired:
+        try:
+            await services.vault.destroy(session_id)
+            await services.audit.emit(
+                AuditEvent(
+                    ts=time.time(),
+                    session_id=_clamp(session_id),
+                    event_type=VAULT_DESTROY,
+                    detail={"existed": 1, "source": "ttl_expiry"},
+                )
+            )
+        except Exception:
+            logger.warning(
+                "expired session could not be fully destroyed",
+                extra={"session_id": _clamp(session_id)},
+            )
+    return expired
+
+
 async def _require_session(services: Services, session_id: str | None, user_id: str) -> str:
     """Resolve a session ID to a *live* session **owned by** ``user_id``, or raise 401.
 
@@ -156,6 +207,14 @@ async def _require_session(services: Services, session_id: str | None, user_id: 
     """
     if not session_id:
         raise SessionExpiredError(session_id="")
+    # Finish the destruction path for anything the TTL has expired, BEFORE deciding
+    # this request's fate. Two reasons for the ordering. Expiry is discovered on
+    # access, so this is the moment there is something to reap; and the session most
+    # likely to be expired is the one being presented right now -- which is exactly
+    # the one `DELETE /sessions` cannot clean up, because its ownership check raises
+    # for an expired session and skips `vault.destroy`. Reaping here is what makes
+    # those rows reclaimable at all. The 401 below is unaffected either way.
+    await reap_expired_sessions(services)
     owner = await services.sessions.owner(session_id)
     if not _same_id(user_id, owner):
         raise SessionExpiredError(session_id=_clamp(session_id))

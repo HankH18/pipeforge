@@ -52,9 +52,28 @@ of "John Smith".
 
 That is a deliberate deviation, for three reasons: it needs no cross-call state,
 so two coroutines obfuscating concurrently cannot disagree; it survives
-out-of-order detection, where the surname-only mention is processed first; and it
-cannot drift, because the mapping is a pure function of (session key, role,
-component) rather than of history. The seed label omits the entity type on
+out-of-order detection, where the surname-only mention is processed first; and the
+mapping is a function of (session key, role, component) rather than of the order
+mentions arrive in.
+
+**It is not a function of those three alone, and this paragraph used to claim it
+"cannot drift" on exactly that basis.** The collision guard takes a fourth input:
+``_fake_name_word`` retries with an incremented seed step while a candidate shares
+a word with ``forbidden``, and ``forbidden`` is
+``self._original_words(vault, session_id) | own_words`` -- which grows monotonically
+as a session vaults more documents. So the answer *does* depend on history, just
+not on ordering within one call (``_fake_name_word``'s own docstring already says
+the set is stable for the duration of one ``obfuscate``, which is the narrower and
+true statement).
+
+What that costs, measured rather than asserted: over 350 two-document sessions
+driven through the real engine, a surname never silently switched to a *different*
+fake surname -- but the guard exhausted its attempts and **degraded the component
+to a plain token in ~4% of collision-heavy sessions**, which is a visible loss of
+the linking this section exists to provide. Fixing it properly needs the fake
+pinned in the vault on first issue, i.e. the cross-call state the first paragraph
+deliberately avoids; that trade is recorded in README section 7 rather than made
+here silently. The seed label omits the entity type on
 purpose, so a person detected as ``NAME`` in one document and ``CLIENT_IDENTITY``
 in another pseudonymizes identically within the session.
 

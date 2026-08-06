@@ -594,8 +594,19 @@ async def test_expired_session(make_harness: HarnessFactory) -> None:
         await harness.orchestrator.run(live_id, USER_ID, doc_id, PROMPT, "tokenization")
     assert live_id not in await harness.sessions.active_ids()
 
-    # The sweep's destruction path then clears the rows the key already made
-    # undecryptable.
+    # The destruction path then clears the rows the key already made undecryptable.
+    #
+    # This is called by hand, and the comment here used to attribute it to "the
+    # sweep's destruction path" -- machinery that did not exist. `SessionRegistry`
+    # dropped the expired key and nothing else: the rows and the plaintext cache
+    # survived, and no API call could reclaim them, because `DELETE /sessions` gates
+    # on an ownership check that raises for an expired session. Meanwhile the
+    # README's traceability table cited THIS test as evidence for "purged on
+    # expiry/logout". `deps.reap_expired_sessions` now runs that path for real, on
+    # the request that discovers the expiry; it is covered by
+    # `test_ttl_expiry_runs_the_whole_destruction_path`. The hand call stays here
+    # because this test is about the *restore* behaviour after destruction, and it
+    # should not silently depend on which caller did the destroying.
     await harness.vault.destroy(live_id)
     assert await harness.vault.row_count(live_id) == 0
     assert harness.vault.originals_for_session(live_id) == frozenset()

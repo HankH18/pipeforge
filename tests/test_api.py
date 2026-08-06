@@ -2802,3 +2802,50 @@ async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image
             f"`git check-ignore -v {relative}`: an unanchored ignore pattern "
             f"matches a directory of that name at any depth."
         )
+
+
+async def test_ttl_expiry_runs_the_whole_destruction_path(
+    client: AsyncClient, services: Services
+) -> None:
+    """Build doc section 4 step 10: expiry destroys like logout, not only the key.
+
+    Only the key half happened. `SessionRegistry._sweep_locked` drops the dict
+    entry, and its own `sweep()` docstring says "the caller is responsible for the
+    rest (vault rows, VAULT_DESTROY audit event)" -- there was no caller. `sweep()`
+    appeared exactly once in the whole tree, in a test.
+
+    So an expired session left AES-GCM rows in vault.db and a decrypted
+    `_SessionCache` resident in RAM until process exit, and they were
+    **unreclaimable**: `DELETE /sessions` gates on `_owns_session` ->
+    `sessions.owner()`, which raises for an expired session and returns False, so
+    `vault.destroy` was skipped. Nothing short of a restart cleared them.
+
+    Asserted through the HTTP surface rather than by calling the reaper, because
+    the property is "a request discovers the expiry and finishes the job";
+    calling the helper directly would only prove the helper works.
+    """
+    doc_id = await _upload(client)
+
+    # A session that is alive long enough to vault something, then expires.
+    session_id, _expires = await services.sessions.create(OWNER, ttl_seconds=1)
+    run = await _run(client, session_id, doc_id)
+    assert run.status_code == 200, run.text
+    assert await services.vault.row_count(session_id) > 0, "premise: the vault holds rows"
+    assert session_id in services.vault.cached_session_ids(), "premise: plaintext is cached"
+
+    await asyncio.sleep(1.2)
+
+    # Any authenticated request now finishes the destruction path. This one gets its
+    # 401, which is correct and is not what is under test.
+    assert (await _run(client, session_id, doc_id)).status_code == 401
+
+    assert await services.vault.row_count(session_id) == 0, "vault rows survived expiry"
+    assert session_id not in services.vault.cached_session_ids(), "plaintext cache survived"
+    destroys = [
+        e
+        for e in await services.audit.query(session_id=session_id)
+        if e.event_type == "VAULT_DESTROY"
+    ]
+    assert destroys, "expiry emitted no VAULT_DESTROY"
+    assert destroys[-1].detail["source"] == "ttl_expiry"
+    assert await services.audit.verify_chain() is True
