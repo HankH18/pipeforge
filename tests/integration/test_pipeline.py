@@ -519,10 +519,19 @@ async def test_vault_miss_on_deobfuscation(make_harness: HarnessFactory) -> None
     assert result.stats["restored_count"] == 0
     assert not TOKEN_RE.search(result.restored_text)
 
-    # And audited, once per distinct unknown token, with the token ID but no value.
+    # And audited, once per distinct unknown token, with no value and -- on this
+    # path -- no token ID either. The orchestrator supplies `issued`, so a token the
+    # model invented classifies as `fabricated`, and its ID is eight characters
+    # taken from the model's own bytes rather than anything this session minted.
+    # `Restorer._fail` records why those must not reach `GET /audit`: a document's
+    # own "PHI-" in front of a restored "MRN-40281993" makes them eight digits of a
+    # patient's MRN. A LOST miss -- an ID we did mint -- still carries it, which is
+    # `test_both_kinds_of_miss_are_separated_in_one_response`.
     misses = await harness.audit.query(session_id=session_id, event_type=VAULT_MISS)
     assert len(misses) == 1
-    assert misses[0].token_id == UNKNOWN_TOKEN_ID
+    assert misses[0].token_id is None
+    assert misses[0].detail["classification"] == "fabricated"
+    assert UNKNOWN_TOKEN_ID not in misses[0].model_dump_json()
     assert misses[0].run_id == result.run_id
     assert misses[0].detail["reason"] == "token_not_in_vault"
     assert await harness.audit.verify_chain(session_id) is True

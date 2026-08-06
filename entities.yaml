@@ -80,11 +80,21 @@ entities:
     #
     # The leading anchor is a negative lookbehind on the local-part class, not the
     # '\b' this pattern was first written with. '\b' fires between every letter and
-    # every dot, so on a long dotted run that never reaches an "@" the scan restarts
-    # at each of ~n/2 positions and walks to the end from each: quadratic, measured
-    # at a clean 4x per doubling and 301 ms on 16,000 characters. The lookbehind
-    # admits only positions not already inside a local part, which leaves one start
-    # per run -- 0.19 ms on the same input, and 2.00x per doubling. Matches are
+    # every dot, so on a long dotted run the scan restarts at each of ~n/2 positions
+    # and walks to the end from each: quadratic, a clean 4x per doubling, measured
+    # at 65 / 258 / 1035 ms on 4,000 / 8,000 / 16,000 characters.
+    #
+    # The run must END IN AN "@" to reproduce it, and this comment previously said
+    # the opposite -- "a long dotted run that never reaches an '@'" -- which is the
+    # input the regression test still used and the reason it certified a fix it
+    # never exercised. `regex` prefilters on the required literal, so with no '@' in
+    # the subject the scan never starts at all: the pre-fix pattern returns in
+    # 0.006 ms on 16,000 characters, and reverting the lookbehind left all 37 ReDoS
+    # attacks green. See `email-dotted-local-at` in tests/test_detection.py.
+    #
+    # The lookbehind admits only positions not already inside a local part, which
+    # leaves one start per run -- 1.02 ms on the 16,000-character '@'-terminated
+    # input, against 1035 ms, and 2.00x per doubling. Matches are
     # unchanged on every fixture and near-miss in the suite; where the two forms can
     # differ at all the lookbehind starts one character earlier, which widens the
     # masked span rather than narrowing it.

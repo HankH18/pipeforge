@@ -311,7 +311,16 @@ class PipelineOrchestrator:
             llm.text,
             strategy=chosen,
             surrogates=surrogate_map,
-            # Diagnostics only -- changes no output byte. It lets a VAULT_MISS say
+            # NOT diagnostics only -- this comment used to say so and it is wrong in
+            # three of four cases. Supplying `issued` changes output bytes: an
+            # unbracketed token whose ID we did not mint is left VERBATIM instead of
+            # being replaced by `[UNRESOLVED_ENTITY]` (README Deviation 49), and a
+            # bracketed unminted one is refused a vault lookup it would otherwise be
+            # given. `restorer.py` and `tests/test_deobfuscation.py` both retract the
+            # "changes no output byte" wording already; this was the copy that was
+            # missed. What follows is still true and is the reason it is passed.
+            #
+            # It lets a VAULT_MISS say
             # WHICH kind of miss it was: a token we minted this run that the vault
             # can no longer resolve (`vault_lost`, an ERROR -- our bug) versus one
             # the model invented (`fabricated`, a WARNING -- expected). Without it

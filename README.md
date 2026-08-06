@@ -7,21 +7,53 @@ fetch + decrypt → detect → obfuscate → EGRESS GATE → provider → restor
 ```
 
 The claim this system makes is narrow and testable: **no whole vaulted value leaves the process
-boundary toward the provider, and that is verifiable by inspection — subject to four named
+boundary toward the provider, and that is verifiable by inspection — subject to three named
 boundaries this design does not close.** Obfuscation is reversible within a session and
 cryptographically irreversible across sessions.
 
-The word doing the work is **whole**, and the four boundaries are stated here rather than 300
+The word doing the work is **whole**, and the three boundaries are stated here rather than 300
 lines down, because each one is a shape that has been *confirmed* to reach the provider with the
-gate live: a partial value (one component of a multi-word original — the *composite-span* sub-case,
-where detection merged a list of values into one span, is now closed on both sides; see §7 gap 9),
-a value glued inside a longer alphanumeric word (**names and other digit-poor values only** — a
-digit-carrying identifier *is* caught, see the two identifier floors below), a combining mark
-spliced into a value, and a homoglyph substitution.
+gate live:
+
+1. **A partial value** — one component of a multi-word original. The *composite-span* sub-case,
+   where detection merged a list of values into one span, is closed on both sides; see §7 gap 9.
+2. **A value glued inside a longer alphanumeric word**, *names and other digit-poor values only*
+   — a digit-carrying identifier **is** caught, see the two identifier floors below.
+3. **A homoglyph substitution** — Cyrillic `о` for Latin `o` is different bytes, and catching it
+   needs a UTS-39 confusables table rather than another normalisation form.
+
 Each is pinned by a named test so that closing one later is a red rather than a silent widening
-of the claim; all four are detailed under *Leakage harness* below. A stronger claim was written
-here first, and it was wrong in the way that matters — it promised `never` while the document
-itself documented the exceptions.
+of the claim; all three are detailed under *Leakage harness* below.
+
+**This list said *four* until recently, and the fourth was wrong in the direction that flatters
+the document**: it named a combining mark spliced into a value as an open boundary, with a
+rationale — *"folding marks out would make `José` and `Jose` the same value"* — that is a
+statement about the **needle**, while the gate folds the **haystack**. `_deaccent` compares a
+mark-stripped payload against an unstripped needle, so `José` and `Jose` stay distinct *and* the
+splice is caught. The code had closed it and the README was still advertising it, citing a test
+(`test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`) that **does not
+exist** — here and in the §10 traceability table. The real ones are
+`test_egress_gate.py::test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider`
+and `integration/test_pipeline.py::test_a_combining_mark_spliced_into_a_name_never_reaches_the_provider`.
+
+**Two shapes that were open and undeclared are also now closed**, both found by adversarial
+review rather than by the harness, and both reproduced end to end before being fixed:
+
+- **Any alteration of a multi-word original's interior separator.** `Marguerite Vandenberg` was
+  vaulted from a clean mention and reached the provider as `Marguerite<U+200B>Vandenberg` —
+  identical to a human reader and to the model, and missed by all four compared forms, because
+  every one of them keeps the separator in the needle. Deleting the space, or writing `-`, `_`
+  or `.` in its place, missed identically. Pass 1 now compares a form that relaxes the separator
+  *between* components while keeping the word boundaries at the outer edges — which is what
+  distinguishes it from boundary 2 above, still open, where the *neighbour* is alphanumeric.
+- **A value in the redact band.** A detection scoring between the two thresholds is redacted and
+  gets no vault row, so pass 1 had no needle for it — while the re-scan dropped it for the same
+  numeric reason, because both banded on `SCP_THRESHOLD_OBFUSCATE`. Both payload-side passes
+  were therefore switched off over precisely the band that produces un-vaulted values, and a
+  real SSN scoring 0.40 reached the provider byte-for-byte. See *Graceful degradation* in §6.
+
+A stronger claim was written here first, and it was wrong in the way that matters — it promised
+`never` while the document itself documented the exceptions.
 
 Everything below is measured on this repository, not aspirational.
 
@@ -34,7 +66,7 @@ Everything below is measured on this repository, not aspirational.
 | What does it **not** defend? | §3 — **start with "The weakest point in this design"**: `user_id` is an asserted claim and there is no authn at this tier |
 | The six live-review questions | §5 — each answered in its first sentence |
 | Where it breaks at scale | §5 Q1 — the bottleneck is not the one you would guess, and the obvious fix was measured and **rejected** |
-| What I got wrong | §8 Deviations (47, each with a reason) and §7 Known gaps |
+| What I got wrong | §8 Deviations (49, each with a reason) and §7 Known gaps |
 
 **If you are cloning this repository right now, read this first.** Until the commit that carries
 this sentence, `.gitignore` line 7 was `data/`. In git's grammar an unanchored pattern matches a
@@ -87,7 +119,7 @@ It is invisible on macOS and Docker Desktop, where the file-sharing layer remaps
 ownership to the calling user — which is exactly why it survived this long: every
 local run here was clean.
 
-The spaCy `en_core_web_lg` model (~590 MB) is baked in at **build** time, not fetched at
+The spaCy `en_core_web_lg` model (425 MiB on disk) is baked in at **build** time, not fetched at
 runtime. That is deliberate: the premise of this system is that detection happens locally and
 no document text reaches a third party, so the container must not need network access to
 start. The cost is a **1.31 GB image** — measured with `docker image inspect`, twice, on two
@@ -150,27 +182,37 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1578 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
-                             #   127 leakage - 5 bench - rest unit + integration
-mypy --strict                # clean, 39 source files -- PACKAGE ONLY, see below
+1583 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+                             #   128 leakage - 5 bench - rest unit + integration
+mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 96% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   4038 statements, 121 missed; 980 branches, 76 partial
+                             #   4306 statements, 124 missed; 1052 branches, 80 partial
 ```
 
 **On the scope of that mypy line, because "clean" is doing less work than it looks.**
 `pyproject.toml` pins `files = ["secure_context_pipeline"]`, so `mypy --strict` type-checks the
-**package only** — 39 files. The test suite is roughly half the repository by line count and is
-**not** covered by that gate. Run against the whole tree it is 65 files and 69 remaining errors,
-none of which is a latent bug: 27 are `attr-defined` from monkeypatching module-level re-exports
-(a legitimate test idiom that `--strict` dislikes), 19 are `arg-type` where tests construct
+**package only** — 52 files. The test suite is roughly half the repository by line count and is
+**not** covered by that gate. Run against the whole tree it is 79 files and 100 remaining errors,
+none of which is a latent bug: 46 are `attr-defined` from monkeypatching module-level re-exports
+(a legitimate test idiom that `--strict` dislikes), 31 are `arg-type` where tests construct
 `Detection(category="PII")` with a bare `str` instead of the `EntityCategory` enum, and the rest
 are assorted narrowing complaints. What *was* worth fixing is fixed: **37 stale `# type: ignore`
 suppressions** had accumulated across four audit loops and are gone — decayed scaffolding that
-only a checker would ever find. The scope is stated rather than widened because the 19 `arg-type`
+only a checker would ever find. The scope is stated rather than widened because the `arg-type`
 hits are the interesting residue: those tests are not exercising the enum the production path
 actually carries, which is a mild stub-blindness signal and a real next step rather than a
 one-line config change.
+
+**Every number in this section was stale until an adversarial review pass re-measured them**, and
+the way they went stale is worth one sentence because it is the same failure this document keeps
+recording about the code. They were all measured correctly, once, at the commit that split
+`api/app.py` into `routes/` and added `textrules.py`/`daterules.py` — and then the file count,
+the statement count and the suite total all moved while the prose did not. The line above this
+block reads *"Everything below is output from this repository, not an estimate"*, and the
+pre-submission checklist tells a reviewer what output to expect, so a stale figure here is not
+cosmetic: it is a check that fails for the reader running it. Re-derive them with the commands
+in the block rather than trusting this paragraph.
 
 **On that coverage number.** It is reported because it was *not* measured for the first four
 review passes — `pytest-cov` was not installed — and the cost of that shows up in this
@@ -185,7 +227,7 @@ transient fault would have wedged every subsequent write.
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2850 originals vaulted and scanned, 2394 surrogates round-tripped)
+          (2991 originals vaulted and scanned, 2398 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the
@@ -361,23 +403,27 @@ rather than a silent widening of the claim:
   through the real writer by
   `test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did`, which asserts
   *which* limb caught it so the attribution cannot rot into "the scan handles it".
-- **A combining mark spliced into a value.** `normalize` is NFKC, which *composes* — so a
-  decomposed rendering of `José` is caught, and that half is now asserted. What no
-  normalisation form can do is remove a mark that was never in the vaulted value: `J` + U+0301 +
-  `ohn Smith` is simply a different string. Folding marks out would make `José` and `Jose` the
-  same value, which the gate's `_INVISIBLE_RE` deliberately refuses in a comment naming that
-  exact trade. Pinned by
-  `test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims`.
+- **A combining mark spliced into a value — CLOSED, and this entry is kept to record that the
+  argument for leaving it open was wrong.** The reasoning was: *"folding marks out would make
+  `José` and `Jose` the same value."* That is true of the **needle** and irrelevant to the
+  **haystack**, and the gate folds the haystack. `_deaccent` strips marks from the payload only,
+  so `Nathaniél Brightwater` matches a vaulted `Nathaniel Brightwater` while a payload that
+  legitimately says `Jose` still does not match a vaulted `José` — the needle keeps its accent.
+  Pinned by `test_egress_gate.py::test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider`
+  and `integration/test_pipeline.py::test_a_combining_mark_spliced_into_a_name_never_reaches_the_provider`.
+  The residual is narrower and stated: a vaulted value that *itself* carries a mark (`José Ruiz`)
+  is not protected against a *second* mark being spliced into it, because the needle is never
+  stripped. Closing that needs the same confusables table the homoglyph gap needs.
 - **Homoglyphs.** Cyrillic `о` for Latin `o` needs a confusables table, not another
   normalisation form. Out of scope in the gate for the same reason.
 
-**The last three are blind spots the harness and the gate mostly share**, because both resolve to
-the same occurrence rule — so for those shapes there is usually no second opinion. Confirmed
+**The remaining two are blind spots the harness and the gate mostly share**, because both resolve
+to the same occurrence rule — so for those shapes there is usually no second opinion. Confirmed
 rather than reasoned about: with the gate **live**, a real vaulted original spliced into a real
-payload with one combining acute inserted, or glued to a letter, completed the run and reached
-the provider. Where the gate is a second opinion that is survivable; on the audit database and
-the process log, where nothing else looks, it is not — which is why these are recorded as claims
-the harness does not make rather than as cases it happens not to have hit.
+payload glued to a letter completed the run and reached the provider. Where the gate is a second
+opinion that is survivable; on the audit database and the process log, where nothing else looks,
+it is not — which is why these are recorded as claims the harness does not make rather than as
+cases it happens not to have hit.
 
 **"Mostly" is the honest word, and the exception is worth a paragraph**, because it is where this
 project's recurring defect last showed up. The glued-into-a-longer-word boundary does **not**
@@ -541,10 +587,15 @@ Full pipeline detail, mock provider, analyzer already warm (median of three runs
 | Document | Size | Spans | Distinct entities vaulted | End to end |
 |---|---|---|---|---|
 | `legal_brief_large.txt` | 12,062 words | 739 (647 obfuscated, 64 redacted, 28 stripped) | 251 | **7.16 s** (budget 15 s) |
-| `medical_note.txt` | 393 words | 54 (52 obfuscated, 2 redacted, 0 stripped) | 32 | **0.28 s** |
+| `medical_note.txt` | 393 words | 52 (50 obfuscated, 2 redacted, 0 stripped) | 32 | **0.28 s** |
 
-(The medical note's span count read `52` here until it was re-derived: 52 is the *obfuscated*
-count, and 54 is the total. The brief's row was already consistent — 647 + 64 + 28 = 739.)
+(Counts are **engine-level** — what `PipelineResult.detections` carries and what `demo.py` prints
+— not detector-level. The distinction is the whole reason this row was wrong twice. The detector
+returns 54 spans for the medical note; overlap resolution and dedupe reduce that to the 52 the
+payload is actually built from. An earlier note here claimed the opposite — that 52 was the
+*obfuscated* count and 54 the total — which inverted the two roles and disagreed with the number
+`demo.py` prints on every run, i.e. with the first thing a reviewer sees. The brief's row is
+consistent on the same basis: 647 + 64 + 28 = 739.)
 
 ### Useful demo flags
 
@@ -1211,10 +1262,16 @@ is paraphrasing a token it was never given the referent for. It mangles the toke
 restorer's regex is deliberately tolerant of exactly those forms, and
 `test_deobfuscation.py::test_mangled_token_forms_restore` enumerates them. It mangles one past
 recognition — `[UNRESOLVED_ENTITY]` plus a `VAULT_MISS` audit event, a degraded answer rather
-than a failed request. It **invents** a token that was never issued — same path, and
-`integration/test_pipeline.py::test_vault_miss_on_deobfuscation` is that case. It emits
-something that merely looks like a token — the restorer resolves against the vault, so an
-unissued ID cannot resolve to anybody's data.
+than a failed request. It **invents** a token that was never issued — for a bracketed one, the
+same path, and `integration/test_pipeline.py::test_vault_miss_on_deobfuscation` is that case;
+for an unbracketed one it is left verbatim instead, which is Deviation 49. It emits something
+that merely looks like a token — and the protection there is **not** that the vault is asked
+and declines. On the production path the vault is never asked at all: the orchestrator hands
+the restorer the set of IDs this run actually minted, and an ID outside that set is refused
+before any lookup happens. The distinction is the whole mechanism rather than a nicety, because
+a token ID is eight hex characters and two sessions' ID spaces do collide by chance; asking the
+vault about an ID we did not issue is exactly how a coincidence becomes a substitution of one
+entity's value for another's. `restorer.py`'s own docstring records that incident.
 
 The contract buys *readability*. The guarantee is upstream of it, in the fact that the model
 never received the value. That is the whole reason the egress gate is the security control and
@@ -1639,6 +1696,41 @@ That last failure-mode row is the one that should drive the decision. A mangled 
 visible, audited, recoverable failure. A fake name mistaken for a real one by a clinician or a
 paralegal is a silent one.
 
+### Graceful degradation: the third outcome, and what it costs
+
+Every entity does not get a surrogate. There are **two** thresholds, and the band between them
+is where a value is destroyed rather than masked:
+
+| Detector score | Outcome | Vault entry? | Restorable? |
+|---|---|---|---|
+| `>= SCP_THRESHOLD_OBFUSCATE` (0.5) | replaced via the configured strategy | yes — one row per distinct value | **yes** |
+| `>= SCP_THRESHOLD_REDACT` (0.3), below obfuscate | replaced with `[REDACTED_<TYPE>]` | **no** | **no — permanently** |
+| below `SCP_THRESHOLD_REDACT` | left alone | no | n/a |
+
+The middle row is the requirement that low-confidence detections are **redacted, never passed
+through raw** — a detector that is unsure must not be allowed to leak. The consequence is worth
+stating plainly rather than leaving to be discovered: a redacted span has no vault entry, so
+**restore cannot put it back**, and the answer the user reads keeps the `[REDACTED_PHONE]`
+marker where the original stood. That is a deliberate trade — an unrecoverable value is
+preferable to a leaked one — but it is a real loss of utility and it is not rare.
+
+**Measured on the four committed fixtures: 18 of 23 `PHONE` detections (78%) land in this
+band**, and they are the only entity type that does. Presidio's `PhoneRecognizer` bases at 0.40
+and context lifts it to 0.75, so a phone number written without a nearby context word scores
+0.40 and is destroyed. The *"2 redacted"* figure printed for `medical_note.txt` is both of
+that fixture's phone numbers — there is no policy-redacted entity in it to explain them. So
+the first question a reviewer is likely to ask after a demo run — *"why did the phone number
+come back redacted?"* — has this as its answer, and the fix is a per-entity `threshold:`
+override in `entities.yaml` rather than a code change.
+
+One consequence for the egress gate is not obvious and is worth the sentence: a redacted value
+gets no vault row, which used to mean the gate had **no needle for it** while its re-scan
+dropped the same value for the same numeric reason. Both payload-side passes were switched off
+over exactly this band. The vault now records confidence-band values as unrestorable
+gate-only needles — no token, no surrogate, no row, nothing added to any restore path — so
+"no vault entry" still holds in the sense the specification means it, and the gate can still
+see them. See §7 gap 1 and `SessionVault.note_unrestorable`.
+
 ---
 
 ## 7. Known gaps & next day
@@ -1918,7 +2010,7 @@ Recorded per the build doc's instruction. Each one is a deliberate choice with a
 | 31 | **`EMAIL` gains a `patterns:` backstop** alongside `presidio: EMAIL_ADDRESS`. | Presidio's `EmailRecognizer` validates every candidate through `tldextract`, which resolves the domain against the **Public Suffix List** — an address whose suffix is not on that list scores zero and is dropped *silently*. Measured **0.0 recall** on `@acme.internal`, `@hospital.local`, `@mail.corp` and `@cluster.lan`, which is exactly what enterprise and hospital documents carry. EMAIL is a §2-mandated entity type, so a recogniser that only sees public domains does not satisfy the requirement. |
 | 32 | **Sentence-tail patterns tolerate a soft line wrap; `CASE_STRATEGY`'s capture window goes 120 → 240 characters.** | The build doc's `[^.\n]{0,120}` terminates a span at the first newline. Every document reaching the detector has been through `extraction.py` and arrives **hard-wrapped**, so on a realistic document `action: redact` covered only the *first line* of its own strategy sentence and **shipped the remainder to the provider**. That is the failure the forced redaction exists to prevent. A blank line still ends the span, so paragraphs cannot run together. |
 | 33 | **`LAB_RESULT` is case-folded and its tail made lazy.** | Greedy matching read `"your LDL is 162 and your A1C came back at 7.4"` as a single span ending at the `1` of `A1C` — so the second result, `7.4`, escaped obfuscation entirely. A greedy quantifier on a tail pattern does not merely over-capture; it swallows the boundary that the *next* value needed. |
-| 34 | **Five of the build doc's own `context:` words are replaced by lemma stems** (`filed`→`file`, `presents`→`present`, `prescribed`→`prescribe`, `takes`→`take`, `routing`→`rout`). | Presidio's context enhancer tests `configured_word in lemma`. `"filed"` is not a substring of the lemma `"file"`, so five of the specification's context words were **inert — no boost, ever**. That boost is what keeps a 0.70 pattern hit ahead of spaCy's flat 0.85, so the inert words were quietly losing overlap resolutions. |
+| 34 | **Three of the build doc's own `context:` words are replaced by lemma stems** (`filed`→`file`, `presents`→`present`, `prescribed`→`prescribe`); a fourth, `routing`→`rout`, is a **widening rather than a repair**; and a fifth, `takes`, is dropped outright rather than stemmed (see Deviation 46). | Presidio's context enhancer tests `configured_word in lemma` as a **substring**. `"filed"` is not a substring of the lemma `"file"`, so those three specification words were **inert — no boost, ever**, and that boost is what keeps a 0.70 pattern hit ahead of spaCy's flat 0.85, so the inert words were quietly losing overlap resolutions. **This row previously said all five were inert, and for `routing` that was false in the phrasing that matters.** spaCy lemmatises `routing` to `routing` in the noun-adjunct reading — `"ACH routing number 021000021"`, i.e. the actual ACH context — so the spec's own word boosts there, 0.70 → 1.00. It is inert only in the verb reading (`"we are routing the payment to account no. …"`, lemma `rout`). The shipped `rout` is a substring of **both** lemmas and so covers both readings; the honest cost is that it is a substring of `routine`, `route` and `router` too, which the spec's word is not. Kept because a missed ACH context is a missed obfuscation and a spurious boost is not. |
 | 35 | **Overlap resolution ranks pattern/gazetteer-backed entities above presidio-backed ones** — below policy actions, above score. | Presidio scores every spaCy guess 0.85 and every registry pattern 0.70, so the *general-purpose guess* took the label off the *specific claim*. Measured consequence: a docket number `24-ARB-00912`, typed as `DATE_TIME`, was being routed through the **Tier-2 date-shift path** — parsed as a date and re-rendered. Coverage is unchanged by construction; only the label moves, and it moves toward the more specific recogniser. |
 | 36 | **The diagnosis gazetteer grows from 109 to 208 terms.** | §9.2's stated coverage target is "fixtures plus realistic docs", and common presenting conditions were simply absent. This is the most corpus-fitted change in this group and is flagged as such in §4. |
 | 37 | **`TOKEN_RE` bounds every quantifier §9.7 leaves unbounded**: `\s*`→`\s{0,4}`, `[A-Z0-9_]*`→`{0,63}`, the hint suffix→`{1,24}`. | The specified regex is **catastrophically backtrackable**: adjacent unbounded quantifiers around an optional group cost **93 s** on a payload of 128,000 whitespace characters, which is a denial-of-service reachable from an ordinary document upload, and the restorer runs on every response. Bounding fixes it at **9.8 ms** on the same input. (This row previously said "a crafted 500-character input", which was wrong and trivially falsifiable — 500 characters is instant. The cost is quadratic in input length: measured 0.0058 / 0.023 / 0.090 / 0.363 / 1.446 s at 1k / 2k / 4k / 8k / 16k characters, i.e. **exactly 4x per doubling**, which extrapolates to 93 s at 128k. The 93 s and 10 ms figures were both right; the input size was not.) The behavioural cost was measured rather than assumed and is exactly **one** case: more than four whitespace characters inside a token leaves the closing bracket behind (`[PHI_NAME_1a2b3c4d     ]` → `John Smith     ]`). The value still restores, nothing leaks, and no post-restore assertion trips. The other two bounds cost nothing — neither an entity name past 63 characters nor a hint past 24 is emittable, because `format_surrogate` refuses to construct one. |
@@ -1933,6 +2025,7 @@ Recorded per the build doc's instruction. Each one is a deliberate choice with a
 | 46 | **`CASE_ID` pattern 1 drops §6.2's `(?:Case|Docket)\s+No\.?\s*[:#]?\s*` prefix**, widens `[a-z]{2}` to `[a-z]{2,4}`, and adds `(?i)`. | Real briefs cite bare docket numbers, and requiring the lexical prefix missed them. The cost is that the pattern now claims any `d:dd-xx-ddd` run in **any** document category with no lexical context, which is exactly the broadening Deviation 15 relies on. Deviation 3 covers only the backslash spelling and was previously the only row mentioning `CASE_ID`. Same class, lower stakes: `MEDICATION` drops the spec's `takes` context word (explained in `entities.yaml`, not here until now), and `MRN`/`ACCOUNT_NUMBER` are wholesale rewrites acknowledged only in a §4 parenthetical. |
 | 47 | **`regex` is a hard runtime dependency and is now declared.** | `detection/registry.py` does `import regex`, and it resolved only transitively through `presidio-analyzer`. It is not optional: `MRN` and `ACCOUNT_NUMBER` use PCRE `\K` and possessive quantifiers, which the standard library's `re` **cannot compile at all** (`bad escape \K`), so `entities.yaml` is not portable to `re` and every path that touches the registry — config, detector, engine, strategies — fails at import without it. Deviation 2 enumerated the added dependencies and omitted the one that was undeclared. |
 | 48 | **A Tier-2 span that is a *list* of dates is split into one detection per date** (`Detector._split_composite_dates`), and the egress gate derives a scan needle per constituent of a composite vaulted original (`_composite_needles`). | spaCy returns `03/11/2024, 09/17/2024` as one `DATE` span, so the whole string became a single vault original. A different date shifted onto `03/11/2024` then rendered a **verbatim slice** of that original, and both leak scanners reported clean — correctly, since each asks whether a *whole* vaulted value occurs. The pipeline was manufacturing the partial disclosure that §1's first boundary describes. Splitting is refused unless every constituent parses, because a partial split leaves a rump span with the same defect; the gate limb is duplicated on purpose so the fix does not depend on detection being right. It is also a utility gain — those dates previously degraded to a plain token, losing the interval property Tier 2 exists for. |
+| 49 | **§9.7's `[UNRESOLVED_ENTITY]` + `VAULT_MISS` rule is not applied to an *unbracketed* token whose ID this run did not mint** — it is left byte-for-byte, with `vault_misses` unincremented and no audit row. | §9.7 states the rule for any unknown `token_id`, unconditionally, and the shipped restorer honours it for every **bracketed** form (including all seven mangled shapes in §10.7). The carve-out is the `foreign` branch in `Restorer._resolve`, and it exists because an unbracketed match is far more likely to be *document text* than a mangled token: `TOKEN_RE` is deliberately tolerant of missing brackets so the restorer can read what an LLM mangled, and that same tolerance makes a clinical document's own `PHI-MRN-40281993` a match. Substituting `[UNRESOLVED_ENTITY]` there would delete a real sentence from the user's answer to protect a value that was never ours; leaving it is the conservative failure. The narrowing is only available when `issued` is supplied, which the orchestrator always does — so the production path takes this branch and the library default (`issued=None`) does not. Pinned by `test_a_document_reference_the_model_echoes_never_reaches_the_audit_log`. |
 
 ---
 
@@ -2024,7 +2117,7 @@ marked as such rather than quietly asserted.
 | **Critical constraint** — reversible in-session, irreversible across | `crypto/keys.py::derive_token_id` (HMAC under an ephemeral key), key destruction | `test_crypto.py::test_token_id_deterministic_within_session`, `::test_token_id_non_deterministic_across_sessions`, `::test_token_id_is_irreversible_without_the_key`; `integration/test_pipeline.py::test_restoration_is_impossible_after_the_session_is_destroyed` |
 | **NFR** — config-only entity add | `entities.yaml`; `entity_type` opaque downstream | `test_extensibility.py::test_package_source_never_mentions_passport` (the grep **is** the proof), plus the three end-to-end cases beside it |
 | **NFR** — strategy swappable via config | strategy registry dict, `Settings.strategy` | `test_obfuscation.py::test_dummy_strategy_plugs_in_with_zero_engine_changes`, `::test_per_entity_strategy_override_is_config_only`; `test_llm.py::test_new_provider_name_is_selectable_with_zero_other_changes` |
-| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, **three** passes — §9.5.3 specifies two; the third is Deviation 42) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the four stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims`, `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims`, `::test_a_combining_mark_inside_a_value_is_outside_what_this_harness_claims` (the glued-word boundary applies to the byte limb of the audit scan too; the query limb is what catches a label-column original — see `::test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`); round-trip completeness is derived independently of the restorer, enforced by `::test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`; `demo.py --dump-wire` for the literal HTTP body |
+| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, **three** passes — §9.5.3 specifies two; the third is Deviation 42) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the three stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims` and `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims` (the homoglyph one by `test_egress_gate.py::test_a_homoglyph_substitution_is_outside_what_the_scan_claims`, which was **missing entirely** until this audit — the only entry in the list whose status was an assertion about the code rather than a measurement of it); the combining-mark shape is **closed**, not a boundary, and is pinned by `test_egress_gate.py::test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider` (the glued-word boundary applies to the byte limb of the audit scan too; the query limb is what catches a label-column original — see `::test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`); round-trip completeness is derived independently of the restorer, enforced by `::test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`; `demo.py --dump-wire` for the literal HTTP body |
 | **NFR** — vault isolation is cryptographic, cross-session | per-session HKDF vault keys, AAD `session_id:token_id` | `test_vault.py::test_aad_binding_across_sessions`, `::test_aad_binding_across_token_ids`; `integration/test_pipeline.py::test_concurrent_session_isolation` (50 interleaved ops) |
 | **NFR** — graceful degradation (never pass through raw) | engine threshold policy, `action: redact` | `test_obfuscation.py::test_mid_confidence_span_is_redacted_without_a_vault_entry`, `::test_case_strategy_is_force_redacted_in_both_modes`; `test_detection.py::test_below_floor_span_is_dropped` |
 | **NFR** — async pipeline, spaCy off the event loop | `detector.detect` (`asyncio.to_thread` behind `Semaphore(4)`), `aiosqlite`, `aiofiles` | `integration/test_pipeline.py::test_the_pipeline_never_blocks_the_event_loop`; `test_extraction.py::test_extraction_runs_off_the_event_loop_thread` |
@@ -2124,7 +2217,7 @@ ledger too.
 pytest -q            # expect: all passed, 1 skipped (the real-network LLM smoke test)
 pytest -m leakage -q # expect: 100/100 runs clean, 0 leaks
 pytest -m bench -q   # expect: 5 measurements, all inside budget
-mypy                 # expect: Success, 39 source files
+mypy                 # expect: Success, 52 source files
 ruff check .         # expect: All checks passed!
 
 # The partial-branch list, which is the part worth reading:

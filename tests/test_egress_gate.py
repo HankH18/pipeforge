@@ -3834,3 +3834,50 @@ async def test_a_surrogate_shared_between_the_document_and_the_prompt_refuses_th
     assert exc.value.detail["token_ids"] == "5e6f7a8b,1a2b3c4d"
     assert trace == [], "the run reached the gate or the provider with an ambiguous payload"
     await audit.close()
+
+
+async def test_a_homoglyph_substitution_is_outside_what_the_scan_claims(
+    tmp_path: Path,
+) -> None:
+    """The one declared boundary that had no test naming it.
+
+    A boundary pinned by nothing can close or widen without anyone noticing, which
+    is the failure mode the other declared boundaries all have a test to prevent.
+    This one did not, while the README listed it alongside them -- so it was the
+    only entry in that list whose status was an assertion about the code rather
+    than a measurement of it.
+
+    Cyrillic U+043E for Latin `o` is different bytes, and no normalisation form
+    this module applies collapses them: NFKC does not (they are distinct
+    characters, not compatibility variants), the invisible fold does not (neither
+    is a format character), and `_deaccent` does not (neither carries a combining
+    mark). Catching it needs a UTS-39 confusables table, which this project does
+    not ship.
+
+    If this test ever fails, the gate has *gained* homoglyph detection -- which is
+    good, and the README's boundary list must lose an entry the same day.
+    """
+    latin = "Rosalind Thornton"
+    # Written as an escape, not as a literal: a Cyrillic o pasted into this file
+    # is indistinguishable from a Latin one to the next reader of the very test
+    # that distinguishes them.
+    cyrillic_o = "\u043e"
+    spoofed = latin.replace("o", cyrillic_o)
+    assert spoofed != latin, "premise: the substitution really did change the bytes"
+    assert spoofed.encode("utf-8") != latin.encode("utf-8")
+
+    gate = EgressGate(
+        vault=FakeVault({latin}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+
+    # It reaches the provider: the scan returns cleanly rather than blocking.
+    report = await gate.check(f"Countersigned: {spoofed} RN", "sess-homoglyph")
+    assert report.originals_scanned == 1, "premise: the original really was in scope"
+
+    # And the clean spelling is still caught, so this is a homoglyph-shaped hole
+    # rather than the scan being broken.
+    with pytest.raises(EgressBlockedError):
+        await gate.check(f"Countersigned: {latin} RN", "sess-homoglyph")

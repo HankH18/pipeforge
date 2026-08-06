@@ -340,10 +340,11 @@ def test_every_context_word_can_boost_a_real_match(registry: EntityRegistry) -> 
 
     ``LemmaContextAwareEnhancer`` runs ``configured_word in surrounding_word`` --
     a substring test, in that direction -- so an inflected word never fires: the
-    lemma of "filed" is "file", and "filed" is not a substring of "file". Five
+    lemma of "filed" is "file", and "filed" is not a substring of "file". Three
     words shipped in the build doc's own registry were inert this way, which cost
     the boost that keeps a ``CASE_ID`` pattern hit ahead of spaCy's DATE_TIME
-    guess on the same span.
+    guess on the same span. (A fourth, "routing", is *not* one of them -- see the
+    note at the loop below, and README Deviation 34.)
 
     The list searched is ``nlp_artifacts.keywords``, **not** ``.lemmas``:
     ``_extract_surrounding_words`` walks the preceding lemmas but keeps one only
@@ -367,11 +368,28 @@ def test_every_context_word_can_boost_a_real_match(registry: EntityRegistry) -> 
         if not (spec.patterns or spec.gazetteer):
             continue
         for word in spec.context:
-            artifacts = nlp_engine.process_text(word, "en")
-            if not any(word.lower() in keyword.lower() for keyword in artifacts.keywords):
+            # Tried standing alone AND inside a minimal noun phrase, and a word is
+            # inert only if BOTH fail. Lemmatisation is contextual, so the
+            # standing-alone reading is a proxy rather than the answer -- and
+            # trusting it alone is the same shape of mistake this test exists to
+            # catch, one filter short of the mechanism. It is not hypothetical:
+            # spaCy lemmatises an isolated "routing" to "rout" (this test would call
+            # it inert) but "ACH routing number 021000021" to "routing" (the
+            # enhancer boosts). README Deviation 34 asserted the inert reading as
+            # fact for a while on the strength of exactly this check.
+            readings = (word, f"the {word} number is 5")
+            if not any(
+                any(
+                    word.lower() in keyword.lower()
+                    for keyword in nlp_engine.process_text(reading, "en").keywords
+                )
+                for reading in readings
+            ):
+                artifacts = nlp_engine.process_text(word, "en")
                 inert.append(
                     f"{name}: {word!r} lemmatises to {artifacts.lemmas} and survives "
-                    f"the stop-word filter as {artifacts.keywords}"
+                    f"the stop-word filter as {artifacts.keywords}, in isolation and "
+                    f"in a noun phrase"
                 )
     assert inert == [], "\n".join(["context words the enhancer can never match:", *inert])
 
@@ -3813,10 +3831,24 @@ REDOS_ATTACKS: list[tuple[str, Callable[[int], str]]] = [
     ("attorney-hyphens", lambda n: "attorney" + "-" * n + "client"),
     ("blanks-only", lambda n: " " * n),
     ("newlines-only", lambda n: "\n" * n),
-    # EMAIL's backstop: a long run of local-part characters that never reaches an
-    # "@", and a dotted-domain group that repeats. The first of these is what
-    # caught the '\b' anchor -- see the note in entities.yaml.
+    # EMAIL's backstop: a long run of local-part characters, and a dotted-domain
+    # group that repeats.
+    #
+    # `email-dotted-local-at` is the row that can actually fail, and its absence is
+    # why this family certified a fix it never exercised. The claim was that the
+    # pre-fix '\b' anchor went quadratic "on a long dotted run that never reaches an
+    # '@'" -- but `regex` short-circuits on a required-literal prefilter, so with no
+    # '@' anywhere in the subject the scan never starts: measured on the pre-fix
+    # pattern, `"a." * 8000` returns in 0.006 ms and every assertion below passes.
+    # Reverting the lookbehind and running all 37 attacks produced ZERO failures.
+    #
+    # One trailing '@' satisfies the prefilter, and then the anchor difference is
+    # exactly as described: '\b' fires between every letter and every dot, so the
+    # scan restarts at ~n/2 positions and walks to the end from each. Measured on
+    # the pre-fix pattern, 65 / 258 / 1035 ms at n = 4k / 8k / 16k -- a clean 4x per
+    # doubling, and both assertions below go red.
     ("email-dotted-local", lambda n: "a." * (n // 2)),
+    ("email-dotted-local-at", lambda n: "a." * (n // 2) + "@"),
     ("email-long-local", lambda n: "a" * n + "@"),
     ("email-hyphen-domain", lambda n: "user@" + "a-" * (n // 2)),
     ("email-dotted-domain", lambda n: "user@" + "a." * (n // 2)),
