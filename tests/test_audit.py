@@ -317,7 +317,22 @@ async def test_verify_chain_recomputes_rather_than_trusting_the_stored_hash(
 
 
 async def test_an_inserted_row_breaks_the_chain(audit: AuditLogger, tmp_path: Path) -> None:
-    """Appending a fabricated event past the end must not verify."""
+    """A row inserted WITHOUT recomputing the chain must not verify.
+
+    The docstring used to say "appending a fabricated event past the end must not
+    verify", and that is not what this proves. The row below carries
+    ``prev_hash='nope'`` and ``entry_hash='also-nope'`` -- it fails on the link
+    check, on the ``seq`` continuity check and on its own content hash, three ways
+    at once, none of which an attacker who has read ``compute_entry_hash`` would
+    walk into. What it establishes is the real and narrower thing: an ``INSERT``
+    that does not maintain the chain is caught.
+
+    The append that *does* maintain it is a different matter and is not detectable
+    here at all. See
+    :func:`test_a_correctly_hashed_tail_append_is_a_known_residual` immediately
+    below, which pins that as an accepted limitation rather than leaving the gap
+    between the two shapes to be inferred from this test's name.
+    """
     for _ in range(2):
         await audit.emit(make_event())
     async with aiosqlite.connect(tmp_path / "audit.db") as conn:
@@ -329,6 +344,89 @@ async def test_an_inserted_row_breaks_the_chain(audit: AuditLogger, tmp_path: Pa
         )
         await conn.commit()
     assert await audit.verify_chain() is False
+
+
+async def test_a_correctly_hashed_tail_append_is_a_known_residual(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """A competently forged tail append verifies True. That is the accepted limit.
+
+    This test asserts the *opposite* of what the neighbouring tamper tests assert,
+    on purpose. It is here so the boundary of the tamper-evidence claim is a fact
+    the suite states rather than a sentence in the README that nothing checks.
+
+    The forgery: read the tail row, take its ``entry_hash`` as ``prev_hash``,
+    allocate ``seq = tail + 1``, and compute ``entry_hash`` with the same public
+    :func:`compute_entry_hash` the writer uses. Every check in ``verify_chain``
+    then passes, and none of them can do otherwise:
+
+    * the link check passes -- ``prev_hash`` genuinely is the previous row's hash;
+    * the ``seq`` continuity check passes -- the row is the next number;
+    * the content hash recomputes correctly -- the digest formula holds no secret;
+    * both watermarks agree -- ``sqlite_sequence`` is bumped by the ``INSERT``
+      itself, and ``audit_chain_meta``'s trigger forbids only a *decrease*.
+
+    So the forged row is indistinguishable from a legitimate one, and it is
+    indistinguishable *in principle*: an unkeyed hash chain whose every piece of
+    state is held by the writer cannot separate "the application appended this"
+    from "someone with the same file access appended this". No additional check
+    inside this process closes it, which is why this is pinned as a residual rather
+    than filed as a bug.
+
+    Note what this is not. Truncation, mid-chain ``INSERT``, reorder, ``UPDATE`` of
+    any persisted column, replay at a new ``seq``, a forged genesis, and deleting a
+    session's rows are all caught, each by its own test above. The gap is
+    specifically **appending**, and its practical shape is narrow but real: an
+    attacker cannot alter or remove a record of what happened, only add a record of
+    something that did not. Closing it needs an anchor outside the writer's reach --
+    an off-box append-only sink, or an HMAC key the auditor holds and the
+    application host does not. Both are listed in README section 5 Q5 as production
+    work, and neither is shipped here.
+    """
+    for i in range(3):
+        await audit.emit(make_event(ts=7000.0 + i, detail={"i": i}))
+    assert await audit.verify_chain() is True, "premise: a clean log verifies"
+
+    forged = {"forged": "this event never happened"}
+    async with aiosqlite.connect(tmp_path / "audit.db") as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT seq, entry_hash FROM audit_events ORDER BY seq DESC LIMIT 1"
+        )
+        tail = await cursor.fetchone()
+        assert tail is not None
+        seq, prev = int(tail["seq"]) + 1, str(tail["entry_hash"])
+        entry_hash = compute_entry_hash(
+            prev,
+            chain_payload(
+                seq=seq,
+                ts=9999.0,
+                session_id="sess-1",
+                run_id="run-1",
+                event_type=DETECT,
+                entity_type=None,
+                token_id=None,
+                detail=forged,
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO audit_events"
+            " (seq, ts, session_id, run_id, event_type, entity_type, token_id,"
+            "  detail, prev_hash, entry_hash)"
+            " VALUES (?, 9999.0, 'sess-1', 'run-1', ?, NULL, NULL, ?, ?, ?)",
+            (seq, DETECT, json.dumps(forged), prev, entry_hash),
+        )
+        await conn.commit()
+
+    # The residual, asserted rather than described.
+    assert await audit.verify_chain() is True, (
+        "a correctly-hashed tail append is now detected -- if this is a deliberate "
+        "improvement, delete this test and update README section 5 Q5, which "
+        "documents the gap it pins"
+    )
+    # And it really is a forgery: the fabricated row is readable as a genuine event.
+    rows = await audit.query()
+    assert [dict(event.detail) for event in rows][-1] == forged
 
 
 async def test_reordering_two_rows_breaks_the_chain(audit: AuditLogger, tmp_path: Path) -> None:

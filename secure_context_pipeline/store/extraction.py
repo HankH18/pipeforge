@@ -25,6 +25,7 @@ import io
 import logging
 import re
 import time
+import unicodedata
 import zipfile
 from collections.abc import Iterator
 from pathlib import PurePosixPath
@@ -364,15 +365,59 @@ def _extract_docx(content: bytes) -> str:
 
 
 def _normalise(text: str) -> str:
-    """Trim trailing whitespace per line, cap blank runs, end with one newline.
+    """NFC, trim trailing whitespace per line, cap blank runs, end with one newline.
 
     Returns ``""`` for anything with no visible characters -- a scanned PDF or
     an empty upload is not an error, it is a document with no text.
+
+    **NFC is a detection control, not tidiness.** The same name in NFD -- ``e`` +
+    U+0301 rather than ``é`` -- is a different string to spaCy's tokenizer and to
+    the statistical model trained on top of it, and the model does not merely score
+    it lower: it stops emitting the span. Measured on ten accented names, in a
+    document reading ``Patient {name}, DOB ..., presented today``::
+
+        name              NFC vaulted            NFD vaulted
+        René Müller       René Müller            -- nothing --
+        Chloé Dubois      Chloé Dubois           -- nothing --
+        Jörg Königsberg   Jörg Königsberg        -- nothing --
+        Åsa Lindqvist     Åsa Lindqvist          -- nothing --
+        Iñaki Errázuriz   Iñaki Errázuriz        -- nothing --
+        Élodie Chaumont   Élodie Chaumont        Chaumont   (given name only)
+
+    Six of ten names went entirely undetected, and one lost its given name. This
+    is not a fail-closed miss: nothing was vaulted, so pass 1 has no needle to
+    look for, pass 2 is the same detector that just missed it, and pass 3 matches
+    patterns -- and a person's name is not a pattern. The run returns **200** and
+    the name reaches the provider verbatim. A homoglyph or an invisible character
+    is an attack someone has to mount; NFD is the *default* on macOS filesystems
+    and a routine output of ordinary editors and PDF extractors, so this fired on
+    honest documents with nobody attacking anything.
+
+    NFC rather than the NFKC used by
+    :func:`~secure_context_pipeline.crypto.keys.normalize`, and the difference
+    matters here in a way it does not there. NFKC is *compatibility* folding: it
+    rewrites ``ﬁ`` to ``fi``, ``①`` to ``1``, ``½`` to ``1``+``\u2044``+``2``. That is right for a
+    comparison key, whose whole job is to collapse variants onto one bucket, and
+    wrong for the document, whose text is about to be sliced by character offset,
+    handed to a provider, and reassembled -- rewriting characters would change what
+    the record says. NFC is canonical-only: it composes ``e``+U+0301 into ``é``,
+    which are *the same character* by Unicode's own definition, and changes nothing
+    else. It is also what the W3C specifies for interchange, so it is the form the
+    text most likely arrived in already.
+
+    Applied here, before the ``rstrip`` below, because composition can consume a
+    trailing combining mark and the newline handling should see the final form.
+    Every document in the system passes through this function -- ``.txt``, ``.pdf``
+    and ``.docx`` alike, since :func:`_extract_sync` funnels all three here -- which
+    is what makes one call sufficient. Offsets stay coherent for free: the detector,
+    the engine, the vault and the gate all see the string this returns, and no
+    caller keeps an index into the pre-composition text.
     """
     if not text.strip():
         return ""
 
-    unified = text.replace("\r\n", "\n").replace("\r", "\n")
+    composed = unicodedata.normalize("NFC", text)
+    unified = composed.replace("\r\n", "\n").replace("\r", "\n")
     stripped = "\n".join(line.rstrip() for line in unified.split("\n"))
     collapsed = _EXCESS_BLANK_LINES.sub("\n\n\n", stripped)
     return collapsed.strip("\n") + "\n"

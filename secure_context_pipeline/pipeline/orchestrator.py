@@ -56,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import unicodedata
 import uuid
 from collections.abc import Sequence
 
@@ -85,6 +86,7 @@ from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import EgressGate
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
+from secure_context_pipeline.surrogates import STRICT_TOKEN_RE
 from secure_context_pipeline.vault.session_vault import SessionVault
 
 __all__ = ["PipelineOrchestrator"]
@@ -134,6 +136,19 @@ class PipelineOrchestrator:
         chosen = strategy or self._settings.strategy
         stats: dict[str, float] = {}
         t0 = time.perf_counter()
+
+        # The document gets canonical composition in `extraction._normalise`, which
+        # is the choke point every stored document passes through. The prompt has no
+        # such choke point -- it arrives on the request and goes straight to the
+        # detector -- so it is composed here, for the reason spelled out at length
+        # in that function: spaCy does not merely score an NFD name lower, it stops
+        # emitting the span, and an entity that is never detected is never vaulted,
+        # which means no pass of the gate has a needle to look for. Since 3b made
+        # the prompt a first-class egress channel, leaving it uncomposed would put
+        # the hole straight back in the input the user types by hand -- and typing
+        # is precisely where a composed-vs-decomposed accent is decided by the OS's
+        # keyboard layout rather than by anyone's intent.
+        user_prompt = unicodedata.normalize("NFC", user_prompt)
 
         # 1-2. Fetch + decrypt. A wrong user's derived key fails GCM auth, which the
         #      store surfaces as NOT_FOUND -- no existence oracle.
@@ -305,7 +320,7 @@ class PipelineOrchestrator:
 
         # 8. Restore. LLM output is untrusted text -- string operations only.
         mark = time.perf_counter()
-        surrogate_map = await self._surrogate_map(session_id, tokens, chosen)
+        surrogate_map = self._surrogate_map(tokens)
         restored = await self._restorer.restore(
             session_id,
             llm.text,
@@ -602,14 +617,32 @@ class PipelineOrchestrator:
             run_id=run_id[:MAX_DETAIL_VALUE_LEN],
         )
 
-    async def _surrogate_map(
-        self, session_id: str, tokens: Sequence[TokenRecord], strategy: str
+    def _surrogate_map(
+        self, tokens: Sequence[TokenRecord]
     ) -> dict[str, str] | None:
-        """Surrogate -> original, for pseudonymization only.
+        """The surrogates this run issued that are pseudonyms, as a candidate list.
 
-        Tokenization restores by hash, so it needs no map. Pseudonyms are ordinary
-        words with no embedded key, so the restorer needs the candidate list; the
-        values come back out of the vault rather than being carried along the run.
+        Tokenization restores by hash, so a run that issued only tokens needs no map.
+        Pseudonyms are ordinary words with no embedded key, so the restorer needs the
+        candidate list; the values come back out of the vault rather than being
+        carried along the run.
+
+        **Keys, not pairs.** Every value here is ``""``, and that is the interface
+        rather than a stub. ``Restorer.restore`` compiles its alternation from
+        ``supplied``'s *keys*, and ``_restore_surrogates`` treats a falsy value as
+        "not pre-resolved" and looks the surrogate up itself. Doing the lookup here
+        as well was duplicated work -- two vault reads per surrogate -- and it moved
+        the miss to the wrong place: :class:`VaultMissError` raised here escapes
+        ``run()`` and fails the request, while the same miss inside the restorer is
+        caught, recorded as a ``VAULT_MISS`` audit event with
+        ``reason="surrogate_not_in_vault"``, and rendered as
+        ``[UNRESOLVED_ENTITY]``. ``restore``'s own docstring fixes which of those is
+        correct -- "an unknown token degrades the answer, it never fails the
+        request" -- and degrading is the safe direction anyway: the alternative to a
+        visible ``[UNRESOLVED_ENTITY]`` is a fabricated name left in the text
+        reading exactly like a real one. So resolution and miss handling both live
+        in the restorer, in one place, and this method only answers "which strings
+        in the payload are pseudonyms this run issued".
 
         ``tokens`` is the *merged* list (:func:`_merge_tokens`), so it includes
         surrogates the prompt contributed. Passing only the document's would be the
@@ -639,14 +672,32 @@ class PipelineOrchestrator:
         the ones a reader cannot see. Closing it belongs in the restorer -- ordering
         the token pass first, or re-asserting after the surrogate pass -- not here.
         """
-        if strategy != "pseudonymization":
-            return None
-        mapping: dict[str, str] = {}
-        for token in tokens:
-            mapping[token.surrogate] = await self._vault.get_by_surrogate(
-                session_id, token.surrogate
-            )
-        return mapping
+        # Built from the RECORDS, not from this run's strategy string.
+        #
+        # `if strategy != "pseudonymization": return None` was the whole test, and it
+        # is wrong because the vault has no strategy dimension: a run reuses whatever
+        # record an earlier call in the same session minted. Order a pseudonymization
+        # run then a tokenization run -- which the API allows, since `strategy` is a
+        # per-request field, and which a per-entity `strategy:` override in
+        # entities.yaml produces on its own -- and the second run splices a PSEUDONYM
+        # into the payload while restoring by hash only. The surrogate pass never
+        # runs, so the caller is handed the fabricated name as the answer, with
+        # `restored_count=0`, `vault_misses=0` and no residual assertion tripped:
+        # a fake reads exactly like a real value, which is why nothing downstream
+        # notices.
+        #
+        # A surrogate that is not a `STRICT_TOKEN_RE` match is a pseudonym and needs
+        # a map entry whatever the run asked for. Testing the shape of what was
+        # actually emitted is the only test that cannot drift from what the payload
+        # contains -- the restorer's surrogate pass is gated on this map being
+        # non-empty, not on the strategy string, so supplying it under tokenization
+        # is exactly what makes the mixed case restore.
+        mapping = {
+            token.surrogate: ""
+            for token in tokens
+            if token.surrogate and not STRICT_TOKEN_RE.fullmatch(token.surrogate)
+        }
+        return mapping or None
 
     async def _collect_seq(self, run_id: str) -> list[int]:
         """Every audit ``seq`` this run produced, paginated to completion.

@@ -32,6 +32,7 @@ import re
 import secrets
 import textwrap
 import time
+import unicodedata
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1165,6 +1166,35 @@ async def test_a_combining_mark_spliced_into_a_name_never_reaches_the_provider(
     The mark position matters and is the reason this is an integration test: with the
     mark inside a token, NER often still finds the name and re-vaults it, so the leak
     closes itself and a unit test choosing that position proves nothing.
+
+    **The assertion changed when NFC composition was added at ingestion, and the
+    direction it changed in is the point.** It used to read::
+
+        error = await _blocked_run(harness, document, "medical")
+        assert error.detail["reason"] == "vault_original"
+
+    -- that is, it asserted the run was *refused*. Refusal was the correct
+    behaviour for a value the pipeline could not recognise, and it is not what this
+    test is for. The requirement is in the test's own name: **never reaches the
+    provider**. A block is one way to satisfy that; it is not the only way, and it
+    is the worse way, because the document comes back unusable.
+
+    U+0301 after ``l`` has a precomposed form (U+013A, ``ĺ``), so canonical
+    composition turns the spliced string into a single token spaCy reads as a name.
+    Both mentions are now detected, vaulted and obfuscated separately, and the run
+    succeeds with nothing leaked -- measured: neither ``Nathaniel`` nor
+    ``Brightwater`` nor even the prefix ``Nathanie`` appears anywhere in the
+    outbound payload. So the guarantee holds *more* strongly than before and the
+    document is processable, which is a strict improvement over a 422.
+
+    Asserting on the payload rather than on the exception is also strictly stronger
+    independently of that: ``_blocked_run`` is satisfied by a block that happened
+    for some unrelated reason, and would have gone on passing if the name had begun
+    leaking through a different path while some other value tripped the gate. The
+    fail-closed ``vault_original`` mechanism itself is not going uncovered -- it is
+    asserted in seventeen places in ``test_egress_gate.py``, and by
+    ``test_an_ssn_the_detector_scores_at_zero_never_reaches_the_provider`` two tests
+    below, which is the right level for it.
     """
     harness: Harness = await make_harness()
     mark = "́"
@@ -1173,8 +1203,26 @@ async def test_a_combining_mark_spliced_into_a_name_never_reaches_the_provider(
         "The primary contact is Nathaniel Brightwater, the coordinator.\n\n"
         f"For continuity, direct questions to Nathaniel{mark} Brightwater at reception.\n"
     )
-    error = await _blocked_run(harness, document, "medical")
-    assert error.detail["reason"] == "vault_original"
+    assert unicodedata.normalize("NFC", document) != document, "premise: composable"
+
+    doc_id = await harness.upload(document, "medical", "spliced.txt")
+    session_id, _ = await harness.sessions.create(USER_ID)
+    result = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+
+    payload = result.obfuscated_payload
+    # The prefix as well as the whole components: composition acts on the LAST
+    # letter of "Nathaniel", so a fix that merely relocated the damage would leave
+    # "Nathanie" behind, and checking only the full name would call that clean.
+    for fragment in ("Nathaniel Brightwater", "Nathaniel", "Brightwater", "Nathanie"):
+        assert fragment not in payload, f"{fragment!r} reached the provider"
+
+    # Two mentions, two distinct originals, both vaulted -- the spliced spelling is
+    # a different string and must not be silently folded onto the clean one.
+    vaulted = harness.vault.originals_for_session(session_id)
+    assert "Nathaniel Brightwater" in vaulted
+    assert f"Nathanie{unicodedata.normalize('NFC', 'l' + mark)} Brightwater" in vaulted
 
 
 async def test_an_ssn_the_detector_scores_at_zero_never_reaches_the_provider(
@@ -1505,3 +1553,196 @@ async def test_a_hard_wrapped_document_is_processable_at_all(
     result = await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
     assert harness.provider.calls == 1
     assert result.restored_text
+
+
+async def test_a_second_run_under_a_different_strategy_restores_the_first_run_s_pseudonyms(
+    make_harness: HarnessFactory,
+) -> None:
+    """Mixed strategies in one session must not hand the caller a fabricated name.
+
+    ``_surrogate_map`` short-circuited on the RUN's strategy string::
+
+        if strategy != "pseudonymization":
+            return None
+
+    but the vault's original -> record index has no strategy dimension: a run
+    reuses whatever record an earlier call in the same session minted. So order a
+    pseudonymization run then a tokenization run -- which the API allows, since
+    ``strategy`` is a per-request field on ``POST /query``, and which a per-entity
+    ``strategy:`` override in ``entities.yaml`` produces inside a single run on its
+    own -- and the second run splices a *pseudonym* into the payload and then
+    restores by hash only. The surrogate pass never runs.
+
+    What makes this worse than a miss is that it is silent in every channel built
+    to catch exactly this. ``restored_count`` is ``0`` and ``vault_misses`` is
+    ``0``: nothing was missed, because nothing was looked for. The gate is happy --
+    a pseudonym is not an original, so no pass fires. The residual assertion is
+    happy. And the value that reaches the caller is a well-formed human name, so
+    unlike a leftover ``[PHI_NAME_1a2b3c4d]`` there is no shape in the output that
+    reads as wrong. Measured on the mutant, the answer came back naming
+    "Alexander Johnson" and "Yolanda Foster" -- people who do not exist, in a
+    clinical answer about someone who does.
+
+    The map is now built from the RECORDS: any surrogate that is not a
+    ``STRICT_TOKEN_RE`` match is a pseudonym and gets an entry, whatever the run
+    asked for. Testing the shape of what was actually emitted is the only test
+    that cannot drift from what the payload contains.
+    """
+    harness: Harness = await make_harness()
+    text = (
+        "Clinical note.\n\n"
+        "Patient Marguerite Vandenberg was seen by Dr. Alan Reed today.\n"
+    )
+    doc_id = await harness.upload(text, "medical", "mixed.txt")
+    session_id, _ = await harness.sessions.create(USER_ID)
+
+    first = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "pseudonymization"
+    )
+    pseudonyms = {d.surrogate for d in first.detections if d.surrogate}
+    assert pseudonyms, "premise: run 1 minted surrogates"
+    assert not any(STRICT_TOKEN_RE.fullmatch(s) for s in pseudonyms), (
+        "premise: run 1 minted PSEUDONYMS, not hash tokens"
+    )
+
+    second = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+
+    # The premise of the bug: run 2 reuses run 1's records, so its payload carries
+    # pseudonyms even though it asked for tokenization.
+    assert "Marguerite Vandenberg" not in second.obfuscated_payload
+    assert any(p in second.obfuscated_payload for p in pseudonyms), (
+        "premise: the second run really did reuse the first run's pseudonyms"
+    )
+
+    # The bug: those pseudonyms survive into the answer, and the real name never
+    # comes back. Both halves matter -- a fabricated name reaching the caller is
+    # the harm; the missing original is how you would notice.
+    leftover = sorted(p for p in pseudonyms if p in second.restored_text)
+    assert leftover == [], f"fabricated names reached the caller: {leftover}"
+    assert "Marguerite Vandenberg" in second.restored_text
+    assert second.stats["restored_count"] > 0
+    assert second.stats["vault_misses"] == 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["René Müller", "Chloé Dubois", "Jörg Königsberg", "Åsa Lindqvist", "Iñaki Errázuriz"],
+)
+async def test_a_decomposed_accent_does_not_send_a_name_to_the_provider_in_the_clear(
+    make_harness: HarnessFactory, name: str
+) -> None:
+    """The same document in NFD must not leak the name NFC protects.
+
+    Unicode gives two spellings of an accented letter: NFC composes ``é`` into
+    U+00E9, NFD decomposes it into ``e`` + U+0301. They are *canonically
+    equivalent* -- the same character, by Unicode's own definition -- render
+    identically, and compare unequal.
+
+    spaCy does not merely score the decomposed spelling lower. It stops emitting
+    the span. Measured on ten accented names before this fix, six vanished
+    completely and one (``Élodie Chaumont``) came back as ``Chaumont`` alone, the
+    given name silently dropped.
+
+    That is not a fail-closed miss, which is what makes it the worst kind. Every
+    layer downstream is keyed on the vault: pass 1 compares the payload against
+    values the vault holds, and an entity never detected was never vaulted, so
+    there is no needle to look for. Pass 2 is a re-scan by the same detector that
+    just missed it. Pass 3 matches independent regexes -- and a person's name is
+    not a regex. So all three passes agree the payload is clean, the run returns
+    **200**, and the name goes to the provider verbatim. Nothing anywhere reports a
+    warning, because from the pipeline's point of view nothing happened.
+
+    A homoglyph or a zero-width space is an attack somebody has to mount. NFD is
+    the *default* on macOS filesystems, and a routine output of text editors and
+    PDF extractors -- Deviation 32 notes every document reaching the detector has
+    been through ``extraction.py``. So this fired on honest documents, uploaded by
+    honest users, with nobody attacking anything.
+
+    The fix is canonical composition at ingestion (``extraction._normalise``, the
+    one function all three file kinds funnel through) and on the prompt. NFC, not
+    the NFKC used for comparison keys: NFKC would rewrite ``ﬁ`` to ``fi`` and
+    ``½`` to ``1``+``\u2044``+``2``, which is right for a lookup bucket and wrong for a document
+    that is about to be sliced by offset and reassembled.
+
+    Asserted against the outbound payload, not against the detection count. "The
+    detector found it" is the mechanism; "it did not reach the provider" is the
+    guarantee, and only the second one is what the product claims.
+    """
+    harness: Harness = await make_harness()
+    text = unicodedata.normalize(
+        "NFD",
+        "Clinical note.\n\n"
+        f"Patient {name}, DOB 1974-03-02, presented today.\n"
+        f"The care team discussed {name}'s medication with the family.\n",
+    )
+    assert text != unicodedata.normalize("NFC", text), "premise: NFD really differs"
+
+    doc_id = await harness.upload(text, "medical", "decomposed.txt")
+    session_id, _ = await harness.sessions.create(USER_ID)
+    result = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+
+    # Both spellings, because the store composes and the assertion must not be
+    # satisfied merely by the composition having happened somewhere.
+    payload = result.obfuscated_payload
+    for form in ("NFC", "NFD"):
+        spelling = unicodedata.normalize(form, name)
+        assert spelling not in payload, f"{form} spelling of {name!r} reached the provider"
+        for part in spelling.split():
+            assert part not in payload, f"{form} component {part!r} reached the provider"
+
+    assert name in result.restored_text, "and it must still come back"
+
+
+async def test_a_prompt_pseudonym_restores_to_the_real_value(
+    make_harness: HarnessFactory,
+) -> None:
+    """A name typed into the prompt must be masked outbound and restored inbound.
+
+    The document half of this is covered several times over. The prompt half is
+    newer -- the prompt only became a detect/obfuscate input once it was recognised
+    as an egress channel in its own right -- and it is the half where a gap is
+    invisible, because under pseudonymization an unrestored surrogate is a
+    well-formed human name rather than a leftover ``[PII_NAME_...]``. There is
+    nothing in the output for a reader to notice.
+
+    Proved against the real vault and the real restorer, which is what makes it
+    worth having next to the stub-driven check in ``test_egress_gate.py``: that one
+    can only assert what the orchestrator *hands* the restorer, and the claim here
+    is what comes back. It is also what keeps ``_surrogate_map``'s values honest --
+    they are now the empty sentinel, so the vault lookup that produces this answer
+    happens entirely inside ``_restore_surrogates``, and if that lookup regressed
+    the stub test would still pass while this one would not.
+    """
+    harness: Harness = await make_harness()
+    doc_id = await harness.upload(
+        "Clinical note.\n\nThe patient was seen in clinic today.\n", "medical", "p.txt"
+    )
+    session_id, _ = await harness.sessions.create(USER_ID)
+
+    name = "Bernadette Halloran"
+    result = await harness.orchestrator.run(
+        session_id,
+        USER_ID,
+        doc_id,
+        f"What is the current medication plan for {name}?",
+        "pseudonymization",
+    )
+
+    assert name not in result.obfuscated_payload, "the typed name reached the provider"
+
+    # Asked of the vault, not of `result.detections`: that field is `obf.spans`,
+    # the DOCUMENT's spans, so the prompt's surrogate is deliberately not in it.
+    record = await harness.vault.get_by_original(session_id, "NAME", normalize(name))
+    assert record is not None, "premise: the prompt's name was vaulted"
+    surrogate = record.surrogate
+    assert surrogate in result.obfuscated_payload, "premise: a pseudonym went out"
+    assert not STRICT_TOKEN_RE.fullmatch(surrogate), "premise: a pseudonym, not a token"
+
+    # The point: the pseudonym is gone from the answer and the real name is back.
+    assert surrogate not in result.restored_text, "the invented name was left in the answer"
+    assert name in result.restored_text
+    assert result.stats["vault_misses"] == 0

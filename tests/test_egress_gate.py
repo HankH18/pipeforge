@@ -41,7 +41,7 @@ from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.deobfuscation.restorer import Restorer, RestoreResult
 from secure_context_pipeline.detection.detector import Detector
 from secure_context_pipeline.detection.registry import load_registry
-from secure_context_pipeline.errors import EgressBlockedError, PipelineError
+from secure_context_pipeline.errors import EgressBlockedError, PipelineError, VaultMissError
 from secure_context_pipeline.llm.base import LLMResponse
 from secure_context_pipeline.models import (
     AuditEvent,
@@ -93,13 +93,35 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 class FakeVault:
-    """Only the one sync capability the gate needs."""
+    """The gate's one sync capability, plus the surrogate lookup the orchestrator makes.
 
-    def __init__(self, originals: set[str] | None = None) -> None:
+    ``get_by_surrogate`` is here because several tests in this module drive the whole
+    orchestrator with an engine that emits a human-readable surrogate rather than a
+    ``[PII_NAME_...]`` token, while the run itself takes the default ``tokenization``
+    strategy. That mixed shape used to be silently skipped -- ``_surrogate_map``
+    short-circuited on the strategy string, so nothing ever asked the vault to
+    reverse a pseudonym and this double could get away without the method.
+
+    It raises :class:`VaultMissError` for an unknown surrogate, as the real
+    :meth:`SessionVault.get_by_surrogate` does. A double that returned a placeholder
+    string instead would let a restore quietly succeed against a value the vault
+    never held, which is the failure this module exists to catch.
+    """
+
+    def __init__(
+        self, originals: set[str] | None = None, by_surrogate: dict[str, str] | None = None
+    ) -> None:
         self._originals = frozenset(originals or set())
+        self._by_surrogate = dict(by_surrogate or {})
 
     def originals_for_session(self, session_id: str) -> frozenset[str]:
         return self._originals
+
+    async def get_by_surrogate(self, session_id: str, surrogate: str) -> str:
+        try:
+            return self._by_surrogate[surrogate]
+        except KeyError:
+            raise VaultMissError(session_id=session_id[:8]) from None
 
 
 class ExplodingVault:
@@ -3625,6 +3647,30 @@ async def test_the_restorer_is_told_about_the_tokens_the_prompt_issued(
     rendered as a visible ``[UNRESOLVED_ENTITY]``, it is handed to the caller as
     though it were the answer. Neither failure changes any assertion in the rest of
     this file.
+
+    **The map is asserted by its keys.** It used to be asserted as full pairs::
+
+        assert seen["surrogates"] == {prompt_fake: "John Smith", document_fake: "Ana Diaz"}
+
+    and the values are now uniformly ``""``, because ``_surrogate_map`` stopped
+    pre-resolving. That was not a simplification for its own sake: resolving here
+    *and* in ``_restore_surrogates`` meant two vault reads per surrogate, and it put
+    the miss in the wrong place -- a :class:`VaultMissError` raised in the
+    orchestrator escapes ``run()`` and fails the request, while the same miss inside
+    the restorer is caught, audited as ``surrogate_not_in_vault`` and rendered as
+    ``[UNRESOLVED_ENTITY]``, which is what ``Restorer.restore``'s docstring says must
+    happen ("an unknown token degrades the answer, it never fails the request").
+
+    Keys are what this test was ever about: the requirement in the paragraph above
+    is *membership* -- "the prompt's pseudonym reached the map" -- and with the
+    values now a constant they say nothing about which side contributed a surrogate.
+    They are still pinned below, so the map remains fully specified rather than
+    partially checked. That the pseudonyms then restore to the right originals is a
+    different claim, proved end-to-end against a real vault and a real restorer by
+    ``test_a_prompt_pseudonym_restores_to_the_real_value`` and
+    ``test_a_second_run_under_a_different_strategy_restores_the_first_run_s_pseudonyms``
+    in the integration suite -- a stub restorer that echoes its input, which is what
+    this test uses, could not prove it here.
     """
     prompt_fake = "Marion Delacroix"
     document_fake = "Rachel Medina"
@@ -3691,9 +3737,15 @@ async def test_the_restorer_is_told_about_the_tokens_the_prompt_issued(
     assert seen["issued"] == {"1a2b3c4d", "5e6f7a8b"}, (
         f"the prompt's token id never reached the restorer: {seen['issued']}"
     )
-    assert seen["surrogates"] == {prompt_fake: "John Smith", document_fake: "Ana Diaz"}, (
-        f"the prompt's pseudonym is unmapped, so it restores to nothing: {seen['surrogates']}"
+    surrogates = seen["surrogates"]
+    assert isinstance(surrogates, dict)
+    assert set(surrogates) == {prompt_fake, document_fake}, (
+        f"the prompt's pseudonym is unmapped, so it restores to nothing: {surrogates}"
     )
+    # Pinned, so the map stays fully specified: every value is the "not
+    # pre-resolved" sentinel the restorer keys its own vault lookup on. A stray
+    # non-empty value here would silently re-enable the double lookup.
+    assert set(surrogates.values()) == {""}, surrogates
     assert result.stats["tokens_issued"] == 2.0
     assert result.stats["prompt_tokens_issued"] == 1.0
     await audit.close()

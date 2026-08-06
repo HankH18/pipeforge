@@ -197,7 +197,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1991 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1999 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
@@ -609,9 +609,11 @@ is simply a worse measurement of the same thing. Relaxing the budget instead wou
 claim, which is the one thing not on the table.
 
 It still catches a real regression, and that is checked rather than argued: a deliberate +10 s
-regression injected into `PipelineOrchestrator.run` fails the full-pipeline budget at 17.16 s,
-because a genuine slowdown affects every iteration and therefore moves the minimum. (A +6 s
-regression passes — correctly, since 12.7 s is genuinely inside a 15 s budget.) The two
+regression injected into `PipelineOrchestrator.run` fails the full-pipeline budget — it lands at
+baseline + 10 s, because a genuine slowdown affects every iteration and therefore moves the
+minimum. (A +6 s regression passes — correctly, since that is genuinely inside a 15 s budget.)
+Both are stated relative to the baseline rather than as fixed totals, because the baseline is a
+measurement that moves with the code and a hard-coded sum silently stops matching it. The two
 high-headroom rows are single-shot because contention cannot plausibly consume the margin
 between a sub-microsecond lookup and a 5 ms budget, or between a 4.8 ms restore and a 500 ms
 one — and note that this is an argument about those *budgets*, not about the sampled headroom
@@ -628,8 +630,8 @@ Full pipeline detail, mock provider, analyzer already warm (median of three runs
 
 | Document | Size | Spans | Distinct entities vaulted | End to end |
 |---|---|---|---|---|
-| `legal_brief_large.txt` | 12,062 words | 739 (647 obfuscated, 64 redacted, 28 stripped) | 251 | **7.16 s** (budget 15 s) |
-| `medical_note.txt` | 393 words | 52 (51 obfuscated, 1 redacted, 0 stripped) | 32 | **0.28 s** |
+| `legal_brief_large.txt` | 12,062 words | 739 (647 obfuscated, 64 redacted, 28 stripped) | 251 | **6.48 s** (budget 15 s) |
+| `medical_note.txt` | 393 words | 52 (51 obfuscated, 1 redacted, 0 stripped) | 32 | **0.29 s** |
 
 (Counts are **engine-level** — what `PipelineResult.detections` carries and what `demo.py` prints
 — not detector-level. The distinction is the whole reason this row was wrong twice. The detector
@@ -1142,32 +1144,42 @@ pins it.
 
 ### Q1 — A 50-page brief with 200 entities. Where does it break?
 
-Measured on `fixtures/legal_brief_large.txt` (12,062 words, 739 spans, **251 distinct
-entities** vaulted), full pipeline, mock provider: **7.16 s end to end**, against a 15 s budget.
+Measured on `fixtures/legal_brief_large.txt` (12,062 words, **251 distinct entities** vaulted
+plus 13 redacted values held as gate-only needles, so pass 1 scans for **264**), full pipeline,
+mock provider: **6.4 s end to end**, against a 15 s budget.
 
-The stage breakdown is the answer, and it is not the one you would guess (median of three runs
+The stage breakdown is the answer, and it is not the one you would guess (best of three runs
 on a loaded machine):
 
 | Stage | Brief (12k words) | Medical note (393 words) |
 |---|---|---|
-| Detect (spaCy, stage 3) | 3,303 ms | 107 ms |
-| Obfuscate (engine) | 645 ms | 21 ms |
-| **Egress gate** | **2,779 ms** | **152 ms** |
-| Restore | 1.9 ms | 0.5 ms |
+| Detect (spaCy, stage 3) | 2,816 ms | 109 ms |
+| Obfuscate (engine) | 871 ms | 33 ms |
+| **Egress gate** | **2,911 ms** | **156 ms** |
+| Restore | 2.4 ms | 1.2 ms |
 
 **The gate costs about as much as detection.** That is the finding, and it took measuring the
-gate's two passes separately to see it:
+gate's two passes separately to see it (pass 1 is median-of-15; it is short enough that a single
+sample is mostly scheduler noise):
 
 | | Brief | Medical note |
 |---|---|---|
-| Pass 1 — scan for vault originals, `O(payload × entities)` | 21.3 ms | 0.36 ms |
-| Pass 2 — detector re-scan of the payload | 2,678 ms | 148 ms |
+| Pass 1 — scan for vault originals, `O(payload × entities)` | 277 ms | 1.8 ms |
+| Pass 2 — detector re-scan of the payload | 2,759 ms | 151 ms |
 
 So **spaCy runs twice per request** — once over the document in stage 3, once over the
-assembled payload inside the gate — and those two passes are **84%** of wall time on the brief
-and **89%** on the medical note. The originals scan, the part that looks alarming on paper
-because it is `O(payload × entities)`, is **0.8%** of the gate on the brief and **0.2%** on the
-note.
+assembled payload inside the gate — and those two passes are **87%** of wall time on the brief
+and **86%** on the medical note.
+
+**Pass 1's numbers here are 13x and 5x what this README used to claim** (21.3 ms and 0.36 ms),
+and the increase is a deliberate purchase rather than a regression. Each of the four compared
+forms in Deviation 48, the flexible-separator limb that closed the digit-regrouping release, and
+the spacing-diacritic skeleton all added work to the same `O(payload × originals)` loop — every
+one of them added because a vaulted original was reaching the provider without it. The stale
+numbers mattered because of the conclusion drawn from them: this section used to say the
+originals scan was **0.8%** of the gate on the brief, i.e. a rounding error. It is now **9.5%**
+on the brief and **1.2%** on the note. Still not the bottleneck — pass 2 is, by roughly 10x —
+but no longer negligible, and no longer something to wave away when deciding what to optimise.
 
 #### The number above is per-*document*; the thing that grows is the *session*
 
@@ -1177,11 +1189,11 @@ document in a 3600 s session**, not per request. Measured against an 81 KB paylo
 
 | Session originals | Pass 1 |
 |---|---|
-| 251 (one brief) | 36.6 ms |
-| 1,000 | 122 ms |
-| 5,000 | 587 ms |
-| 20,000 | 2,384 ms |
-| 60,000 | 7,378 ms |
+| 251 (one brief) | 68.5 ms |
+| 1,000 | 216 ms |
+| 5,000 | 1,022 ms |
+| 20,000 | 4,023 ms |
+| 60,000 | 12,141 ms |
 
 Cleanly linear, as expected. What made it a security problem rather than a latency one is that
 pass 1 was **synchronous, on the event loop**, and `DEFAULT_TIMEOUT_S` claimed to bound the whole
@@ -1195,6 +1207,14 @@ before:  check() returned after 7.35 s   (budget silently ignored)
 after:   check() blocked at 0.52 s       (budget enforced)
          unrelated coroutine starved for 0.03 s
 ```
+
+That capture is from when the defect was found, and the 7.35 s in it is the 60k row of the table
+above **as it then stood**. The same row now measures 12.1 s, for the reasons given earlier in
+this section — so the unbounded stall this closed is now about 65% longer than the capture shows,
+and the enforced side is unchanged, because 0.52 s is the budget rather than a property of the
+scan. The capture is left as recorded rather than re-run with today's numbers: it is evidence of
+a specific fix at a specific commit, and silently restating it against newer code would make it
+look like a fresh measurement of something that has not been re-measured.
 
 The fix is one line — pass 1 runs in a worker thread — and it is the difference between a stated
 budget and an enforced one. Pinned by `test_the_timeout_bounds_pass_one_and_not_only_the_detector`
@@ -1221,7 +1241,7 @@ earlier min-of-3 pass reported 25–39% and was measuring noise):
 Protected spans cover **22.9%** of the payload — not the ~95% this README used to assert
 without measuring — and the system prompt is **834 chars, 0.96%** of it, so skipping it saves
 nothing at all; the +1.4% above is noise around zero, and an earlier pass measured it at −0.2%.
-The whole optimisation is worth ~186 ms of a ~7,160 ms run: **2.6%**.
+The whole optimisation is worth ~186 ms of a ~6,410 ms run: **2.9%**.
 
 (The payload length drifts by ~100 characters between sessions — Tier-2 dates are re-rendered
 under a per-session shift and `12/15/2024` is not the same width as `5/3/2024` — so treat
@@ -1457,7 +1477,8 @@ the shared store never holds anything usable on its own.
   re-checks every link. **Verified by test to detect**: an in-place `UPDATE` of *every* persisted
   column (`session_id`, `run_id`, `event_type`, `entity_type`, `token_id`, `ts` and `detail`,
   each parametrised separately — a column omitted from the digest would be freely editable);
-  inserting a row; reordering two rows; deleting a row from the middle; **replaying** a genuine
+  inserting a row *without recomputing the chain*; reordering two rows; deleting a row from
+  the middle; **replaying** a genuine
   correctly-hashed row at a new `seq`; **forging a new genesis row** and shifting the rest up;
   deleting the newest rows (truncation); deleting every row of one session; and deleting every
   row in the log. A tampered row that makes the walk itself *unreadable* — a non-numeric `ts`, a
@@ -1602,11 +1623,16 @@ the shared store never holds anything usable on its own.
   a compliance job would do), not through the public API. That is the right trade at this tier,
   but it does mean "the auditor can just query it" is true of the library and not of the
   deployed surface — the production shape is a separate authenticated compliance role.
-- **`SESSION_EXPIRE` is declared in the event vocabulary and never emitted** (Deviation 26). TTL
-  lapse is discovered lazily by the next accessor, so nothing is running at the moment a session
-  dies. Logout does emit `VAULT_DESTROY`, so the explicit teardown path is covered and only the
-  passive one is silent. An auditor asking "show me every session that expired" gets an empty
-  result, and would be entitled to read that as "none did".
+- **All twelve event types are emitted, including `SESSION_EXPIRE`** (Deviations 26 and 54). This
+  bullet used to say the opposite — that `SESSION_EXPIRE` was declared and never written, so an
+  auditor asking "show me every session that expired" got an empty result and would be entitled
+  to read it as "none did". The reasoning behind that was: TTL lapse is discovered lazily by the
+  next accessor, so nothing is running at the moment a session dies. The premise was right and
+  the conclusion was wrong — the auditable moment is not when the session dies but when a request
+  **notices**, and `api/deps.reap_expired_sessions` runs exactly there. It emits `SESSION_EXPIRE`
+  and `VAULT_DESTROY` together, the death and the teardown it triggered being two facts a
+  timeline wants separately, with no background sweeper and no timer thread.
+  `test_api.py::test_ttl_expiry_runs_the_whole_destruction_path` asserts both land.
 
 - **The chain is tamper-*evident*, not tamper-*proof*, and the difference is not academic.**
   The digest is `sha256(prev_hash ‖ canonical_json(event))`. There is no secret in that
@@ -1615,8 +1641,28 @@ the shared store never holds anything usable on its own.
   a demonstrated result against this code. What the chain actually buys is that an attacker
   must rewrite **the entire chain from the forged row forward**, in one consistent pass, with
   write access to the file: it converts "edit one row in SQLite" into "replace the whole log",
-  and it makes every *partial* tamper — the realistic case, including a database-level
-  `UPDATE`, a mid-chain `DELETE`, an `INSERT`, a reorder, and a truncated tail — detectable.
+  and it makes most *partial* tampers — the realistic case, including a database-level
+  `UPDATE`, a mid-chain `DELETE`, a mid-chain `INSERT`, a reorder, and a truncated tail —
+  detectable.
+
+  **One partial tamper is not detectable, and it is a cheap one: appending to the tail.**
+  Read the last row, take its `entry_hash` as `prev_hash`, use `seq + 1`, and compute the new
+  `entry_hash` with the same public formula. Every check passes, and each for a reason that
+  cannot be patched from inside this process — the link genuinely is correct, the `seq`
+  genuinely is next, the digest has no secret to get wrong, and both watermarks move on their
+  own (`sqlite_sequence` is bumped by the `INSERT`; `audit_chain_meta`'s trigger forbids only
+  a *decrease*). A forged tail row is not merely hard to distinguish from a legitimate append —
+  it is identical to one. This is the general limit of an unkeyed hash chain whose every piece
+  of state is held by the writer, not a defect in this implementation, and it is pinned as an
+  accepted residual by `test_a_correctly_hashed_tail_append_is_a_known_residual`, which asserts
+  `verify_chain()` returns `True` and fails if that ever silently changes.
+
+  The practical shape of the gap is narrower than "the log is forgeable": an attacker who
+  cannot rewrite the whole chain still cannot **alter or remove** any record of what happened.
+  They can only **add** a record of something that did not. For an auditor asking "what did
+  this system do", events that are missing or edited are the dangerous ones, and those are the
+  ones that are covered.
+
   For the truncated tail specifically the cost is now four statements that must all land in
   step, and — the part that had been quietly missing — the evidence is **durable**: it used to
   expire on its own as soon as ordinary traffic reused the freed `seq` numbers, so an attacker
