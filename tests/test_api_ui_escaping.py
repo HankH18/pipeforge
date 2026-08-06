@@ -413,3 +413,37 @@ def test_the_escaping_checker_catches_every_way_the_control_can_be_removed() -> 
         assert source.count(before) == 1, (name, source.count(before))
         problems, _ = audit_escaping(source.replace(before, after))
         assert problems, f"the checker does not notice: {name}"
+
+
+def test_no_regex_source_in_the_ui_carries_an_unbounded_quantifier() -> None:
+    """Every quantifier in `app.js`'s grammars is bounded, as `surrogates.py`'s is.
+
+    `TOLERANT_SRC` is commented "mirrors TOKEN_RE" and did not: it used `\\s*` and
+    `[A-Z0-9_]*` where the Python grammar uses `\\s{0,4}` and `[A-Z0-9_]{0,63}`,
+    and `surrogates.py` calls those bounds "a security property, not style".
+
+    The consequence is not theoretical. The pattern runs over
+    `result.raw_llm_response` -- model output, uncapped -- and the shipped
+    MockProvider echoes its input, so a document carrying a long whitespace run
+    comes straight back. Measured in node against the real file: 645 ms at 20,000
+    characters, 2,560 ms at 40,000 -- a clean 4x per doubling, i.e. ~26 s on a
+    128k run, a frozen tab. Bounded, the same inputs are 0 ms and 1 ms. No shipped
+    fixture triggers it (longest whitespace run: 46 characters), which is why it
+    survived: this asserts the property rather than waiting for a fixture to grow.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    grammars = re.findall(r"^\s*const (\w*_SRC) = ([\s\S]*?);$", source, re.MULTILINE)
+    assert grammars, "no regex-source constants found in app.js -- has it been renamed?"
+
+    offenders: list[str] = []
+    for name, literal in grammars:
+        # `*` and `+` applied to a character class or an escape are the unbounded
+        # spellings. A bounded `{0,4}` is fine, and so is a literal `*` inside a
+        # character class (there is one, in the markdown-edge trimmers).
+        for match in re.finditer(r"(\\[sSwWdD]|\[[^\]]+\])([*+])", literal):
+            offenders.append(f"{name}: {match.group(0)!r}")
+    assert offenders == [], (
+        "unbounded quantifier(s) in a UI grammar: "
+        + ", ".join(offenders)
+        + " -- bound them the way surrogates.py bounds TOKEN_RE"
+    )

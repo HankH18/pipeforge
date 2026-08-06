@@ -66,7 +66,7 @@ Everything below is measured on this repository, not aspirational.
 | What does it **not** defend? | §3 — **start with "The weakest point in this design"**: `user_id` is an asserted claim and there is no authn at this tier |
 | The six live-review questions | §5 — each answered in its first sentence |
 | Where it breaks at scale | §5 Q1 — the bottleneck is not the one you would guess, and the obvious fix was measured and **rejected** |
-| What I got wrong | §8 Deviations (55, each with a reason) and §7 Known gaps |
+| What I got wrong | §8 Deviations (56, each with a reason) and §7 Known gaps |
 
 **If you are cloning this repository right now, read this first.** Until the commit that carries
 this sentence, `.gitignore` line 7 was `data/`. In git's grammar an unanchored pattern matches a
@@ -182,7 +182,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1583 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1602 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
@@ -227,7 +227,7 @@ transient fault would have wedged every subsequent write.
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2991 originals vaulted and scanned, 2398 surrogates round-tripped)
+          (2963 originals vaulted and scanned, 2421 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the
@@ -2032,6 +2032,7 @@ Recorded per the build doc's instruction. Each one is a deliberate choice with a
 | 53 | **`load_registry` validates `only_in_doc_categories` against `DOC_CATEGORIES`**, which moved to `models.py` so both consumers share one vocabulary. | It was validated against nothing. A typo (`medial`) loaded clean, and because the field is enforced by *restricting the requested entity set*, an unmatchable value restricted the entity out of **every** document including `general` and unclassified — never detected, so never vaulted, so no egress-gate backstop either. A one-character config typo silently removed an entity and all three of its defences, while the adjacent `category:` typo has always raised. |
 | 54 | **TTL expiry now runs the full destruction path** (`api/deps.reap_expired_sessions`), not only the key pop. | §4 step 10 and §9.4 both say expiry destroys like logout — key popped, vault rows deleted, `VAULT_DESTROY` audited. Only the first happened. `SessionRegistry.sweep()`'s own docstring says "the caller is responsible for the rest", and there was no caller: `sweep()` appeared exactly once in the tree, in a test. An expired session therefore left AES-GCM rows in `vault.db` and a decrypted cache in RAM until process exit — and they were **unreclaimable**, because `DELETE /sessions` gates on an ownership check that raises for an expired session and skips `vault.destroy`. Reaping runs on the request that discovers the expiry, which is also the request that would otherwise strand the rows. Also closes Deviation 26's missing expiry event. |
 | 55 | **A lone name component is always treated as a surname**; §9.3's "same rule for first names" is not implemented. | `role` is `"last"` for the final word of a span and `"first"` otherwise, so a bare given name (`"Priya said…"`) gets a surname-shaped fake and does not link to the `Priya Raman` mapped elsewhere. It is the right default for these documents — a lone component in clinical and legal prose is overwhelmingly a surname (`"Dr. Patel said…"`) — and the module docstring has always said so, but the ledger had not. |
+| 56 | **The demo UI's "destroy session, then run again" shows the *erasure*, not a live vault miss** (§9.10 describes it as demonstrating the vault-miss path). | A destroyed session is refused at the session check — `401 SESSION_EXPIRED` — **before** the vault is consulted, so no `VAULT_MISS` is reachable from one in this architecture; the button's banner promised otherwise. What it does demonstrate is stronger: the key is gone, so nothing can be decrypted at all. The genuine vault-miss path is exercised where it actually occurs — a model inventing a token inside a *live* session — by `test_vault_miss_on_deobfuscation` at both unit and integration level, and by `demo.py`. Two supporting bugs fixed with it: `destroySession` nulled `S.sessionId`, and `loadAudit` bailed on a null one, so the audit panel went blank at exactly the moment `VAULT_DESTROY` landed in it, and the `SESSION_EXPIRED` refresh branch was dead code. |
 
 ---
 

@@ -31,10 +31,27 @@ real are deliberately drawn from reserved or never-issued ranges:
 
 Three notes for consumers of :func:`expected_entities`:
 
-1.  For pattern-backed entity types the planted literal is the *whole span the
-    registry regex will match* (e.g. ``"MRN: 4823910"``, ``"HbA1c of 8.2"``,
-    ``"settlement demand of $2,400,000"``), not just the payload digits.  That
-    is what the vault will hold, so round-trip assertions are exact.
+1.  For *most* pattern-backed entity types the planted literal is the whole span
+    the registry regex will match (e.g. ``"HbA1c of 8.2"``, ``"settlement demand
+    of $2,400,000"``), not just the payload digits, so round-trip assertions are
+    exact.
+
+    **Two types are the exception, and this paragraph used to deny it.**
+    ``MRN`` and ``ACCOUNT_NUMBER`` anchor with PCRE ``\\K``, which *resets the
+    match start* -- so the span the engine vaults is the bare digits
+    (``"4823910"``), not the planted literal (``"MRN: 4823910"``). The old
+    wording ("the planted literal is the whole span... That is what the vault
+    will hold") is false for them, and the consequence is worse than an
+    inaccurate comment: an absence assertion phrased over the *planted* literal
+    (``assert "MRN: 9224297" not in payload``) passes in a world where the bare
+    digits are on the wire, because the label prefix was never the thing at risk.
+
+    Anything asserting over these types must use the value the vault holds, which
+    is what ``vault.originals_for_session`` returns and what the leakage harness
+    scans. Measured on the committed fixtures: 129 of 850 planted occurrences are
+    not fully inside a detected span, almost all of them ``CASE_ID`` (124) plus
+    ``ACCOUNT_NUMBER`` (4) and ``MRN`` (1) -- so "every one fully inside a
+    detected span" was never true either.
 2.  ``PRIVILEGED_MARKER`` (``action: strip``) and ``CASE_STRATEGY``
     (``action: redact``) do not round-trip by design -- the span is removed or
     replaced rather than tokenised.  They are still returned, because they must

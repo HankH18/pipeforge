@@ -1176,6 +1176,12 @@ async def dump_wire(capture: WireCapture, checks: CheckList, originals: frozense
         scan = scan_for_originals(text, originals)
         worst = ScanResult(
             hits=worst.hits + scan.hits,
+            # Carried, not dropped. Without it `leaks` (= hits - substring_only)
+            # cannot be computed across bodies, which is what made the check below
+            # use the wrong field. `scanned`/`skipped_short` are deliberately NOT
+            # summed: `originals` is the same frozenset for every body, so adding
+            # them would report one session's values N times.
+            substring_only=worst.substring_only + scan.substring_only,
             scanned=scan.scanned,
             skipped_short=scan.skipped_short,
         )
@@ -1184,7 +1190,15 @@ async def dump_wire(capture: WireCapture, checks: CheckList, originals: frozense
     kv("written", str(WIRE_DUMP_PATH))
     checks.record(
         "ZERO originals in the literal HTTP request body (network inspection)",
-        worst.hits == 0 and bool(capture.bodies),
+        # `.leaks`, not `.hits` -- the same field `run_case` asserts on, and the
+        # difference is not cosmetic. `hits` counts every occurrence including one
+        # that appears ONLY inside a longer word, which `ScanResult.detail` itself
+        # explains is not a disclosure (the documented Brown/Browning coincidence).
+        # Asserting `hits == 0` therefore failed `--real --dump-wire` with exit 1 on
+        # something that is not a leak, and the explanation `detail` carries was
+        # printed under a FAIL. This path has no test of its own, which is how the
+        # two halves of the demo drifted apart.
+        worst.leaks == 0 and bool(capture.bodies),
         worst.detail if capture.bodies else "no request bodies were captured",
     )
 

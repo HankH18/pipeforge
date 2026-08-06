@@ -2502,9 +2502,30 @@ def test_no_leak_comparison_in_this_module_bypasses_the_shared_rule() -> None:
     # the byte limb so it could carry the label-column case alone was tried and
     # reverted (see find_in_bytes); deleting either limb on the assumption that the
     # other one covers it is the same mistake in the other direction.
-    run_start = source.index("async def test_no_original_ever_leaves_the_process")
-    for limb in ("find_in_text(originals, audit_json)", "find_in_bytes(originals, harness.audit_bytes())"):
-        assert limb in source[run_start:], (
+    # Anchored on the DEFINITION, with a line-anchored regex rather than `.index`.
+    #
+    # `source.index("async def test_no_original_ever_leaves_the_process")` resolved
+    # to line 2481 -- a string literal inside this function's own earlier assertion
+    # -- and not to the definition at 2604. So `source[run_start:]` began *above*
+    # the tuple below, and each needle matched its own text in that tuple. The
+    # guard could not fail.
+    #
+    # It was also not checking what it said: `find_in_text(originals, audit_json)`
+    # does not appear in the run body at all -- the audit limb calls
+    # `find_in_digit_heavy_text`, which is the digit-floored variant. A guard
+    # anchored correctly but still spelling that needle would go red immediately,
+    # which is how the staleness surfaced.
+    match = re.search(r"^async def test_no_original_ever_leaves_the_process", source, re.M)
+    assert match is not None, "the 100-run body has been renamed; this guard is stale"
+    run_body = source[match.start() :]
+    following = re.search(r"\n(?:async )?def ", run_body[1:])
+    if following is not None:
+        run_body = run_body[: following.start()]
+    for limb in (
+        "find_in_digit_heavy_text(originals, audit_json)",
+        "find_in_bytes(originals, harness.audit_bytes())",
+    ):
+        assert limb in run_body, (
             f"the audit assertion no longer applies {limb} -- the two limbs see "
             "different things and neither is redundant"
         )

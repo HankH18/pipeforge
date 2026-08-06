@@ -3,7 +3,7 @@
    HTML-escaped before it is inserted. Nothing untrusted is ever interpolated raw. */
 'use strict';
 (() => {
-  const S = { sessionId: null, docId: null, uploadKey: null, busy: false };
+  const S = { sessionId: null, lastSessionId: null, docId: null, uploadKey: null, busy: false };
 
   const $ = (id) => document.getElementById(id);
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -11,11 +11,27 @@
   const userId = () => $('user').value.trim() || 'demo-user';
 
   // Emitted surrogate grammar + redaction markers (mirrors surrogates.py).
-  const MARKS_SRC = '\\[(PII|PHI|LEGAL|FIN)_[A-Z][A-Z0-9_]*_[0-9a-f]{8}(?:\\|[a-z0-9-]+)?\\]' +
-    '|\\[REDACTED_[A-Z][A-Z0-9_]*\\]';
+  // Bounded for the same reason TOLERANT_SRC below is -- and this one was NOT in
+  // the audit that found that one; the test asserting the property caught it.
+  // It runs over `result.obfuscated_payload`, which is our own output but is
+  // assembled from document text, so the run lengths are still an uploader's to
+  // choose.
+  const MARKS_SRC = '\\[(PII|PHI|LEGAL|FIN)_[A-Z][A-Z0-9_]{0,63}_[0-9a-f]{8}(?:\\|[a-z0-9-]{1,24})?\\]' +
+    '|\\[REDACTED_[A-Z][A-Z0-9_]{0,63}\\]';
   // Tolerant matcher (mirrors TOKEN_RE) — LLM output mangles brackets and case.
-  const TOLERANT_SRC = '[[{(]?\\s*(?:PII|PHI|LEGAL|FIN)[_-][A-Z][A-Z0-9_]*[_-][0-9a-fA-F]{8}' +
-    '(?:\\s*\\|\\s*[a-z0-9-]+)?\\s*[\\]})]?';
+  //
+  // Every quantifier is BOUNDED, and the bounds are the ones surrogates.py calls
+  // "a security property, not style" — 4 for stray whitespace, 63 for the entity
+  // type body (MAX_ENTITY_TYPE_LEN - 1), 24 for a hint. This comment said it
+  // mirrored TOKEN_RE while using `\s*` and `[A-Z0-9_]*`, i.e. the two unbounded
+  // spellings that grammar exists to avoid, and it is applied to
+  // `result.raw_llm_response` — model output, uncapped. The shipped MockProvider
+  // echoes its input, so a document carrying a long whitespace run comes straight
+  // back: measured, a 128k-character run froze the tab for 26 seconds. No shipped
+  // fixture triggers it (longest whitespace run: 46 characters), which is exactly
+  // why it survived.
+  const TOLERANT_SRC = '[[{(]?\\s{0,4}(?:PII|PHI|LEGAL|FIN)[_-][A-Z][A-Z0-9_]{0,63}[_-][0-9a-fA-F]{8}' +
+    '(?:\\s{0,4}\\|\\s{0,4}[a-z0-9-]{1,24})?\\s{0,4}[\\]})]?';
   const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   // Under pseudonymization the surrogate is a realistic fake ("Christina Palmer"),
@@ -210,11 +226,26 @@
       // destroyed for the user it was created for.
       await api('DELETE', '/sessions/' + encodeURIComponent(S.sessionId) +
         '?user_id=' + encodeURIComponent(userId()));
+      // Kept so the audit panel can still be read after destruction. `loadAudit`
+      // bails on a null `sessionId`, so nulling this was also what made the audit
+      // tail go blank at exactly the moment VAULT_DESTROY lands in it — the one
+      // event the destroy button exists to show.
+      S.lastSessionId = S.sessionId;
       S.sessionId = null;
       $('session-badge').className = 'badge err';
       $('session-badge').textContent = 'session destroyed';
+      // Says what the next run actually demonstrates. It used to promise "the
+      // second run must fail" as though it showed the vault-miss path (build doc
+      // section 9.10) — it does not, and cannot: the request is refused at the
+      // session check (401 SESSION_EXPIRED) before the vault is consulted, so no
+      // VAULT_MISS is reachable from a destroyed session in this architecture.
+      // What it does demonstrate is the erasure itself, which is the stronger
+      // property. See README Deviation 56.
       banner('warn', 'VAULT_DESTROYED',
-        'Session key and vault rows are gone — irreversibly. Press Run again: the second run must fail.');
+        'Session key and vault rows are gone — irreversibly. Press Run again: the ' +
+        'second run is refused with SESSION_EXPIRED before the vault is even ' +
+        'consulted. The audit tail below shows VAULT_DESTROY.');
+      await loadAudit();
     } catch (e) { showError(e); } finally { setBusy(false); }
   }
 
@@ -275,14 +306,20 @@
   }
 
   async function loadAudit(runId) {
-    if (!S.sessionId) return;
+    // Falls back to the destroyed session's ID. `S.sessionId` is null after a
+    // destroy, and bailing on that made the `SESSION_EXPIRED` refresh branch above
+    // dead code AND blanked the panel exactly when VAULT_DESTROY appears in it.
+    // The audit endpoint deliberately does not check liveness, so a destroyed
+    // session's tail is still readable by its owner -- see README Deviation 18.
+    const scope = S.sessionId || S.lastSessionId;
+    if (!scope) return;
     try {
       // user_id is required and is *proved*: the API checks it against the owner
       // recorded in the log at SESSION_CREATE. Without it the log handed any
       // anonymous holder of a run_id the session_id, doc_id and user_id of the
       // run — i.e. both credential pairs it takes to read the original document
       // and to erase the vault.
-      let q = '/audit?session_id=' + encodeURIComponent(S.sessionId) +
+      let q = '/audit?session_id=' + encodeURIComponent(scope) +
         '&user_id=' + encodeURIComponent(userId()) + '&limit=200';
       if (runId) q += '&run_id=' + encodeURIComponent(runId);
       const r = await api('GET', q);
