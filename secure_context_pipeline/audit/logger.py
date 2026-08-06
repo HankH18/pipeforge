@@ -106,15 +106,18 @@ __all__ = [
 # stage a schema change, and the audit log is the last place that should refuse
 # to record something it did not expect.
 #
-# Eleven of the twelve are emitted somewhere in the package. ``SESSION_EXPIRE``
-# is **declared but never emitted**, and that is a real gap rather than a spare
-# constant: TTL lapse is discovered lazily, by the next accessor to ask
-# ``SessionRegistry`` for a key, so the moment a session dies is not a moment any
-# code is running. Logout does emit ``VAULT_DESTROY`` (section 4 step 10), so the
-# explicit teardown path is covered and only the passive one is silent. Closing it
-# means giving the registry a sweeper and an audit handle -- see README Deviations.
-# The constant stays because ``query(event_type=SESSION_EXPIRE)`` returning an
-# empty list is the honest answer, and deleting it would hide the gap instead.
+# All twelve are now emitted. ``SESSION_EXPIRE`` was declared and never emitted for
+# a long time, and the reason it stayed unemitted is worth keeping: TTL lapse is
+# discovered lazily, by the next accessor to ask ``SessionRegistry`` for a key, so
+# the moment a session dies is not a moment any code is running. Logout emitted
+# ``VAULT_DESTROY`` (section 4 step 10), so the explicit teardown path was covered
+# and only the passive one was silent.
+#
+# ``deps.reap_expired_sessions`` closes it: the request that *discovers* an expiry
+# finishes the destruction path and emits both events -- ``SESSION_EXPIRE`` for the
+# death and ``VAULT_DESTROY`` for the teardown it triggered, because an auditor
+# asking "when did this session end, and was it torn down" wants both facts and
+# they are not the same fact.
 # --------------------------------------------------------------------------
 SESSION_CREATE = "SESSION_CREATE"
 DETECT = "DETECT"

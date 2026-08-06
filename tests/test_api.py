@@ -2841,11 +2841,15 @@ async def test_ttl_expiry_runs_the_whole_destruction_path(
 
     assert await services.vault.row_count(session_id) == 0, "vault rows survived expiry"
     assert session_id not in services.vault.cached_session_ids(), "plaintext cache survived"
-    destroys = [
-        e
-        for e in await services.audit.query(session_id=session_id)
-        if e.event_type == "VAULT_DESTROY"
-    ]
+    events = await services.audit.query(session_id=session_id)
+    destroys = [e for e in events if e.event_type == "VAULT_DESTROY"]
     assert destroys, "expiry emitted no VAULT_DESTROY"
     assert destroys[-1].detail["source"] == "ttl_expiry"
+    # And SESSION_EXPIRE, which was declared in `audit/logger.py` from the first
+    # commit and never emitted anywhere -- the gap Deviation 26 records. The two
+    # are different facts (the session died; the vault was torn down) and an
+    # auditor reconstructing a timeline wants both.
+    expires = [e for e in events if e.event_type == "SESSION_EXPIRE"]
+    assert expires, "expiry emitted no SESSION_EXPIRE"
+    assert expires[-1].detail["source"] == "ttl_expiry"
     assert await services.audit.verify_chain() is True

@@ -29,7 +29,12 @@ from secure_context_pipeline.api.constants import (
 )
 from secure_context_pipeline.api.middleware import _caller_key, _limits
 from secure_context_pipeline.api.schemas import MAX_ID_LEN, ErrorResponse
-from secure_context_pipeline.audit.logger import SESSION_CREATE, VAULT_DESTROY, AuditLogger
+from secure_context_pipeline.audit.logger import (
+    SESSION_CREATE,
+    SESSION_EXPIRE,
+    VAULT_DESTROY,
+    AuditLogger,
+)
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.detection.detector import Detector
 from secure_context_pipeline.detection.registry import EntityRegistry
@@ -174,14 +179,23 @@ async def reap_expired_sessions(services: Services) -> list[str]:
     for session_id in expired:
         try:
             await services.vault.destroy(session_id)
-            await services.audit.emit(
-                AuditEvent(
-                    ts=time.time(),
-                    session_id=_clamp(session_id),
-                    event_type=VAULT_DESTROY,
-                    detail={"existed": 1, "source": "ttl_expiry"},
+            # SESSION_EXPIRE first, then VAULT_DESTROY: the passive death and the
+            # teardown it triggers are two facts, and an auditor asking "when did
+            # this session end and was it torn down" wants both. `SESSION_EXPIRE`
+            # was declared in `audit/logger.py` and never emitted anywhere -- the
+            # gap that module's own comment calls "real rather than a spare
+            # constant", and that Deviation 26 records. Emitting it here is what
+            # makes Deviation 54's claim to close it true; it was written before
+            # the event existed.
+            for event_type in (SESSION_EXPIRE, VAULT_DESTROY):
+                await services.audit.emit(
+                    AuditEvent(
+                        ts=time.time(),
+                        session_id=_clamp(session_id),
+                        event_type=event_type,
+                        detail={"existed": 1, "source": "ttl_expiry"},
+                    )
                 )
-            )
         except Exception:
             logger.warning(
                 "expired session could not be fully destroyed",
