@@ -251,15 +251,6 @@ class SessionRegistry:
                 raise SessionExpiredError(session_id=_short(session_id))
             return entry.key
 
-    async def expires_at(self, session_id: str) -> float:
-        """Wall-clock expiry for a live session; same error contract as :meth:`key`."""
-        async with self._lock:
-            self._sweep_locked()
-            entry = self._sessions.get(session_id)
-            if entry is None:
-                raise SessionExpiredError(session_id=_short(session_id))
-            return entry.expires_at
-
     async def owner(self, session_id: str) -> str:
         """The ``user_id`` this session was created for; same error contract as :meth:`key`.
 

@@ -202,15 +202,30 @@ async def test_one_unreadable_page_does_not_lose_the_other_pages() -> None:
     assert "Page two synthetic marker" not in text
 
 
-async def test_a_pdf_whose_only_page_fails_is_empty_text_not_an_error() -> None:
-    """No extractable text is a document with no text, not a rejected upload.
+async def test_a_pdf_whose_only_page_fails_is_an_error_not_an_empty_document() -> None:
+    """A failed page and a scanned page are NOT the same case.
 
-    Same rule a scanned PDF gets: the caller receives ``""`` and can decide, and
-    ``put`` still stores the original bytes.
+    This test asserted they were -- "same rule a scanned PDF gets: the caller
+    receives an empty string" -- and that equivalence is the defect. Both returned
+    ``""``, so a document whose extraction failed completely was indistinguishable
+    from one that genuinely has no text layer, with the only signal a log line.
+    Downstream that means the detector finds nothing, nothing is vaulted, the
+    payload carries no document content, and the pipeline reports a clean
+    successful run over a file it never read -- handing the user a confident answer
+    about a document that was never extracted.
+
+    The two are distinguishable: a scanned page returns ``""`` WITHOUT raising, so
+    the failure count separates them. That control is the second half of this test,
+    so the distinction is pinned rather than the old assertion simply deleted.
     """
-    raw = build_pdf_bytes([["Unreachable synthetic marker"]], broken_pages={0})
+    broken = build_pdf_bytes([["Unreachable synthetic marker"]], broken_pages={0})
+    with pytest.raises(PipelineError) as raised:
+        await extract_text("broken.pdf", broken)
+    assert raised.value.detail["reason"] == "pdf_all_pages_failed"
 
-    assert await extract_text("scan.pdf", raw) == ""
+    # The control: a real PDF with a genuinely empty page still extracts to "".
+    scanned = build_pdf_bytes([[]])
+    assert await extract_text("scan.pdf", scanned) == ""
 
 
 async def test_a_failing_page_is_logged_by_class_name_only(

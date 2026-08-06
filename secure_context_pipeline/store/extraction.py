@@ -226,18 +226,45 @@ def _extract_pdf(content: bytes) -> str:
         ) from None
 
     parts: list[str] = []
+    failed = 0
     for index, page in enumerate(pages):
         try:
             page_text = page.extract_text()
         except Exception as exc:  # one bad page must not lose the whole document
             # Class name only: a pypdf message can quote raw stream bytes.
+            failed += 1
             logger.warning(
                 "pdf page extraction failed (page=%d, error=%s)", index, type(exc).__name__
             )
             page_text = None
         parts.append(page_text or "")
 
-    logger.debug("pdf extracted (pages=%d, bytes=%d)", len(pages), len(content))
+    # A document whose every page FAILED is not an empty document, and returning
+    # "" for both made them indistinguishable to every caller -- the only signal
+    # was a log line nobody reads. That matters here more than it would elsewhere:
+    # empty text means the detector finds nothing, so nothing is vaulted, the
+    # payload carries no document content, and the pipeline reports a clean,
+    # successful run over a file whose contents it never actually read. The user
+    # gets a confident answer about a document that was never extracted.
+    #
+    # A scanned PDF is a genuinely different case and stays supported: its pages
+    # return "" WITHOUT raising, so `failed` is zero and the empty result is a fact
+    # about the document rather than about the parser. Counting failures is what
+    # separates the two, which is why the counter exists rather than a check on the
+    # joined text.
+    #
+    # Partial failure keeps the old behaviour -- some pages are better than none --
+    # but the count now reaches the log line rather than only the per-page warning.
+    if pages and failed == len(pages):
+        raise PipelineError(
+            reason="pdf_all_pages_failed",
+            pages=len(pages),
+            bytes=len(content),
+        )
+
+    logger.debug(
+        "pdf extracted (pages=%d, failed_pages=%d, bytes=%d)", len(pages), failed, len(content)
+    )
     return "\n\n".join(parts)
 
 

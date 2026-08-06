@@ -113,7 +113,20 @@ def load_gazetteer(filename: str) -> dict[str, str]:
         stripped = line.strip()
         if not stripped or stripped.startswith(_COMMENT_PREFIX):
             continue
-        term, _, hint = stripped.partition("\t")
+        # Partitioned on the RAW line, not on `stripped`. The guard below exists to
+        # reject a line whose TERM is empty -- `"\toral-antidiabetic"`, a hint with
+        # no term, which is what a mis-edited TSV row looks like -- and partitioning
+        # the stripped line defeated it: `.strip()` eats the leading tab, so the
+        # HINT was promoted to the term position and silently registered as a
+        # detection term. `oral-antidiabetic` would have become a MEDICATION the
+        # detector matches on. The guard was not dead code to delete; it was a live
+        # guard the line above it had disarmed.
+        #
+        # Latent rather than live on the shipped files -- both gazetteers have zero
+        # leading-tab lines -- but it is the same fail-open-on-a-config-typo class
+        # as the `only_in_doc_categories` defect, and a gazetteer is exactly the
+        # kind of file that gets hand-edited.
+        term, _, hint = line.partition("\t")
         key = normalise_term(term)
         if not key:
             continue

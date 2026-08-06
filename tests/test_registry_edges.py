@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pytest
 
-from secure_context_pipeline.config import Settings
 from secure_context_pipeline.detection import recognizers as recognizers_module
 from secure_context_pipeline.detection import registry as registry_module
 from secure_context_pipeline.detection.recognizers import (
@@ -33,9 +32,8 @@ from secure_context_pipeline.detection.registry import (
     RegistryAction,
     load_registry,
 )
-from secure_context_pipeline.errors import ConfigError, SessionExpiredError
+from secure_context_pipeline.errors import ConfigError
 from secure_context_pipeline.models import EntityCategory
-from secure_context_pipeline.vault.session_registry import SessionRegistry
 
 # A TSV exercising every branch of the gazetteer parser: a comment, a blank line,
 # a normal term, a term with no class column, a term needing whitespace and case
@@ -485,27 +483,31 @@ def test_an_omitted_categories_block_admits_every_category(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-async def test_expires_at_reports_the_deadline_and_then_expires_like_the_key(
-    settings: Settings,
-) -> None:
-    """``expires_at`` must sweep before answering and must be no better an oracle than
-    ``key``: an expired session and a session that never existed have to be
-    indistinguishable, or a caller can enumerate live session IDs through it.
+
+
+def test_a_gazetteer_row_with_no_term_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hint with no term must not become a detection term.
+
+    `load_gazetteer` guards on an empty term, and that guard was unreachable: it
+    partitioned the STRIPPED line, and `.strip()` eats the leading tab that makes a
+    term empty. So `"\\toral-antidiabetic"` -- what a mis-edited TSV row looks like --
+    promoted the HINT into the term position and silently registered
+    `oral-antidiabetic` as a MEDICATION the detector matches on.
+
+    Latent on the shipped files (both have zero leading-tab rows) but the same
+    fail-open-on-a-config-typo class as the `only_in_doc_categories` defect, and a
+    gazetteer is exactly the kind of file that gets hand-edited.
     """
-    clock = FakeClock(1000.0)
-    sessions = SessionRegistry(settings, clock=clock)
+    monkeypatch.setattr(recognizers_module, "GAZETTEER_DIR", tmp_path)
+    recognizers_module._GAZETTEER_CACHE.clear()
+    (tmp_path / "bad.txt").write_text(
+        "metformin\toral-antidiabetic\n\tinsulin-analogue\ninsulin\tinjectable\n",
+        encoding="utf-8",
+    )
 
-    session_id, created_deadline = await sessions.create("alice", ttl_seconds=60)
-    assert created_deadline == 1060.0
-    assert await sessions.expires_at(session_id) == 1060.0
+    table = recognizers_module.load_gazetteer("bad.txt")
 
-    with pytest.raises(SessionExpiredError):
-        await sessions.expires_at("0" * 32)
-
-    clock.advance(61)
-    with pytest.raises(SessionExpiredError):
-        await sessions.expires_at(session_id)
-    with pytest.raises(SessionExpiredError):
-        await sessions.key(session_id)
-    # The TTL sweep is a side effect of the read, not of some background task.
-    assert await sessions.active_ids() == frozenset()
+    assert "insulin-analogue" not in table, "a hint with no term became a detection term"
+    assert table["metformin"] == "oral-antidiabetic"
+    assert table["insulin"] == "injectable"
+    recognizers_module._GAZETTEER_CACHE.clear()
