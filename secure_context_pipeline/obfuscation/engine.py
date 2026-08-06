@@ -539,11 +539,20 @@ class ObfuscationEngine:
         for detection in surviving:
             key = (detection.entity_type, normalize(detection.text))
             best[key] = max(best.get(key, 0.0), detection.score)
+        # The GROUP score decides the band; the SPAN keeps its own score.
+        #
+        # A first version passed `detection.model_copy(update={"score": group_max})`
+        # into `_classify`, and that copy is what flowed on into `_span()`,
+        # `_record()` and the audit `detail={"score": ...}`. Every span of a repeated
+        # value was then stamped with the maximum confidence seen anywhere in the
+        # document for that value, so `SpanOut.score` -- which the UI renders in a
+        # tooltip and the audit trail records -- reported a measurement the detector
+        # never made at that offset. Banding on the group is the intended policy;
+        # rewriting the evidence to match the policy is not.
         planned = [
             self._classify(
-                detection.model_copy(
-                    update={"score": best[(detection.entity_type, normalize(detection.text))]}
-                )
+                detection,
+                band_score=best[(detection.entity_type, normalize(detection.text))],
             )
             for detection in surviving
         ]
@@ -577,8 +586,16 @@ class ObfuscationEngine:
         spec = self._registry.get(entity_type)
         return spec is None or spec.allowed_in(doc_category)
 
-    def _classify(self, detection: Detection) -> _Planned | None:
-        """Registry action first, then the confidence band. No entity names here."""
+    def _classify(self, detection: Detection, *, band_score: float | None = None) -> _Planned | None:
+        """Registry action first, then the confidence band. No entity names here.
+
+        ``band_score`` is the score the BAND is decided on -- the maximum across
+        every sighting of this ``(entity_type, normalized value)``. It defaults to
+        the span's own score so a direct caller keeps the obvious behaviour.
+        ``detection.score`` is left untouched either way, because it is evidence
+        (what the detector measured here) rather than policy (what we do about it),
+        and `_span`, `_record` and the audit detail all read it.
+        """
         action = self._registry.action_of(detection.entity_type)
         if action is RegistryAction.STRIP:
             return _Planned(detection, EntityAction.STRIPPED, _REASON_POLICY_STRIP)
@@ -588,9 +605,10 @@ class ObfuscationEngine:
         threshold = self._registry.threshold_for(
             detection.entity_type, self._settings.threshold_obfuscate
         )
-        if detection.score >= threshold:
+        score = detection.score if band_score is None else band_score
+        if score >= threshold:
             return _Planned(detection, EntityAction.OBFUSCATED, "")
-        if detection.score >= self._settings.threshold_redact:
+        if score >= self._settings.threshold_redact:
             return _Planned(detection, EntityAction.REDACTED, _REASON_LOW_CONFIDENCE)
         # Below the redact floor the detector should already have dropped it;
         # dropping again here keeps the engine correct when called directly.

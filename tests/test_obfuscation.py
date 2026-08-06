@@ -27,10 +27,12 @@ from typing import ClassVar
 import pytest
 from pydantic import ValidationError
 
+from secure_context_pipeline import daterules
 from secure_context_pipeline.api.schemas import MAX_PROMPT_CHARS, PipelineRunRequest
 from secure_context_pipeline.audit.logger import OBFUSCATE, REDACT, STRIP, AuditLogger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import derive_token_id, normalize
+from secure_context_pipeline.daterules import parse_source_date
 from secure_context_pipeline.detection import detector as detector_module
 from secure_context_pipeline.detection.registry import GAZETTEER_DIR, EntityRegistry, EntitySpec
 from secure_context_pipeline.errors import ConfigError, PipelineError, VaultMissError
@@ -4003,3 +4005,98 @@ def test_an_oversized_prompt_is_refused_at_the_schema_boundary() -> None:
 
     # The band the two literals above imply, stated once so the intent is legible.
     assert 2_000 <= MAX_PROMPT_CHARS < 1_000_000
+
+
+async def test_one_value_gets_one_band_across_all_its_sightings(env: Env) -> None:
+    """A repeated value is banded once, on its highest-scoring sighting.
+
+    `_classify` reads one span's score, so a value the detector sees twice at
+    different confidences was banded twice -- tokenized where it scored above the
+    obfuscate threshold and irreversibly `[REDACTED_<TYPE>]` where it scored below,
+    in the SAME payload. Live on `fixtures/medical_note.txt`. It fails safe, but it
+    contradicts the engine's own rule (one vault row, one token, N splices), shows
+    the model two referents for one entity, and costs a restoration.
+
+    Reverting to per-span banding left the whole suite green, so this pins it.
+    """
+    text = "Call 704-555-0151 now. Contact number 704-555-0151 for the ward."
+    low = span(text, "704-555-0151", "PHONE", score=0.40)
+    high = span(text, "704-555-0151", "PHONE", score=0.75)
+    high = high.model_copy(update={"start": text.rindex("704-555-0151")})
+    high = high.model_copy(update={"end": high.start + len("704-555-0151")})
+
+    result = await env.engine.obfuscate(env.session_id, text, [low, high])
+
+    actions = {s.action for s in result.spans}
+    assert actions == {"obfuscated"}, f"one value got two different masks: {actions}"
+    assert "[REDACTED_PHONE]" not in result.obfuscated_text
+    assert len(result.tokens) == 1, "one value, one vault row"
+
+
+async def test_the_band_is_decided_on_the_group_score_but_the_span_keeps_its_own(
+    env: Env,
+) -> None:
+    """Banding is policy; `SpanOut.score` is evidence. They must not be conflated.
+
+    A first version passed a score-rewritten copy into `_classify`, and that copy
+    flowed on into `_span()`, `_record()` and the audit `detail`. Every span of a
+    repeated value was then stamped with the maximum confidence seen anywhere in
+    the document, so the UI tooltip and the audit trail reported a measurement the
+    detector never made at that offset.
+    """
+    text = "Call 704-555-0151 now. Contact number 704-555-0151 for the ward."
+    low = span(text, "704-555-0151", "PHONE", score=0.40)
+    high = span(text, "704-555-0151", "PHONE", score=0.75)
+    high = high.model_copy(update={"start": text.rindex("704-555-0151")})
+    high = high.model_copy(update={"end": high.start + len("704-555-0151")})
+
+    result = await env.engine.obfuscate(env.session_id, text, [low, high])
+
+    scores = sorted(round(s.score, 2) for s in result.spans)
+    assert scores == [0.40, 0.75], (
+        f"spans report {scores}; each must keep the score measured AT that span, "
+        f"not the group maximum"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2024-01-15", "2024-01-15"),
+        ("01/15/2024", "2024-01-15"),
+        ("Jan 15 2024", "2024-01-15"),
+        ("9:15 AM", None),
+        ("10:30", None),
+        ("3:45 pm", None),
+        ("1900", None),
+    ],
+)
+def test_a_date_whose_components_came_from_the_anchor_is_refused(
+    text: str, expected: str | None
+) -> None:
+    """`_parse_fallback`'s two-anchor probe, which nothing pinned.
+
+    The `\\d+`-twice guard rejects a bare year but NOT a bare clock time: `9:15 AM`
+    has two digit runs, neither a date component, so dateutil resolved the whole
+    date from the anchor and the payload asserted a day the source never mentions.
+    Relocating the anchor from *today* to a fixed date moved that lie rather than
+    removing it, and every subsequent clock time collided on the same fabricated
+    date -- three times on one page rendering three incomparable ways.
+
+    No digit heuristic can decide this. Parsing against two anchors that share no
+    field answers it exactly: a component the text supplies is identical both
+    times, one taken from the default differs.
+    """
+    parsed = parse_source_date(text)
+    assert (None if parsed is None else parsed.value.isoformat()) == expected
+
+
+def test_the_two_fallback_anchors_share_no_field() -> None:
+    """The probe's discriminating power rests on this, so it is asserted.
+
+    An anchor sharing even one field with the primary would be blind to a text
+    that omits exactly that field -- the component would agree between the two
+    parses and read as supplied by the source.
+    """
+    a, b = daterules._FALLBACK_ANCHOR, daterules._FALLBACK_PROBE
+    assert a.year != b.year and a.month != b.month and a.day != b.day

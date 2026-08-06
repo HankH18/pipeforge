@@ -1576,3 +1576,34 @@ def test_normalize_keeps_whitespace_controls_as_separators(control: str) -> None
     and, for the EgressGate, a needle that no longer matches its own payload.
     """
     assert normalize(f"John{control}Smith") == "john smith"
+
+
+def test_no_control_this_strips_is_also_whitespace() -> None:
+    """`_CONTROLS` and `_WHITESPACE` must not overlap, by construction.
+
+    They did, on `\\x1c-\\x1f` (FILE/GROUP/RECORD/UNIT separator). Python's `\\s`
+    matches all four -- `"\\x1c".isspace()` is True -- and the control strip runs
+    FIRST, so it won and they were deleted rather than collapsed:
+    `normalize("John\\x1cSmith")` was `"johnsmith"`, two words glued into a
+    different value. That is precisely the failure `_CONTROLS`' own comment warns
+    about, committed by the class the comment sits on.
+
+    Quantified over the whole range rather than over the three characters the old
+    comment happened to name, because a hand-listed exclusion is what went wrong.
+    """
+    overlap = [
+        f"U+{code:04X}"
+        for code in range(0x110000)
+        if code < 0x100 and keys._CONTROLS.match(chr(code)) and keys._WHITESPACE.match(chr(code))
+    ]
+    assert overlap == [], (
+        f"{overlap} are matched by BOTH classes; the control strip runs first, so "
+        f"they are deleted instead of collapsed to a space -- gluing two words into "
+        f"a value the document never contained"
+    )
+
+
+@pytest.mark.parametrize("control", ["\x1c", "\x1d", "\x1e", "\x1f"])
+def test_the_separator_controls_collapse_rather_than_glue(control: str) -> None:
+    """The four that were wrong, as named regressions."""
+    assert normalize(f"John{control}Smith") == "john smith"

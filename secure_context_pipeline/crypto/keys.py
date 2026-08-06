@@ -83,10 +83,19 @@ _WHITESPACE = re.compile(r"\s+")
 
 #: C0 and C1 control characters that are **not** whitespace. Removed by
 #: :func:`normalize`; see its docstring for why this is an availability fix. The
-#: whitespace controls (``\t``, ``\n``, ``\r``, ``\v``, ``\f``, U+0085) are excluded
-#: from the class deliberately -- ``_WHITESPACE`` collapses those to a space, and
-#: deleting them instead would silently glue two words together.
-_CONTROLS = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x84\x86-\x9f]")
+#: whitespace controls are excluded from the class deliberately -- ``_WHITESPACE``
+#: collapses those to a space, and deleting them instead would silently glue two
+#: words together.
+#:
+#: The exclusion is defined by what ``_WHITESPACE`` actually matches, not by a
+#: hand-listed three. ``\t \n \r \v \f`` and U+0085 were named and excluded; the
+#: FILE/GROUP/RECORD/UNIT separators ``\x1c-\x1f`` were not, and Python's ``\s``
+#: matches all four (``'\x1c'.isspace()`` is True). Because the control strip runs
+#: FIRST, it won: ``normalize('John\x1cSmith')`` was ``'johnsmith'`` -- two words
+#: glued into a different value, which is exactly the failure this comment warns
+#: about, committed by the class the comment sits on. Pinned by
+#: ``test_no_control_this_strips_is_also_whitespace``.
+_CONTROLS = re.compile(r"[\x00-\x08\x0e-\x1b\x7f-\x84\x86-\x9f]")
 
 
 def _hkdf(ikm: bytes, info: bytes) -> bytes:
