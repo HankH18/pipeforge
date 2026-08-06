@@ -173,6 +173,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Iterable, Sequence
+from itertools import groupby
 from typing import Final, NamedTuple, Protocol
 
 from secure_context_pipeline.audit.logger import EGRESS_BLOCK, EGRESS_PASS, AuditLogger
@@ -181,7 +182,11 @@ from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.errors import MAX_DETAIL_VALUE_LEN, EgressBlockedError
 from secure_context_pipeline.models import AuditEvent, Detection, EgressReport
 from secure_context_pipeline.surrogates import REDACTION_RE, STRICT_TOKEN_RE
-from secure_context_pipeline.textrules import delimited_parts, occurs_as_a_unit
+from secure_context_pipeline.textrules import (
+    boundary_guards,
+    delimited_parts,
+    occurs_as_a_unit,
+)
 
 __all__ = [
     "AUDIT_EMIT_TIMEOUT_S",
@@ -189,6 +194,7 @@ __all__ = [
     "HIGH_SEVERITY_TYPES",
     "MIN_IDENTIFIER_DIGITS",
     "MIN_IDENTIFIER_RUN_DIGITS",
+    "MIN_JOINED_ALNUM_LEN",
     "MIN_ORIGINAL_LEN",
     "EgressGate",
 ]
@@ -271,6 +277,24 @@ MIN_IDENTIFIER_DIGITS: Final = 7
 #: ``test_no_shipped_identifier_pattern_can_match_below_the_gate_s_run_floor`` (the
 #: registry and this constant can no longer disagree without a red).
 MIN_IDENTIFIER_RUN_DIGITS: Final = 6
+
+#: How many letters an **all-alphabetic, multi-component** original must have, once
+#: its separators are removed, before :func:`_separator_needles` compares it as a bare
+#: substring. An all-digit join reuses :data:`MIN_IDENTIFIER_DIGITS` instead -- "how
+#: much digit content makes a string specific enough to compare unbounded" is a
+#: question that constant already answers, and a second number for it would drift
+#: apart from the first. A join that MIXES letters and digits gets no needle at all;
+#: see :func:`_separator_needles` for why that case is the dangerous one.
+#:
+#: Eight is chosen against the payload projection this needle is compared to, which is
+#: the whole payload with every non-alphanumeric character removed -- so every word is
+#: glued to its neighbours and short needles acquire landing sites that the document
+#: never wrote. ``John Smith`` joins to nine characters and is covered; ``Jo Ann``
+#: joins to five, would match inside ``joanna``, and is not. That is a real residual
+#: and it is the same one :data:`MIN_ORIGINAL_LEN` accepts for short values: a
+#: two-component value whose components are both very short keeps only the four
+#: bounded forms.
+MIN_JOINED_ALNUM_LEN: Final = 8
 
 #: Wall-clock budget for one whole ``check()``. Exceeding it blocks, because a
 #: detector that never returns is indistinguishable from one that has not finished
@@ -591,6 +615,9 @@ class EgressGate:
             if any(needle in payload_skeleton for needle in _identifier_needles(folded)):
                 hits += 1
                 continue
+            if _occurs_with_flexible_separator(folded, payload_skeleton):
+                hits += 1
+                continue
             if any(
                 _occurs_in_any_bounded_form(part, haystacks)
                 for part in _composite_needles(original)
@@ -666,7 +693,38 @@ class EgressGate:
         blocked: list[str] = []
         warnings = 0
         for det in detections:
-            if det.score < self._settings.threshold_obfuscate:
+            # Two different questions, and they had one threshold between them.
+            #
+            # A high-severity re-hit is a *deny* decision, so it is floored at
+            # ``threshold_redact`` -- the lowest score at which this pipeline
+            # considers a span worth acting on at all. Everything else is a
+            # *warning*, and stays at ``threshold_obfuscate``.
+            #
+            # Using ``threshold_obfuscate`` for both was a live release, not a
+            # style point. It is the same number the engine bands on, so the two
+            # blind spots coincided exactly: a value scoring in
+            # ``[redact, obfuscate)`` is redacted (hence never vaulted, so pass 1
+            # has no needle) and was then dropped here for the same numeric
+            # reason. Measured on the shipped detector and registry: Presidio's
+            # ``UsSsnRecognizer`` scores a bare nine-digit run at 0.05 and the
+            # context enhancer floors a context-boosted hit at 0.40, so
+            # ``Member SSN 452189376 verified against payer records.`` is typed
+            # ``SSN@0.40`` -- and this gate released it while its own detector
+            # said SSN. The perverse part is the direction: the more clearly the
+            # document labelled the SSN, the less protected it was.
+            #
+            # The floor is ``threshold_redact`` rather than zero on purpose. An
+            # unlabelled nine-digit run scores 0.05, and blocking on that would
+            # deny every payload containing any nine-digit number -- an invoice
+            # line, a part number -- while adding nothing: at 0.05 the detector is
+            # not claiming it is an SSN. Pinned by
+            # ``test_a_high_severity_hit_in_the_redact_band_blocks``.
+            floor = (
+                self._settings.threshold_redact
+                if det.entity_type in self._high_severity
+                else self._settings.threshold_obfuscate
+            )
+            if det.score < floor:
                 continue
             if _overlaps(det.start, det.end, protected):
                 continue
@@ -1045,6 +1103,13 @@ def _occurs_in_any_bounded_form(value: str, haystacks: _Haystacks) -> bool:
 _DIGIT_RUN_RE = re.compile(rf"[0-9]{{{MIN_IDENTIFIER_RUN_DIGITS},}}")
 _ANY_DIGIT_RE = re.compile(r"[0-9]")
 
+#: What :func:`_separator_needles` allows *between* two components of a
+#: multi-component original: any run of non-alphanumeric characters, including none
+#: at all. Spelled ``[\W_]`` rather than ``\W`` because ``\W`` treats underscore as a
+#: word character, and underscore is one of the substitutions demonstrated to walk a
+#: value out -- here it has to count as a separator, not as content.
+_INTERIOR_SEPARATOR: Final = r"[\W_]*"
+
 
 def _identifier_needles(value: str) -> tuple[str, ...]:
     """Forms of ``value`` that disclose it **whatever they are glued to**.
@@ -1123,6 +1188,132 @@ def _identifier_needles(value: str) -> tuple[str, ...]:
         needles.append(stripped)
     needles.extend(_DIGIT_RUN_RE.findall(stripped))
     return tuple(dict.fromkeys(needles))
+
+
+def _alnum_only(value: str) -> str:
+    """``value`` reduced to its letters and digits. Applied to BOTH sides.
+
+    Symmetric, unlike :func:`_deaccent`, and it has to be: the whole point is that
+    the two sides disagree about the separator, so neither side's spelling of it can
+    be trusted.
+    """
+    return "".join(ch for ch in value if ch.isalnum())
+
+
+def _separator_needles(value: str) -> tuple[str, ...]:
+    """The components of a MULTI-COMPONENT original, joined with nothing.
+
+    **The shape this closes, which the four bounded forms could not see.** All four
+    compare a needle that keeps its interior separator against a payload that has
+    changed it. ``Marguerite Vandenberg`` was vaulted from a clean mention; the
+    payload carried ``Marguerite<U+200B>Vandenberg``; and every form missed:
+
+    * *raw* -- different bytes;
+    * *normalised* -- U+200B is not ``\\s``, so collapsing whitespace does not touch
+      it and the needle still carries a space the haystack does not;
+    * *folded* -- stripping the invisible **glues the two words together**
+      (``margueritevandenberg``) while the needle still says ``marguerite
+      vandenberg``;
+    * *skeleton* -- same, plus mark-stripping, which is not the difference here.
+
+    It is worth being exact about the mechanism, because the first diagnosis was that
+    the fold *caused* the miss and that is wrong: deleting the space outright, or
+    writing ``-``, ``_`` or ``.`` in its place, all miss identically and none of them
+    involves the fold. The real property is that **any alteration of a multi-word
+    original's interior separator defeats every form that keeps the separator in the
+    needle.** So this form keeps none of it, on either side.
+
+    That is also why the obvious repair -- strip ``\\s`` from both sides and keep the
+    word-boundary rule -- does not work. Removing the separator makes the neighbours
+    alphanumeric, so :func:`_occurs_as_a_unit` then rejects the very match it was
+    asked to find (``...MargueriteVandenbergRN...``). This comparison is therefore
+    unbounded, and the floors below are what pay for that.
+
+    **The outer word boundaries are kept, and only the INTERIOR separator is
+    relaxed.** That distinction is the whole design, and the first version of this
+    function got it wrong in a way this repository had already paid for once. Dropping
+    the boundaries entirely -- comparing a fully joined needle against a fully joined
+    payload -- does close the demonstrated leak, and it also re-opens two false
+    positives the module docstring and
+    ``test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims``
+    both name explicitly: ``chronic low back pain`` matching inside ``chronic low back
+    pains``, and ``John Smith`` inside ``xJohn Smithx``. The plural one is the
+    instructive one, because it is not exotic -- fixture originals include ordinary
+    clinical phrases, and a red that appears and vanishes between runs is
+    indistinguishable from a real leak until somebody spends an hour on it.
+
+    With the outer boundaries kept, every one of those resolves correctly, because in
+    each the *neighbour* is alphanumeric rather than the *separator* being different:
+
+    * ``Marguerite<U+200B>Vandenberg RN`` -- interior separator changed, outer
+      neighbours are ``:`` and a space. **Blocks**, which is the leak this closes.
+    * ``chronic low back pains`` -- separators intact, a letter follows the last
+      component. **Does not block.**
+    * ``xJohn Smithx`` -- separators intact, letters on both outer edges. **Does not
+      block**, so the second declared boundary is unchanged rather than quietly
+      rewritten.
+    * ``Filed 03/12/850`` against ``03/12/85``, and ``$1,234.567`` against
+      ``$1,234.56`` -- a digit follows. **Does not block**, which is what lets this
+      limb accept mixed letter-and-digit values that a joined comparison had to
+      exclude for prefix collisions (``1:23-cv-045678`` no longer threatens
+      ``1:23-cv-04567``).
+
+    **What it catches beyond the demonstrated case**, all measured: a vaulted
+    ``512-24-8710`` against a bare ``512248710``; ``5,567,281`` against ``5567281``;
+    ``MRN: 5567281`` against ``MRN 5567281``. Those are separator *variants* of an
+    identifier, which :func:`_identifier_needles` covers only when a single contiguous
+    run already clears its floor.
+
+    Returns a **pattern source string**, not a literal, because "any separator or
+    none" is not expressible as a substring. It is the one needle in pass 1 with no
+    ``in`` pre-filter available, so it is applied last and only to values that reached
+    it -- see :meth:`EgressGate._scan_originals`.
+    """
+    stripped = value.strip()
+    # Split on the SAME predicate the pattern below rejoins on, via groupby rather
+    # than a regex: `\w` and `str.isalnum()` disagree at the edges (underscore, some
+    # marks), and a needle built by one rule from a split made by the other is the
+    # kind of quiet divergence this module keeps finding in itself.
+    parts = ["".join(run) for keep, run in groupby(stripped, key=str.isalnum) if keep]
+    if len(parts) < 2:
+        # Single component: there is no interior separator to alter, so the bounded
+        # forms already cover it and there is nothing for this limb to add.
+        return ()
+    if len(_alnum_only(stripped)) < MIN_JOINED_ALNUM_LEN:
+        return ()
+    # Guards come from `textrules`, the module that owns the single definition of
+    # "as a unit" -- not restated here. Every component begins and ends alphanumeric
+    # by construction (that is what groupby split on), so both guards are always
+    # meaningful and `boundary_guards` is asked about the components rather than
+    # about the original, whose own edges may be punctuation.
+    left, right = boundary_guards(parts[0][0]), boundary_guards(parts[-1][-1])
+    return (left[0] + _INTERIOR_SEPARATOR.join(re.escape(p) for p in parts) + right[1],)
+
+
+def _occurs_with_flexible_separator(value: str, haystack: str) -> bool:
+    """``value`` present in ``haystack`` with its interior separators spelled anyhow.
+
+    The applied form of :func:`_separator_needles`, and the only thing that should
+    call it: the pattern that function returns has no substring pre-filter of its own,
+    and applying it directly to a large originals set is a measurable regression
+    rather than a theoretical one. ``test_a_long_pass_one_does_not_stall_unrelated
+    _coroutines`` drives 60k originals through pass 1 and went from passing to a
+    ``gate_exception`` timeout the moment the raw ``re.search`` was added.
+
+    The pre-filter is exact, not heuristic: the pattern requires every component to be
+    present as a literal, in order, so the absence of **any one** of them is a
+    sufficient reject. The longest component is used because it is the most selective,
+    and one C-level ``in`` rejects the overwhelmingly common miss before the regex
+    engine is entered at all -- the same trick, for the same reason, as
+    :func:`~secure_context_pipeline.textrules.occurs_as_a_unit`.
+    """
+    patterns = _separator_needles(value)
+    if not patterns:
+        return False
+    parts = ["".join(run) for keep, run in groupby(value.strip(), key=str.isalnum) if keep]
+    if max(parts, key=len) not in haystack:
+        return False
+    return any(re.search(pattern, haystack) for pattern in patterns)
 
 
 def _composite_needles(value: str) -> tuple[str, ...]:

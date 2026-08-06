@@ -209,6 +209,7 @@ from secure_context_pipeline.pipeline.egress_gate import (
     _composite_needles,
     _deaccent,
     _identifier_needles,
+    _occurs_with_flexible_separator,
     _strip_invisible,
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
@@ -708,6 +709,14 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
         if (
             bounded(original)
             or any(needle in skeleton_hay for needle in _identifier_needles(folded))
+            # The separator-invariant limb. Mirrors the gate's fifth comparison:
+            # a multi-component original whose interior separator the payload
+            # spells differently -- or not at all -- defeats all four bounded
+            # forms, because every one of them keeps the separator in the needle.
+            # Without this limb the harness is weaker than the gate, and
+            # ``test_the_harness_is_never_weaker_than_the_gate_on_generated_input``
+            # is what says so out loud.
+            or _occurs_with_flexible_separator(folded, skeleton_hay)
             or any(bounded(part) for part in _composite_needles(original))
         ):
             found.append(original)
@@ -2238,11 +2247,24 @@ _GLUED = (
 #: An entry here is a suppression somebody signed for; a suppression that is *not* here
 #: is a spec error, and that is what the test below is looking for.
 _DECLINED_BY_DESIGN: dict[tuple[str, str], str] = {
+    # Every pair here still holds after the separator-invariant limb was added, and
+    # that is a deliberate property of the limb rather than a coincidence: it relaxes
+    # the separator BETWEEN a value's components and keeps the word boundaries at its
+    # outer edges, so glue -- which is an alphanumeric NEIGHBOUR, not a different
+    # separator -- is still declined. An earlier draft dropped the outer boundaries
+    # too; it removed the ten `John Smith`/`ada.brown@example.com` rows below and
+    # simultaneously re-manufactured the `chronic low back pain` plural false
+    # positive this module already names. See `_separator_needles`.
     ("John Smith", "xJohn Smith"): _GLUED,
     ("John Smith", "John Smithx"): _GLUED,
     ("John Smith", "xJohn Smithx"): _GLUED,
     ("John Smith", "1John Smith"): _GLUED,
     ("John Smith", "John Smith1"): _GLUED,
+    ("ada.brown@example.com", "xada.brown@example.com"): _GLUED,
+    ("ada.brown@example.com", "ada.brown@example.comx"): _GLUED,
+    ("ada.brown@example.com", "xada.brown@example.comx"): _GLUED,
+    ("ada.brown@example.com", "1ada.brown@example.com"): _GLUED,
+    ("ada.brown@example.com", "ada.brown@example.com1"): _GLUED,
     ("Brown", "xBrown"): _GLUED,
     ("Brown", "Brownx"): _GLUED,
     ("Brown", "xBrownx"): _GLUED,
@@ -2256,11 +2278,6 @@ _DECLINED_BY_DESIGN: dict[tuple[str, str], str] = {
     ("Case No. 3:24-cv-01188", "xCase No. 3:24-cv-01188x"): _GLUED,
     ("Case No. 3:24-cv-01188", "1Case No. 3:24-cv-01188"): _GLUED,
     ("Case No. 3:24-cv-01188", "Case No. 3:24-cv-011881"): _GLUED,
-    ("ada.brown@example.com", "xada.brown@example.com"): _GLUED,
-    ("ada.brown@example.com", "ada.brown@example.comx"): _GLUED,
-    ("ada.brown@example.com", "xada.brown@example.comx"): _GLUED,
-    ("ada.brown@example.com", "1ada.brown@example.com"): _GLUED,
-    ("ada.brown@example.com", "ada.brown@example.com1"): _GLUED,
     ("HbA1c of 8.2", "xHbA1c of 8.2"): _GLUED,
     ("HbA1c of 8.2", "HbA1c of 8.2x"): _GLUED,
     ("HbA1c of 8.2", "xHbA1c of 8.2x"): _GLUED,

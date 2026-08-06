@@ -231,6 +231,16 @@ class ObfuscationEngine:
                 )
                 redactions.append(_record(detection))
                 spans.append(_span(detection, EntityAction.REDACTED, None))
+                # A confidence-band redaction is still a VALUE the detector typed,
+                # and it gets no vault row -- which used to leave the EgressGate
+                # with no needle for it while pass 2 dropped it for the same
+                # numeric reason. Hand it to the gate as an unrestorable needle.
+                # Policy redactions (`action: redact`, e.g. CASE_STRATEGY) are
+                # deliberately excluded: that span is prose, not a value, and its
+                # phrasing recurs in ordinary text. See
+                # ``SessionVault.note_unrestorable``.
+                if item.reason == _REASON_LOW_CONFIDENCE:
+                    self._vault.note_unrestorable(session_id, detection.text)
                 continue
             record = records[(detection.entity_type, normalize(detection.text))]
             replacements.append(

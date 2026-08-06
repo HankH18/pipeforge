@@ -3240,7 +3240,19 @@ async def test_per_entity_threshold_override_is_honoured(env: Env) -> None:
     assert result.tokens == []
     # Redaction above the redact floor is irreversible by design: no vault row.
     assert await env.vault.row_count(env.session_id) == 0
-    assert env.vault.originals_for_session(env.session_id) == frozenset()
+    # ... and irreversible is asserted directly rather than inferred from the
+    # originals set. This assertion used to read `originals_for_session(...) ==
+    # frozenset()`, and that was the *leak* written down as the contract: a
+    # redact-band value got no row, so the EgressGate had no needle for it, while
+    # pass 2 dropped the same value for the same numeric reason (both banded on
+    # threshold_obfuscate). Both payload-side passes were therefore switched off
+    # over exactly the band that produces un-vaulted values, and a real SSN reached
+    # the provider byte-for-byte. The value is now handed to the gate as an
+    # unrestorable needle; build doc section 9.2's "no vault entry" is what the
+    # three checks below pin, and section 9.4 documents this set as the gate's.
+    assert env.vault.originals_for_session(env.session_id) == frozenset({"123-45-6789"})
+    assert await env.vault.get_by_original(env.session_id, "SSN", normalize("123-45-6789")) is None
+    assert env.vault.surrogates_for_session(env.session_id) == {}
 
 
 # ---------------------------------------------------------------------------

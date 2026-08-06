@@ -121,6 +121,13 @@ class _SessionCache:
     by_surrogate: dict[str, str] = field(default_factory=dict)
     by_original: dict[tuple[str, str], TokenRecord] = field(default_factory=dict)
     originals: set[str] = field(default_factory=set)
+    #: Values this session decided were sensitive but deliberately did **not**
+    #: tokenize -- the redact band. They carry no token ID, no surrogate and no
+    #: row, so nothing here is restorable and nothing here is written to disk;
+    #: the set exists so that :meth:`SessionVault.originals_for_session` can hand
+    #: the EgressGate a needle for a value the pipeline already judged sensitive.
+    #: See :meth:`SessionVault.note_unrestorable` for why that gap was a leak.
+    gate_only: set[str] = field(default_factory=set)
     #: Memoised immutable view handed to the EgressGate; invalidated on write.
     _view: frozenset[str] | None = field(default=None, init=False, repr=False)
     #: Memoised immutable view of ``by_surrogate``; invalidated on write. Separate
@@ -166,11 +173,25 @@ class _SessionCache:
         existing = self.by_token.get(token_id)
         return existing is not None and existing != original
 
+    def add_gate_only(self, original: str) -> None:
+        """Record a sensitive value that gets no token, no surrogate and no row."""
+        if original in self.gate_only:
+            return
+        self.gate_only.add(original)
+        self._view = None
+
     def view(self) -> frozenset[str]:
-        """Immutable snapshot of the originals. O(1) except for the first read after a write."""
+        """Immutable snapshot of the originals. O(1) except for the first read after a write.
+
+        The union of the tokenized originals and the redact-band values: both are
+        things this session judged sensitive, and the gate's question is "did a
+        sensitive value reach the payload", not "did a *restorable* one".
+        ``by_token``/``by_surrogate`` deliberately do not see ``gate_only``, so no
+        redact-band value is ever restorable through any lookup.
+        """
         cached = self._view
         if cached is None:
-            cached = frozenset(self.originals)
+            cached = frozenset(self.originals | self.gate_only)
             self._view = cached
         return cached
 
@@ -484,6 +505,57 @@ class SessionVault:
         if cache is None:
             return frozenset()
         return cache.view()
+
+    def note_unrestorable(self, session_id: str, original: str) -> None:
+        """Tell the gate about a value the engine redacted rather than tokenized.
+
+        **Synchronous, cache-only, and deliberately not a ``put``.** No token ID is
+        derived, no surrogate is issued, no ciphertext is written and no row is
+        created, so this adds nothing to any restore path: ``get_by_token``,
+        ``get_by_surrogate`` and ``get_by_original`` cannot see it, and the build
+        doc's "no vault entry" rule for the redact band (section 9.2) still holds
+        exactly. The only observable effect is that
+        :meth:`originals_for_session` returns one more needle.
+
+        It exists because the two blind spots coincided. A detection scoring in
+        ``[threshold_redact, threshold_obfuscate)`` is redacted, and ``_group``
+        skips anything that is not ``OBFUSCATED``, so it got no row -- which meant
+        pass 1 had nothing to look for. Pass 2 then dropped the same value for the
+        same numeric reason (it re-scans at ``threshold_obfuscate``). So over
+        precisely the band that produces un-vaulted values, *both* payload-side
+        passes were switched off. Measured on the real detector: ``Member SSN
+        452189376 verified against payer records.`` scores ``SSN@0.40``, was
+        redacted at its labelled mention, and the same nine digits then reached the
+        provider byte-for-byte inside ``ledgerref452189376x`` with the gate
+        reporting clean.
+
+        Scoped to *values*, not prose: the engine calls this for confidence-band
+        redactions only, never for ``action: redact`` policy spans like
+        ``CASE_STRATEGY``. A strategy sentence is free text whose phrasing
+        legitimately recurs, so scanning for it would block on ordinary prose
+        while buying nothing -- the value it protects is the *sentence*, and the
+        sentence is what got replaced. See ``ObfuscationEngine._plan``.
+
+        Dies with the session: this lives in the cache ``destroy()`` drops, so a
+        destroyed session contributes nothing and cannot be resurrected by a late
+        call -- the ``_destroyed`` guard is the same one ``put`` uses for the
+        write that loses the race with logout.
+
+        It *creates* the cache when there is none, and that is load-bearing rather
+        than incidental: the cache is otherwise only ever created by ``put``, so a
+        document whose every detection landed in the redact band -- exactly the
+        case this method exists for -- had no cache at all, and an earlier version
+        of this method returned silently and left the leak open.
+
+        Unlike ``put`` this cannot await the registry to re-validate the session,
+        because the EgressGate needs the read side to stay synchronous. The caller
+        is the engine, which has already awaited ``sessions.key(session_id)``
+        before any of this runs, so the session is live by construction.
+        """
+        if session_id in self._destroyed:
+            return
+        cache = self._caches.setdefault(session_id, _SessionCache())
+        cache.add_gate_only(original)
 
     def surrogates_for_session(self, session_id: str) -> Mapping[str, str]:
         """``surrogate -> original`` for this session. **Synchronous, amortised O(1).**
