@@ -4036,3 +4036,71 @@ async def test_the_separator_limb_blocks_plain_ascii_variance(
     with pytest.raises(EgressBlockedError) as raised:
         await gate.check(spelling, "sess-sep")
     assert raised.value.detail["reason"] == "vault_original"
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [
+        # Escapes, not literals -- these are the characters the fold removes, and a
+        # literal one here is indistinguishable from a backtick to the next reader
+        # of the test that distinguishes them. Same rule as `_INVISIBLE_RE`'s source.
+        "\u00b4",  # ACUTE ACCENT
+        "\u00a8",  # DIAERESIS
+        "\u00af",  # MACRON
+        "\u02d8",  # BREVE
+        "\u02da",  # RING ABOVE
+    ],
+)
+@pytest.mark.parametrize("vaulted", ["Nathaniel Brightwater", "MRN 5567281"])
+async def test_a_spacing_diacritic_spliced_into_a_value_is_blocked(
+    tmp_path: Path, vaulted: str, mark: str
+) -> None:
+    """The sibling of the combining-mark splice, which `_deaccent` could not close.
+
+    Not an oversight but an ordering problem: by the time `_deaccent` runs, NFKC has
+    already expanded a spacing diacritic into a SPACE plus a combining mark, so
+    folding the mark leaves the space behind and the value stays broken. Measured on
+    the real gate before the fix: a vaulted `Nathaniel Brightwater` and a vaulted
+    `MRN 5567281` both reached the provider through four spacing marks while the
+    combining-mark control blocked -- and README declared this shape CLOSED.
+
+    The class is defined by compatibility decomposition (`<compat> 0020 <mark>`)
+    rather than a hand-picked list, so a codepoint a future Unicode release adds is
+    covered the day it lands.
+    """
+    spliced = vaulted[:5] + mark + vaulted[5:]
+    gate = EgressGate(
+        vault=FakeVault({vaulted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(f"Countersigned: {spliced} RN", "sess-spacing")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+async def test_a_modifier_letter_without_a_diacritic_decomposition_is_not_covered(
+    tmp_path: Path,
+) -> None:
+    """The boundary of the fix above, asserted so it cannot be over-read.
+
+    U+02C8 MODIFIER LETTER VERTICAL LINE is `Lm` with no compatibility
+    decomposition, so it is not a spacing *diacritic* and this fold does not remove
+    it. It draws a mark-like glyph, which puts it in the same class as the declared
+    homoglyph boundary -- catching it needs a confusables table, not another
+    normalisation form.
+
+    If this test ever fails, the gate has gained confusables handling and the
+    README's boundary list must lose an entry the same day.
+    """
+    gate = EgressGate(
+        vault=FakeVault({"Nathaniel Brightwater"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    report = await gate.check(
+        "Countersigned: Natha\u02c8niel Brightwater RN", "sess-spacing"
+    )
+    assert report.originals_scanned == 1, "premise: the original was in scope"

@@ -182,7 +182,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1637 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1652 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
@@ -231,7 +231,7 @@ transient fault would have wedged every subsequent write.
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2979 originals vaulted and scanned, 2422 surrogates round-tripped)
+          (2981 originals vaulted and scanned, 2426 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the
@@ -248,7 +248,7 @@ the assertion and the denominator as the thing that proves the assertion was act
 The two tallies beside it behave differently from each other, and the difference is worth stating
 precisely rather than describing both as "reproducible":
 
-- **2,979 originals** is stable for a given commit. Document seeds are fixed, so the same 100
+- **2,981 originals** is stable for a given commit. Document seeds are fixed, so the same 100
   documents carry the same values, and this number only moves when detection changes. Observed
   identical on every run of the current build.
 - **The surrogate round-trip count is not stable and is not a fingerprint of the build.** Two
@@ -415,9 +415,21 @@ rather than a silent widening of the claim:
   legitimately says `Jose` still does not match a vaulted `José` — the needle keeps its accent.
   Pinned by `test_egress_gate.py::test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider`
   and `integration/test_pipeline.py::test_a_combining_mark_spliced_into_a_name_never_reaches_the_provider`.
-  The residual is narrower and stated: a vaulted value that *itself* carries a mark (`José Ruiz`)
-  is not protected against a *second* mark being spliced into it, because the needle is never
-  stripped. Closing that needs the same confusables table the homoglyph gap needs.
+  **The first version of this closure covered only *combining* marks, and that was narrower than
+  it read.** A *spacing* diacritic — U+00B4 ACUTE ACCENT, U+00A8 DIAERESIS and the rest of the
+  modifier block — draws the same glyph and walked straight through, on the real gate, for a
+  vaulted name *and* a vaulted MRN. The cause was ordering rather than oversight: NFKC expands a
+  spacing diacritic into a **space** plus a combining mark, so folding the mark afterwards leaves
+  the space behind and the value stays broken. The skeleton form is now derived from the raw
+  payload with those characters removed first, and the class is defined by compatibility
+  decomposition (`<compat> 0020 <mark>`) rather than a hand-picked list.
+
+  Two residuals, both stated rather than implied. A vaulted value that *itself* carries a mark
+  (`José Ruiz`) is not protected against a *second* mark being spliced into it, because the
+  needle is never stripped. And a modifier *letter* with no diacritic decomposition — U+02C8
+  MODIFIER LETTER VERTICAL LINE — is not in the class and is not removed; it belongs with the
+  homoglyph boundary below, and closing it needs the same confusables table. Both are pinned by
+  tests that go red the day either changes.
 - **Homoglyphs.** Cyrillic `о` for Latin `o` needs a confusables table, not another
   normalisation form. Out of scope in the gate for the same reason.
 

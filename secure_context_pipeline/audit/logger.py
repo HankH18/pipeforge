@@ -1026,11 +1026,15 @@ def _reject_content_sized_fields(event: AuditEvent) -> None:
                 field=key[:MAX_DETAIL_VALUE_LEN],
                 length=len(key),
             )
-        if isinstance(detail_value, str) and len(detail_value) > MAX_DETAIL_VALUE_LEN:
+        # Rendered width, every type -- see `AuditEvent._reject_long_values`. This is
+        # the write boundary, reachable with an event built by `model_construct`,
+        # which skips the model validator entirely; a ceiling enforced in only one of
+        # the two places is a ceiling the other path does not have.
+        if len(str(detail_value)) > MAX_DETAIL_VALUE_LEN:
             raise PipelineError(
                 reason="audit_detail_exceeds_ceiling",
                 field=key[:MAX_DETAIL_VALUE_LEN],
-                length=len(detail_value),
+                length=len(str(detail_value)),
             )
 
 

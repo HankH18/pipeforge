@@ -596,7 +596,11 @@ class EgressGate:
         """
         payload_norm = normalize(payload)
         payload_folded = _strip_invisible(payload_norm)
-        payload_skeleton = _deaccent(payload_folded)
+        # The skeleton is derived from the RAW payload with spacing diacritics
+        # removed first -- see `_strip_spacing_marks` for why the order matters.
+        # NFKC expands one into a space plus a combining mark, so folding the mark
+        # afterwards leaves the space and the value stays broken.
+        payload_skeleton = _deaccent(_strip_invisible(normalize(_strip_spacing_marks(payload))))
         haystacks = _Haystacks(
             raw=payload,
             normalized=payload_norm,
@@ -1024,6 +1028,41 @@ _INVISIBLE_RE = re.compile(
 
 def _strip_invisible(value: str) -> str:
     return _INVISIBLE_RE.sub("", value)
+
+
+#: Characters that RENDER as a diacritic but are not combining marks -- U+00B4
+#: ACUTE ACCENT, U+00A8 DIAERESIS, U+02D8 BREVE and the rest of the spacing
+#: modifier block. Identified by their compatibility decomposition, which is a
+#: space followed by the combining mark they draw: ``<compat> 0020 0301``. That is
+#: the definition rather than a hand-picked list, so a codepoint added by a future
+#: Unicode release is covered the day it lands.
+def _is_spacing_diacritic(ch: str) -> bool:
+    return unicodedata.decomposition(ch).startswith("<compat> 0020 ")
+
+
+def _strip_spacing_marks(value: str) -> str:
+    """``value`` with spacing diacritics removed. Applied to the HAYSTACK only.
+
+    :func:`_deaccent` folds *combining* marks and closes the splice it was written
+    for. It cannot close this one, and the reason is an ordering problem rather
+    than an oversight: by the time ``_deaccent`` runs, the payload has been through
+    NFKC, which expands ``U+00B4`` into a space plus a combining acute. Stripping
+    the mark then leaves the **space** behind, so ``Nathan<U+00B4>iel`` becomes
+    ``nathan iel`` -- a different string from ``nathaniel``, and one no later form
+    recovers. Measured on the real gate: a vaulted ``Nathaniel Brightwater`` and a
+    vaulted ``MRN 5567281`` both reached the provider through four spacing marks
+    while the combining-mark control blocked.
+
+    So this runs on the RAW payload, before ``normalize``, and removes the
+    character outright rather than letting NFKC turn it into whitespace.
+
+    Asymmetric for the same reason :func:`_deaccent` is: only the haystack is
+    stripped, so a vaulted value that legitimately contains a modifier letter is
+    still a distinct value from one that does not.
+    """
+    if not any(_is_spacing_diacritic(ch) for ch in value):
+        return value
+    return "".join(ch for ch in value if not _is_spacing_diacritic(ch))
 
 
 def _deaccent(value: str) -> str:

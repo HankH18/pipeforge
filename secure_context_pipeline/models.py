@@ -391,10 +391,29 @@ class AuditEvent(BaseModel):
                     f"audit detail key exceeds {MAX_DETAIL_VALUE_LEN} chars; "
                     "audit records must not carry content"
                 )
-            if isinstance(value, str) and len(value) > MAX_DETAIL_VALUE_LEN:
+            # Measured on the RENDERED width, for every type -- not on `str` alone.
+            #
+            # `isinstance(value, str)` was the whole test, and `detail` is typed
+            # `int | float | str`. An integer has no length, so a document encoded as
+            # one walked straight through: 1,540 characters of clinical note becomes
+            # a 3,709-digit int, which validated, chained, persisted, and came back
+            # out of `GET /audit` -- recoverable with one `to_bytes`. That falsified
+            # three separate written guarantees (this module's docstring point 1,
+            # `AuditEvent`'s own docstring, and the README's "the log cannot hold
+            # content -- a paragraph, a note, a document").
+            #
+            # The quantified test that was supposed to cover this iterates
+            # `model_fields` but only ever tried a *string* payload, so it stayed
+            # green while the claim was false -- a checker that shares the
+            # implementation's blind spot.
+            #
+            # `str(value)` is the right measure because it is what `canonical_json`
+            # serialises and what a reader gets back: whatever a future value type
+            # is, its rendered width is what reaches the row.
+            if len(str(value)) > MAX_DETAIL_VALUE_LEN:
                 raise ValueError(
-                    f"audit detail {key!r} exceeds {MAX_DETAIL_VALUE_LEN} chars; "
-                    "audit records must not carry content"
+                    f"audit detail {key!r} exceeds {MAX_DETAIL_VALUE_LEN} chars "
+                    f"when rendered; audit records must not carry content"
                 )
         # `dict(v)` is belt-and-braces, and honestly so: pydantic already builds a
         # new dict when it coerces the `Mapping` annotation, so replacing this with

@@ -2253,3 +2253,85 @@ def test_the_chain_covers_prev_hash_and_seq_behaviourally() -> None:
     assert compute_entry_hash("deadbeef", chain_payload(seq=1, **base)) != first
     # Same event content and predecessor, different position -> likewise.
     assert compute_entry_hash("", chain_payload(seq=2, **base)) != first
+
+
+# ---------------------------------------------------------------------------
+# The detail ceilings, at BOTH enforcement points and for every value type.
+# ---------------------------------------------------------------------------
+
+#: 1,540 characters of clinical note, encoded as a single integer. This is the
+#: shape that walked through: `detail` is typed `int | float | str`, the ceiling
+#: tested `isinstance(value, str)`, and an integer has no length.
+_DOC = "Clinical note: patient Margaret Chen, MRN 40281993, dx metastatic carcinoma. " * 20
+_DOC_AS_INT = int.from_bytes(_DOC.encode("utf-8"), "big")
+
+
+def test_a_document_encoded_as_an_integer_is_refused_by_the_model() -> None:
+    """`AuditEvent` must not accept content in any renderable type.
+
+    Three written guarantees rested on this and all three were false: `models.py`'s
+    docstring ("no field capable of holding an original value ... enforced by the
+    schema rather than by convention"), `AuditEvent`'s own ("this schema *cannot
+    hold* an original value"), and the README's ("the log cannot hold **content** --
+    a paragraph, a note, a document").
+
+    A 1,540-character note became a 3,709-digit int, which validated, chained,
+    persisted, and came back out of `GET /audit` recoverable with one `to_bytes`.
+    The quantified test that was supposed to cover this iterates `model_fields` but
+    only ever tried a *string* payload -- a checker sharing the implementation's
+    blind spot.
+    """
+    with pytest.raises(ValidationError):
+        make_event(detail={"n": _DOC_AS_INT})
+
+    # And the recovery that made it a disclosure rather than a curiosity.
+    recovered = _DOC_AS_INT.to_bytes((_DOC_AS_INT.bit_length() + 7) // 8, "big").decode()
+    assert recovered.startswith("Clinical note"), "premise: the int really is the document"
+
+
+async def test_a_document_encoded_as_an_integer_is_refused_at_the_write_boundary(
+    tmp_path: Path,
+) -> None:
+    """The same ceiling, on the path that skips the model validator.
+
+    `model_construct` bypasses validation entirely, so the write boundary is the
+    only thing standing between a constructed event and the row.
+    """
+    log = await AuditLogger.open(tmp_path / "audit.db")
+    try:
+        event = AuditEvent.model_construct(
+            ts=1.0,
+            session_id="sess-int",
+            event_type=DETECT,
+            detail={"n": _DOC_AS_INT},
+        )
+        with pytest.raises(PipelineError) as raised:
+            await log.emit(event)
+        assert raised.value.detail["reason"] == "audit_detail_exceeds_ceiling"
+        assert await log.length() == 0, "nothing was written"
+    finally:
+        await log.close()
+
+
+def test_an_oversized_detail_key_is_refused_by_the_model() -> None:
+    """Both halves of a dict entry are bounded, not just the value."""
+    with pytest.raises(ValidationError):
+        make_event(detail={"k" * (MAX_DETAIL_VALUE_LEN + 1): 1})
+
+
+async def test_an_oversized_detail_key_is_refused_at_the_write_boundary(tmp_path: Path) -> None:
+    """The key ceiling, on the `model_construct` path. Untested at both points before."""
+    log = await AuditLogger.open(tmp_path / "audit.db")
+    try:
+        event = AuditEvent.model_construct(
+            ts=1.0,
+            session_id="sess-key",
+            event_type=DETECT,
+            detail={"k" * (MAX_DETAIL_VALUE_LEN + 1): 1},
+        )
+        with pytest.raises(PipelineError) as raised:
+            await log.emit(event)
+        assert raised.value.detail["reason"] == "audit_detail_key_exceeds_ceiling"
+        assert await log.length() == 0
+    finally:
+        await log.close()
