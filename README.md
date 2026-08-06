@@ -182,12 +182,12 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1656 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1986 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 96% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   4370 statements, 125 missed; 1074 branches, 79 partial
+                             #   4370 statements, 125 missed; 1074 branches, 79 partial (package only; see below)
 ```
 
 **On the scope of that mypy line, because "clean" is doing less work than it looks.**
@@ -207,6 +207,17 @@ checkable number is the one above.) The scope is stated rather than widened beca
 hits are the interesting residue: those tests are not exercising the enum the production path
 actually carries, which is a mild stub-blindness signal and a real next step rather than a
 one-line config change.
+
+**Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
+`pyproject.toml` configures. Measured across the whole repository — package, `demo.py` and
+`fixtures/` — it is **98%** of 18,339 statements. Those two files were the last real gaps:
+`demo.py` sat at **26%** and `fixtures/generator.py` at **69%** while every module around them
+was above 90, because each defect this audit found got a regression test and nothing went back
+to cover what had never been tested at all. `demo.py` is now 94% and the generator 96%; the
+demo is the first artefact a reviewer runs, and until this pass its `--dump-wire` path, its
+fail-closed demonstration, its destruction demonstration and its entire argument surface had no
+test. `ui/app.js` had no *execution* tests either — only checks that read it as text — and now
+has behavioural ones driven through `node`.
 
 **Every number in this section was stale until an adversarial review pass re-measured them**, and
 the way they went stale is worth one sentence because it is the same failure this document keeps
