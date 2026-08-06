@@ -288,18 +288,26 @@ entities:
 
   AMOUNT:
     category: FIN
-    # Group-structured rather than the build doc's `[\d,]{1,12}`, and the reason is
-    # a partial disclosure rather than tidiness. A character-class bound counts
-    # digits AND commas together and truncates at the twelfth: `$1,234,567,890.12`
-    # matched only `$1,234,567,`, splicing the token in beside a bare `890.12` --
-    # six digits of a real figure left in the clear, with no vault needle for them
-    # because the vaulted original is the truncated string. Same class as the
-    # partial-value shape Deviation 48 was written to close. `{1,2}` on the cents
-    # (the doc says `{2}`) closes the same hole one character wide: `$1,234.5`
-    # matched `$1,234` and left `.5`. The trailing `\b` is dropped because the
-    # group structure now ends the match at a non-digit by construction, and `\b`
-    # after an optional cents group refused `$5.` at a sentence end.
-    patterns: ['\$\s?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?']
+    # Unbounded over digits and commas, ending on a digit, rather than the build
+    # doc's `[\d,]{1,12}`. The reason is a partial disclosure rather than tidiness:
+    # a character-class BOUND counts digits and commas together and truncates at the
+    # twelfth, so `$1,234,567,890.12` matched only `$1,234,567,` -- the token was
+    # spliced in beside a bare `890.12`, six digits of a real figure in the clear,
+    # with no pass-1 needle for them because the vaulted original is the truncated
+    # string. Same class as the partial-value shape Deviation 48 exists to close.
+    #
+    # A strictly 3-digit-grouped alternation (`\d{1,3}(?:,\d{3})+|\d+`) was tried
+    # first and is WORSE than the build doc's version, not better: it truncates every
+    # amount that is not grouped in threes. `$12,34,567` -- Indian numbering, and
+    # any typo -- matched `$12` and left `,34,567` on the wire, where the original
+    # pattern matched the whole thing. Assuming a grouping convention re-created the
+    # defect it was written to remove, one shape to the left.
+    #
+    # Ending on a digit (`\d[\d,]*\d|\d`) keeps a trailing clause comma out of the
+    # span. `{1,2}` on the cents (the doc says `{2}`) closes the same hole one
+    # character wide: `$1,234.5` matched `$1,234` and left `.5`. Linear, no nesting:
+    # 0.6 ms against 80,000 characters of `1,`.
+    patterns: ['\$\s?(?:\d[\d,]*\d|\d)(?:\.\d{1,2})?']
     only_in_doc_categories: [financial]
     tier: 4
     context: [transaction, payment, deposit, withdrawal, balance]
