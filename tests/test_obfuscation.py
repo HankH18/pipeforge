@@ -32,7 +32,6 @@ from secure_context_pipeline.api.schemas import MAX_PROMPT_CHARS, PipelineRunReq
 from secure_context_pipeline.audit.logger import OBFUSCATE, REDACT, STRIP, AuditLogger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import derive_token_id, normalize
-from secure_context_pipeline.daterules import parse_source_date
 from secure_context_pipeline.detection import detector as detector_module
 from secure_context_pipeline.detection.registry import GAZETTEER_DIR, EntityRegistry, EntitySpec
 from secure_context_pipeline.errors import ConfigError, PipelineError, VaultMissError
