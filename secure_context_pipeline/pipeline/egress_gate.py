@@ -298,15 +298,40 @@ MIN_IDENTIFIER_RUN_DIGITS: Final = 6
 #: the behaviour against, and it told them a narrower rule protects them than the one
 #: that runs.
 #:
-#: **What eight actually buys**, measured on the generator corpus (26 seeds, four
-#: document kinds, 8,143 distinct planted originals): 8,073 are multi-component, and
-#: the floor excludes 343 of them -- 4.2%, overwhelmingly lab values like ``HDL 28``
-#: and ``WBC 9.6``. Those are the residual, and lowering the floor to cover them would
-#: make ``HDL`` plus two digits a needle over the whole payload, which is the
-#: false-positive class :func:`_composite_needles` refuses by design. Pinned in both
-#: directions by ``test_the_joined_alnum_floor_is_the_one_the_limb_applies``; before
-#: that test the constant did not appear in the suite at all and could be lowered to 1
-#: in silence.
+#: **What eight buys, and what it costs -- both measured.** On the generator corpus
+#: (26 seeds, four document kinds, 8,143 distinct planted originals) 8,073 are
+#: multi-component and the floor excludes 343 of them, 4.2%.
+#:
+#: The cost is not only lab values. It includes ordinary two-word person names:
+#: ``Amy Cox`` and ``Ann Lee`` are six alphanumerics, ``Jo Ann`` is five, and for all
+#: of them this limb is dead -- so a payload that respells the space walks the whole
+#: name out. That is a real open boundary and it is named as the fourth entry in the
+#: README's list rather than left implied here.
+#:
+#: **It is not closeable by lowering the number, and that was measured rather than
+#: assumed.** Real short names and common English phrases occupy the same length
+#: range, so no floor separates them:
+#:
+#:     floor 5 -> covers 6 of 6 test names, and gives ``of the``/``in the``/``to the``
+#:               needles that match the shipped fixtures 67 / 95 / 53 times
+#:     floor 6 -> covers 2 of 6, still matches 5 common phrases
+#:     floor 8 -> covers 0 of 6, matches 0 common phrases
+#:
+#: A phrase-shaped original reaching the vault is not hypothetical here: confidence-band
+#: redactions are handed to the gate as needles (see ``SessionVault.note_unrestorable``),
+#: and a prose entity can be one. So lowering the floor trades a narrow leak for a broad
+#: outage -- every document containing the phrase would be denied.
+#:
+#: What would actually close it is the entity TYPE, which this limb cannot see: build
+#: doc section 9.4 fixes ``originals_for_session`` as ``frozenset[str]``, so the gate is
+#: handed strings with no way to tell ``Amy Cox`` from ``of the``. Threading types
+#: through would let the limb apply to identifier and name types and skip prose ones.
+#: That is the fix, and it is a change to the vault interface the specification pins,
+#: so it is recorded in README section 7 rather than made here.
+#:
+#: Pinned in both directions by
+#: ``test_the_joined_alnum_floor_is_the_one_the_limb_applies``; before that test the
+#: constant did not appear in the suite at all and could be lowered to 1 in silence.
 MIN_JOINED_ALNUM_LEN: Final = 8
 
 #: Wall-clock budget for one whole ``check()``. Exceeding it blocks, because a
@@ -621,6 +646,7 @@ class EgressGate:
             skeleton=payload_skeleton,
             marked=payload_skeleton != payload_folded,
         )
+        payload_digits: str | None = None
         hits = 0
         for original in originals:
             if len(original.strip()) < MIN_ORIGINAL_LEN:
@@ -651,6 +677,13 @@ class EgressGate:
             ) or _occurs_with_flexible_separator(folded, payload_skeleton):
                 hits += 1
                 continue
+            regrouped = _regrouped_identifier_needle(folded)
+            if regrouped is not None:
+                if payload_digits is None:
+                    payload_digits = _digits_only(payload_folded)
+                if regrouped in payload_digits:
+                    hits += 1
+                    continue
             if any(
                 _occurs_in_any_bounded_form(part, haystacks)
                 for part in _composite_needles(original)
@@ -1408,6 +1441,56 @@ def _occurs_with_flexible_separator(value: str, haystack: str) -> bool:
     if max(parts, key=len) not in haystack:
         return False
     return any(re.search(pattern, haystack) for pattern in patterns)
+
+
+def _digits_only(value: str) -> str:
+    """``value`` reduced to its ASCII digits."""
+    return "".join(ch for ch in value if "0" <= ch <= "9")
+
+
+def _regrouped_identifier_needle(value: str) -> str | None:
+    """The digit skeleton of an identifier, for a payload that RE-GROUPS it.
+
+    :func:`_separator_needles` relaxes the separator *between* a value's components,
+    which tolerates a payload carrying FEWER separators than the vaulted form
+    (``47-1234567`` against ``471234567``). It is one-directional: it returns nothing
+    for a single-component value, so it could not tolerate a payload carrying MORE
+    separators than the vaulted form. A vaulted ``100200300400``, detected and
+    tokenised from its clean mention, therefore rode out to the provider byte for
+    byte as ``1002-0030-0400`` -- every digit, in order, with three dashes inserted --
+    past all four bounded forms, both identifier needles and the composite limb.
+
+    Comparing digit skeletons closes both directions at once, because the projection
+    is applied to the needle and the payload alike: any regrouping, spacing or
+    punctuation of the same digits collapses to the same string.
+
+    Floored at :data:`MIN_IDENTIFIER_RUN_DIGITS`, and unbounded like
+    :func:`_identifier_needles` -- for the same reason. The payload projection
+    concatenates every digit in the document, so a short needle acquires landing
+    sites the document never wrote; six is where that stops being likely and is
+    already this module's answer to "how much digit content is specific enough to
+    compare without an adjacency rule".
+    """
+    # The same two conditions `_identifier_needles` applies to its whole-value
+    # needle, and both were learned the hard way rather than chosen.
+    #
+    # NO LETTERS: a value mixing letters and digits is an identifier shape, and
+    # identifier shapes collide by PREFIX -- the digit skeleton of `1:23-cv-04567` is
+    # contained in that of the companion docket `1:23-cv-045678`, so an unbounded
+    # comparison denies a payload that merely cites the neighbouring case.
+    #
+    # SEVEN digits, not six: a digit TOTAL is not a contiguous run.
+    # `MIN_IDENTIFIER_RUN_DIGITS` was tried here first and re-broke the shapes
+    # `test_a_value_below_the_identifier_floor_keeps_the_boundary_rule` exists to
+    # protect -- `$1,234.56` totals six digits, and its skeleton is contained in that
+    # of the ordinary text `$1,234.567`.
+    stripped = value.strip()
+    if any(ch.isalpha() for ch in stripped):
+        return None
+    digits = _digits_only(stripped)
+    if len(digits) < MIN_IDENTIFIER_DIGITS:
+        return None
+    return digits
 
 
 def _composite_needles(value: str) -> tuple[str, ...]:

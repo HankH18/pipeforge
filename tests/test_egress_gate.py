@@ -4125,3 +4125,73 @@ def test_the_joined_alnum_floor_is_the_one_the_limb_applies() -> None:
         "the floor moved; the two assertions above are written against 8 and the "
         "docstring's false-positive argument is measured at 8"
     )
+
+
+@pytest.mark.parametrize(
+    ("vaulted", "spelling"),
+    [
+        ("100200300400", "wire reference 1002-0030-0400 for the beneficiary"),
+        ("100200300400", "wire reference 1002 0030 0400 for the beneficiary"),
+        ("5567281", "MRN 556-7281 on file"),
+        ("471234567", "EIN 47-123-4567 on the return"),
+    ],
+)
+async def test_a_regrouped_digit_identifier_is_blocked(
+    tmp_path: Path, vaulted: str, spelling: str
+) -> None:
+    """The separator limb was one-directional; the digit skeleton closes both ends.
+
+    `_separator_needles` splits the NEEDLE into alphanumeric runs and rejoins them
+    with a flexible separator, which tolerates a payload carrying FEWER separators
+    than the vaulted form. It returns nothing for a single-component value, so it
+    could not tolerate a payload carrying MORE. A vaulted `100200300400`, detected
+    and tokenised from its clean mention, rode out to the provider byte for byte as
+    `1002-0030-0400` -- every digit, in order, with three dashes inserted -- past all
+    four bounded forms, both identifier needles and the composite limb.
+    """
+    gate = EgressGate(
+        vault=FakeVault({vaulted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(spelling, "sess-regroup")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+async def test_a_short_two_word_original_is_the_fourth_declared_boundary(
+    tmp_path: Path,
+) -> None:
+    """The floor's cost, pinned so it cannot close or widen silently.
+
+    `Amy Cox` is six alphanumerics, under `MIN_JOINED_ALNUM_LEN`, so the
+    separator-invariant limb does not apply and a payload respelling the space walks
+    the whole name out. That is README boundary 4.
+
+    It is not closeable by lowering the floor: real short names and common English
+    phrases occupy the same length range, so a floor low enough to cover `Amy Cox`
+    also gives `of the` a needle that matches the shipped fixtures 67 times. Closing
+    it needs the entity type, which §9.4 fixes out of this interface.
+
+    If this test fails, the gate has gained coverage of short multi-word originals
+    and the README's boundary list must lose an entry the same day.
+    """
+    gate = EgressGate(
+        vault=FakeVault({"Amy Cox"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    report = await gate.check("Countersigned: Amy-Cox RN", "sess-short")
+    assert report.originals_scanned == 1, "premise: the short original was in scope"
+
+    # The control: the same shape above the floor IS caught.
+    longer = EgressGate(
+        vault=FakeVault({"Marguerite Vandenberg"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError):
+        await longer.check("Countersigned: Marguerite-Vandenberg RN", "sess-short")

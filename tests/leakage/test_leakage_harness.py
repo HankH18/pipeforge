@@ -208,8 +208,10 @@ from secure_context_pipeline.pipeline.egress_gate import (
     EgressGate,
     _composite_needles,
     _deaccent,
+    _digits_only,
     _identifier_needles,
     _occurs_with_flexible_separator,
+    _regrouped_identifier_needle,
     _strip_invisible,
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
@@ -625,6 +627,12 @@ def mask(value: str) -> str:
 occurs_as_a_unit = _textrules_occurs_as_a_unit
 
 
+def _digit_skeleton_hit(folded: str, digits_hay: str) -> bool:
+    """Whether ``folded``'s digit skeleton occurs in the payload's."""
+    needle = _regrouped_identifier_needle(folded)
+    return needle is not None and needle in digits_hay
+
+
 def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
     """Every original occurring in ``haystack``, in **every** comparison the gate makes.
 
@@ -703,6 +711,7 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
             or occurs_as_a_unit(folded, skeleton_hay)
         )
 
+    digits_hay = _digits_only(skeleton_hay)
     found: list[str] = []
     for original in originals:
         folded = _strip_invisible(normalize(original))
@@ -726,6 +735,14 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
             # checks is the defect this file exists to avoid.
             or _occurs_with_flexible_separator(folded, folded_hay)
             or _occurs_with_flexible_separator(folded, skeleton_hay)
+            # The digit-skeleton limb. Mirrors the gate's comparison for a
+            # letter-free identifier: any regrouping of the same digits collapses
+            # to the same string on both sides, which is what catches a vaulted
+            # `100200300400` written on the wire as `1002-0030-0400`. Without it
+            # this harness is weaker than the gate, and
+            # `test_the_harness_is_never_weaker_than_the_gate_on_generated_input`
+            # is what said so -- it went red the moment the gate gained the limb.
+            or _digit_skeleton_hit(folded, digits_hay)
             or any(bounded(part) for part in _composite_needles(original))
         ):
             found.append(original)

@@ -7,11 +7,11 @@ fetch + decrypt → detect → obfuscate → EGRESS GATE → provider → restor
 ```
 
 The claim this system makes is narrow and testable: **no whole vaulted value leaves the process
-boundary toward the provider, and that is verifiable by inspection — subject to three named
+boundary toward the provider, and that is verifiable by inspection — subject to four named
 boundaries this design does not close.** Obfuscation is reversible within a session and
 cryptographically irreversible across sessions.
 
-The word doing the work is **whole**, and the three boundaries are stated here rather than 300
+The word doing the work is **whole**, and the four boundaries are stated here rather than 300
 lines down, because each one is a shape that has been *confirmed* to reach the provider with the
 gate live:
 
@@ -21,9 +21,24 @@ gate live:
    — a digit-carrying identifier **is** caught, see the two identifier floors below.
 3. **A homoglyph substitution** — Cyrillic `о` for Latin `o` is different bytes, and catching it
    needs a UTS-39 confusables table rather than another normalisation form.
+4. **A multi-word original shorter than 8 alphanumeric characters, whose separator the payload
+   respells.** The separator-invariant limb below has a length floor, and ordinary two-word
+   names sit under it: `Amy Cox` and `Ann Lee` are six characters, `Jo Ann` is five. For those,
+   a payload writing `Amy-Cox` or `AmyCox` walks the whole name out.
+
+   **This one is not closeable by lowering the number, which was measured rather than assumed.**
+   Real short names and common English phrases occupy the same length range: at a floor of 5 all
+   six test names are covered *and* `of the` / `in the` / `to the` become needles that match the
+   shipped fixtures 67, 95 and 53 times; at 8, no phrase matches and no name is covered. Since
+   confidence-band redactions are handed to the gate as needles, a phrase-shaped original
+   reaching the vault is not hypothetical — so lowering the floor trades a narrow leak for a
+   broad outage. What would close it is the entity **type**, which the limb cannot see: §9.4
+   fixes `originals_for_session` as `frozenset[str]`, so the gate gets strings with no way to
+   tell `Amy Cox` from `of the`. Threading types through is the fix, and it changes an interface
+   the specification pins.
 
 Each is pinned by a named test so that closing one later is a red rather than a silent widening
-of the claim; all three are detailed under *Leakage harness* below.
+of the claim; all four are detailed under *Leakage harness* below.
 
 **This list said *four* until recently, and the fourth was wrong in the direction that flatters
 the document**: it named a combining mark spliced into a value as an open boundary, with a
@@ -182,7 +197,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1986 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1991 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
@@ -242,7 +257,7 @@ transient fault would have wedged every subsequent write.
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2981 originals vaulted and scanned, 2426 surrogates round-tripped)
+          (2981 originals vaulted and scanned, 2434 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the
