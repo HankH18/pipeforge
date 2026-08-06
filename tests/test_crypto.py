@@ -1594,7 +1594,7 @@ def test_no_control_this_strips_is_also_whitespace() -> None:
     overlap = [
         f"U+{code:04X}"
         for code in range(0x110000)
-        if code < 0x100 and keys._CONTROLS.match(chr(code)) and keys._WHITESPACE.match(chr(code))
+        if keys._CONTROLS.match(chr(code)) and keys._WHITESPACE.match(chr(code))
     ]
     assert overlap == [], (
         f"{overlap} are matched by BOTH classes; the control strip runs first, so "
@@ -1603,7 +1603,16 @@ def test_no_control_this_strips_is_also_whitespace() -> None:
     )
 
 
-@pytest.mark.parametrize("control", ["\x1c", "\x1d", "\x1e", "\x1f"])
+@pytest.mark.parametrize(
+    "control",
+    [
+        "\x1c", "\x1d", "\x1e", "\x1f",
+        # Non-Latin-1 whitespace, so the property is pinned outside the range the
+        # class algebra above used to be restricted to.
+        "\u2028",  # LINE SEPARATOR
+        "\u2029",  # PARAGRAPH SEPARATOR
+    ],
+)
 def test_the_separator_controls_collapse_rather_than_glue(control: str) -> None:
     """The four that were wrong, as named regressions."""
     assert normalize(f"John{control}Smith") == "john smith"

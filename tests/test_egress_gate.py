@@ -59,12 +59,14 @@ from secure_context_pipeline.pipeline.egress_gate import (
     HIGH_SEVERITY_TYPES,
     MIN_IDENTIFIER_DIGITS,
     MIN_IDENTIFIER_RUN_DIGITS,
+    MIN_JOINED_ALNUM_LEN,
     MIN_ORIGINAL_LEN,
     EgressGate,
     _composite_needles,
     _deaccent,
     _identifier_needles,
     _occurs_as_a_unit,
+    _separator_needles,
     _strip_invisible,
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
@@ -4104,3 +4106,22 @@ async def test_a_modifier_letter_without_a_diacritic_decomposition_is_not_covere
         "Countersigned: Natha\u02c8niel Brightwater RN", "sess-spacing"
     )
     assert report.originals_scanned == 1, "premise: the original was in scope"
+
+
+def test_the_joined_alnum_floor_is_the_one_the_limb_applies() -> None:
+    """`MIN_JOINED_ALNUM_LEN` is pinned in both directions.
+
+    The constant the separator limb's docstring says "pays for" its unbounded
+    comparison did not appear in the suite at all: lowering it from 8 to 1 left
+    every targeted gate test green, so a future edit could widen the limb's
+    false-positive surface silently. (Raising it far enough to disable the limb is
+    caught, by the true-positive tests above -- but only that direction was.)
+    """
+    # One under the floor: no needle, so the limb does not apply.
+    assert _separator_needles("abc defg") == (), "7 joined characters is under the floor"
+    # At the floor: a needle.
+    assert _separator_needles("abcd efgh") != (), "8 joined characters is at the floor"
+    assert MIN_JOINED_ALNUM_LEN == 8, (
+        "the floor moved; the two assertions above are written against 8 and the "
+        "docstring's false-positive argument is measured at 8"
+    )

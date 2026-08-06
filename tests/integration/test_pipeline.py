@@ -1449,16 +1449,23 @@ async def test_a_hard_wrapped_document_leaks_no_name_tail_to_the_provider(
         following = re.match(r"[ \t]*\n[ \t]*([A-Z][a-z]{3,})", wrapped[span.end : span.end + 40])
         if following is not None:
             dropped.append((wrapped[span.start : span.end], following.group(1)))
+    # The payload assertion runs FIRST, on the tails actually collected. Written the
+    # other way round it sat below `assert dropped == []` and therefore iterated an
+    # empty list on every green run -- dead code, and the same never-failing-check
+    # class this test's own history is a record of. Ordering it this way means the
+    # docstring's claim about the outbound payload is enforced rather than implied.
+    assert payload, "premise: the provider was called"
+    for _head, tail in dropped:
+        assert not re.search(rf"\b{re.escape(tail)}\b", payload), (
+            f"the tail {tail!r} was cut from its span AND is verbatim in the "
+            f"outbound payload -- nothing vaulted it, so the gate cannot see it"
+        )
+
     assert dropped == [], (
         f"{len(dropped)} person span(s) end at a line break with a capitalised word "
         f"immediately after: {dropped[:3]} -- the tail was cut off the span, so it "
         f"was never vaulted and the egress gate cannot see it"
     )
-
-    # And the tails really are absent from what the provider received.
-    assert payload, "premise: the provider was called"
-    for _head, tail in dropped:
-        assert not re.search(rf"\b{re.escape(tail)}\b", payload)
 
 
 @pytest.mark.parametrize("width", [62, 50, 40])

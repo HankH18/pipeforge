@@ -1010,6 +1010,16 @@ class DestroyProbe:
     text: str
     strategy: str
     surrogate_map: dict[str, str] | None
+    #: The token IDs the producing run actually minted. Passed to `restore` as
+    #: `issued`, exactly as `PipelineOrchestrator` does. Without it the restorer
+    #: runs ungated: it queries the vault for any token-shaped run in the model's
+    #: output, so a coincidence between eight hex characters in the response and a
+    #: live token ID substitutes another entity's value -- the incident
+    #: `restorer.py`'s module docstring records -- and every miss audits as
+    #: MISS_INDETERMINATE carrying the model's own bytes in `token_id`. Harmless on
+    #: the mock path, where the response is built from our own tokens; the `--real`
+    #: path is where a live model can emit whatever it likes.
+    minted: frozenset[str]
     source: str
 
 
@@ -1024,6 +1034,7 @@ def build_probe(outcomes: list[RunOutcome]) -> DestroyProbe | None:
                 text=outcome.result.raw_llm_response,
                 strategy=outcome.result.strategy,
                 surrogate_map=None,
+                minted=frozenset(extract_token_ids(outcome.result.obfuscated_payload)),
                 source=f"{len(token_ids)} token(s) in the {outcome.result.strategy} response",
             )
     # No tokens anywhere: pseudonyms only. An empty mapped value is the
@@ -1038,6 +1049,7 @@ def build_probe(outcomes: list[RunOutcome]) -> DestroyProbe | None:
                     text=outcome.result.raw_llm_response,
                     strategy=outcome.result.strategy,
                     surrogate_map={span.surrogate: ""},
+                    minted=frozenset(extract_token_ids(outcome.result.obfuscated_payload)),
                     source=f"pseudonym echoed in the {outcome.result.strategy} response",
                 )
     return None
@@ -1067,7 +1079,11 @@ async def demonstrate_destruction(
 
     kv("probe", probe.source)
     before = await harness.restorer.restore(
-        session_id, probe.text, strategy=probe.strategy, surrogates=probe.surrogate_map
+        session_id,
+        probe.text,
+        strategy=probe.strategy,
+        surrogates=probe.surrogate_map,
+        issued=probe.minted,
     )
     if probe.token_id is not None:
         original = await harness.vault.get_by_token(session_id, probe.token_id)
@@ -1109,7 +1125,11 @@ async def demonstrate_destruction(
 
     try:
         await harness.restorer.restore(
-            session_id, probe.text, strategy=probe.strategy, surrogates=probe.surrogate_map
+            session_id,
+            probe.text,
+            strategy=probe.strategy,
+            surrogates=probe.surrogate_map,
+            issued=probe.minted,
         )
         successes.append("restorer.restore returned normally")
     except PipelineError as exc:

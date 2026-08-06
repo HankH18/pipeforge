@@ -2853,3 +2853,39 @@ async def test_ttl_expiry_runs_the_whole_destruction_path(
     assert expires, "expiry emitted no SESSION_EXPIRE"
     assert expires[-1].detail["source"] == "ttl_expiry"
     assert await services.audit.verify_chain() is True
+
+
+async def test_a_health_poll_does_not_disarm_the_ttl_reaper(
+    client: AsyncClient, services: Services
+) -> None:
+    """The regression that made the reaper a no-op in the shipped container.
+
+    `reap_expired_sessions` was the only caller that KEPT `SessionRegistry.sweep()`'s
+    return value, but six accessors call `_sweep_locked()` and discard it. Whichever
+    observed an expiry first removed the ID permanently, so the reaper never saw it
+    and the vault rows survived to process exit.
+
+    Not a rare race: the shipped Dockerfile polls `GET /health` every 30 seconds and
+    that route calls `active_ids`. Reverting the fix leaves the whole suite green,
+    which is why this test exists -- the only direct `sweep()` test disqualifies
+    itself in its own comment, because it exercises the case where nothing else has
+    touched the registry, i.e. the case the bug does not affect.
+    """
+    doc_id = await _upload(client)
+    session_id, _ = await services.sessions.create(OWNER, ttl_seconds=1)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+    assert await services.vault.row_count(session_id) > 0, "premise: the vault holds rows"
+
+    await asyncio.sleep(1.2)
+
+    # The health poll observes the expiry first and drops the key. Before the fix
+    # this consumed the only notification the reaper would ever get.
+    assert (await client.get("/health")).status_code == 200
+
+    # A later authenticated request must still finish the destruction path.
+    assert (await _run(client, session_id, doc_id)).status_code == 401
+    assert await services.vault.row_count(session_id) == 0, (
+        "the health poll swallowed the expiry: the reaper never saw it and the "
+        "vault rows are stranded until process exit"
+    )
+    assert session_id not in services.vault.cached_session_ids()
