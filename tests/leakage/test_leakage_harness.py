@@ -716,6 +716,15 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
             # Without this limb the harness is weaker than the gate, and
             # ``test_the_harness_is_never_weaker_than_the_gate_on_generated_input``
             # is what says so out loud.
+            # BOTH haystacks, accent-preserving first. Handing this limb only the
+            # deaccented one made it dead for every accented original -- the needle
+            # keeps its accent by design, so it cannot occur in a deaccented
+            # haystack. This module imports the gate's own helper, so it inherited
+            # that blind spot exactly and reported 100/100 CLEAN on payloads the
+            # gate was releasing. Spelled out here rather than left to the shared
+            # helper, because a harness that can only be as strong as the thing it
+            # checks is the defect this file exists to avoid.
+            or _occurs_with_flexible_separator(folded, folded_hay)
             or _occurs_with_flexible_separator(folded, skeleton_hay)
             or any(bounded(part) for part in _composite_needles(original))
         ):

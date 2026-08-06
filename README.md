@@ -182,7 +182,7 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-1602 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
+1608 passed, 1 skipped       # full suite; the skip is the real-network LLM smoke test
                              #   128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
@@ -227,7 +227,7 @@ transient fault would have wedged every subsequent write.
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2963 originals vaulted and scanned, 2421 surrogates round-tripped)
+          (2979 originals vaulted and scanned, 2431 surrogates round-tripped)
 ```
 
 **100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the

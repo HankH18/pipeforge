@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import secrets
+import textwrap
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -1391,3 +1393,69 @@ async def test_concurrent_runs_on_one_session_do_not_cross_wires(
     originals = harness.vault.originals_for_session(session_id)
     assert "03/12/1985" in originals
     assert await harness.vault.row_count(session_id) == len(originals)
+
+
+async def test_a_hard_wrapped_document_leaks_no_name_tail_to_the_provider(
+    make_harness: HarnessFactory,
+) -> None:
+    """The shape the shipped corpus structurally cannot see.
+
+    `fixtures/legal_brief_large.txt` is stored UNWRAPPED (mean line ~527 chars), so
+    no committed fixture exercises a name straddling a line break -- while
+    `extraction.py` hard-wraps every real PDF and DOCX, which is the whole subject
+    of Deviation 32. A blanket "trim every NER span at its first newline" therefore
+    passed the entire suite while sending verbatim surnames to the provider: the
+    trim discarded the second half of `'Margaret\\n    Whitfield'`, nothing vaulted
+    it, and the gate had no needle for a value nobody vaulted.
+
+    Asserted end to end on the OUTBOUND payload, with no shared heuristic: an
+    earlier version of this test re-derived the detector's field-label rule and
+    disagreed with it, flagging correctly-kept wrapped surnames. The property that
+    matters is not "which spans were trimmed" but "is any component of a detected
+    person still readable on the wire".
+    """
+    harness: Harness = await make_harness()
+    source = generator.generate(SEED, "legal")
+    wrapped = "\n".join(textwrap.fill(p, width=62) for p in source.split("\n\n"))
+    assert max(len(line) for line in wrapped.split("\n")) <= 80, "premise: it is wrapped"
+
+    doc_id = await harness.upload(wrapped, "legal", "brief.txt")
+    session_id, _ = await harness.sessions.create("test-user")
+    result = await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+
+    payload = harness.provider.last_user or ""
+    assert payload, "premise: the provider was called"
+
+    # The discriminating signal: a PERSON span that ENDS exactly at a line break
+    # with a capitalised word on the next line. That word was part of the name and
+    # was dropped from the span -- so nothing vaults it, and the gate has no needle
+    # for a value nobody vaulted.
+    #
+    # Chosen because it is present in BOTH configurations. An earlier version
+    # filtered to spans that still CONTAIN a newline, which the blanket trim removes
+    # by construction -- the assertion selected exactly the spans the bug destroys
+    # and so could never see it. Measured on this fixture: 0 here, 3 under the
+    # blanket trim ('Michael'||Gonzalez, 'Steven'||Lopez, 'David'||Ford).
+    #
+    # Scoped to person entities and not to every vaulted original, because the prose
+    # entities (CASE_STRATEGY, SETTLEMENT_TERM) are whole sentences and a
+    # component-wise rule over those asserts the pipeline must scrub ordinary
+    # English ('coordinated', 'figure').
+    person_types = {"NAME", "CLIENT_IDENTITY"}
+    dropped: list[tuple[str, str]] = []
+    for span in result.detections:
+        if span.entity_type not in person_types:
+            continue
+        following = re.match(r"[ \t]*\n[ \t]*([A-Z][a-z]{3,})", wrapped[span.end : span.end + 40])
+        if following is not None:
+            dropped.append((wrapped[span.start : span.end], following.group(1)))
+    assert dropped == [], (
+        f"{len(dropped)} person span(s) end at a line break with a capitalised word "
+        f"immediately after: {dropped[:3]} -- the tail was cut off the span, so it "
+        f"was never vaulted and the egress gate cannot see it"
+    )
+
+    # And the tails really are absent from what the provider received.
+    assert payload, "premise: the provider was called"
+    for _head, tail in dropped:
+        assert not re.search(rf"\b{re.escape(tail)}\b", payload)

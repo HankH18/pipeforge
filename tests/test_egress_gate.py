@@ -3881,3 +3881,62 @@ async def test_a_homoglyph_substitution_is_outside_what_the_scan_claims(
     # rather than the scan being broken.
     with pytest.raises(EgressBlockedError):
         await gate.check(f"Countersigned: {latin} RN", "sess-homoglyph")
+
+
+@pytest.mark.parametrize(
+    ("vaulted", "spelling"),
+    [
+        ("José Ruiz", "Patient José-Ruiz was seen."),
+        ("José Ruiz", "Patient José​Ruiz was seen."),
+        ("Renée Ashford", "Countersigned: Renée_Ashford RN"),
+        ("Nguyễn Thi Lan", "Referred by Nguyễn.Thi.Lan today."),
+    ],
+)
+async def test_the_separator_limb_applies_to_accented_originals_too(
+    tmp_path: Path, vaulted: str, spelling: str
+) -> None:
+    """The separator-invariant limb must not be switched off by a diacritic.
+
+    It was. `_scan_originals` handed the limb only `payload_skeleton` -- the
+    DEACCENTED payload -- while the needle is deliberately never deaccented, which
+    is what keeps `José` and `Jose` distinct values. So no component of an accented
+    original could occur in the haystack, the substring pre-filter rejected before
+    the regex ran, and the limb was dead for every marked value: `José Ruiz`
+    vaulted from a clean mention reached the provider as `José-Ruiz`, while the
+    unaccented control `Jose-Ruiz` blocked.
+
+    Not one of the three declared boundaries, and not the documented accent
+    residual either -- that one is about a SECOND mark spliced into an
+    already-marked value. Here the accent is byte-identical on both sides and only
+    the separator is respelt.
+
+    The leakage harness imports the same helper and was handed the same single
+    haystack, so 100/100 clean was not evidence for any accented value.
+    """
+    gate = EgressGate(
+        vault=FakeVault({vaulted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(spelling, "sess-accent")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+async def test_the_separator_limb_keeps_jose_and_jose_distinct(tmp_path: Path) -> None:
+    """The needle keeps its accent, so widening the haystack cannot merge two people.
+
+    The guard on the fix above: offering the limb the accent-preserving haystack
+    must not make `José Ruiz` match a payload that says `Jose Ruiz`. It cannot,
+    because only the haystack is ever stripped -- but that is the property the
+    asymmetry rests on, so it is asserted rather than argued.
+    """
+    gate = EgressGate(
+        vault=FakeVault({"José Ruiz"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    report = await gate.check("Patient Jose Ruiz was seen.", "sess-accent")
+    assert report.originals_scanned == 1, "premise: the accented original was in scope"

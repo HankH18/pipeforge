@@ -472,6 +472,36 @@ def resolve_overlaps(
 # ---------------------------------------------------------------------------
 # Detector
 # ---------------------------------------------------------------------------
+#: A field label the detector may safely cut an NER span back to: a short run of
+#: letters and spaces, immediately followed by a colon in the surrounding text.
+#: Bounded, because it is matched against document text.
+_FIELD_LABEL_TAIL_RE = re.compile(r"[A-Za-z][A-Za-z ]{0,20}\Z")
+
+
+def _is_field_label_tail(text: str, newline: int, end: int) -> bool:
+    """Whether ``text[newline:end]`` is a wrapped-on field LABEL rather than value.
+
+    The distinction the newline alone cannot make. ``'David Ochoa\n    DOB'`` is a
+    name that ran into the next field's label -- the tail is ``DOB`` and the document
+    continues ``: 1974-03-02`` -- so cutting at the break recovers the real name.
+    ``'Margaret\n    Whitfield, who signed...'`` is one name across a soft wrap;
+    cutting it there throws the surname away and, because the discarded half is then
+    never vaulted, sends it to the provider in the clear.
+
+    Two accepted shapes: a tail that is only whitespace (the span merely ran past the
+    end of its line), and a tail that looks like a label AND is followed by a colon.
+    Everything else is treated as part of the value.
+    """
+    tail = text[newline:end].strip()
+    if not tail:
+        return True
+    if _FIELD_LABEL_TAIL_RE.fullmatch(tail) is None:
+        return False
+    # The colon lives just past the span -- it is what makes the tail a label rather
+    # than a capitalised word that happens to follow a wrap.
+    return text[end : end + 2].lstrip().startswith(":")
+
+
 class Detector:
     """Registry-driven PII/PHI/legal/financial detection over a document."""
 
@@ -709,9 +739,28 @@ class Detector:
         # whole subject of Deviation 32. Trimming those at the first newline cut
         # `action: redact` back to the first line of its own strategy sentence and
         # shipped the rest, and five recall tests said so.
+        #
+        # **And the newline alone is not the condition.** Trimming every NER span at
+        # its first line break was the first attempt and it LEAKED, for the mirror
+        # of the reason pattern spans must not be trimmed: the same wrapping that
+        # makes a strategy sentence cross a line makes a *name* cross one. spaCy
+        # returns `'Margaret\n    Whitfield'` as one PERSON; blanket-trimming vaulted
+        # only `Margaret` and sent the surname to the provider verbatim, with the
+        # gate silent because it had no needle for a value nobody vaulted. Measured
+        # on `legal_brief_large.txt` re-wrapped at 62 columns -- what a real PDF or
+        # DOCX extraction produces -- 14 verbatim surname occurrences of 8 clients
+        # reached the outbound payload. The shipped copy of that fixture is
+        # *unwrapped* (mean line 527 chars), which is exactly why the suite could not
+        # see it.
+        #
+        # So the trim fires only on the shape actually observed in the `David Ochoa`
+        # case: the tail after the line break is a FIELD LABEL -- a short run of
+        # letters and spaces immediately followed by a colon -- or is nothing but
+        # whitespace. A tail that continues the value (`Whitfield, who signed...`) is
+        # kept, and the whole wrapped span is vaulted and spliced as one.
         if spec.presidio:
             newline = text.find("\n", start, end)
-            if newline != -1:
+            if newline != -1 and _is_field_label_tail(text, newline, end):
                 end = newline
             end = start + len(text[start:end].rstrip())
             if start >= end:

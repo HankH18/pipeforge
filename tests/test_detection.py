@@ -4619,6 +4619,14 @@ async def test_zz_reset_analyzer_cache_forces_a_rebuild(settings: Settings) -> N
     assert after is get_analyzer(settings.spacy_model)
 
 
+def _looks_like_a_label_tail(span: str) -> bool:
+    """Whether a span ran into the next field's label rather than wrapping mid-value."""
+    if "\n" not in span:
+        return False
+    tail = span.split("\n", 1)[1].strip()
+    return bool(tail) and re.fullmatch(r"[A-Za-z][A-Za-z ]{0,20}", tail) is not None
+
+
 def _read_fixture(name: str) -> str:
     """Fixture text. Module-level and sync so the pathlib call is off the loop."""
     return (Path(__file__).resolve().parent.parent / "fixtures" / name).read_text(
@@ -4661,10 +4669,17 @@ async def test_no_detection_spans_a_line_break(
     # to span a hard wrap -- see Deviation 32 -- so asserting this over all of them
     # is asserting the opposite of the spec, which is what a first version did.
     ner_backed = {n for n, spec in registry.entities.items() if spec.presidio}
+    # A newline inside an NER span is only wrong when the tail is a FIELD LABEL --
+    # `'David Ochoa\n    DOB'`. A span that wraps mid-VALUE
+    # (`'Margaret\n    Whitfield'`) must be kept whole: trimming it throws the
+    # surname away, and because the discarded half is then never vaulted, it goes to
+    # the provider in the clear. Asserting "no NER span crosses a newline" was the
+    # first version of this test and it certified that leak.
     offenders = [
         (d.entity_type, d.text)
         for d in await detector.detect(text, category)
-        if d.entity_type in ner_backed and ("\n" in d.text or d.text != d.text.rstrip())
+        if d.entity_type in ner_backed
+        and (_looks_like_a_label_tail(d.text) or d.text != d.text.rstrip())
     ]
     assert offenders == [], (
         f"{len(offenders)} detection(s) in {fixture} cross a line break or carry "

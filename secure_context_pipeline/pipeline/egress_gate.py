@@ -615,7 +615,23 @@ class EgressGate:
             if any(needle in payload_skeleton for needle in _identifier_needles(folded)):
                 hits += 1
                 continue
-            if _occurs_with_flexible_separator(folded, payload_skeleton):
+            # Offered BOTH the accent-preserving haystack and the deaccented one,
+            # and the first is not optional: with only the skeleton, this limb was
+            # dead for every original carrying a diacritic. The needle is
+            # deliberately never deaccented (that is what keeps `José` and `Jose`
+            # distinct values), so an accented component simply does not occur in a
+            # deaccented haystack -- `_occurs_with_flexible_separator`'s substring
+            # pre-filter rejected it before the regex ever ran. `José Ruiz` vaulted
+            # from a clean mention reached the provider as `José-Ruiz` while the
+            # unaccented control `Jose-Ruiz` blocked, which is the exact shape this
+            # limb was added to close.
+            #
+            # Adding the folded haystack costs nothing and preserves the asymmetry:
+            # needle `josé ruiz` still does not match a payload that says `jose
+            # ruiz`, because the needle keeps its accent in both comparisons.
+            if _occurs_with_flexible_separator(
+                folded, haystacks.folded
+            ) or _occurs_with_flexible_separator(folded, payload_skeleton):
                 hits += 1
                 continue
             if any(
