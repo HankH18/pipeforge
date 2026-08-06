@@ -34,11 +34,14 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from secure_context_pipeline.api.schemas import MAX_ID_LEN
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto import aead, keys
+from secure_context_pipeline.crypto.keys import normalize
 from secure_context_pipeline.errors import ConfigError, CryptoAuthError, PipelineError
 from secure_context_pipeline.models import (
     MASK,
@@ -1500,3 +1503,76 @@ def test_the_error_subclass_walk_sees_the_classes_errors_py_documents() -> None:
     }
     assert documented_elsewhere <= found, sorted(documented_elsewhere - found)
     assert {f"secure_context_pipeline.errors.{name}" for name in ERRORS_PY_SUBCLASSES} <= found
+
+
+# ---------------------------------------------------------------------------
+# normalize() idempotency -- property-based, because the failing input was one
+# nobody had thought of.
+# ---------------------------------------------------------------------------
+
+
+@given(st.text(max_size=40))
+@settings(max_examples=800, deadline=None)
+def test_normalize_is_idempotent(value: str) -> None:
+    """``normalize(normalize(x)) == normalize(x)``, for every string.
+
+    Not a nicety: two call sites disagree about how many times to apply it.
+    ``SessionVault.put`` indexes on one pass and ``get_by_original`` re-normalises
+    defensively on the stated grounds that this holds. When it did not, the write
+    landed under one key and the read-back missed under another, and the engine
+    raised ``vault_put_not_readable`` from a branch commented "this cannot happen"
+    -- an HTTP 500 from an ordinary .txt upload.
+
+    Casefolding is not closed over NFKC: ``casefold("ß")`` is ``"ss"``, so
+    ``"ß" + U+0323`` folds to ``"ss" + U+0323`` and a second NFKC composes the new
+    trailing ``s`` with the mark. A hand-written corpus does not contain that; a
+    generator does.
+    """
+    once = normalize(value)
+    assert normalize(once) == once
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ß̣",  # the found case: casefold expands, then NFKC composes
+        "ß̇x",
+        "Weiß̣",
+        "Ǆ̣",  # DŽ -- another expanding fold next to a mark
+    ],
+)
+def test_normalize_is_idempotent_on_the_expanding_folds(value: str) -> None:
+    """The specific shapes the property test found, kept as named regressions."""
+    assert normalize(normalize(value)) == normalize(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["John\x00Smith", "acme\x01corp", "a\x7fb", "\x9fMarcus Delacroix"],
+)
+def test_normalize_removes_non_whitespace_controls(value: str) -> None:
+    """A control character must not survive into an HMAC label.
+
+    `derive_token_id` frames its message as ``label || 0x00 || value``, so
+    `_label_bytes` rejects a label carrying its own NUL. That guard was written
+    for entity types -- "an opaque, config-supplied string" -- and Deviation 45
+    then routed the normalised *document value* into the same label. One NUL in a
+    detected span, or in the JSON `prompt` field with an entirely benign document,
+    raised `ConfigError` out of the obfuscation hot path as HTTP 500, while every
+    other pseudonymization failure degrades to a plain token.
+    """
+    normalized = normalize(value)
+    assert "\x00" not in normalized
+    assert not any(ord(ch) < 0x20 and not ch.isspace() for ch in normalized)
+    # And the label the pseudonymizer builds from it is now constructible.
+    keys.derive_faker_seed(secrets.token_bytes(32), f"NAME:{normalized}")
+
+
+@pytest.mark.parametrize("control", ["\t", "\n", "\r"])
+def test_normalize_keeps_whitespace_controls_as_separators(control: str) -> None:
+    """The whitespace controls collapse to a space rather than vanishing.
+
+    Deleting them would glue two words into one, which is a different value --
+    and, for the EgressGate, a needle that no longer matches its own payload.
+    """
+    assert normalize(f"John{control}Smith") == "john smith"

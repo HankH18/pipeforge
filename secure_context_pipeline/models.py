@@ -111,7 +111,19 @@ from pydantic import (
 # the same reason. Re-exported so `models.MAX_DETAIL_VALUE_LEN` keeps working.
 from secure_context_pipeline.errors import MAX_DETAIL_VALUE_LEN
 
+#: The categories a document may be filed under, and the **single** vocabulary two
+#: independent consumers must agree on: `DocumentStore.put` validates an upload
+#: against it, and `load_registry` validates every `only_in_doc_categories` entry
+#: against it. It lives here rather than in `store/` because `detection/registry.py`
+#: cannot import the store without inverting the layering -- and while it lived
+#: there, the registry simply did not check. A typo (`medial` for `medical`) loaded
+#: clean and silently disabled that entity in EVERY document, including `general`
+#: and unclassified ones: no detection, so no vault entry, so no egress-gate
+#: backstop either. A typo in `category:` raises; this one did not.
+DOC_CATEGORIES: frozenset[str] = frozenset({"medical", "legal", "financial", "general"})
+
 __all__ = [
+    "DOC_CATEGORIES",
     "MASK",
     "MAX_AUDIT_LABEL_LEN",
     "MAX_DETAIL_VALUE_LEN",

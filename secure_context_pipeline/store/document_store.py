@@ -73,6 +73,7 @@ from secure_context_pipeline.errors import (
     PipelineError,
     StoreAuthError,
 )
+from secure_context_pipeline.models import DOC_CATEGORIES
 from secure_context_pipeline.store import extraction
 
 __all__ = [
@@ -87,11 +88,12 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: The categories a document may be filed under. These drive the registry's
-#: ``only_in_doc_categories`` scoping (build doc section 9.2): a legal document
-#: resolves ``PERSON`` to ``CLIENT_IDENTITY``, a medical one does not. ``None``
-#: means "unclassified" and is always allowed.
-DOC_CATEGORIES: frozenset[str] = frozenset({"medical", "legal", "financial", "general"})
+#: Re-exported from `models` so this module's public name is unchanged. The set is
+#: defined there because `detection/registry.py` validates against it too and cannot
+#: import the store; see the note at its definition for the fail-open that caused.
+#: These drive the registry's ``only_in_doc_categories`` scoping (build doc section
+#: 9.2): a legal document resolves ``PERSON`` to ``CLIENT_IDENTITY``, a medical one
+#: does not. ``None`` means "unclassified" and is always allowed.
 
 RAW_SUFFIX = ".raw"
 TEXT_SUFFIX = ".txt"

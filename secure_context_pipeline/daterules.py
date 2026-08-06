@@ -61,6 +61,13 @@ _DIGIT_RUN_RE = re.compile(r"\d+")
 #: "today" -- a shifted today is a wrong date that looks right.
 _FALLBACK_ANCHOR = datetime(2000, 1, 1)
 
+#: The second anchor :func:`_parse_fallback` parses against. Shares **no field** with
+#: :data:`_FALLBACK_ANCHOR` -- different year, month and day -- so any component the
+#: text does not supply differs between the two parses and is detectable as invented.
+#: A probe sharing even one field would be blind to a text that omits exactly that
+#: field.
+_FALLBACK_PROBE = datetime(1997, 6, 24)
+
 
 @dataclass(frozen=True, slots=True)
 class SourceDate:
@@ -202,14 +209,35 @@ def _parse_month_year(text: str) -> SourceDate | None:
 def _parse_fallback(text: str) -> SourceDate | None:
     """``dateutil`` for anything the format table missed; renders ISO.
 
-    Guarded by "at least two digit runs" so a bare year ("2024") is *not*
-    silently promoted to 1 January and shifted into a plausible-looking lie.
+    Guarded twice, and the second guard is the one that works.
+
+    The digit-run count rejects a bare year ("2024") so it is not silently promoted
+    to 1 January and shifted into a plausible-looking lie. It does **not** reject a
+    bare clock time: ``9:15 AM`` has two digit runs, neither of which is a date
+    component, and ``dateutil`` resolved the whole date from the anchor. The payload
+    then asserted ``2000-03-14`` for a span whose text says nothing about any day --
+    which is exactly the failure this module's own comment says it exists to prevent
+    ("a shifted today is a wrong date that looks right"). Relocating the anchor from
+    *today* to a fixed date moved that lie; it did not remove it. Worse, every
+    subsequent clock time in the document resolves to the same fabricated date and
+    collides in the vault, so three times on one page render three incomparable ways.
+
+    So the real question is asked directly: **did any date component come from the
+    text, or all of them from the default?** Parsing twice against two anchors that
+    share no field answers it exactly -- a component the text supplies is identical
+    both times, and one taken from the default differs. No heuristic about digits can
+    decide this, which is why the first guard could not.
     """
     if len(_DIGIT_RUN_RE.findall(text)) < 2:
         return None
     try:
         parsed = dateutil_parser.parse(text, default=_FALLBACK_ANCHOR, fuzzy=False)
+        probe = dateutil_parser.parse(text, default=_FALLBACK_PROBE, fuzzy=False)
     except (ValueError, OverflowError, TypeError):
+        return None
+    if parsed.date() != probe.date():
+        # At least one of (year, month, day) was invented by the anchor. A date this
+        # pipeline made up is not a date it may shift and present as the source's.
         return None
     return SourceDate(parsed.date(), lambda shifted: shifted.isoformat())
 

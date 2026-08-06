@@ -3767,6 +3767,11 @@ def test_duplicate_entity_name_is_rejected_at_load(tmp_path: Path) -> None:
         ("registry_category_not_declared", "categories: [PII]\nentities:\n  X: {category: PHI, patterns: ['a']}\n"),
         ("registry_gazetteer_missing", "categories: [PHI]\nentities:\n  X: {category: PHI, gazetteer: nope.txt}\n"),
         ("registry_entity_has_no_recognizer", "categories: [PII]\nentities:\n  X: {category: PII, context: [a]}\n"),
+        # A typo here used to load CLEAN and disable the entity in every document,
+        # including `general` and unclassified ones -- no detection, so no vault
+        # entry, so no egress-gate backstop. The adjacent `category:` typo one row
+        # up has always raised, which is what made this one easy to miss.
+        ("registry_unknown_doc_category", "categories: [PII]\nentities:\n  X: {category: PII, patterns: ['a'], only_in_doc_categories: [medial]}\n"),
         ("registry_no_entities", "categories: [PII]\nentities: {}\n"),
         ("registry_not_a_mapping", "- a\n- b\n"),
         ("registry_yaml_invalid", "categories: [PII\nentities:\n"),

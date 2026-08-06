@@ -19,7 +19,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from secure_context_pipeline.errors import ConfigError
-from secure_context_pipeline.models import EntityCategory
+from secure_context_pipeline.models import DOC_CATEGORIES, EntityCategory
 from secure_context_pipeline.surrogates import validate_entity_type
 
 __all__ = [
@@ -274,6 +274,22 @@ def load_registry(path: str | Path | None = None) -> EntityRegistry:
 
         if spec.category not in categories:
             raise ConfigError(reason="registry_category_not_declared", entity_type=spec.name[:64])
+        # `only_in_doc_categories` is checked against the SAME vocabulary
+        # `DocumentStore.put` validates an upload against, and until now it was
+        # checked against nothing. The failure mode is the bad one: a typo
+        # (`medial` for `medical`) loads clean, and because the detector enforces
+        # this field by *restricting the requested entity set*, an unmatchable
+        # value restricts the entity out of every document -- `general`,
+        # `medical`, and unclassified alike. The entity is then never detected,
+        # so never vaulted, so the egress gate has no needle for it either: a
+        # one-character config typo silently removes an entity and all three of
+        # its backstops. The adjacent `category:` typo has always raised, which is
+        # what made this one easy to miss.
+        unknown = tuple(c for c in spec.only_in_doc_categories if c not in DOC_CATEGORIES)
+        if unknown:
+            raise ConfigError(
+                reason="registry_unknown_doc_category", entity_type=spec.name[:64]
+            )
         if spec.gazetteer and not (GAZETTEER_DIR / spec.gazetteer).is_file():
             raise ConfigError(reason="registry_gazetteer_missing", entity_type=spec.name[:64])
         if not spec.is_recognizer_backed:

@@ -81,6 +81,13 @@ HKDF_SALT = b"scp-v1"
 MAX_TOKEN_COUNTER = 0xFFFFFFFF
 _WHITESPACE = re.compile(r"\s+")
 
+#: C0 and C1 control characters that are **not** whitespace. Removed by
+#: :func:`normalize`; see its docstring for why this is an availability fix. The
+#: whitespace controls (``\t``, ``\n``, ``\r``, ``\v``, ``\f``, U+0085) are excluded
+#: from the class deliberately -- ``_WHITESPACE`` collapses those to a space, and
+#: deleting them instead would silently glue two words together.
+_CONTROLS = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x84\x86-\x9f]")
+
 
 def _hkdf(ikm: bytes, info: bytes) -> bytes:
     """One 32-byte key from ``ikm``, separated from every other key by ``info``."""
@@ -267,8 +274,53 @@ def normalize(value: str) -> str:
     restores both as whichever appeared first. That is the intended trade -- one
     token per entity is what makes the payload's co-occurrence structure honest and
     the vault small -- but it is a fidelity loss, not a free lunch.
+
+    **NFKC is applied again after casefolding, and that second pass is what makes
+    this function idempotent.** Casefolding is not closed over NFKC: it *expands*
+    some characters, and an expansion can leave a combining mark adjacent to a
+    freshly-produced base character that NFKC would then compose. The concrete
+    case is the German sharp s. ``casefold("ß")`` is ``"ss"``, so ``"ß" + U+0323``
+    (combining dot below) folds to ``"ss" + U+0323`` -- and a second NFKC composes
+    the trailing ``s`` with the mark into ``ṣ``, a different string.
+    ``normalize(normalize(x)) != normalize(x)``.
+
+    That mattered because two call sites disagreed about how many times to apply
+    it. :meth:`SessionVault.put` indexes on one pass;
+    :meth:`SessionVault.get_by_original` re-normalises defensively, on the stated
+    grounds that this function is idempotent -- which it was not. The two produced
+    different keys for such a value, so the write landed and the read-back missed,
+    and the engine raised ``vault_put_not_readable`` from a branch commented
+    ``# pragma: no cover -- this cannot happen``. It could: an ordinary ``.txt``
+    upload containing the sequence returned HTTP 500 under both strategies.
+
+    Pinned by ``test_normalize_is_idempotent`` (property-based, over the whole
+    Unicode range rather than over a list of cases somebody thought of).
+
+    **Non-whitespace C0/C1 controls are removed**, and that is a availability fix
+    rather than a canonicalisation preference. ``derive_token_id`` frames its HMAC
+    message as ``label || 0x00 || value`` and :func:`_label_bytes` therefore
+    rejects a label containing its own NUL -- correctly, since that framing is only
+    injective without one. That guard was written when a label was an entity type,
+    i.e. "an opaque, config-supplied string"; Deviation 45 then routed the
+    *normalised document value* into the same label
+    (``f"{entity_type}:{normalize(text)}"`` in ``PseudonymizationStrategy._seed``),
+    which made a guard against a config typo into a guard against document content.
+    A single NUL anywhere in a detected span -- or in the JSON ``prompt`` field, with
+    an entirely benign document -- raised ``ConfigError`` out of the obfuscation hot
+    path and surfaced as HTTP 500. Every other pseudonymization failure degrades to
+    a plain token; that one did not.
+
+    Removing them here fixes it at the canonicalisation point, which is the only
+    place that fixes it for *every* consumer rather than for the one that reported
+    it. A C0 control renders as nothing, so dropping it loses no disclosure and no
+    reader-visible content -- the same argument the EgressGate's invisible-character
+    fold makes. Whitespace controls (``\\t``, ``\\n``, ``\\r``) are deliberately not
+    in scope: they are whitespace, and the collapse above already turns them into a
+    single space rather than deleting them.
     """
-    return _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", value)).strip().casefold()
+    stripped = _CONTROLS.sub("", value)
+    folded = _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", stripped)).strip().casefold()
+    return unicodedata.normalize("NFKC", folded)
 
 
 def derive_token_id(session_key: bytes, entity_type: str, value: str, *, counter: int = 0) -> str:
