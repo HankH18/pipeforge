@@ -278,22 +278,35 @@ MIN_IDENTIFIER_DIGITS: Final = 7
 #: registry and this constant can no longer disagree without a red).
 MIN_IDENTIFIER_RUN_DIGITS: Final = 6
 
-#: How many letters an **all-alphabetic, multi-component** original must have, once
-#: its separators are removed, before :func:`_separator_needles` compares it as a bare
-#: substring. An all-digit join reuses :data:`MIN_IDENTIFIER_DIGITS` instead -- "how
-#: much digit content makes a string specific enough to compare unbounded" is a
-#: question that constant already answers, and a second number for it would drift
-#: apart from the first. A join that MIXES letters and digits gets no needle at all;
-#: see :func:`_separator_needles` for why that case is the dangerous one.
+#: How many alphanumeric characters a **multi-component** original must have, with its
+#: separators removed, before :func:`_separator_needles` builds a needle for it. One
+#: floor, applied to every multi-component value regardless of composition.
 #:
-#: Eight is chosen against the payload projection this needle is compared to, which is
-#: the whole payload with every non-alphanumeric character removed -- so every word is
-#: glued to its neighbours and short needles acquire landing sites that the document
-#: never wrote. ``John Smith`` joins to nine characters and is covered; ``Jo Ann``
-#: joins to five, would match inside ``joanna``, and is not. That is a real residual
-#: and it is the same one :data:`MIN_ORIGINAL_LEN` accepts for short values: a
-#: two-component value whose components are both very short keeps only the four
-#: bounded forms.
+#: **This docstring described a different design until it was re-read against the
+#: code.** It claimed three branches -- an all-digit join reusing
+#: :data:`MIN_IDENTIFIER_DIGITS`, an all-alphabetic join using this constant, and a
+#: mixed letter-and-digit join getting no needle at all -- and none of that is what
+#: runs. `_separator_needles` tests `len(_alnum_only(stripped)) < MIN_JOINED_ALNUM_LEN`
+#: and nothing else: `1:23-cv-04567` and `MRN A-5567281` both get needles, and
+#: `MIN_IDENTIFIER_DIGITS` is never consulted here. It also described the comparison
+#: as a bare substring against an alnum-stripped payload projection, which was the
+#: FIRST design and was replaced precisely because it re-opened the
+#: `chronic low back pain` / `pains` false positive. What ships keeps the outer word
+#: boundaries and relaxes only the interior separator.
+#:
+#: The three-branch story was not harmless: it is the kind of prose a reviewer checks
+#: the behaviour against, and it told them a narrower rule protects them than the one
+#: that runs.
+#:
+#: **What eight actually buys**, measured on the generator corpus (26 seeds, four
+#: document kinds, 8,143 distinct planted originals): 8,073 are multi-component, and
+#: the floor excludes 343 of them -- 4.2%, overwhelmingly lab values like ``HDL 28``
+#: and ``WBC 9.6``. Those are the residual, and lowering the floor to cover them would
+#: make ``HDL`` plus two digits a needle over the whole payload, which is the
+#: false-positive class :func:`_composite_needles` refuses by design. Pinned in both
+#: directions by ``test_the_joined_alnum_floor_is_the_one_the_limb_applies``; before
+#: that test the constant did not appear in the suite at all and could be lowered to 1
+#: in silence.
 MIN_JOINED_ALNUM_LEN: Final = 8
 
 #: Wall-clock budget for one whole ``check()``. Exceeding it blocks, because a
@@ -733,12 +746,26 @@ class EgressGate:
             # said SSN. The perverse part is the direction: the more clearly the
             # document labelled the SSN, the less protected it was.
             #
-            # The floor is ``threshold_redact`` rather than zero on purpose. An
-            # unlabelled nine-digit run scores 0.05, and blocking on that would
-            # deny every payload containing any nine-digit number -- an invoice
-            # line, a part number -- while adding nothing: at 0.05 the detector is
-            # not claiming it is an SSN. Pinned by
-            # ``test_a_high_severity_hit_in_the_redact_band_blocks``.
+            # The floor is ``threshold_redact`` rather than zero on purpose: it makes
+            # the gate act wherever the ENGINE would have acted, which is the property
+            # that closes the band. An unlabelled nine-digit run scores 0.05 and is
+            # left alone, so an invoice or part number does not deny every payload it
+            # appears in.
+            #
+            # What that does NOT mean -- and an earlier version of this comment
+            # implied it -- is that a hit at or above the floor is the detector
+            # "claiming it is an SSN". Presidio's score here is context-derived, and
+            # :meth:`_protected_spans` exempts our own output from being a *finding*
+            # but not from being *context*: a ``[PII_SSN_...]`` token or a
+            # ``[REDACTED_SSN]`` marker this pipeline printed lifts any bare
+            # nine-digit run in the same payload to 0.40 and denies the request.
+            # Measured: 0 such denials across 64 corpus documents, because the
+            # generator's nine-digit values are themselves planted entities and get
+            # tokenised -- but a real document carrying a handled SSN *and* an
+            # untyped claim or invoice number is denied. Fail-closed, and disclosed in
+            # README section 7 rather than left for a reviewer to find.
+            #
+            # Pinned by ``test_a_high_severity_hit_in_the_redact_band_blocks``.
             floor = (
                 self._settings.threshold_redact
                 if det.entity_type in self._high_severity
@@ -1246,11 +1273,16 @@ def _identifier_needles(value: str) -> tuple[str, ...]:
 
 
 def _alnum_only(value: str) -> str:
-    """``value`` reduced to its letters and digits. Applied to BOTH sides.
+    """``value`` reduced to its letters and digits.
 
-    Symmetric, unlike :func:`_deaccent`, and it has to be: the whole point is that
-    the two sides disagree about the separator, so neither side's spelling of it can
-    be trusted.
+    Used as a **length measure only** -- :func:`_separator_needles` calls it to decide
+    whether a value clears :data:`MIN_JOINED_ALNUM_LEN`. No payload is ever passed
+    through it.
+
+    This said "Applied to BOTH sides. Symmetric, unlike ``_deaccent``", which was
+    true of the first design: that one compared a joined needle against a joined
+    payload projection. That design was replaced because it re-opened a false
+    positive, and the comment outlived it.
     """
     return "".join(ch for ch in value if ch.isalnum())
 

@@ -1793,6 +1793,21 @@ see them. See §7 gap 1 and `SessionVault.note_unrestorable`.
 
 **Stated honestly, in rough priority order:**
 
+- **Two shapes the egress gate denies that are not disclosures, and one it may deny that is
+  not a leak.** The gate is allowed to be wrong in the deny direction, but a denial reads like
+  a leak to whoever investigates it, so both are named here. (a) The re-scan floor is
+  `threshold_redact`, and Presidio's score at that level is *context*-derived: a
+  `[PII_SSN_…]` token or `[REDACTED_SSN]` marker this pipeline printed lifts any bare
+  nine-digit run in the same payload to 0.40, so a document carrying a handled SSN **and** an
+  untyped claim or invoice number is denied. Measured at 0 denials across 64 corpus documents,
+  because generated nine-digit values are themselves planted entities and get tokenised.
+  (b) The separator-invariant limb allows an unbounded run of non-alphanumerics between a
+  value's components, so two components of a multi-word original appearing consecutively
+  across a sentence break or a list bullet match. Bounding that run is the obvious fix and was
+  left undone deliberately: the corpus measurement that would justify a specific bound has not
+  been made, and picking a number without it is how `MIN_IDENTIFIER_DIGITS` acquired the wrong
+  one.
+
 - **`ADDRESS` is among the weakest entities here, and the recall table's 100% does not mean
   what it looks like.** `ADDRESS` rides Presidio's `LOCATION` recognizer, so what it actually
   detects is bare place names — on `financial_disclosure.txt` the only two ADDRESS spans are
