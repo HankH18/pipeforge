@@ -41,14 +41,23 @@ with ``restored_count`` up, ``vault_misses`` at zero and outcome ``ok``.
 So ``issued`` now gates the substitution rather than merely labelling the miss:
 
 * an ID this run minted resolves exactly as before;
-* an ID it did not, written in a **bracketed** form, is the model inventing a
-  placeholder -- it degrades to ``[UNRESOLVED_ENTITY]`` and audits as
+* an ID it did not, written in a **square-bracketed** form, is the model
+  inventing a placeholder -- it degrades to ``[UNRESOLVED_ENTITY]`` and audits as
   :data:`MISS_FABRICATED`, and the vault is never asked;
-* an ID it did not, written **without brackets**, is indistinguishable from
-  ordinary document text and is left byte-for-byte alone. It is counted
+* an ID it did not, written **without square brackets**, is indistinguishable
+  from ordinary document text and is left byte-for-byte alone. It is counted
   (``foreign_tokens``) and logged, never rewritten. Deleting a user's own
   reference code is a data-integrity failure they cannot see; a token-shaped
   string surviving verbatim is text they can read.
+
+Square brackets specifically, and that word is load-bearing -- see
+:func:`_is_bracketed`. ``TOKEN_RE`` tolerates ``(``, ``{`` and ``[`` because the
+model mangles the pair, but the emitter only ever writes ``[...]``, so a paren is
+never evidence that *we* wrote a run. Reading it as evidence destroyed the single
+most ordinary way a document cites its own reference: ``Reference
+(FIN-ACCOUNT-40281993) is disputed.`` came back as ``Reference
+[UNRESOLVED_ENTITY] is disputed.`` while the same code without the parentheses
+survived verbatim.
 
 Omitting ``issued`` keeps the old, ungated behaviour, and honestly: every miss is
 :data:`MISS_INDETERMINATE` and every token-shaped residue is fatal, because
@@ -189,6 +198,16 @@ _POSSESSIVE_SUFFIXES: tuple[str, ...] = ("'s", _RSQUO + "s", "'", _RSQUO)
 #: ``)`` inside the model's prose cannot terminate a ``[``-opened token.
 _BRACKET_PAIRS: dict[str, str] = {"[": "]", "{": "}", "(": ")"}
 _CLOSERS = "".join(_BRACKET_PAIRS.values())
+
+#: The one bracket pair this pipeline can have written. ``format_surrogate``
+#: builds ``f"[{core}]"`` and refuses to emit anything ``STRICT_TOKEN_RE``
+#: (anchored ``\[...\]``) cannot read back, so a ``(`` or a ``{`` around a
+#: token-shaped run came from the document or the model, never from us. Kept
+#: apart from :data:`_BRACKET_PAIRS` on purpose: the *tolerance* question
+#: (:func:`_consume_unclosed_tail`) needs all three pairs, the *provenance*
+#: question (:func:`_is_bracketed`) must not have them.
+_EMITTED_OPENER = "["
+_EMITTED_CLOSER = "]"
 
 # A bracketed token whose hint the model mangled ("|MANGLED-HINT" -- the hint
 # grammar is lowercase-only) leaves its closing bracket outside TOKEN_RE's match.
@@ -539,10 +558,12 @@ class Restorer:
 
         ``minted``
             The lowercased ``issued`` set, or ``None``. An ID outside it is never
-            sent to the vault. Bracketed, it degrades to ``[UNRESOLVED_ENTITY]``
-            (the model invented a placeholder); unbracketed, it is left verbatim,
-            because that is what an uploaded document's own reference code looks
-            like and destroying it is worse than showing it.
+            sent to the vault. In *square* brackets -- the only shape we emit --
+            it degrades to ``[UNRESOLVED_ENTITY]`` (the model invented a
+            placeholder); in any other shape, parentheses included, it is left
+            verbatim, because that is what an uploaded document's own reference
+            code looks like and destroying it is worse than showing it. See
+            :func:`_is_bracketed` for why parentheses are not our handwriting.
         """
         matches = list(TOKEN_RE.finditer(text))
         if not matches:
@@ -619,9 +640,14 @@ class Restorer:
                 # the one that carries a value.
                 #
                 # The trigger is not adversarial. An ordinary document reference the
-                # model echoes, `(PHI-MRN-40281993)`, is a `TOKEN_RE` match whose
-                # group 3 is eight digits of a real MRN -- and it landed in the
-                # `token_id` column, in the hash chain, and in `GET /audit`. That is
+                # model echoes back in the placeholder shape the system prompt taught
+                # it, `[PHI-MRN-40281993]`, is a `TOKEN_RE` match whose group 3 is
+                # eight digits of a real MRN -- and it landed in the `token_id`
+                # column, in the hash chain, and in `GET /audit`. (The parenthesised
+                # `(PHI-MRN-40281993)` used to reach this branch too, which was a
+                # second and worse defect -- `_is_bracketed` read a paren as our own
+                # handwriting and deleted the reference. Fixed there; the square
+                # form still arrives here and still carries the MRN.) That is
                 # the outcome build doc section 16 forbids unconditionally. For a
                 # FABRICATED miss the ID is by definition not ours -- `minted` was
                 # supplied and this ID is not in it -- so the classification is the
@@ -1210,16 +1236,35 @@ def _shift_spans(
 
 
 def _is_bracketed(matched: str) -> bool:
-    """Did this token match carry a bracket on either side?
+    """Did this token match carry a bracket **this pipeline could have written**?
 
     The discriminator between "the model invented a placeholder" and "the document
     contained a reference code". Either side is enough: a dropped bracket is a
     mutation class the mock models and the build doc lists (section 9.6), so
     demanding both would push half of the model's own placeholders into the
     left-alone branch. Both absent means nothing in the string says *we* wrote it.
+
+    **Square only.** This asked ``stripped[0] in _BRACKET_PAIRS``, reusing the
+    pair table and so accepting ``(``, ``{``, ``)`` and ``}`` as evidence of our
+    authorship. We never write those: :func:`~secure_context_pipeline.surrogates.
+    format_surrogate` builds ``f"[{core}]"`` and will not emit a marker
+    ``STRICT_TOKEN_RE`` -- anchored on ``\\[...\\]`` -- cannot read back. Prose
+    wears parentheses constantly, so the effect was that a document's own
+    reference cited the most ordinary way there is, ``Reference
+    (FIN-ACCOUNT-40281993) is disputed.``, was claimed, replaced by
+    ``[UNRESOLVED_ENTITY]``, and audited :data:`MISS_FABRICATED` -- blaming the
+    model for text it had copied faithfully -- while the identical code *without*
+    the parentheses survived byte-for-byte. Same string, opposite outcomes,
+    decided by a character prose supplies for free.
+
+    ``TOKEN_RE`` keeps tolerating all three pairs and must: matching a mangled
+    token is how it gets restored. Tolerance is a question about *shape*; this is
+    a question about *provenance*, and only the shape we emit answers it.
     """
     stripped = matched.strip()
-    return bool(stripped) and (stripped[0] in _BRACKET_PAIRS or stripped[-1] in _CLOSERS)
+    return bool(stripped) and (
+        stripped[0] == _EMITTED_OPENER or stripped[-1] == _EMITTED_CLOSER
+    )
 
 
 def _collapse_ws(text: str) -> str:

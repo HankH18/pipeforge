@@ -2485,6 +2485,196 @@ async def test_a_throttled_audit_probe_writes_no_row(app: FastAPI, client: Async
     )
 
 
+@contextlib.contextmanager
+def _walk_meter(app: FastAPI, capacity: int) -> Any:
+    """Install a tight chain-walk meter for one test and put the original back.
+
+    Held on ``app.state.audit_chain_walks`` rather than inside
+    ``app.state.rate_limits``, so ``_meters`` does not reach it and this has to
+    save and restore it separately -- the module shares one app, and a budget
+    left spent here would throttle whichever test ran next.
+    """
+    original = getattr(app.state, "audit_chain_walks", None)
+    app.state.audit_chain_walks = _tight_meter(capacity)
+    try:
+        yield
+    finally:
+        app.state.audit_chain_walks = original
+
+
+async def test_the_chain_walk_is_bounded_per_caller_however_long_the_log_gets(
+    app: FastAPI, client: AsyncClient, services: Services
+) -> None:
+    """``GET /audit/verify`` was anonymous *and* free, and only the first is by design.
+
+    The route re-hashes every row in ``audit_events`` -- ``_CHAIN_SQL`` has no
+    ``WHERE`` clause -- and the log is append-only and unprunable, so the cost of
+    one request rises forever: measured on this build, 7.4 ms at 1 000 rows,
+    35.2 ms at 5 000, 143.3 ms at 20 000, and 50 back-to-back anonymous calls all
+    answered 200. ``GET`` is not in ``METERED_METHODS`` (nothing durable is
+    written) and no scope proof is required (nothing is disclosed), so both
+    existing meters reasoned past it: they bound *writes* and *guessing*, not
+    *work*.
+
+    The assertion that matters is the third one -- the number of chain walks
+    actually performed, counted by wrapping ``AuditLogger.verify_chain`` itself.
+    Counting 429s instead would only prove the meter answers 429; it would stay
+    green if the handler walked the chain and *then* refused, which is the
+    ordering half of this control. Nothing here reads the meter's own state, so
+    the checker shares no machinery with the thing it checks.
+
+    The scoped form is charged from the same bucket, because it is the same
+    whole-chain walk: metering only the unscoped form would move the cost one
+    query parameter over, which is the mistake ``AUDIT_PROOF_BURST`` already
+    records for the oracle it bounds.
+
+    ``test_a_long_log_costs_more_of_the_same_budget_than_a_short_one`` covers the
+    other half -- that the price rises with the log -- which is what keeps this
+    bound true as the append-only log grows.
+    """
+    session_id = await _create_session(client)
+    walks = 0
+    real_verify = services.audit.verify_chain
+
+    async def counted_verify(scope: str | None = None) -> bool:
+        nonlocal walks
+        walks += 1
+        return await real_verify(scope)
+
+    with mock.patch.object(services.audit, "verify_chain", counted_verify), _walk_meter(app, 3):
+        answers = [await client.get("/audit/verify") for _ in range(25)]
+        statuses = [answer.status_code for answer in answers]
+        # The owner-scoped form shares the exhausted budget: same walk, same cost.
+        scoped = await client.get(
+            "/audit/verify", params={"session_id": session_id, "user_id": OWNER}
+        )
+
+    assert statuses[:3] == [200] * 3, statuses
+    assert set(statuses[3:]) == {429}, statuses
+    assert walks == 3, (
+        f"25 anonymous requests against a 3-token budget must cost 3 chain walks; cost {walks}. "
+        f"A meter charged after the walk leaves every status-code assertion above green."
+    )
+    assert scoped.status_code == 429, scoped.text
+    assert walks == 3, f"the scoped form must share the budget, not open a second one: {walks}"
+
+    # The walks that were paid for covered a real, non-empty chain -- a bound that
+    # holds because there was nothing to hash would prove nothing.
+    assert answers[0].json()["length"] > 0, answers[0].text
+    refused = answers[3].json()
+    assert refused["code"] == "RATE_LIMITED", refused
+    assert refused["detail"]["retry_after_seconds"] > 0, refused
+    # Anonymous, and still anonymous: the refusal names nothing either.
+    assert session_id not in answers[3].text
+
+    # With the budget restored the tamper check still answers -- this is a bound
+    # on cost, not an outage on the one publicly checkable claim in the system.
+    restored = await client.get("/audit/verify")
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["valid"] is True, restored.text
+
+
+async def test_a_long_log_costs_more_of_the_same_budget_than_a_short_one(
+    app: FastAPI, client: AsyncClient, services: Services
+) -> None:
+    """The price is rows of chain, not requests, and that is not a refinement.
+
+    One token per request was built first and measured doing nothing: a burst of
+    20 with one token per second, against a 20 000-row log, answered **all 50** of
+    a back-to-back anonymous flood, because a walk that takes 752 ms refills its
+    own token while it runs. The log is append-only and unprunable, so the walk
+    gets slower forever while a request meter's ceiling stays put -- it reads as
+    enforced while metering nothing.
+
+    Both halves are driven through the same budget so the comparison means
+    something: twelve tokens buys twelve walks of a short log and one walk of a
+    50 000-row one. The long log is *reported* rather than written, and
+    deliberately: appending 50 000 rows to the module's shared audit database
+    would slow every later test in this file and change the chain length other
+    tests measure deltas against. What is asserted is the route's own arithmetic
+    against the count it is given, observed from outside by counting the walks
+    that actually happened.
+    """
+    walks = 0
+    real_verify = services.audit.verify_chain
+    real_length = services.audit.length
+
+    async def counted_verify(scope: str | None = None) -> bool:
+        nonlocal walks
+        walks += 1
+        return await real_verify(scope)
+
+    async def long_log(scope: str | None = None, **filters: Any) -> int:
+        return 50_000 if scope is None and not filters else await real_length(scope, **filters)
+
+    with mock.patch.object(services.audit, "verify_chain", counted_verify):
+        with mock.patch.object(services.audit, "length", long_log), _walk_meter(app, 12):
+            long_statuses = [(await client.get("/audit/verify")).status_code for _ in range(12)]
+        long_walks = walks
+
+        walks = 0
+        with _walk_meter(app, 12):
+            short_statuses = [(await client.get("/audit/verify")).status_code for _ in range(12)]
+        short_walks = walks
+
+        # The scoped form is priced by the *whole* log too, because it hashes the
+        # whole log: ``verify_chain(session_id=...)`` narrows what it asserts on,
+        # not what it reads. Pricing it by its own session's handful of rows would
+        # hand any session owner the unbounded walk this meter just took away.
+        walks = 0
+        owned = {"session_id": await _create_session(client), "user_id": OWNER}
+        with mock.patch.object(services.audit, "length", long_log), _walk_meter(app, 12):
+            first_scoped = await client.get("/audit/verify", params=owned)
+            second_scoped = await client.get("/audit/verify", params=owned)
+        scoped_walks = walks
+
+        # A log so long that the unclamped price exceeds any bucket. The price is
+        # capped at the bucket's capacity, so a full bucket still buys exactly one
+        # walk: an uncapped price would make a long enough chain permanently
+        # unverifiable over HTTP, which is a silent end to the one claim this
+        # system offers to be checked on -- a worse outcome than serving it slowly.
+        walks = 0
+
+        async def enormous_log(scope: str | None = None, **filters: Any) -> int:
+            return 10_000_000 if scope is None and not filters else await real_length(scope)
+
+        with mock.patch.object(services.audit, "length", enormous_log), _walk_meter(app, 12):
+            enormous = await client.get("/audit/verify")
+            starved = await client.get("/audit/verify")
+        enormous_walks = walks
+
+    assert long_walks == 1, (
+        f"a 50 000-row chain must cost 11 of the 12 tokens, leaving room for one walk; "
+        f"got {long_walks} walks and statuses {long_statuses}. A flat price per request "
+        f"buys 12 -- and buys them faster the longer the log gets."
+    )
+    assert long_statuses.count(200) == 1, long_statuses
+    assert set(long_statuses[1:]) == {429}, long_statuses
+
+    # Same budget, same twelve requests, a log of a few hundred rows: all twelve.
+    assert short_walks == 12, (short_walks, short_statuses)
+    assert short_statuses == [200] * 12, short_statuses
+    assert (await client.get("/audit/verify")).json()["length"] < 5_000, (
+        "this file's shared log must stay under one token's worth of rows, or the "
+        "contrast above is measuring the wrong thing"
+    )
+
+    assert first_scoped.status_code == 200, first_scoped.text
+    assert scoped_walks == 1, (
+        f"the owner-scoped form walks the whole chain, so it must be priced by the whole "
+        f"chain: 12 tokens buys one 50 000-row walk, not two. Got {scoped_walks}, second "
+        f"answer {second_scoped.status_code}."
+    )
+    assert second_scoped.status_code == 429, second_scoped.text
+
+    assert enormous.status_code == 200, enormous.text
+    assert enormous_walks == 1, (
+        f"a full bucket must always buy one walk however long the log is; got "
+        f"{enormous_walks}. An uncapped price makes the chain permanently unverifiable."
+    )
+    assert starved.status_code == 429, starved.text
+
+
 async def test_every_mutating_route_is_metered_including_ones_added_later(
     app: FastAPI, client: AsyncClient
 ) -> None:
@@ -3008,3 +3198,23 @@ async def test_a_health_poll_does_not_disarm_the_ttl_reaper(
         "vault rows are stranded until process exit"
     )
     assert session_id not in services.vault.cached_session_ids()
+
+    # The other half of the same mechanism: the drain must be once-only.
+    # Everything above passes whether or not `_drain_unreaped_locked` calls
+    # `self._unreaped.clear()`, because the FIRST reap succeeds either way. With
+    # the `clear()` removed, three consecutive `sweep()` calls each returned the
+    # same expired ID (measured), and since `reap_expired_sessions` runs on every
+    # authenticated request, one expired session then appends a SESSION_EXPIRE and
+    # a VAULT_DESTROY to the hash chain per request for the life of the process
+    # while `_unreaped` grows without bound.
+    assert (await _run(client, session_id, doc_id)).status_code == 401
+
+    # Asserted from the auditor's side rather than off the registry's internals:
+    # a session expires once, so a reader of the log must see exactly one of each
+    # event, no matter how many requests happened to observe the expiry.
+    destroys = await services.audit.length(session_id=session_id, event_type="VAULT_DESTROY")
+    assert destroys == 1, f"expiry re-reaped: {destroys} VAULT_DESTROY events for one session"
+    expires = await services.audit.length(session_id=session_id, event_type="SESSION_EXPIRE")
+    assert expires == 1, f"expiry re-reaped: {expires} SESSION_EXPIRE events for one session"
+    assert await services.sessions.sweep() == [], "the unreaped drain was not consumed"
+    assert await services.audit.verify_chain() is True

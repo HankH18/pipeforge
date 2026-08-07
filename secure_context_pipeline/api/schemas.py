@@ -61,8 +61,23 @@ __all__ = [
 MAX_ID_LEN = 64
 
 #: Ceiling on the user's question. The document is not bounded here (that is the
-#: store's business); the prompt is, because it is spliced into the outbound
-#: payload verbatim.
+#: store's business); the prompt is, because every stage the prompt drives is linear
+#: in its length and none of them is skippable: its own detect pass, its own
+#: obfuscate pass, one vault write per value it contributes, and the gate's re-scan
+#: of the assembled payload -- all of it on a request body accepted before any
+#: auth-shaped check has run.
+#:
+#: This comment used to give a different reason -- that the prompt reaches the
+#: provider unmodified -- and that reason was false, which matters because rule 1
+#: above says these rules govern the whole module: a reader would conclude that PII
+#: typed into ``prompt`` and absent from the document reaches the provider. It does not.
+#: :class:`~secure_context_pipeline.pipeline.orchestrator.PipelineOrchestrator` runs
+#: the prompt through the same detector and the same engine as the document before
+#: the payload is built (``prompt_entities_detected`` / ``prompt_tokens_issued`` in
+#: ``PipelineResult.stats``, one ``OBFUSCATE`` audit row per vaulted prompt value),
+#: and what the injector splices in is the obfuscated prompt. Measured end to end
+#: with the PII in the prompt only and a document holding none: 4 entities detected,
+#: 4 tokens issued, and all four originals absent from ``obfuscated_payload``.
 MAX_PROMPT_CHARS = 8_000
 
 StrategyName = Literal["tokenization", "pseudonymization"]

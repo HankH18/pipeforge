@@ -110,13 +110,41 @@ closed:
    (``Brown``/``Browning``), and it does not transfer to a nine-digit identifier, so
    :func:`_identifier_needles` now scans digit-carrying values with no adjacency
    requirement at all. See that function for the exact rule and its cost.
-2. *A combining mark spliced into a value.* ``Nathaniel Brightwater`` was vaulted
+2. *A mark spliced into a value.* ``Nathaniel Brightwater`` was vaulted
    from its clean mention and reached the provider as ``Nathaniél
    Brightwater`` -- a different string to every one of the three original forms, and
    identical to ``Nathaniel Brightwater`` for a human reader and for the model. The
    *payload* is now compared in a mark-stripped skeleton form as well
    (:func:`_deaccent`); the needle is deliberately not stripped, which is what keeps
-   ``José`` and ``Jose`` distinct values. See :func:`_deaccent`.
+   ``José`` and ``Jose`` distinct values.
+
+   This entry said "combining mark", and the fold behind it was closed for 912 of
+   the 2,408 marks in this interpreter's Unicode database -- which is worse than an
+   overstatement, because nothing anywhere reported the other 1,496. It selected on
+   :func:`unicodedata.combining`, the canonical *combining class*, and 1,063 ``Mn``,
+   420 ``Mc`` and 13 ``Me`` codepoints answer that question with ``0``. Measured on
+   the real gate with one mark spliced into the vaulted name above: U+0E31 THAI
+   CHARACTER MAI HAN-AKAT, U+0903 DEVANAGARI SIGN VISARGA and U+20DD COMBINING
+   ENCLOSING CIRCLE each walked it to the provider with ``EGRESS_PASS`` recorded,
+   while U+0301 blocked. Two instances of one wrong question: casefold *rewrites*
+   U+0345 into a Greek letter, so a mark of combining class 240 survived as well --
+   which is why the strip now also runs on the raw payload, ahead of normalisation
+   (:func:`_skeleton`).
+
+   Widening that selection to the general category was **not a pure widening**, and
+   the same reproduction that closed the splice opened a second shape before it was
+   caught: the occurrence test on the stripped string is a word-boundary rule, so a
+   class-0 mark sitting *beside* the value was a boundary character until the fold
+   deleted it and glued the value to its neighbour. Measured by differential fuzz on
+   ``_scan_originals``, 60,000 randomized cases: the widened rule blocked 16,429
+   payloads the old one released and released **212** the old one blocked. Both
+   halves reproduce end to end -- ``Contact Nathanie<U+0301>l
+   Brightwater<U+0903>Corporation`` was ``EGRESS_BLOCKED`` before the widening and
+   ``EGRESS_PASS`` after it. The payload is therefore skeletonised under **both**
+   selections and compared against both (:func:`_skeleton_views`); a union of two
+   haystack-only folds is strictly additive, and the fuzz reports 0 regressions
+   against either baseline. See :func:`_deaccent`, :func:`_skeleton` and
+   :func:`_skeleton_views`.
 3. *One constituent of a composite original.* A vault original is whatever the
    detector called one span, and a span is not always one value: spaCy returns
    ``03/11/2024, 09/17/2024`` as a single ``DATE``, so a string the document contains
@@ -143,15 +171,25 @@ closed:
    sides of the comparison now write decimal digits in ASCII
    (:func:`_fold_decimal_digits`).
 
-Two gaps remain:
+5. *A separator written as a transport escape.* ``Marguerite Vandenberg``, vaulted
+   and tokenised out of the ``Patient:`` line, rode out in the same payload's chart
+   link as ``?patient=Marguerite%20Vandenberg``. Every bounded form keeps the space;
+   the separator-relaxing limb keeps only "non-alphanumeric", and ``%20``,
+   ``&nbsp;``, ``&#32;`` and ``<br/>`` all carry word characters, so a character
+   class cannot span one. The payload is now also compared in a **decoded** view
+   (:func:`_decode_transport_escapes`). This was filed as residual gap 2 below, and
+   the argument that it was unreachable was the wrong half of the question -- see
+   there.
+
+Three gaps remain:
 
 1. *Homoglyph substitution.* Cyrillic U+043E for Latin ``o`` is different bytes;
    catching it needs a confusables table, not another normalisation form. This is
-   the same class as the combining mark above and is the obvious next thing to
-   close; the difference is that a UTS-39 confusables table is data this project
-   does not ship, while ``unicodedata`` already knows what a combining mark is.
-2. *A lossy or re-writing encoding layer* (base64, percent-encoding, a
-   summarizer) applied to outbound text. This pipeline applies none -- the payload
+   the same class as the mark above and is the obvious next thing to close; the
+   difference is that a UTS-39 confusables table is data this project does not ship,
+   while ``unicodedata`` already knows what a mark is.
+2. *A lossy or re-writing encoding layer* (base64, a summarizer) applied to
+   outbound text. This pipeline applies none -- the payload
    is assembled from the obfuscated document verbatim -- so this is reachable only
    if some future stage adds one, which would have to bring the gate with it. The
    SDK's JSON serialization is not that stage and is worth saying so out loud,
@@ -162,8 +200,35 @@ Two gaps remain:
    body is parsed back out of ``httpx.MockTransport`` and compared to the strings
    handed to the provider.
 
-Both are detection-recall and upstream-integrity questions rather than scan-form
-questions; passes 2 and 3 and the vault are what cover them.
+   **Percent-encoding used to be filed here, and filing it here was the defect.**
+   The reachability argument above is about an encoding applied *on the way out*,
+   and an encoded value does not need one: it only has to be **present in the
+   uploaded document**, which is user-controlled input the pipeline then transports
+   verbatim exactly as advertised. ``%20`` in a portal URL and ``&nbsp;``/``<br/>``
+   in anything round-tripped through HTML or Word are ordinary spellings of a space
+   in an ordinary ``.md``, ``.txt`` or ``.docx`` upload. That is shape 5 above; it
+   was reproduced end to end with the API returning 200 and
+   ``egress_rescan_warnings`` at zero, and it is closed. What stays here is the other
+   half -- an encoding this pipeline would itself apply -- which is hypothetical in a
+   way the inbound half never was.
+3. *A mark inside a vaulted value AND a reordering mark immediately beside it.*
+   Removing a mark takes a word boundary with it, so the payload is skeletonised
+   under both mark selections (shape 2 above) -- but a mark whose combining class is
+   non-zero is deleted by *both* selections by construction, so it glues the value to
+   its neighbour in both and the boundary rule denies the occurrence. Measured with
+   ``Brightwater`` vaulted, one U+0301 spliced in, and each of the 2,408 marks in
+   turn immediately outside: 1,230 block, 1,178 do not. It predates the widening --
+   the rule that shipped before it releases the same payload -- and closing it needs
+   the removed character to survive as a boundary *token* rather than to be deleted,
+   i.e. a sentinel that
+   :func:`~secure_context_pipeline.textrules.occurs_as_a_unit` knows to skip. See
+   :func:`_skeleton_views`, which states the cost of that change and why the union
+   was taken instead.
+
+The first two are detection-recall and upstream-integrity questions rather than
+scan-form questions; passes 2 and 3 and the vault are what cover them. The third is a
+scan-form question, and the reason it is filed rather than closed is an interface
+change to a module four components share, not an argument that it is unreachable.
 
 **What the guarantee is, stated so it cannot be read as more than it is.** Pass 1
 backstops every value the pipeline *vaulted*, whatever the detector's recall was on
@@ -179,13 +244,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import logging
 import re
 import time
 import unicodedata
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from itertools import groupby
 from typing import Final, NamedTuple, Protocol
+from urllib.parse import unquote
 
 from secure_context_pipeline.audit.logger import EGRESS_BLOCK, EGRESS_PASS, AuditLogger
 from secure_context_pipeline.config import Settings
@@ -608,7 +675,8 @@ class EgressGate:
         strict here. Pass 2 keeps its skip-list because a *detector* re-hit on a
         well-formed fake is a different question from a byte-exact original.
 
-        Each original is compared in four bounded forms, and any one of them counts
+        Each original is compared in five bounded forms -- seven haystacks, since two
+        of them are derived under both mark selections -- and any one of them counts
         as a hit. Each additional form only ever *widens* the scan:
 
         1. **raw** -- the byte-exact value;
@@ -625,12 +693,30 @@ class EgressGate:
            fold those. That fold is applied to the needle as well, which is the one
            deliberate exception to the rule the next form states -- see
            :func:`_fold_decimal_digits` for why digits earn it and marks do not.
-        4. **skeleton** -- the folded needle against a folded payload with every
-           combining mark removed (:func:`_deaccent`), which is what catches a mark
-           spliced into a value. Asymmetric on purpose: only the *haystack* is
-           stripped, so ``José`` in the vault still does not match ``Jose`` on the
-           wire. Skipped outright when the payload carries no combining mark at all,
-           which is the common case and makes this form free there.
+        4. **skeleton** -- the folded needle against a folded payload with every mark
+           removed (:func:`_deaccent`, applied both before and after normalisation --
+           see :func:`_skeleton`), which is what catches a mark spliced into a value.
+           Derived **twice, under both definitions of "mark"** and compared against
+           both (:func:`_skeleton_views`): the general category, which is the whole
+           class of 2,408 and the one that sees a splice, and the canonical combining
+           class, which is the 912-codepoint subset and the one that keeps the other
+           1,496 as the word boundaries they are when they sit *beside* the value
+           rather than inside it. Selecting on the category alone closed the first
+           shape and opened the second; the union closes both and cannot regress
+           either, since both are haystack-only folds of the same payload. Asymmetric
+           on purpose: only the *haystack* is stripped, so ``José`` in the vault still
+           does not match ``Jose`` on the wire. Skipped outright when the payload
+           carries no mark at all, which is the common case and makes this form free
+           there, and the second view is skipped again whenever it agrees with the
+           first.
+        5. **decoded** -- the folded needle against the skeleton of a payload whose
+           percent-escapes, HTML character references and tags have been resolved
+           (:func:`_decode_transport_escapes`). ``Marguerite%20Vandenberg`` is the
+           whole vaulted name on the wire and no form above sees it, because every
+           one of them keeps the separator and the separator-relaxing limb below
+           allows only non-alphanumeric characters between components. Skipped
+           outright when the payload carries no ``%``, ``&`` or ``<``, and again when
+           decoding changed nothing.
 
         The first three are **not** redundant, and assuming they were is how the
         middle one nearly disappeared unnoticed: on text with no invisible characters,
@@ -671,19 +757,38 @@ class EgressGate:
         """
         payload_norm = normalize(payload)
         payload_folded = _fold_decimal_digits(_strip_invisible(payload_norm))
-        # The skeleton is derived from the RAW payload with spacing diacritics
-        # removed first -- see `_strip_spacing_marks` for why the order matters.
-        # NFKC expands one into a space plus a combining mark, so folding the mark
-        # afterwards leaves the space and the value stays broken.
-        payload_skeleton = _fold_decimal_digits(
-            _deaccent(_strip_invisible(normalize(_strip_spacing_marks(payload))))
+        payload_skeleton, payload_boundary = _skeleton_views(payload)
+        # Every mark-folded view of the payload, for the two limbs below that read a
+        # skeleton directly rather than through `_occurs_in_any_bounded_form`. Both
+        # of them used to read the one skeleton there was, and both inherit the
+        # boundary defect `_skeleton_views` documents -- the separator limb through
+        # `_occurs_as_a_unit`'s guards, the identifier limb through a needle that
+        # carries a class-0 mark of its own and can only be found in a haystack that
+        # kept it.
+        skeletons: tuple[str, ...] = (
+            (payload_skeleton,)
+            if payload_boundary is None
+            else (payload_skeleton, payload_boundary)
         )
+        decoded = _decode_transport_escapes(payload)
+        if decoded is None:
+            payload_decoded: str | None = None
+            payload_decoded_boundary: str | None = None
+        else:
+            payload_decoded, payload_decoded_boundary = _skeleton_views(decoded)
+            if payload_decoded == payload_skeleton:
+                payload_decoded = None
+            if payload_decoded_boundary == payload_boundary:
+                payload_decoded_boundary = None
         haystacks = _Haystacks(
             raw=payload,
             normalized=payload_norm,
             folded=payload_folded,
             skeleton=payload_skeleton,
             marked=payload_skeleton != payload_folded,
+            boundary_skeleton=payload_boundary,
+            decoded=payload_decoded,
+            decoded_boundary=payload_decoded_boundary,
         )
         payload_digits: str | None = None
         hits = 0
@@ -694,7 +799,11 @@ class EgressGate:
                 hits += 1
                 continue
             folded = _fold_decimal_digits(_strip_invisible(normalize(original)))
-            if any(needle in payload_skeleton for needle in _identifier_needles(folded)):
+            if any(
+                needle in skeleton
+                for needle in _identifier_needles(folded)
+                for skeleton in skeletons
+            ):
                 hits += 1
                 continue
             # Offered BOTH the accent-preserving haystack and the deaccented one,
@@ -711,9 +820,20 @@ class EgressGate:
             # Adding the folded haystack costs nothing and preserves the asymmetry:
             # needle `josé ruiz` still does not match a payload that says `jose
             # ruiz`, because the needle keeps its accent in both comparisons.
-            if _occurs_with_flexible_separator(
-                folded, haystacks.folded
-            ) or _occurs_with_flexible_separator(folded, payload_skeleton):
+            #
+            # And the DECODED haystack, because the limb's own claim -- that it
+            # relaxes any spelling of the interior separator -- is false against a
+            # separator that carries word characters (`%20`, `&nbsp;`, `<br/>`).
+            # `_INTERIOR_SEPARATOR` is a character class and cannot span one. See
+            # `_decode_transport_escapes` for the reproduction.
+            if (
+                _occurs_with_flexible_separator(folded, haystacks.folded)
+                or any(_occurs_with_flexible_separator(folded, s) for s in skeletons)
+                or (
+                    haystacks.decoded is not None
+                    and _occurs_with_flexible_separator(folded, haystacks.decoded)
+                )
+            ):
                 hits += 1
                 continue
             regrouped = _regrouped_identifier_needle(folded)
@@ -1142,7 +1262,7 @@ def _is_spacing_diacritic(ch: str) -> bool:
 def _strip_spacing_marks(value: str) -> str:
     """``value`` with spacing diacritics removed. Applied to the HAYSTACK only.
 
-    :func:`_deaccent` folds *combining* marks and closes the splice it was written
+    :func:`_deaccent` folds *marks* and closes the splice it was written
     for. It cannot close this one, and the reason is an ordering problem rather
     than an oversight: by the time ``_deaccent`` runs, the payload has been through
     NFKC, which expands ``U+00B4`` into a space plus a combining acute. Stripping
@@ -1164,8 +1284,36 @@ def _strip_spacing_marks(value: str) -> str:
     return "".join(ch for ch in value if not _is_spacing_diacritic(ch))
 
 
-def _deaccent(value: str) -> str:
-    """``value`` with every combining mark removed. Applied to the HAYSTACK only.
+def _is_mark(ch: str) -> bool:
+    """Whether ``ch`` is a mark -- the general category, i.e. the whole class.
+
+    2,408 codepoints in this interpreter's database, and this is the selection
+    :func:`_deaccent` uses by default. See :func:`_is_reordering_mark` for the other
+    one and :func:`_skeleton_views` for why the module needs both rather than the
+    wider one alone.
+    """
+    return unicodedata.category(ch)[0] == "M"
+
+
+def _is_reordering_mark(ch: str) -> bool:
+    """Whether canonical ordering *reorders* ``ch`` -- combining class not 0.
+
+    A strict subset of :func:`_is_mark`: every one of the 2,408 category-``M``
+    codepoints answers :func:`unicodedata.combining` with something, 912 of them with
+    a non-zero class, and **no codepoint outside category ``M`` has a non-zero class
+    at all** (measured over the full 0x110000 range on Unicode 14.0.0, the version
+    this interpreter carries). So this selects 912 marks and nothing else, and
+    ``_is_reordering_mark(ch)`` implies ``_is_mark(ch)``.
+
+    That containment is the whole reason this predicate is kept rather than deleted
+    as the superseded one. Removing a mark is not a pure widening -- see
+    :func:`_skeleton_views`.
+    """
+    return unicodedata.combining(ch) != 0
+
+
+def _deaccent(value: str, *, is_mark: Callable[[str], bool] = _is_mark) -> str:
+    """``value`` with every mark (general category ``M``) removed. HAYSTACK only.
 
     :data:`_INVISIBLE_RE` folds characters that render as nothing and deliberately
     stops short of combining diacritics, because a diacritic is *visible* and
@@ -1195,15 +1343,271 @@ def _deaccent(value: str) -> str:
 
     NFD-then-strip-then-NFC rather than a character class: the mark can arrive
     precomposed (``ĺ``, U+013A) or as a base plus U+0301, and only decomposition
-    makes those the same question. The fast path returns ``value`` unchanged when
-    decomposition finds no mark at all, which is every payload that is not carrying
-    one -- and every ASCII payload without touching NFC.
+    makes those the same question. Two fast paths return ``value`` itself. An ASCII
+    string cannot contain a mark and is its own NFD, so it never enters the
+    decomposition at all -- ``str.isascii`` is a flag check on the string object, the
+    same one :func:`_fold_decimal_digits` opens with, and it matters because
+    :func:`_skeleton` calls this twice per haystack: on a 63 KB ASCII payload the
+    second call was 31 ms of guaranteed-nothing. The wider path returns ``value``
+    when decomposition finds no mark, which is every non-ASCII payload not carrying
+    one, without touching NFC.
+
+    **"Is this a mark" is the general category, not the canonical combining class,
+    and for two years this function asked the wrong one.** It selected on
+    :func:`unicodedata.combining`, which answers "how does this codepoint reorder
+    under canonical ordering" -- a question 1,496 of the 2,408 category-``M``
+    codepoints in this interpreter's Unicode database answer with ``0`` (1,063
+    ``Mn``, 420 ``Mc``, 13 ``Me``). Every one of them survived the fold untouched,
+    so the whole class the module docstring called closed was closed for the
+    subset of marks that happen to reorder. Measured on the real gate, one mark
+    spliced into a vaulted ``Nathaniel Brightwater``: U+0301 (ccc 230) and U+0316
+    (ccc 220) blocked, while U+0E31 THAI CHARACTER MAI HAN-AKAT (``Mn``, ccc 0),
+    U+0903 DEVANAGARI SIGN VISARGA (``Mc``, ccc 0) and U+20DD COMBINING ENCLOSING
+    CIRCLE (``Me``, ccc 0) all walked the vaulted original to the provider with
+    ``EGRESS_PASS`` recorded. The selection is now ``category()[0] != "M"``, which
+    is the property the docstring always claimed.
+
+    The asymmetry is unaffected by the widening -- only the haystack is stripped
+    either way, so ``José``/``Jose`` stay distinct, which is pinned by
+    ``test_the_skeleton_form_does_not_collapse_jose_and_jose``.
+
+    **The widening was not free, and ``is_mark`` is what pays for it.** Deleting a
+    character is not a pure widening of a scan whose occurrence test is a
+    *word-boundary* rule: a mark sitting immediately before or after a value was a
+    non-alphanumeric character, i.e. a valid boundary, and removing it glues the
+    value to the neighbouring run so that :func:`_occurs_as_a_unit` then rejects the
+    very occurrence this fold exists to find. The caller therefore derives the
+    haystack under **both** selections and compares against both; see
+    :func:`_skeleton_views` for the measured regression and the union argument.
     """
+    if value.isascii():
+        return value
     decomposed = unicodedata.normalize("NFD", value)
-    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    stripped = "".join(ch for ch in decomposed if not is_mark(ch))
     if len(stripped) == len(decomposed):
         return value
     return unicodedata.normalize("NFC", stripped)
+
+
+#: The characters that can begin a transport escape of a separator. A payload
+#: carrying none of them decodes to itself, so :func:`_decode_transport_escapes`
+#: can return ``None`` without touching it.
+_TRANSPORT_ESCAPE_HINT_RE: Final = re.compile(r"[%&<]")
+
+#: One HTML/XML tag, collapsed to a space rather than to nothing: ``<br/>`` between
+#: two components of a name is a rendered *break*, so the space is the faithful
+#: reading and it is also the one that keeps the four bounded forms able to see the
+#: result (``Marguerite Vandenberg``, not ``MargueriteVandenberg``). ``[^<>]`` so a
+#: stray ``<`` in prose cannot make this span half a paragraph.
+_MARKUP_TAG_RE: Final = re.compile(r"<[^<>]*>")
+
+
+def _decode_transport_escapes(value: str) -> str | None:
+    """``value`` with percent-escapes, character references and tags decoded.
+
+    Applied to the HAYSTACK only, like every other fold here except the digit one.
+
+    **The shape this closes, and why the module's residual gap 2 was the wrong
+    half of the question.** That gap files "a lossy or re-writing encoding layer
+    applied to outbound text" as unreachable because *this pipeline applies none*.
+    That is true and it is beside the point: the encoding does not have to be
+    applied on the way out, it only has to be **present in the uploaded document**,
+    which is user-controlled input the pipeline then transports verbatim exactly as
+    advertised. ``%20`` in a portal URL and ``&nbsp;``/``&#32;``/``<br/>`` in
+    anything round-tripped through HTML or Word are ordinary spellings of a space in
+    an ordinary ``.md``, ``.txt`` or ``.docx`` upload.
+
+    Reproduced end to end before this was written, on a one-page encounter note:
+    ``Marguerite Vandenberg`` was detected, vaulted and tokenised out of the
+    ``Patient:`` line, and the same whole name rode out to the provider inside
+    ``?patient=Marguerite%20Vandenberg&view=summary`` -- with ``orchestrator.run``
+    returning normally, the provider called once, ``egress_rescan_warnings`` at
+    zero and the API returning 200. Under pseudonymization it is worse than a leak:
+    the prose says ``Megan Padilla`` while the URL in the same payload says
+    ``Marguerite%20Vandenberg``, so the model is handed the real identity *and* a
+    decoy.
+
+    **Why this is a haystack fold rather than a wider separator class.**
+    :func:`_separator_needles` already relaxes the interior separator, but
+    :data:`_INTERIOR_SEPARATOR` is a character class and no character class can span
+    ``%20`` or ``&nbsp;`` -- each carries word characters. Widening the class to
+    admit alphanumerics is the wrong repair: it would make ``John Smith`` match
+    ``JohnQSmith``. Decoding the payload instead keeps the needle untouched, which
+    is what keeps every asymmetry this module depends on.
+
+    **What it costs, measured on a 36 KB clinical payload** rather than argued from
+    the shape of the code, because this is a second full haystack derivation and
+    those are the expensive part of pass 1:
+
+    * no ``%``, ``&`` or ``<`` anywhere -- 0.28 ms, one regex search, ``None``;
+    * ``&`` and ``<`` present but nothing actually decodes (``Smith & Jones``,
+      ``Dose < 5 mg``: no valid entity, no closing ``>``) -- 0.32 ms, ``None``. This
+      is the case that matters, because an ampersand in prose is ordinary and a
+      naive implementation would pay the full second derivation for every one;
+    * one real escape present -- 0.46 ms here plus 18.4 ms for the
+      :func:`_skeleton` pass the caller then runs on the result.
+
+    **Where it over-reads, said plainly.** ``_MARKUP_TAG_RE`` is a tag pattern
+    applied to text that is not necessarily markup, so ``a < b Jane Doe > c`` loses
+    its middle, and ``unquote`` will read ``50%20`` in prose as ``50`` plus a space.
+    Both make the decoded view *lose* text, so both can only hide a match this view
+    would otherwise make -- never invent one -- and the four undecoded forms are
+    compared regardless. That is the direction this gate is allowed to be wrong in.
+
+    Returns ``None`` -- meaning "nothing new to compare" -- when the payload carries
+    no escape character at all, and again when decoding was a no-op.
+    """
+    if not _TRANSPORT_ESCAPE_HINT_RE.search(value):
+        return None
+    decoded = _MARKUP_TAG_RE.sub(" ", html.unescape(unquote(value)))
+    return decoded if decoded != value else None
+
+
+def _skeleton(value: str, *, is_mark: Callable[[str], bool] = _is_mark) -> str:
+    """The most-folded haystack form: marks, invisibles and digit scripts all gone.
+
+    Factored out because two haystacks need it -- the payload and its
+    transport-decoded twin -- and the derivation is an ordering argument that must
+    not be restated in two places.
+
+    ``is_mark`` selects *which* characters count as marks and is the only difference
+    between the two skeletons :func:`_skeleton_views` derives. Everything else about
+    the derivation -- the order, the double application, the digit fold -- is shared,
+    which is what makes the pair a union of two views rather than two rules.
+
+    ``_deaccent`` runs **twice, and the first one is on the raw payload**, before
+    :func:`~secure_context_pipeline.crypto.keys.normalize`. That is the same reason
+    :func:`_strip_spacing_marks` already runs there, and it is not symmetry for its
+    own sake: ``normalize`` casefolds, and casefold *rewrites* U+0345 COMBINING
+    GREEK YPOGEGRAMMENI into a Greek iota **letter**. After that no mark-based rule
+    can see it -- measured, ``_deaccent(normalize("Nathan\\u0345iel"))`` is
+    ``"nathan\\u03b9iel"``, the mark gone from the category but the character still
+    breaking the value, while ``_deaccent`` on the raw string yields
+    ``"Nathaniel"``. The second application is still needed because NFKC's own
+    compatibility decompositions introduce marks that were not there in the raw.
+    """
+    return _fold_decimal_digits(
+        _deaccent(
+            _strip_invisible(normalize(_deaccent(_strip_spacing_marks(value), is_mark=is_mark))),
+            is_mark=is_mark,
+        )
+    )
+
+
+def _skeleton_views(value: str) -> tuple[str, str | None]:
+    """The skeleton under BOTH mark selections: ``(category, combining-class)``.
+
+    The second element is ``None`` when the two agree, which is every payload that
+    carries no combining-class-0 mark -- so the extra comparison it buys is skipped
+    exactly as ``_Haystacks.marked`` skips the skeleton on a payload with no mark.
+
+    **What the second derivation costs**, measured on a 36 KB clinical payload rather
+    than argued from the shape of the code, because a whole extra ``normalize`` pass
+    is the expensive part of pass 1's setup:
+
+    * ASCII -- **+0.18 ms**, one flag check on the string object and no second pass
+      at all (the fast path below), and this is the common payload;
+    * non-ASCII whose marks all reorder -- **+13.1 ms**, the second pass runs and
+      returns a string equal to the first, so the per-original cost stays at one
+      skeleton;
+    * non-ASCII carrying a class-0 mark -- **+9.0 ms**, and one more haystack in the
+      comparison for each original.
+
+    Against a pass 1 that takes roughly a second at 20k originals and a
+    :data:`DEFAULT_TIMEOUT_S` of 30, all three are noise. The middle one is the case
+    a cheaper guard would remove, and there is no cheap guard: deciding whether a
+    payload carries a class-0 mark means asking :mod:`unicodedata` about every
+    character, which costs about what the derivation costs.
+
+    **Why two views rather than the wider one.** Widening :func:`_deaccent` from
+    :func:`unicodedata.combining` to :func:`unicodedata.category` closed a real leak
+    -- 1,496 of Unicode's 2,408 marks have combining class 0 and every one of them
+    survived the old fold, so a mark spliced *inside* a vaulted value defeated pass 1
+    -- and it opened another one in the same stroke, because **removing a mark is not
+    a pure widening**. The occurrence test on the stripped string is
+    :func:`_occurs_as_a_unit`, a word-boundary rule. A class-0 mark sitting
+    immediately before or after the value used to be a non-alphanumeric character,
+    which *is* a boundary; deleting it glues the value to the neighbouring
+    alphanumeric run and the boundary rule then denies the occurrence.
+
+    Measured by differential fuzz over ``_scan_originals``, identical randomized
+    inputs to the old and the widened rule -- 60,000 cases, a vaulted original with
+    one to three marks drawn from the whole category spliced into random positions
+    and random text glued on either side:
+
+        widened blocks more: 16,429 cases      widened blocks LESS: 212 cases
+
+    Minimised, and both halves are real. Vault holds ``Nathaniel Brightwater``::
+
+        "Contact Nathanie<U+0301>l Brightwater<U+0903>Corporation for details."
+            combining-class skeleton: "...nathaniel brightwater<U+0903>corporation..."
+                -> the class-0 mark is still there, still a boundary  -> HIT
+            category skeleton:        "...nathaniel brightwatercorporation..."
+                -> glued to "corporation", boundary denied            -> MISS
+        "Contact Nathanie<U+0903>l Brightwater today."
+            combining-class skeleton: "...nathanie<U+0903>l brightwater..."  -> MISS
+            category skeleton:        "...nathaniel brightwater..."          -> HIT
+
+    End to end through :meth:`EgressGate.check` with a vault holding only that name,
+    the first payload was ``EgressBlockedError(vault_original)`` under the old rule
+    and ``EGRESS_PASS``, released, under the widened one. Replacing the class-0 mark
+    with a space blocks under both, which is the tell: the defect is the *boundary*,
+    not the mark.
+
+    So the repair is a union rather than a third rule. Both elements are
+    haystack-only folds of the same payload, the needle is untouched, and pass 1
+    hits if the value occurs as a unit in *either* -- so this can only ever find more
+    than either view alone and cannot regress either direction. Measured the same
+    way, the same 60,000 cases against both baselines, as blocks-more / blocks-less:
+    **16,430 / 0** against the old rule and **213 / 0** against the widened one --
+    the union exactly, with zero regressions in either direction, and one case more
+    than either (a U+0345 splice with a class-0 mark beside it, which needs the
+    raw-side strip of one view and the class-0 boundary of the other). Repeated at
+    100,000 cases on three seeds and with spacing diacritics, invisibles, non-ASCII
+    digits and transport-escaped separators mixed into the generator: 0 regressions
+    against either baseline every time.
+
+    The alternative considered and not taken was replacing each mark with a
+    non-alphanumeric sentinel and teaching the needle match to skip it. That is
+    structurally tidier -- one view, and ``Nathanie<mark>l`` reads as one word while
+    ``Brightwater<mark>Corporation`` reads as two -- but the skeleton is not only
+    fed to :func:`_occurs_as_a_unit`: :func:`_identifier_needles` tests it with a
+    bare ``in`` and :func:`_occurs_with_flexible_separator` runs a regex over it, and
+    a sentinel is invisible to neither. It would have to be threaded through
+    :func:`~secure_context_pipeline.textrules.occurs_as_a_unit`, which four
+    components share by design, to fix one component's haystack. The sentinel is also
+    not inert in the derivation: it sits in the string across ``normalize``, where it
+    blocks NFKC composition and stops a whitespace run collapsing, so the sentinel
+    view is *not* the deleting view plus sentinels and the substring pre-filter that
+    keeps pass 1 off the critical path stops being exact. The union is provably
+    non-regressing in a way a new matcher is not.
+
+    **What this union does not close, measured rather than implied by omission.** A
+    mark inside the value plus a mark *beside* it whose combining class is non-zero:
+    both views delete the outside one by definition, so both glue the value to its
+    neighbour. Measured on the real gate with ``Brightwater`` vaulted and one U+0301
+    spliced in, sweeping every one of the 2,408 marks through the outside position:
+    1,230 block and 1,178 do not -- the 912 that reorder, plus 266 class-0 marks that
+    another declared fold removes first (U+034F and the Mongolian free variation
+    selectors are default-ignorable, so :data:`_INVISIBLE_RE` takes them; U+0F73
+    NFKC-decomposes into two marks that both reorder). This is **older than the
+    widening rather than opened by it**: the combining-class rule this gate shipped
+    before released it too. U+0345 is the case that shows a mark-preserving view can
+    never be the whole answer, since casefold turns it into a Greek iota *letter*
+    that glues the words whether or not any fold removes it. Closing the class needs
+    the removed character to survive as a boundary token, which is the sentinel
+    design above and the interface change it implies. Pinned by
+    ``test_a_reordering_mark_beside_a_spliced_value_is_a_declared_boundary``.
+    """
+    skeleton = _skeleton(value)
+    if value.isascii():
+        # No mark can survive in an ASCII string and no fold here can introduce one,
+        # so the two selections cannot disagree and the second derivation -- a full
+        # normalize pass, the expensive half of pass 1's setup -- is skipped
+        # outright. This is the common payload.
+        return skeleton, None
+    bounded = _skeleton(value, is_mark=_is_reordering_mark)
+    return skeleton, (None if bounded == skeleton else bounded)
 
 
 def _fold_decimal_digits(value: str) -> str:
@@ -1280,9 +1684,13 @@ def _fold_decimal_digits(value: str) -> str:
 
 
 class _Haystacks(NamedTuple):
-    """The four payload forms pass 1 compares against, derived once per scan.
+    """The payload forms pass 1 compares against, derived once per scan.
 
-    A tuple rather than four positional arguments because they are always passed
+    Five forms, up to seven strings: the skeleton and the decoded skeleton are each
+    derived under both mark selections (:func:`_skeleton_views`), and the second of
+    each pair is ``None`` whenever it cannot differ from the first.
+
+    A tuple rather than seven positional arguments because they are always passed
     together and getting two of them the wrong way round is a silent widening or
     narrowing of the scan rather than a type error.
     """
@@ -1291,15 +1699,29 @@ class _Haystacks(NamedTuple):
     normalized: str
     folded: str
     skeleton: str
-    #: Whether the payload carries a combining mark at all. When it does not, the
-    #: skeleton form is the folded form and comparing it again buys nothing.
+    #: Whether the payload carries a mark at all. When it does not, the skeleton
+    #: form is the folded form and comparing it again buys nothing.
     marked: bool
+    #: The same skeleton derived under the *combining-class* mark selection
+    #: (:func:`_skeleton_views`), or ``None`` when the two selections agree. It keeps
+    #: class-0 marks, so a mark next to the value is still a word boundary there --
+    #: which is the occurrence ``skeleton`` loses by removing it.
+    boundary_skeleton: str | None
+    #: The skeleton of the payload with transport escapes decoded
+    #: (:func:`_decode_transport_escapes`), or ``None`` when the payload carries no
+    #: escape at all or decoding changed nothing -- in which case comparing it again
+    #: buys nothing, exactly as ``marked=False`` says of the skeleton.
+    decoded: str | None
+    #: ``decoded`` under the combining-class selection, on the same terms as
+    #: ``boundary_skeleton``: the decoded view has the same boundary defect, since it
+    #: is the same fold applied to a different string.
+    decoded_boundary: str | None
 
 
 def _occurs_in_any_bounded_form(value: str, haystacks: _Haystacks) -> bool:
-    """``value`` present in the payload as a unit, in any of the four compared forms.
+    """``value`` present in the payload as a unit, in any of the compared forms.
 
-    The four are documented at :meth:`EgressGate._scan_originals`; this function is
+    They are documented at :meth:`EgressGate._scan_originals`; this function is
     where they are *applied*, and it exists so that both things pass 1 asks about --
     a whole vaulted original and one constituent of a composite one -- ask in exactly
     the same words. The alternative was a second inline copy of the ``forms`` list for
@@ -1321,6 +1743,12 @@ def _occurs_in_any_bounded_form(value: str, haystacks: _Haystacks) -> bool:
     ]
     if haystacks.marked:
         forms.append((folded, haystacks.skeleton))
+    if haystacks.boundary_skeleton is not None:
+        forms.append((folded, haystacks.boundary_skeleton))
+    if haystacks.decoded is not None:
+        forms.append((folded, haystacks.decoded))
+    if haystacks.decoded_boundary is not None:
+        forms.append((folded, haystacks.decoded_boundary))
     return any(
         len(needle) >= MIN_ORIGINAL_LEN and _occurs_as_a_unit(needle, haystack)
         for needle, haystack in forms
@@ -1455,6 +1883,21 @@ def _separator_needles(value: str) -> tuple[str, ...]:
     involves the fold. The real property is that **any alteration of a multi-word
     original's interior separator defeats every form that keeps the separator in the
     needle.** So this form keeps none of it, on either side.
+
+    **What "any" is worth here, stated exactly, because it was overclaimed.** This
+    form relaxes the separator to :data:`_INTERIOR_SEPARATOR`, which is a *character
+    class* -- so what it actually tolerates is any run of non-alphanumeric
+    characters, and a separator carrying word characters is outside it by
+    construction. ``%20``, ``&nbsp;``, ``&#32;`` and ``<br/>`` are all of that shape,
+    all are ordinary transport spellings of a space that a ``.md``/``.txt``/``.docx``
+    upload carries verbatim, and all four walked a whole vaulted
+    ``Marguerite Vandenberg`` to the provider while the hyphen and zero-width
+    controls in the same probe blocked. Widening the class is the wrong repair --
+    admitting alphanumerics between components would make ``John Smith`` match
+    ``JohnQSmith`` -- so the haystack is decoded instead
+    (:func:`_decode_transport_escapes`) and this limb is run against that view too.
+    The claim above is therefore true of the *separator*, and true of the value only
+    once the payload has been decoded first.
 
     That is also why the obvious repair -- strip ``\\s`` from both sides and keep the
     word-boundary rule -- does not work. Removing the separator makes the neighbours

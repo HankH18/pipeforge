@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
@@ -28,6 +29,7 @@ import pytest
 from secure_context_pipeline.audit.logger import DEOBFUSCATE, VAULT_MISS, AuditLogger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.deobfuscation.restorer import (
+    _HINT_TAIL_RE,
     _MAX_LABEL_LEN,
     MISS_FABRICATED,
     MISS_INDETERMINATE,
@@ -37,6 +39,7 @@ from secure_context_pipeline.deobfuscation.restorer import (
     UNRESOLVED_ENTITY,
     Restorer,
     RestoreResult,
+    _canonical_by_shape,
     _compile_surrogate_pattern,
 )
 from secure_context_pipeline.errors import ConfigError, PipelineError, VaultMissError
@@ -375,12 +378,56 @@ async def test_possessive_inside_stripped_emphasis_survives(restorer: Restorer) 
     assert result.text == "John Smith's chart was reviewed."
 
 
+#: The two apostrophes a model actually emits. Written with ``chr`` for the same
+#: reason ``restorer._RSQUO`` is: no character confusable with ASCII ``'`` appears
+#: literally in this source (ruff RUF002), and a reader can see WHICH code point
+#: is meant rather than trusting an editor's rendering. Parametrising over both
+#: pins the PROPERTY -- a possessive rides through and the original comes back --
+#: instead of the spelling of one apostrophe.
+APOSTROPHES = ["'", chr(0x2019)]
+APOSTROPHE_IDS = ["ascii", "typographic"]
+
+
+@pytest.mark.parametrize("apostrophe", APOSTROPHES, ids=APOSTROPHE_IDS)
+async def test_possessive_inside_stripped_emphasis_survives_either_apostrophe(
+    restorer: Restorer, apostrophe: str
+) -> None:
+    """The typographic form is a live branch of ``_POSSESSIVES``, so it is bound here.
+
+    Every possessive the suite fed the token pass used the ASCII apostrophe, so
+    the ``U+2019 + s`` entry could be deleted with all tests green -- while a
+    model that types a smart quote (which is what a model does, unprompted) gets
+    ``**John Smith`` + smart-quote + ``s**`` back: the emphasis no longer
+    collapses, because the possessive was never lifted out of the span, and the
+    user reads raw markdown in a clinical answer.
+    """
+    result = await restorer.restore(
+        SESSION,
+        f"**[PHI_NAME_1a2b3c4d]{apostrophe}s** chart was reviewed.",
+        strategy=TOKENIZATION,
+    )
+
+    assert result.text == f"John Smith{apostrophe}s chart was reviewed."
+    assert result.restored_count == 1
+    assert result.vault_misses == 0
+
+
 async def test_adjacent_tokens_keep_their_separators(restorer: Restorer) -> None:
     text = "PHI_NAME_1a2b3c4d takes PHI_MEDICATION_2f4a1b3c daily."
 
     result = await restorer.restore(SESSION, text, strategy=TOKENIZATION)
 
     assert result.text == "John Smith takes Metformin daily."
+
+
+# The mop-up's own length cap, MEASURED off `_HINT_TAIL_RE` rather than copied in
+# as the literal 48. Two reasons, both about the row below not rotting: the bound
+# can move, and a change that REMOVES the bound outright makes this probe report a
+# far larger number, which grows the row's input past whatever the new limit is
+# instead of letting the row slip under it.
+_TAIL_PROBE = _HINT_TAIL_RE.match("X" * 4096)
+assert _TAIL_PROBE is not None, "the tail pattern is `*`-quantified; it always matches"
+_TAIL_CAP = len(_TAIL_PROBE.group(0))
 
 
 # Everything after a token is the model's own prose. NOTHING may delete any of it:
@@ -402,10 +449,40 @@ PROSE_AFTER_A_MANGLED_HINT = [
         "See [PHI_NAME_1a2b3c4d|note (about the case) here] end.",
         "See John Smith|note (about the case) here] end.",
     ),
-    # A ')' from an unrelated parenthetical must not close a '['-opened token.
+    # CORRECTED COMMENT. This used to read "A ')' from an unrelated parenthetical
+    # must not close a '['-opened token", and this case cannot pin that: the tail
+    # stops at the space after "oral-antidiabetic", so the WHITESPACE bound has
+    # already failed the tail and the closer is never examined at all. What the
+    # row really pins is the whitespace bound in the presence of a later ')'.
+    # The balancing-closer bound needed its own row -- see below, where nothing
+    # else can fail the tail first.
     (
         "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic (see note) daily.",
         "Take Metformin|oral-antidiabetic (see note) daily.",
+    ),
+    # BOUND: the tail must end with the bracket that BALANCES the opener. Both
+    # rows reach that check with every other bound satisfied -- one unbroken run,
+    # no whitespace, well inside the cap, a separator present, no second token --
+    # so the only thing standing between the model's text and deletion is which
+    # pair the closer in reach belongs to. Accept any closer and the answer
+    # becomes "Take (dose Metformin daily.": the dose gone, and the model's own
+    # bracket gone with it, leaving prose that no longer parses as English.
+    (
+        "Take (dose [PHI_MEDICATION_2f4a1b3c|500MG-WITH-FOOD) daily.",
+        "Take (dose Metformin|500MG-WITH-FOOD) daily.",
+    ),
+    (
+        "Take {dose [PHI_MEDICATION_2f4a1b3c|500MG-WITH-FOOD} daily.",
+        "Take {dose Metformin|500MG-WITH-FOOD} daily.",
+    ),
+    # BOUND: length. An emitted hint is at most 24 characters, so a run past
+    # `_TAIL_CAP` is not a mangled hint, it is prose that happens to have no
+    # spaces in it -- a URL, a base64 blob, a long dotted path. Uncap the tail and
+    # every one of these characters is deleted from the answer in silence, which
+    # is why the row is sized off the cap itself rather than a hardcoded number.
+    (
+        f"Ref [PHI_NAME_1a2b3c4d|{'X' * (_TAIL_CAP + 12)}] end.",
+        f"Ref John Smith|{'X' * (_TAIL_CAP + 12)}] end.",
     ),
     # A second token can never be swallowed by the first one's tail.
     (
@@ -767,11 +844,27 @@ async def test_unresolved_carries_token_ids_only(restorer: Restorer) -> None:
 
 #: Token-shaped strings that occur in ordinary documents. None of these is a
 #: token this pipeline issued; every one of them matches ``TOKEN_RE``.
+#:
+#: The first four are the bare form, and for a while they were the *only* form
+#: here -- which made the table blind to the branch that actually destroyed data.
+#: A reference code is most ordinarily cited inside parentheses, and `_is_bracketed`
+#: counted a paren as "a bracket we emitted" even though `format_surrogate` only
+#: ever writes ``[...]``. So the bare cases passed while ``Reference
+#: (FIN-ACCOUNT-40281993) is disputed.`` came back as ``Reference
+#: [UNRESOLVED_ENTITY] is disputed.``: same code, opposite outcome, decided by a
+#: character prose supplies for free. The wrapped forms are pinned here so the
+#: table exercises both sides of that decision instead of one.
 DOCUMENT_TEXT_THAT_LOOKS_LIKE_A_TOKEN = [
     "Reference: FIN-ACCOUNT-40281993 is disputed.",
     "Record locator: PHI-MRN-48273910 in the EHR.",
     "Filed under docket LEGAL-CASE-9e59e5af for routing.",
     "Ticket PII_NAME_deadbeef was closed.",
+    "Reference (FIN-ACCOUNT-40281993) is disputed.",
+    "Record locator (PHI-MRN-48273910) in the EHR.",
+    "Filed under docket (LEGAL-CASE-9e59e5af) for routing.",
+    "Ticket (PII_NAME_deadbeef) was closed.",
+    "Payload {FIN-ACCOUNT-40281993} from the JSON dump.",
+    "The mapping was {PII_NAME_deadbeef} in the config.",
 ]
 
 
@@ -792,6 +885,13 @@ async def test_document_text_that_merely_looks_like_a_token_survives_verbatim(
 
     Left alone is the right outcome and the *visible* one -- the answer still reads
     correctly and the count says something odd was in it.
+
+    The parenthesised and braced rows are the same claim about a wrapper the
+    pipeline never writes: `format_surrogate` emits ``[...]`` and nothing else, so
+    a paren around a token-shaped run is the document's punctuation, not our
+    handwriting. ``foreign_tokens == 1`` rather than ``>= 1`` on every row, because
+    "left alone" and "counted" have to hold together -- a pass that silently
+    stopped counting would still leave the text byte-for-byte correct.
     """
     restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings, audit=audit)
 
@@ -805,6 +905,80 @@ async def test_document_text_that_merely_looks_like_a_token_survives_verbatim(
     assert await audit.query(session_id=SESSION, event_type=VAULT_MISS) == []
     # Counted, not hidden.
     assert result.foreign_tokens == 1
+
+
+#: One reference code, worn six ways, and whether the wrapper is evidence that
+#: *this pipeline* wrote the run. ``True`` means claimable: the substitution runs
+#: and the code degrades to ``[UNRESOLVED_ENTITY]``.
+#:
+#: The digits are a plausible medical record number, so the True rows are also the
+#: rows where an audit leak of group 3 would matter -- see
+#: `test_a_document_reference_the_model_echoes_never_reaches_the_audit_log`.
+WRAPPERS_AND_WHETHER_THEY_ARE_OURS = [
+    # (fragment as it appears in the answer, is it claimable)
+    ("PHI-MRN-40281993", False),  # bare -- a reference code in prose
+    ("(PHI-MRN-40281993)", False),  # a citation's parentheses, not our bracket
+    ("{PHI-MRN-40281993}", False),  # a JSON/template brace, not our bracket
+    ("[PHI-MRN-40281993]", True),  # the shape `format_surrogate` emits
+    # Half a bracket is still our bracket: section 9.6 lists "one bracket dropped"
+    # as a mutation class, so demanding both would push the model's own mangled
+    # placeholders into the left-alone branch.
+    ("[PHI-MRN-40281993", True),
+    ("PHI-MRN-40281993]", True),
+]
+
+
+@pytest.mark.parametrize(
+    ("fragment", "claimable"),
+    WRAPPERS_AND_WHETHER_THEY_ARE_OURS,
+    ids=[f"{f[0]}-{'ours' if f[1] else 'theirs'}" for f in WRAPPERS_AND_WHETHER_THEY_ARE_OURS],
+)
+async def test_only_the_bracket_this_pipeline_emits_marks_a_run_as_ours(
+    settings: Settings, audit: AuditLogger, fragment: str, claimable: bool
+) -> None:
+    """The discriminator is the square bracket, and both directions are pinned here.
+
+    Written as one code in six wrappers rather than six separate cases because the
+    property is a *contrast*: a test that only asserted survival would pass just as
+    happily against a `_is_bracketed` deleted outright, and a test that only
+    asserted destruction would pass against one that always returned True. Both
+    halves have to be in the same table or neither is evidence.
+
+    The False rows are the live defect this table was added for. `_is_bracketed`
+    accepted ``(``, ``{``, ``)`` and ``}`` because it reused `_BRACKET_PAIRS`, the
+    tolerance table `_consume_unclosed_tail` needs -- so ``(PHI-MRN-40281993)`` was
+    claimed, sent nowhere near the vault, replaced by ``[UNRESOLVED_ENTITY]``, and
+    audited as FABRICATED, while the identical code without the parentheses came
+    back untouched. The emitter has only ever written ``[...]``
+    (`format_surrogate`, validated against `STRICT_TOKEN_RE`), so a paren was never
+    evidence of anything but the document's own punctuation.
+    """
+    mrn = "40281993"
+    text = f"See the chart reference {fragment} for details."
+    restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued=[NAME_ID], run_id=RUN
+    )
+
+    rows = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    if claimable:
+        assert result.text != text, "a run in our own bracket must not survive verbatim"
+        assert UNRESOLVED_ENTITY in result.text
+        assert result.fabricated == (mrn,)
+        assert result.foreign_tokens == 0
+        assert len(rows) == 1
+        # The audit-hygiene rule travels with the classification, on every shape
+        # that can reach it -- not only the one shape a single test happens to use.
+        assert rows[0].token_id is None
+        assert mrn not in rows[0].model_dump_json()
+    else:
+        assert result.text == text, "the document's own reference code was rewritten"
+        assert mrn in result.text
+        assert result.fabricated == ()
+        assert result.vault_misses == 0
+        assert result.foreign_tokens == 1
+        assert rows == []
 
 
 async def test_the_vault_is_never_asked_about_an_id_this_run_did_not_issue(
@@ -894,6 +1068,65 @@ async def test_a_bracketed_token_the_model_invented_still_degrades(
     assert [event.detail["classification"] for event in misses] == [MISS_FABRICATED]
 
 
+#: ``(placeholder as the model wrote it, is it ours to claim)``. The dropped-bracket
+#: tolerance in ``_is_bracketed`` used to be unbound -- tightening it to demand BOTH
+#: brackets left every test green -- because each unminted-ID case in this file was
+#: either fully bracketed or fully bare. ``WRAPPERS_AND_WHETHER_THEY_ARE_OURS``
+#: above now pins the same tolerance from the *reference code* side, on a
+#: hyphenated run in prose; this table pins it from the other side, on the exact
+#: underscore grammar ``format_surrogate`` emits, and asserts the FULL output plus
+#: the classification rather than only that the text changed. Section 9.6 lists
+#: "one bracket dropped" as a mutation class the models actually produce, and
+#: ``test_every_mutation_the_mock_emits_survives_restoration`` cannot cover it
+#: because it passes every token as ``issued``, which short-circuits the bracket
+#: test before it is reached.
+INVENTED_PLACEHOLDER_SHAPES = [
+    ("[PHI_NAME_deadbeef]", True),
+    ("[PHI_NAME_deadbeef", True),
+    ("PHI_NAME_deadbeef]", True),
+    # The control: no bracket on either side, so nothing in the string says WE
+    # wrote it, and a document's own reference code must survive byte-for-byte.
+    ("PHI-NAME-deadbeef", False),
+]
+
+
+@pytest.mark.parametrize(
+    ("placeholder", "ours"),
+    INVENTED_PLACEHOLDER_SHAPES,
+    ids=[case[0] for case in INVENTED_PLACEHOLDER_SHAPES],
+)
+async def test_a_half_bracketed_placeholder_is_still_ours_to_degrade(
+    settings: Settings, placeholder: str, ours: bool
+) -> None:
+    """One dropped bracket must not flip a placeholder into the left-alone branch.
+
+    Demanding both brackets pushes half of the model's own mangled placeholders
+    into the branch reserved for the document's reference codes: the user then
+    reads ``Contact [PHI_NAME_deadbeef about it.`` verbatim, and the audit calls
+    it ``foreign`` -- "some other system's identifier" -- rather than
+    ``MISS_FABRICATED``, which is the true story and the one an operator can act
+    on. Pinned as a table so the discriminator is provable in both directions:
+    every half-bracketed form degrades, and the bare form still does not.
+    """
+    restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings)
+    text = f"Contact {placeholder} about it."
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued=[NAME_ID], run_id=RUN
+    )
+
+    if ours:
+        assert result.text == f"Contact {UNRESOLVED_ENTITY} about it."
+        assert result.fabricated == ("deadbeef",)
+        assert result.vault_misses == 1
+        assert result.foreign_tokens == 0
+    else:
+        assert result.text == text
+        assert result.fabricated == ()
+        assert result.vault_misses == 0
+        assert result.foreign_tokens == 1
+
+
 async def test_without_issued_the_old_stricter_rule_still_applies(
     settings: Settings, audit: AuditLogger
 ) -> None:
@@ -955,6 +1188,66 @@ async def test_a_restored_value_is_never_re_read_by_the_token_pass(
     assert await audit.query(session_id=SESSION, event_type=VAULT_MISS) == []
     # The collision was seen and skipped rather than not noticed.
     assert result.restored_collisions == 1
+    # ...and reported. The residue STRADDLES the seam -- "PHI-" is the model's own
+    # prose, "MRN-48273910" is ours -- so it is not wholly inside a restored span
+    # and the post-restore assertion must still count it. This run produced the
+    # count all along and nothing looked at it, which let the assertion's
+    # containment test be relaxed to overlap with the whole suite green.
+    assert result.foreign_tokens == 1
+
+
+async def test_a_straddling_residue_is_reported_and_can_still_fail_the_run(
+    settings: Settings,
+) -> None:
+    """The deliberate asymmetry, both halves, on the one shape that can see it.
+
+    ``_restore_tokens`` excludes a restored span on OVERLAP because rewriting is
+    the destructive act; ``_assert_no_tokens`` excuses only on CONTAINMENT because
+    excusing is the permissive one. Make the assertion as generous as the pass and
+    nothing in the suite noticed -- the two differ only where a residue straddles
+    a splice seam, and that is exactly the shape the module was built around: the
+    document's own ``PHI-`` in front of an ``MRN-`` this stage restored.
+
+    Both halves are asserted because they fail differently. When the residue's
+    8-hex tail is not an ID this run minted it is *foreign*: reportable, not
+    fatal, and the count is the only thing that says the output contains a
+    token-shaped run at all. When the tail IS a minted ID the run must fail
+    closed, because we cannot tell our own un-restored token from the document's
+    reference -- and under an overlap test it instead returns ``ok`` with the
+    residue in the user's answer, which is the silent case, the dangerous one.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Record locator: PHI-MRN-43261190.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"MRN-43261190": "MRN-48273910"},
+        issued=[],
+        run_id=RUN,
+    )
+
+    assert result.text == "Record locator: PHI-MRN-48273910."
+    assert result.restored_collisions == 1
+    assert result.foreign_tokens == 1
+
+    # Same seam, one difference: the restored MRN's digits are an ID this run
+    # minted, so the residue is indistinguishable from a token we failed to
+    # restore. Fail closed.
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    with pytest.raises(PipelineError) as excinfo:
+        await restorer.restore(
+            SESSION,
+            "Record locator: PHI-MRN-43261190.",
+            strategy=PSEUDONYMIZATION,
+            surrogates={"MRN-43261190": "MRN-40281993"},
+            issued=["40281993"],
+            run_id=RUN,
+        )
+
+    assert excinfo.value.detail["reason"] == "residual_token_after_restore"
+    assert excinfo.value.detail["residual"] == 1
 
 
 async def test_a_token_id_colliding_with_a_restored_value_never_substitutes(
@@ -1344,6 +1637,42 @@ async def test_surrogate_possessives_restore(settings: Settings) -> None:
 
     assert result.text == "Smith's chart, Smith' prior notes, and Smith in person."
     assert result.restored_count == 3
+
+
+@pytest.mark.parametrize("apostrophe", APOSTROPHES, ids=APOSTROPHE_IDS)
+async def test_surrogate_possessives_restore_under_either_apostrophe(
+    settings: Settings, apostrophe: str
+) -> None:
+    """Both ``_POSSESSIVE_SUFFIXES`` families, and the failure is worse than cosmetic.
+
+    The test above uses the ASCII apostrophe only, so the two ``U+2019`` entries
+    could be dropped with the whole suite green. They cannot be: the surrogate
+    PATTERN interpolates the typographic apostrophe into its own alternation, so
+    a smart-quoted possessive still MATCHES -- the splitter is then the only thing
+    that can peel it. Without those entries the flexed match resolves to nothing,
+    the pseudonym's original is DELETED from the user's answer and replaced by
+    ``[UNRESOLVED_ENTITY]``, and the miss audits as ``vault_lost``: a
+    data-integrity incident raised over a smart quote.
+
+    Parametrised rather than duplicated so the expectation is built from the same
+    apostrophe as the input -- the assertion pins the property, not a spelling.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+    text = f"Torres{apostrophe}s chart, Torres{apostrophe} prior notes, and Torres in person."
+
+    result = await restorer.restore(
+        SESSION, text, strategy=PSEUDONYMIZATION, surrogates={"Torres": "Smith"}
+    )
+
+    assert result.text == (
+        f"Smith{apostrophe}s chart, Smith{apostrophe} prior notes, and Smith in person."
+    )
+    assert result.restored_count == 3
+    # Named explicitly: the degradation this guards is a DELETED original, not a
+    # cosmetic remnant, and it is silent apart from these two counters.
+    assert UNRESOLVED_ENTITY not in result.text
+    assert result.surrogate_misses == 0
+    assert result.vault_misses == 0
 
 
 # A surrogate wrapped in markdown emphasis. `_` is a regex `\w`, so the old
@@ -1784,11 +2113,14 @@ async def test_a_reflowed_fake_resolves_through_the_vault_too(settings: Settings
 async def test_two_fakes_that_differ_only_in_whitespace_are_never_guessed_between(
     settings: Settings,
 ) -> None:
-    """Ambiguity must not be resolved arbitrarily -- guessing splices a wrong name.
+    """Both spellings are byte-exact keys, so the EXACT path must handle both.
 
-    ``_canonical_by_shape`` drops a collapsed shape claimed by more than one
-    surrogate, so both fall back to exact matching rather than one silently
-    standing in for the other.
+    That is all this case can pin, and the name oversold it: every occurrence
+    here is a key of the surrogate map, so ``_split_surrogate_match`` returns from
+    its first branch and the ``canonical`` argument is never read at all. Replace
+    the ambiguity drop with an arbitrary pick and this test stays green. The two
+    tests below reach the guard -- one through the re-flowed occurrence that is a
+    key of nothing, one against ``_canonical_by_shape`` directly.
     """
     surrogates = {"Ana Lopez": "Maria Torres", "Ana\tLopez": "Priya Raman"}
     restorer = Restorer(vault=FakeVault(), settings=settings)
@@ -1801,6 +2133,64 @@ async def test_two_fakes_that_differ_only_in_whitespace_are_never_guessed_betwee
     )
 
     assert result.text == "Maria Torres and Priya Raman are different people."
+
+
+async def test_an_ambiguous_whitespace_shape_degrades_rather_than_guessing(
+    settings: Settings,
+) -> None:
+    """The guard the test above is NAMED for, reached by an input that needs it.
+
+    A re-flowed occurrence is a key of nothing: ``Ana`` + newline + ``Lopez``
+    matches the whitespace-flexible pattern, both exact checks fail, and the
+    collapsed shape is then the ONLY thing that could resolve it -- which is the
+    one branch where guessing is possible, because that shape is claimed by two
+    different people. Resolve it arbitrarily and the answer names Priya Raman in a
+    sentence about Ana Lopez, with ``restored_count`` going UP and ``vault_misses``
+    at 0: a wrong human name, which has no shape that reads as wrong to a
+    clinician. ``[UNRESOLVED_ENTITY]`` is visibly degraded and therefore correct.
+    """
+    surrogates = {"Ana Lopez": "Maria Torres", "Ana\tLopez": "Priya Raman"}
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Ana\nLopez was admitted.",
+        strategy=PSEUDONYMIZATION,
+        surrogates=surrogates,
+    )
+
+    assert result.text == f"{UNRESOLVED_ENTITY} was admitted."
+    for original in surrogates.values():
+        assert original not in result.text, (original, result.text)
+    assert result.restored_count == 0
+    assert result.surrogate_misses == 1
+
+
+def test_no_collapsed_shape_is_owned_by_two_surrogates() -> None:
+    """The drop stated as a property, checked against an independent collapse.
+
+    The behavioural test above catches the guess through one input; this catches
+    it for every input, and does so without borrowing the module's own
+    ``_collapse_ws``: ``" ".join(s.split())`` is a separate implementation of the
+    same idea, so a shared-helper bug cannot make both sides agree on a wrong
+    answer. A shape two surrogates claim must simply not be in the map.
+    """
+    issued = ["Ana Lopez", "Ana\tLopez", "Ana\nLopez", "Bo Chen", "Bo  Chen", "Cy Dane"]
+
+    canonical = _canonical_by_shape(issued)
+
+    owners: dict[str, set[str]] = {}
+    for surrogate in issued:
+        owners.setdefault(" ".join(surrogate.split()), set()).add(surrogate)
+    contested = {shape for shape, claim in owners.items() if len(claim) > 1}
+    uncontested = {shape for shape, claim in owners.items() if len(claim) == 1}
+
+    assert contested, "premise: the table really does contain colliding shapes"
+    assert not contested & set(canonical), contested & set(canonical)
+    # ...and the drop is surgical: everything unambiguous still resolves, or the
+    # guard would be paid for with the re-flow support it exists to protect.
+    assert set(canonical) == uncontested
+    assert canonical["Cy Dane"] == "Cy Dane"
 
 
 async def test_a_shouted_pseudonym_is_reported_even_though_it_is_not_restored(
@@ -1885,6 +2275,86 @@ async def test_a_clean_pseudonymization_run_reports_no_near_misses(
     assert result.restored_count == 3
     assert result.surrogates_suspected_unrestored == 0
     assert result.surrogates_issued == 3
+
+
+async def test_a_fullwidth_pseudonym_is_reported_even_though_it_is_not_restored(
+    settings: Settings,
+) -> None:
+    """The NFKC half of the near-miss scan, which nothing else in the suite reaches.
+
+    Case is not the only way a fake survives the matcher. A document pasted from a
+    system that stores fullwidth Latin -- or any equal-length compatibility form --
+    hands the user the FAKE name presented as the patient's, and the counter is
+    the only thing that can say so. Every input the suite fed this function was
+    plain ASCII, so both the fold and its length guard could be inverted with the
+    whole suite green.
+
+    The variant is built by translation and then CHECKED against
+    ``unicodedata.normalize``, so the premises this row depends on -- it folds to
+    the fake, and it does so WITHOUT changing the length -- are asserted rather
+    than assumed from a pasted string nobody can read.
+    """
+    fake = "Angela Whitfield"
+    wide = fake.translate({code: code + 0xFEE0 for code in range(0x21, 0x7F)})
+    wide = wide.replace(" ", chr(0x3000))  # IDEOGRAPHIC SPACE, the fullwidth ' '
+    assert wide != fake
+    assert unicodedata.normalize("NFKC", wide) == fake
+    assert len(wide) == len(fake), "premise: equal length is what the guard admits"
+
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        f"PATIENT: {wide}. Seen by {fake} today.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={fake: "Maria Torres"},
+    )
+
+    # The gap is unchanged and still honest: the width variant is NOT restored.
+    assert wide in result.text
+    assert result.restored_count == 1
+    # The signal that has to survive: one occurrence nearly matched.
+    assert result.surrogates_suspected_unrestored == 1
+
+
+async def test_a_length_changing_compatibility_form_keeps_the_exclusion_in_scope(
+    settings: Settings,
+) -> None:
+    """The other side of the same guard: a fold that MOVES offsets is not used.
+
+    A ligature is a compatibility form whose NFKC expansion is longer than the
+    character it replaces, so every offset after it shifts. ``spliced`` is in the
+    coordinates of the real text, so scanning the folded string would test the
+    ``Torres`` inside restored ``Maria Torres`` against a span one character
+    short of it, find it outside, and report a near miss on a run where all three
+    fakes behaved perfectly -- noise in the one counter a reader consults when the
+    answer looks fine but might not be.
+
+    Same surrogate table as ``test_a_fake_inside_a_later_restored_original_is_
+    excused_too``, with one ligature added ahead of the splices: the only
+    difference is the length change, so that is the only thing this can be
+    measuring.
+    """
+    ligature = chr(0xFB01)  # LATIN SMALL LIGATURE FI; NFKC expands it to two chars
+    text = f"The {ligature}nal note: Alvin Reyes and Jane Alderton signed off."
+    assert len(unicodedata.normalize("NFKC", text)) != len(text), "premise: length changes"
+
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        text,
+        strategy=PSEUDONYMIZATION,
+        surrogates={
+            "Alvin Reyes": "Karen Vance",
+            "Jane Alderton": "Maria Torres",
+            "Torres": "Rodriguez",
+        },
+    )
+
+    assert result.text == f"The {ligature}nal note: Karen Vance and Maria Torres signed off."
+    assert result.restored_count == 2
+    assert result.surrogates_suspected_unrestored == 0
 
 
 def test_case_insensitive_matching_would_splice_an_original_into_prose() -> None:
@@ -2256,14 +2726,16 @@ async def test_a_document_reference_the_model_echoes_never_reaches_the_audit_log
 ) -> None:
     """The realistic trigger for the leak `_fail`'s docstring describes, in its sibling.
 
-    Nothing adversarial is required. A clinical document that cites its own record
-    reference -- ``(PHI-MRN-40281993)`` -- is a `TOKEN_RE` match: group 1 is a
-    category literal, group 2 is ``MRN``, and group 3 is eight characters of valid
-    hex that are also eight digits of a patient's medical record number. When the
-    model echoes that reference, the restorer classifies it FABRICATED (we minted no
-    such ID) and used to copy group 3 into the `token_id` column -- into the hash
-    chain, and out through `GET /audit`, whose schema documents itself as safe to
-    hand a compliance reader.
+    Nothing adversarial is required. A clinical document cites its own record
+    reference and the model echoes it back in the placeholder shape the system
+    prompt taught it -- ``[PHI-MRN-40281993]`` (`context_injector` shows the model
+    ``[PHI_NAME_1a2b3c4d]`` and tells it to reproduce placeholders exactly). That is
+    a `TOKEN_RE` match: group 1 is a category literal, group 2 is ``MRN``, and group
+    3 is eight characters of valid hex that are also eight digits of a patient's
+    medical record number. The restorer classifies it FABRICATED (we minted no such
+    ID) and used to copy group 3 into the `token_id` column -- into the hash chain,
+    and out through `GET /audit`, whose schema documents itself as safe to hand a
+    compliance reader.
 
     `Restorer._fail` records this exact incident and fixed it for the residue path.
     This is the same bug one branch over.
@@ -2271,9 +2743,20 @@ async def test_a_document_reference_the_model_echoes_never_reaches_the_audit_log
     mrn_digits = "40281993"
     restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
 
+    # INPUT RE-BASED (was `(PHI-MRN-{mrn_digits})`). The parenthesised form no
+    # longer reaches this branch at all, and must not: `_is_bracketed` used to read
+    # `(` and `{` as evidence that WE emitted the run, so a document's own reference
+    # cited the most ordinary way there is was CLAIMED and replaced by
+    # `[UNRESOLVED_ENTITY]` -- the silent destruction the module docstring forbids,
+    # with an audit row blaming the model for text it copied faithfully. Only `[...]`
+    # is our handwriting (`format_surrogate` -> `f"[{core}]"`). The paren and brace
+    # forms are now pinned as surviving verbatim by
+    # `test_document_text_that_merely_looks_like_a_token_survives_verbatim`; the
+    # audit-hygiene property below is unchanged and is what this test is for, so it
+    # is re-based onto a shape that genuinely IS claimable rather than weakened.
     result = await restorer.restore(
         SESSION,
-        f"See the chart reference (PHI-MRN-{mrn_digits}) for details.",
+        f"See the chart reference [PHI-MRN-{mrn_digits}] for details.",
         strategy=TOKENIZATION,
         issued=[NAME_ID],  # the production path always supplies this
         run_id=RUN,

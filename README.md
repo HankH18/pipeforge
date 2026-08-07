@@ -100,7 +100,7 @@ Everything below is measured on this repository, not aspirational.
 | What does it **not** defend? | §3 — **start with "The weakest point in this design"**: `user_id` is an asserted claim and there is no authn at this tier |
 | The six live-review questions | §5 — each answered in its first sentence |
 | Where it breaks at scale | §5 Q1 — the bottleneck is not the one you would guess, and the obvious fix was measured and **rejected** |
-| What I got wrong | §8 Deviations (56, each with a reason) and §7 Known gaps |
+| What I got wrong | §8 Deviations (57, each with a reason) and §7 Known gaps |
 
 **If you are cloning this repository right now, read this first.** Until the commit that carries
 this sentence, `.gitignore` line 7 was `data/`. In git's grammar an unanchored pattern matches a
@@ -251,25 +251,25 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-2073 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
+2202 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
                              #   The skip is the real-network LLM smoke test.
                              #   Without node it is 35 skipped -- the 34 UI behaviour tests go
                              #   with it. See Path B above.
-                             #   2074 collected: 128 leakage - 5 bench - rest unit + integration
+                             #   2203 collected: 134 leakage + 5 bench + rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 98% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   4403 statements, 66 missed; 1088 branches, 58 partial (package only; see below)
+                             #   4511 statements, 65 missed; 1126 branches, 57 partial (package only; see below)
 ```
 
 **On the scope of that mypy line, because "clean" is doing less work than it looks.**
 `pyproject.toml` pins `files = ["secure_context_pipeline"]`, so `mypy --strict` type-checks the
 **package only** — 52 files. The test suite is roughly half the repository by line count and is
 **not** covered by that gate. Run against the whole tree — `mypy --strict .`, which ignores the
-`files` pin — it is **87 files and 113 remaining errors**, none of which is a latent bug: **52**
+`files` pin — it is **89 files and 114 remaining errors**, none of which is a latent bug: **52**
 are `attr-defined` from monkeypatching module-level re-exports (a legitimate test idiom that
 `--strict` dislikes), **32** are `arg-type` where tests construct `Detection(category="PII")`
-with a bare `str` instead of the `EntityCategory` enum, and the remaining 29 are assorted
+with a bare `str` instead of the `EntityCategory` enum, and the remaining 30 are assorted
 narrowing complaints. Re-derive rather than trust: `mypy --strict . 2>&1 | tail -1` for the
 totals and `| grep -oE '\[[a-z-]+\]$' | sort | uniq -c | sort -rn` for the split. Those two
 absolute counts are the most rot-prone numbers on this page — they move every time a test file
@@ -288,33 +288,62 @@ one-line config change.
 
 **And the same question about the `ruff` line, which had a real hole in it until recently.**
 `ruff check .` is the *linter*. `ruff format` is the *formatter*, it is **not** in the gate, and
-`ruff format --check .` reports **25 files** that would be reformatted. That was cosmetic on its
+`ruff format --check .` reports **26 files** that would be reformatted. That was cosmetic on its
 own; what made it a defect is that `pyproject.toml` disabled `E501` with the comment "line length
 handled by formatter" — so line length was enforced by the formatter, the formatter never ran,
 and the stated 100-column limit was enforced by nothing. There were **145** violations, four of
 them in the package.
 
 `E501` is now on, and the accounting is worth stating exactly because "we turned the rule on"
-can hide a blanket exemption. Of the 145: **33 lay outside the two files that carry generated
-document text, and all 33 are fixed** — most by a formatter pass scoped to just the offending
-files, six by hand. The remainder live in the two per-file exemptions, which are argued rather
-than blanket: `fixtures/*` (88 long lines) and `tests/test_detection.py` (7), whose long lines are
+can hide a blanket exemption. Of the 145, **50 are fixed and 95 remain**: **33 lay outside the
+two files that carry generated document text, and all 33 are fixed** — most by a formatter pass
+scoped to just the offending files, six by hand — and a further **17 inside
+`tests/test_detection.py` were fixed rather than exempted**, taking that file from 24 long lines
+to 7. That split is worth spelling out because the previous version of this paragraph stated the
+33 and the 95 and silently dropped the 17, so a paragraph whose whole point is that the
+accounting is exact was 17 short of its own baseline: **33 + 17 + 95 = 145**. The 95 that remain
+live in the two per-file exemptions, which are argued rather than blanket: `fixtures/*` (88 long
+lines) and `tests/test_detection.py` (7), whose long lines are
 **generated and annotated document text** — `<<NAME|Aurelio Santangelo>>  <<SSN|602 33 1194>>`,
 clinical notes, privileged memoranda. The detector is fed those strings verbatim, so wrapping one
 moves a span offset and changes what the recall table measures; they are also inside
 triple-quoted blocks, where `# noqa` cannot reach. Every other long line was fixed rather than
 exempted, and a planted 110-column line in `config.py` was confirmed to fail the gate, so the
-rule is enforced rather than merely configured. The remaining 25-file formatter divergence is
+rule is enforced rather than merely configured. The remaining 26-file formatter divergence is
 left as a known, stated gap: reformatting the tree wholesale is a large cosmetic diff with no
 correctness content, and it is now the *only* thing `ruff` is not gating.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py`
-and `fixtures/` — it is **98%** of **18,988** statements. (`demo.py` has to be measured on its
-own, and the reason is a small trap: the demo tests load it by *file path* under a synthetic
-module name, so `--cov=demo` warns `module-not-imported` and silently omits all 632 of its
-statements from the total. `coverage run --include='demo.py'` is what reports it.) Those two
-files were the last real gaps:
+and `fixtures/` — it is **98%** of **20,136** statements: **19,504** for the package plus
+`tests/` plus `fixtures/`, and `demo.py`'s **632** on top of that. It is published as its two
+addends because it is the most rot-prone number on this page — every test module added moves it,
+and it was 55 statements adrift within one commit of being written — so
+`tests/test_readme_claims.py` re-derives all three from the source tree in
+`::test_the_whole_repository_statement_total_is_the_one_coverage_would_report`.
+
+**That test grades its three assertions differently, and the reasoning is worth one paragraph
+because the obvious design was tried first and was wrong.** Pinning all three exactly turned the
+whole suite **red on a two-statement drift** — 0.01%, on a sentence whose claim is a percentage.
+A number that moves on every commit is a liability in a guard test: it teaches the next reader to
+edit the assertion instead of the prose. Measured over the last eleven commits, this sum moved
+`+5, 0, +46, +14, 0, +1463, -6, +35, +83, +561, +31` — a median commit shifts it 31 statements
+and the two that added whole test suites shifted it 1,463 and 561. So the sum is checked against
+a **0.5% band** (~100 statements), the cut that separates those two populations, and it **warns
+with the exact replacement number inside the band and fails outside it** — the drift is always
+reported, only the red/green line moved. The two figures beside it stay exact for stated reasons:
+`demo.py`'s **632** is one file carrying an argument rather than a scale, and the package's own
+denominator moved 0 to +18 over those same eleven commits, which is a number a human can keep
+current. The same pass found the *instrument* wrong as well as the number — the helper hardcoded
+`# pragma: no cover` as coverage's whole default exclusion set, when 7.x also drops `...` stub
+bodies and `if TYPE_CHECKING:` blocks, so it over-counted the five package modules carrying a
+Protocol or an abstract method and published a denominator `coverage report` never prints. It now
+uses coverage's own reporter and is checked file by file against a real run.
+
+**`demo.py` has to be measured on its own**, and the reason is a small trap: the demo tests load
+it by *file path* under a synthetic module name, so `--cov=demo` warns `module-not-imported` and
+silently omits all 632 of its statements from the total. `coverage run --include='demo.py'` is
+what reports it. Those two files were the last real gaps:
 `demo.py` sat at **26%** and `fixtures/generator.py` at **69%** while every module around them
 was above 90, because each defect this audit found got a regression test and nothing went back
 to cover what had never been tested at all. `demo.py` is now 94% and the generator 96%; the
@@ -351,14 +380,28 @@ falsifies exactly one condition and asserts that one named check goes red. The w
 test asserts the ledger rather than the section headings, which come from `section()` calls and
 survive the demonstrations under them being deleted: with RUN B and the fail-closed section
 removed, the demo still printed every heading and still exited 0 on `PASS -- 10/10 checks
-passed, 0 failures`. That file is now 53 tests.
+passed, 0 failures`. That file is now 54 tests.
 
 **Leakage harness** (`pytest -m leakage`, 100 runs, both strategies alternating, varied seeds):
 
 ```
 [leakage] 100/100 runs clean, 0 leaks
-          (2981 originals vaulted and scanned, 2434 surrogates round-tripped)
+          (2981 originals vaulted and scanned, 2426 surrogates round-tripped)
 ```
+
+**Three of those four numbers reproduce and the fourth does not, and the block would be dishonest
+if it did not say which.** `100/100`, `0 leaks` and `2981 originals` came back identical on all
+four runs measured for this section. The surrogate tally did not: **2421, 2426, 2426 and 2436**
+across those same four runs. It counts surrogates the *model* referenced and the restorer then
+round-tripped, and the mock provider's echo is drawn against a per-session pseudonym key, so which
+surrogates come back is re-rolled every run — the same non-determinism
+`test_a_short_surrogate_inside_a_longer_word_has_not_survived` was written for, where it made a
+red "appear and disappear between runs". Expect roughly 2,430 there and treat a different value as
+normal; treat a `2981` that moved, or anything other than `100/100, 0 leaks`, as a finding. This
+paragraph exists because the block previously published `2434` — a value none of the four runs
+printed, sitting inside a block headed "output from this repository, not an estimate".
+`tests/test_readme_claims.py::test_the_pasted_leakage_tally_is_one_the_readme_says_it_observed`
+now requires the pasted figure to be one this paragraph lists.
 
 **100 runs, zero leaks** is the load-bearing result. It has been reproduced on every run of the
 committed tree, but read the summary line precisely, because the two halves of it mean different
@@ -492,9 +535,12 @@ not move under the stronger instrument** — 100/100, zero leaks, on three conse
 is the only reason it is worth more than it was before: the same result now survives a scan that
 sees strictly more.
 
-**Four boundaries are stated rather than closed**, because closing them would manufacture false
-reds indistinguishable from real ones. Each is pinned by a test, so closing one later is a red
-rather than a silent widening of the claim:
+**The four boundaries named at the top of this file are stated rather than closed**, because
+closing them would manufacture false reds indistinguishable from real ones. They are the same
+four, in the same words, as the numbered list in the opening section — this list carried a
+different four until this pass, because it counted the combining-mark shape (closed, and kept
+below as a record) and never mentioned the separator floor at all. Each is pinned by a test, so
+closing one later is a red rather than a silent widening of the claim:
 
 - **Partial disclosure.** If a splice bug leaves *one component* of a multi-word original behind
   — the surname of a vaulted full name — neither the harness nor the gate reports it. Both ask
@@ -533,7 +579,8 @@ rather than a silent widening of the claim:
   through the real writer by
   `test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did`, which asserts
   *which* limb caught it so the attribution cannot rot into "the scan handles it".
-- **A combining mark spliced into a value — CLOSED, and this entry is kept to record that the
+- *(Not one of the four — a retired boundary, kept here as a record of how it was argued.)*
+  **A combining mark spliced into a value — CLOSED, and this entry is kept to record that the
   argument for leaving it open was wrong.** The reasoning was: *"folding marks out would make
   `José` and `Jose` the same value."* That is true of the **needle** and irrelevant to the
   **haystack**, and the gate folds the haystack. `_deaccent` strips marks from the payload only,
@@ -558,9 +605,20 @@ rather than a silent widening of the claim:
   tests that go red the day either changes.
 - **Homoglyphs.** Cyrillic `о` for Latin `o` needs a confusables table, not another
   normalisation form. Out of scope in the gate for the same reason.
+- **A multi-word original under the 8-alphanumeric floor, whose separator the payload respells.**
+  The separator-invariant limb only runs on values long enough that a respelling cannot collide
+  with ordinary English, so `Amy-Cox` or `AmyCox` for a vaulted `Amy Cox` walks the whole name
+  out. The floor is measured rather than assumed: over 26 seeds × four kinds, 358 of 8,390
+  multi-component values sit under it, and once the digit-bearing ones (still scanned unbounded)
+  are removed, **91** are left with only the four bounded forms — 69 lab values, 19 small amounts
+  and three names. Lowering it does not close the boundary, it trades a narrow leak for a broad
+  outage: at a floor of 5, `of the` becomes a needle that matches the shipped fixtures 67 times.
+  Pinned by
+  `test_egress_gate.py::test_the_floor_s_corpus_measurement_is_the_one_the_docstring_quotes`.
 
-**The remaining two are blind spots the harness and the gate mostly share**, because both resolve
-to the same occurrence rule — so for those shapes there is usually no second opinion. Confirmed
+**Two of those four — partial disclosure and the glued-into-a-longer-word shape — are blind spots
+the harness and the gate mostly share**, because both resolve to the same occurrence rule — so
+for those shapes there is usually no second opinion. Confirmed
 rather than reasoned about: with the gate **live**, a real vaulted original spliced into a real
 payload glued to a letter completed the run and reached the provider. Where the gate is a second
 opinion that is survivable; on the audit database and the process log, where nothing else looks,
@@ -821,8 +879,13 @@ round:
   the original document and to erase the vault. `routes/audit.py` calls the previous behaviour
   "a live, complete break", which is accurate.
 - **Failed ownership proofs are metered and audited.** ~20 failures from one caller earns
-  `429`, and each one writes an `AUDIT_ACCESS_DENIED` event — a **13th** event type, which is
-  why Deviation 26's original count is out of date — there are now **13** event types, all of them emitted. Writes (`POST /sessions`,
+  `429`, and each one writes an `AUDIT_ACCESS_DENIED` event — a **13th** event type, and one that
+  sits deliberately **outside** `EVENT_TYPES`. That frozenset stays the build doc's fixed
+  **twelve** and is asserted by count in `tests/test_audit.py`, so the only phrasing that is true
+  of the code is **twelve members of the vocabulary, all emitted, plus a thirteenth emitted
+  beside it** — written and chained like any other row. §5 Q5 and Deviation 26 now say it that
+  way as well; both read "all twelve" until this pass, which left one count described two
+  different ways in one document. Writes (`POST /sessions`,
   `POST /documents`, `DELETE /sessions/{id}`) are metered on the same mechanism.
 - **Uploads are capped** (`REQUEST_TOO_LARGE`) and read in bounded chunks, so an unbounded body
   cannot be streamed into memory.
@@ -1389,8 +1452,10 @@ centerpiece's blocking path deserves its own review cycle, not a footnote in a p
 
 Bottlenecks in order, corrected by measurement:
 
-1. **The second spaCy pass**, ~37% of end-to-end wall time. It cannot be *scoped* away safely,
-   per the measurement above; the tractable form is making the blocking path not need spaCy.
+1. **The second spaCy pass**, ~43% of end-to-end wall time (2,759 ms of the 6.4 s above; the
+   ~37% this list used to give was computed against numbers this section now retracts). It
+   cannot be *scoped* away safely, per the measurement above; the tractable form is making the
+   blocking path not need spaCy.
 2. **spaCy NER itself**, which is then the floor for both passes. It scales roughly linearly
    with document length; mitigated today by paragraph-boundary chunking with parallel
    per-chunk analysis (`asyncio.to_thread`, semaphore of 4). The scale answer is a process
@@ -1400,7 +1465,10 @@ Bottlenecks in order, corrected by measurement:
    unique entity. Batching into a single transaction per run removes the syscall overhead.
 
 Aho-Corasick for the originals scan — the obvious answer, and the one this README gave before
-the passes were timed separately — would optimise 21 ms out of 7,160. It is the right
+the passes were timed separately — would optimise **277 ms out of 6,400**, i.e. 4.3% of the run.
+(This sentence said "21 ms out of 7,160" until this pass: 21.3 ms is the pass-1 figure four
+paragraphs above explicitly retracts, and 7,160 ms is not a total this file measures anywhere.
+The corrected figure is 13x larger and still does not change the ranking.) It is the right
 asymptotic shape and the wrong thing to do first. That is worth saying plainly: the
 `O(payload × entities)` term was reasoned about rather than measured, and measuring it changed
 the ranking.
@@ -1793,7 +1861,9 @@ the shared store never holds anything usable on its own.
   things from the same endpoint, and the fix is a *separate* authenticated compliance API with
   its own authorisation — not a query parameter on the one anonymous callers can reach. Not
   built.
-- **All twelve event types are emitted, including `SESSION_EXPIRE`** (Deviations 26 and 54). This
+- **All twelve members of `EVENT_TYPES` are emitted, including `SESSION_EXPIRE`** — plus a
+  thirteenth, `AUDIT_ACCESS_DENIED`, which sits outside that frozenset by design and is described
+  in §2 (Deviations 26 and 54). This
   bullet used to say the opposite — that `SESSION_EXPIRE` was declared and never written, so an
   auditor asking "show me every session that expired" got an empty result and would be entitled
   to read it as "none did". The reasoning behind that was: TTL lapse is discovered lazily by the
@@ -2207,7 +2277,7 @@ see them. See §7 gap 1 and `SessionVault.note_unrestorable`.
    wrong about the other, which is worth recording.
    - **`api/app.py` was 1,835 lines carrying seven concerns**, with all eight endpoint handlers
      nested as closures in one 345-line `_register_routes`, so no endpoint was importable. Now
-     **307 lines** (`wc -l`, and it moves with any edit) — `create_app()` and the module
+     **308 lines** (`wc -l`, and it moves with any edit) — `create_app()` and the module
      docstring — over `constants.py`, `deps.py`, `middleware.py`, `lifespan.py`, `errors.py` and
      `routes/{sessions,documents,pipeline,audit,health}.py`. The stated blocker ("the closures bind to that function's locals") turned out
      to be false: checked by AST, `_register_routes` has **zero** locals and every `app`
@@ -2381,7 +2451,7 @@ Recorded per the build doc's instruction. Each one is a deliberate choice with a
 | 23 | `PipelineResult` carries `raw_llm_response`; `ObfuscationResult` carries `stripped`. | Neither is in the spec's §7 schema. `raw_llm_response` is required by the spec's *own* UI section, whose third panel shows the model's reply with tokens still visible; `stripped` is needed because strip and redact are different actions and the API cannot report what it did without distinguishing them. |
 | 24 | `SpanOut.action` is an `EntityAction` StrEnum, not a bare `str`; `AuditEvent.detail` is a read-only `Mapping`, not a `dict`. | Both are tightenings. The enum makes `obfuscated`/`redacted`/`stripped` exhaustive and typo-proof under `mypy --strict`; the read-only mapping stops a caller mutating an event's detail after the entry hash is computed, which would silently break the chain. `detail` still serializes as a plain object, so the wire format is unchanged. |
 | 25 | The date-shift floor correction treats `Δ == 0` as positive. | The spec writes `sign(Δ)*30`, which is undefined at zero. Choosing positive is arbitrary but must be *chosen*, or the shift is unspecified for one value in 600. |
-| 26 | **`SESSION_EXPIRE` was in the §7 event vocabulary and never emitted — now CLOSED.** | TTL lapse is discovered *lazily* — `SessionRegistry` sweeps on the next access — so there is no moment at which a session expires and code is running to record it. That was the argument for leaving it unemitted, and it was the wrong conclusion from a correct premise: the right moment is not when the session dies but when a request **notices**, which is exactly where `deps.reap_expired_sessions` now runs. It emits `SESSION_EXPIRE` and `VAULT_DESTROY` together — the death and the teardown it triggered are two facts an auditor reconstructing a timeline wants separately. No background sweeper and no timer thread, which is the failure mode this row was right to refuse. All twelve event types are now emitted. See Deviation 54. |
+| 26 | **`SESSION_EXPIRE` was in the §7 event vocabulary and never emitted — now CLOSED.** | TTL lapse is discovered *lazily* — `SessionRegistry` sweeps on the next access — so there is no moment at which a session expires and code is running to record it. That was the argument for leaving it unemitted, and it was the wrong conclusion from a correct premise: the right moment is not when the session dies but when a request **notices**, which is exactly where `deps.reap_expired_sessions` now runs. It emits `SESSION_EXPIRE` and `VAULT_DESTROY` together — the death and the teardown it triggered are two facts an auditor reconstructing a timeline wants separately. No background sweeper and no timer thread, which is the failure mode this row was right to refuse. All twelve members of `EVENT_TYPES` are now emitted, plus the thirteenth (`AUDIT_ACCESS_DENIED`) that §2 describes and that is deliberately outside that frozenset. See Deviation 54. |
 | 27 | **Two of §4's ten numbered steps emit no dedicated audit event.** The narrative says each step "emits audit events and captures latency"; steps 2 (fetch + decrypt) and 5 (context injection) capture latency only. | §7 fixes the event-type vocabulary and neither step has a member of it. Inventing `DOC_FETCH`/`INJECT` would be a *larger* deviation — from the vocabulary, which is the part a compliance reader depends on — for evidence that already exists elsewhere: the fetch is evidenced on the `DETECT` event emitted immediately after it in the same `run_id` (now carrying `doc_id` and `fetch_ms`, so the "which documents were read" question is answerable), and the injection is evidenced by `EGRESS_PASS`, which carries the sha256 and length of exactly the assembled payload. Both steps are timed in `PipelineResult.stats`; step 5 previously had **no** timing at all, which was a plain gap and is fixed. |
 | 28 | **The token contract reproduces §9.5.2's `[PHI_MEDICATION_2f4a|oral-antidiabetic]` verbatim — a 4-hex hash — while §7 and §9.7 specify 8.** | The build doc contradicts itself, so "follow the spec" is not available: §9.5.2 calls its block "the exact system prompt", §7 declares `token_id` as 8 hex, and §9.7's `TOKEN_RE` requires `[0-9a-fA-F]{8}`. Keeping the prompt verbatim is the *safer* of the two, not merely the more literal. Being outside the grammar makes the literal inert: `TOKEN_RE` does not match it, so the restorer leaves it and the residual assertion stays silent. Normalising it to 8 hex would make it match — and a model echoing the example would then hit a hash the vault never issued, substituting `[UNRESOLVED_ENTITY]` and emitting a spurious **`VAULT_MISS`**, which is supposed to mean a real anomaly worth a compliance look. It is not a skip-list hole either: `_protected_spans` does not cover it, so pass 2 re-scans it like any other prose (more scrutiny than a real token's core gets), pass 1 never exempts it, and the shipped detector finds zero entities in either system prompt. Pinned by `test_the_token_contract_example_is_outside_the_grammar_and_that_is_inert`. |
 | 29 | **`run()` re-derives the outbound digest and refuses to send unless it matches the one the gate cleared**, and `AuditLogger.length()` accepts the full `query()` filter set. | Both are additions rather than departures. The first closes a time-of-check-to-time-of-use window the spec's ordering requirement does not cover: "the gate ran first" and "the gate cleared what we sent" are different claims, and only the second is the guarantee — a stage inserted between the check and the provider call would satisfy every ordering test while releasing unaudited bytes. It fails as `EgressBlockedError(payload_changed_after_check)`, so the 422 handler and the audit trail treat it like any other block. The second makes §9.8's "logs must be queryable" *checkable*: `query` pages at 1000, and without a matching count a full page is indistinguishable from a complete 30-day answer. |
@@ -2506,7 +2576,7 @@ marked as such rather than quietly asserted.
 | **Critical constraint** — reversible in-session, irreversible across | `crypto/keys.py::derive_token_id` (HMAC under an ephemeral key), key destruction | `test_crypto.py::test_token_id_deterministic_within_session`, `::test_token_id_non_deterministic_across_sessions`, `::test_token_id_is_irreversible_without_the_key`; `integration/test_pipeline.py::test_restoration_is_impossible_after_the_session_is_destroyed` |
 | **NFR** — config-only entity add | `entities.yaml`; `entity_type` opaque downstream | `test_extensibility.py::test_package_source_never_mentions_passport` (the grep **is** the proof), plus the three end-to-end cases beside it |
 | **NFR** — strategy swappable via config | strategy registry dict, `Settings.strategy` | `test_obfuscation.py::test_dummy_strategy_plugs_in_with_zero_engine_changes`, `::test_per_entity_strategy_override_is_config_only`, `::test_a_per_entity_strategy_override_restores_in_both_directions` (both override directions carried through `Restorer.restore`, not just the surrogate's shape); `test_llm.py::test_new_provider_name_is_selectable_with_zero_other_changes` |
-| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, **three** passes — §9.5.3 specifies two; the third is Deviation 42) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the three stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims` and `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims` (the homoglyph one by `test_egress_gate.py::test_a_homoglyph_substitution_is_outside_what_the_scan_claims`, which was **missing entirely** until this audit — the only entry in the list whose status was an assertion about the code rather than a measurement of it); the combining-mark shape is **closed**, not a boundary, and is pinned by `test_egress_gate.py::test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider` (the glued-word boundary applies to the byte limb of the audit scan too; the query limb is what catches a label-column original — see `::test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`); round-trip completeness is derived independently of the restorer, enforced by `::test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`; `demo.py --dump-wire` for the literal HTTP body |
+| **NFR** — zero PII in transit, verifiable by inspection | `pipeline/egress_gate.py` (fail-closed, **three** passes — §9.5.3 specifies two; the third is Deviation 42) | `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (**100 runs**), `::test_unknown_shape_value_blocks_egress_and_the_call_never_fires`, `::test_the_leak_scan_bites`; the four stated boundaries are pinned by `::test_a_partial_value_leak_is_outside_what_this_harness_claims` and `::test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims` (the homoglyph one by `test_egress_gate.py::test_a_homoglyph_substitution_is_outside_what_the_scan_claims`, which was **missing entirely** until this audit — the only entry in the list whose status was an assertion about the code rather than a measurement of it; the separator-floor one by `test_egress_gate.py::test_the_floor_s_corpus_measurement_is_the_one_the_docstring_quotes`); the combining-mark shape is **closed**, not a boundary, and is pinned by `test_egress_gate.py::test_a_combining_mark_spliced_into_a_value_no_longer_reaches_the_provider` (the glued-word boundary applies to the byte limb of the audit scan too; the query limb is what catches a label-column original — see `::test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things`); round-trip completeness is derived independently of the restorer, enforced by `::test_the_round_trip_expectation_does_not_share_the_restorer_s_blind_spots`; `demo.py --dump-wire` for the literal HTTP body |
 | **NFR** — vault isolation is cryptographic, cross-session | per-session HKDF vault keys, AAD `session_id:token_id` | `test_vault.py::test_aad_binding_across_sessions`, `::test_aad_binding_across_token_ids`; `integration/test_pipeline.py::test_concurrent_session_isolation` (50 interleaved ops) |
 | **NFR** — graceful degradation (never pass through raw) | engine threshold policy, `action: redact` | `test_obfuscation.py::test_mid_confidence_span_is_redacted_without_a_vault_entry`, `::test_case_strategy_is_force_redacted_in_both_modes`; `test_detection.py::test_below_floor_span_is_dropped` |
 | **NFR** — async pipeline, spaCy off the event loop | `detector.detect` (`asyncio.to_thread` behind `Semaphore(4)`), `aiosqlite`, `aiofiles` | `integration/test_pipeline.py::test_the_pipeline_never_blocks_the_event_loop`; `test_extraction.py::test_extraction_runs_off_the_event_loop_thread` |
@@ -2604,9 +2674,10 @@ ledger too.
 **5 — The suite, in the clean clone.**
 
 ```bash
-pytest -q            # expect WITH node: all passed, 1 skipped (the real-network LLM smoke
-                     #   test) -- minus the one stale assertion §1's block names and explains,
-                     #   which is red on this tree. Without node: 35 skipped --
+pytest -q            # expect WITH node: the pass count §1 pastes, 1 skipped (the real-network
+                     #   LLM smoke test), and no failures. That pass count is written down in
+                     #   exactly one place -- §1 -- so this step cannot drift out of agreement
+                     #   with it, which is what it did. Without node: 35 skipped --
                      #   tests/test_ui_behaviour.py goes with it, and §1's app.js
                      #   execution-test claim is uncovered on your run.
 pytest -m leakage -q # expect: 100/100 runs clean, 0 leaks

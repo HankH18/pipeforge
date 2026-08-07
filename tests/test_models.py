@@ -1103,3 +1103,67 @@ def test_the_boundary_schema_docstrings_state_the_retracted_claim_honestly() -> 
             "the proved scope in routes/audit.py -- and dropping one turns the remaining "
             "two back into an overclaim."
         )
+
+
+def test_the_prompt_cap_comment_names_the_pass_that_rewrites_the_prompt() -> None:
+    """``MAX_PROMPT_CHARS`` must not be justified by "the prompt goes out unmodified".
+
+    The comment on the cap said the prompt was spliced into the outbound payload
+    verbatim, and said it as the *reason* the cap exists -- in the module whose rule 1
+    is declared to govern the whole file. It is false, and it is false in the
+    direction that matters: a reader concludes that a name typed into ``prompt`` and
+    absent from the document reaches the provider. It does not. The orchestrator runs
+    the prompt through the same detector and the same engine as the document before
+    the injector builds the payload.
+
+    This test guards the *prose*. The behaviour behind it is measured elsewhere and
+    with the real detector, by
+    ``test_egress_gate.py::test_pii_typed_into_the_prompt_never_reaches_the_provider``,
+    which parametrises eight values that appear nowhere in the document and asserts
+    each is absent from what the provider was handed -- six of which used to come back
+    ``SENT 200`` with the value on the wire.
+
+    A ``#:`` comment is not reachable through ``__doc__``, so this reads the module
+    source. Checked like
+    ``test_the_boundary_schema_docstrings_state_the_retracted_claim_honestly``: the
+    false sentence is gone AND the honest mechanism is named, so a rewording survives
+    and a rewrite back to the old reason does not. The last limb is what keeps this
+    from decaying into a spelling test -- the stat keys the comment cites are read
+    back off ``PipelineOrchestrator.run``'s own code object, so renaming a stat
+    reddens this instead of quietly orphaning the prose that names it.
+    """
+    # Imported here rather than at module scope: the orchestrator's import graph
+    # pulls in spaCy (~1.8 s measured), and this module is otherwise pure-model.
+    from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
+
+    source = inspect.getsource(api_schemas)
+    start = source.index("#: Ceiling on the user's question")
+    block = source[start : source.index("MAX_PROMPT_CHARS = ", start)]
+    # Unwrapped before matching. The retracted sentence wrapped across two ``#:``
+    # lines, so a search against the raw block found none of it and the "false
+    # sentence is gone" limb could not fire on the very text it was written for.
+    comment = " ".join(line.lstrip("#:").strip() for line in block.splitlines())
+
+    assert "spliced into the outbound payload verbatim" not in comment, (
+        "the MAX_PROMPT_CHARS comment still gives verbatim splicing as the reason for "
+        "the cap. What the injector splices in is the *obfuscated* prompt."
+    )
+    for token in ("obfuscat", "prompt_entities_detected", "prompt_tokens_issued", "OBFUSCATE"):
+        assert token in comment, (
+            f"the MAX_PROMPT_CHARS comment no longer mentions {token!r}. The honest "
+            "reason for the cap is that the prompt drives its own detect pass, its own "
+            "obfuscate pass, a vault write per value and the gate's re-scan -- naming "
+            "the pass is what stops the cap being read as 'the prompt goes out as typed'."
+        )
+
+    run_consts = {c for c in PipelineOrchestrator.run.__code__.co_consts if isinstance(c, str)}
+    for key in ("prompt_entities_detected", "prompt_tokens_issued"):
+        assert key in run_consts, (
+            f"the comment cites stats[{key!r}], which PipelineOrchestrator.run no longer "
+            "writes. Prose that names a key nothing emits is how a retraction rots back "
+            "into the original overclaim."
+        )
+    assert "prompt_entities_detected_XXX" not in run_consts, (
+        "premise: the code-object check can tell present from absent, so the two "
+        "assertions above are not passing for free."
+    )

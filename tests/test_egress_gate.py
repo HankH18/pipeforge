@@ -70,6 +70,7 @@ from secure_context_pipeline.pipeline.egress_gate import (
     _occurs_as_a_unit,
     _regrouped_identifier_needle,
     _separator_needles,
+    _skeleton_views,
     _strip_invisible,
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
@@ -4124,6 +4125,593 @@ async def test_a_spacing_diacritic_spliced_into_a_value_is_blocked(
     with pytest.raises(EgressBlockedError) as raised:
         await gate.check(f"Countersigned: {spliced} RN", "sess-spacing")
     assert raised.value.detail["reason"] == "vault_original"
+
+
+#: Every general-category ``M`` codepoint the running interpreter knows about, and
+#: the subset with canonical combining class 0. Derived from :mod:`unicodedata`
+#: rather than from the gate, for the reason
+#: ``test_every_unicode_format_character_is_folded`` gives about ``Cf``: "every
+#: combining mark" is a claim about the *Unicode standard*, so the standard's own
+#: answer is the expectation and the gate's answer is what is being measured.
+_ALL_MARKS: tuple[str, ...] = tuple(
+    chr(cp) for cp in range(sys.maxunicode + 1) if unicodedata.category(chr(cp))[0] == "M"
+)
+_UNORDERED_MARKS: tuple[str, ...] = tuple(m for m in _ALL_MARKS if unicodedata.combining(m) == 0)
+
+
+async def test_every_unicode_mark_spliced_into_a_value_is_seen_by_pass_one(
+    tmp_path: Path,
+) -> None:
+    """The skeleton form's coverage, measured against Unicode rather than itself.
+
+    The fourth form used to select marks with :func:`unicodedata.combining`, which
+    answers "how does this codepoint reorder under canonical ordering" -- and 1,496
+    of the 2,408 marks in this interpreter's database answer it with 0 (1,063 ``Mn``,
+    420 ``Mc``, 13 ``Me``). Every one of them survived the fold, so a vaulted
+    original with one of them spliced in reached the provider with `EGRESS_PASS`
+    recorded and nothing warned anywhere. Measured on the real gate before the fix,
+    same value and same position: U+0301 (class 230) and U+0316 (class 220) blocked;
+    U+0E31 THAI CHARACTER MAI HAN-AKAT, U+0903 DEVANAGARI SIGN VISARGA and U+20DD
+    COMBINING ENCLOSING CIRCLE all released.
+
+    Nothing could see it, because every test that pinned the closure pinned a
+    *spelling* -- `Jose`, `Nathanie'l`, one U+0301 -- and the leakage harness
+    imported the gate's own `_deaccent`, so the second opinion inherited the
+    identical blind spot and also reported clean. So this asserts the property over
+    the whole derived class instead, and the two controls below are what stop it
+    passing for the wrong reason.
+    """
+    original = "Nathaniel Brightwater"
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+
+    # Non-vacuity 1: the class is the size the database says, and the sub-class the
+    # old rule was blind to is most of it. A future Unicode release moving these
+    # numbers is fine; a release that empties them would make the loop below vacuous.
+    assert len(_ALL_MARKS) > 2000, "the derived mark set collapsed -- the loop is vacuous"
+    assert len(_UNORDERED_MARKS) > 1000, (
+        "the combining-class-0 subset -- the half the old rule could not see -- is empty"
+    )
+
+    missed = [
+        mark
+        for mark in _ALL_MARKS
+        if gate._scan_originals(
+            f"Attending: Nathan{mark}iel Brightwater at reception.", frozenset({original})
+        )
+        != 1
+    ]
+    assert not missed, (
+        "a mark spliced into a vaulted original walks it past pass 1 -- each is a "
+        "one-character bypass that reads as the original to the model: "
+        + " ".join(f"U+{ord(m):04X}" for m in missed[:20])
+    )
+
+    # Non-vacuity 2: pass 1 is not simply saying yes. Splice a LETTER in the same
+    # position and the same scan reports nothing -- `Nathanxiel Brightwater` is not
+    # a disclosure of `Nathaniel Brightwater` and must not block.
+    assert (
+        gate._scan_originals(
+            "Attending: Nathanxiel Brightwater at reception.", frozenset({original})
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    "codepoint",
+    [
+        # One per general category among the marks the old rule left in place, named
+        # by codepoint rather than pasted as a literal -- a mark in this file's source
+        # is invisible to the next reader of the test that distinguishes it.
+        pytest.param(0x0E31, id="Mn-class-0-thai-mai-han-akat"),
+        pytest.param(0x0903, id="Mc-class-0-devanagari-visarga"),
+        pytest.param(0x20DD, id="Me-class-0-enclosing-circle"),
+        pytest.param(0x0345, id="Mn-class-240-ypogegrammeni-casefold-rewrites-it"),
+    ],
+)
+async def test_a_mark_the_old_rule_could_not_see_no_longer_reaches_the_provider(
+    tmp_path: Path, codepoint: int
+) -> None:
+    """The same four vectors again, end to end through `check` rather than one limb.
+
+    `_scan_originals` is where the bug lived, so the test above reads it directly;
+    this one asserts the thing that actually matters -- the call is *blocked* -- so
+    that a future refactor which keeps `_scan_originals` correct while losing its
+    result cannot pass.
+
+    The last parameter is a second, independent instance of the same defect and the
+    reason the strip now runs on the raw payload as well: `normalize` casefolds, and
+    casefold **rewrites** U+0345 into a Greek iota *letter*, so by the time any
+    mark-based rule ran there was no mark left to find. Its combining class is 240,
+    not 0, so fixing only the category selection would have left this one open.
+    """
+    mark = chr(codepoint)
+    original = "Nathaniel Brightwater"
+    payload = f"Attending: Nathan{mark}iel Brightwater at reception."
+
+    # Premises, so a green here cannot mean "the payload contained the value anyway".
+    assert original not in payload
+    assert unicodedata.category(mark)[0] == "M"
+    assert not _occurs_as_a_unit(_strip_invisible(normalize(original)), _strip_invisible(payload))
+
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-mark")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+def test_casefold_really_does_turn_a_mark_into_a_letter(tmp_path: Path) -> None:
+    """The mechanism behind the U+0345 case, asserted so the fix cannot be undone blind.
+
+    Read off :mod:`unicodedata` and :func:`normalize`, not off the gate: the claim is
+    that a *mark* stops being a mark when the payload is normalised, which is why
+    stripping after normalisation cannot be the whole rule. Without this, the raw-side
+    strip in `_skeleton` looks like belt-and-braces and the next reader deletes it.
+    """
+    mark = "ͅ"
+    assert unicodedata.category(mark) == "Mn"
+    rewritten = normalize(f"Nathan{mark}iel")
+    assert unicodedata.category(rewritten[6]) == "Ll", (
+        "casefold no longer rewrites U+0345 into a letter -- if that is genuinely "
+        "true of this interpreter's Unicode data, re-derive it rather than deleting "
+        "the raw-side strip, which other marks may still need"
+    )
+    assert not any(unicodedata.category(ch)[0] == "M" for ch in rewritten), (
+        "there is no mark left in the normalised payload for a mark-based rule to find"
+    )
+
+
+#: One mark per general category among the class-0 marks -- the ones the *category*
+#: fold removes and the *combining-class* fold keeps. Named by codepoint rather than
+#: pasted as a literal, for the reason the parametrization above gives.
+_CLASS_ZERO_MARKS = [
+    pytest.param(0x0E31, id="outside-Mn-class-0-thai-mai-han-akat"),
+    pytest.param(0x0903, id="outside-Mc-class-0-devanagari-visarga"),
+    pytest.param(0x20DD, id="outside-Me-class-0-enclosing-circle"),
+]
+
+
+@pytest.mark.parametrize("outside", _CLASS_ZERO_MARKS)
+@pytest.mark.parametrize(
+    "inside",
+    [
+        pytest.param(0x0301, id="inside-Mn-class-230-acute"),
+        pytest.param(0x0345, id="inside-Mn-class-240-ypogegrammeni"),
+    ],
+)
+@pytest.mark.parametrize("side", ["before", "after", "both"])
+@pytest.mark.parametrize(
+    "original",
+    [
+        pytest.param("Nathaniel Brightwater", id="multi-component"),
+        pytest.param("Brightwater", id="single-component"),
+    ],
+)
+async def test_a_mark_beside_a_value_cannot_hide_a_mark_inside_it(
+    tmp_path: Path, original: str, side: str, inside: int, outside: int
+) -> None:
+    """The second half of the mark question: a mark BESIDE the value, not inside it.
+
+    Widening `_deaccent` from the canonical combining class to the general category
+    closed the splice this file's other mark tests cover -- and removing a mark is
+    **not** a pure widening, because the occurrence test on the stripped string is a
+    *word-boundary* rule. A class-0 mark sitting immediately before or after the
+    value was a non-alphanumeric character, which is a valid boundary; deleting it
+    glues the value onto the neighbouring alphanumeric run and
+    `occurs_as_a_unit` then denies the very occurrence the fold exists to find.
+
+    Reproduced end to end before the repair, vault holding only the name below::
+
+        "Contact Nathanie<U+0301>l Brightwater<U+0903>Corporation for details."
+            combining-class skeleton -> "...brightwater<U+0903>corporation..."  BLOCKED
+            category skeleton        -> "...brightwatercorporation..."          RELEASED
+
+    Differential fuzz over `_scan_originals`, 60,000 randomized cases with the same
+    inputs to both rules: the category rule blocked 16,429 payloads the class rule
+    released and released 212 it blocked. So the payload is skeletonised under
+    **both** selections now and compared against both (`_skeleton_views`).
+
+    Every case here carries a mark inside the value as well, and that is what makes
+    the test non-vacuous: with the value spelled cleanly the raw form sees it and no
+    skeleton is load-bearing at all. The premises below assert exactly that -- none
+    of the three unfolded forms can see this payload, so a green here is a statement
+    about the skeleton comparison and nothing else.
+
+    The inside mark is parametrized over both classes the raw-side strip exists for,
+    including U+0345, which casefold rewrites into a Greek iota *letter* before any
+    mark-based rule can see it.
+
+    **The single-component original is not decoration, and adding it changed what
+    this test proves.** With only the two-word value, every case here was answered by
+    the separator-relaxing limb rather than by the bounded forms -- deleting the
+    boundary view from `_occurs_in_any_bounded_form` outright left the whole suite
+    green. A one-word value has no interior separator, so that limb never builds a
+    needle for it and the bounded forms are the only thing left; measured on the same
+    payload shape, vault holding ``Brightwater``: the rule before the widening
+    blocked, the widened rule released, this one blocks.
+    """
+    spliced = f"{original[:6]}{chr(inside)}{original[6:]}"
+    left = f"Contact{chr(outside)}" if side in ("before", "both") else "Contact "
+    right = f"{chr(outside)}Corporation." if side in ("after", "both") else " Corporation."
+    payload = f"{left}{spliced}{right}"
+
+    # Premises: this is a different string from the original in every form that does
+    # not fold marks, so only the skeleton comparison can be answering.
+    assert original not in payload
+    assert not _occurs_as_a_unit(normalize(original), normalize(payload))
+    assert not _occurs_as_a_unit(
+        _strip_invisible(normalize(original)), _strip_invisible(normalize(payload))
+    )
+    # ...and the mark really is beside a letter, so the boundary is genuinely at risk.
+    assert unicodedata.category(chr(outside))[0] == "M"
+    assert unicodedata.combining(chr(outside)) == 0
+
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-mark-beside")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+async def test_the_separator_limb_reads_both_skeletons_too(tmp_path: Path) -> None:
+    """The second view is wired into every limb that reads a skeleton, not just one.
+
+    `_scan_originals` hands a skeleton to three places: the bounded forms, the
+    unbounded identifier needles and the separator-relaxing limb. All three read the
+    one skeleton there used to be, so all three inherited the boundary defect -- and
+    dropping the second view from the last two left the whole suite green, which is
+    how this test came to exist.
+
+    The payload here defeats the bounded forms on purpose by respelling the interior
+    separator as a hyphen, so the separator limb is the only thing that can answer;
+    it then carries a mark inside one component and a class-0 mark outside the value,
+    which is the shape whose word boundary the category fold deletes. Measured on
+    this payload: the rule before the widening blocked, the widened rule released,
+    and this one blocks.
+    """
+    original = "Nathaniel Brightwater"
+    inside, outside = "\u0301", "\u0903"  # class 230 inside, class 0 outside
+    payload = f"Contact{outside}Nathanie{inside}l-Brightwater{outside}Corporation."
+
+    # Premise: no bounded form can see this -- the separator is not a space in any of
+    # them, which is the whole reason the separator-relaxing limb exists.
+    assert original not in payload
+    assert not _occurs_as_a_unit(
+        _strip_invisible(normalize(original)), _strip_invisible(normalize(payload))
+    )
+
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-mark-separator")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+#: The class-0 marks that are still a word boundary by the time the skeleton is
+#: derived, computed from :mod:`unicodedata` and the gate's *declared* invisible
+#: class rather than from the scan's answer. A class-0 mark drops out of this set for
+#: one of two reasons, and both are other folds in the same pipeline doing what they
+#: are documented to do:
+#:
+#: * it is a default-ignorable that `_INVISIBLE_RE` removes (U+034F COMBINING GRAPHEME
+#:   JOINER, the Mongolian free variation selectors) -- it renders as nothing, so it
+#:   was never a visible boundary;
+#: * NFKC rewrites it into marks that all reorder (U+0F73 -> U+0F71 U+0F72, classes
+#:   129 and 130), so the combining-class fold removes it too.
+#:
+#: 1,230 of the 1,496 class-0 marks survive both, and that count is what
+#: ``test_every_surviving_class_zero_mark_beside_a_value_is_still_a_boundary`` holds
+#: the gate to.
+_BOUNDARY_MARKS: tuple[str, ...] = tuple(
+    mark
+    for mark in _UNORDERED_MARKS
+    if _strip_invisible(mark) == mark
+    and any(
+        unicodedata.category(ch)[0] == "M" and unicodedata.combining(ch) == 0
+        for ch in _strip_invisible(normalize(mark))
+    )
+)
+
+
+async def test_every_surviving_class_zero_mark_beside_a_value_is_still_a_boundary(
+    tmp_path: Path,
+) -> None:
+    """The beside-the-value property over the enumerated class, not four spellings.
+
+    The sibling of `test_every_unicode_mark_spliced_into_a_value_is_seen_by_pass_one`,
+    and here for the same reason: the defect this closes hid behind tests that each
+    pinned one codepoint, so the property is asserted over a set derived from the
+    *Unicode database* instead. The expectation is computed above from
+    :mod:`unicodedata` and the gate's declared invisible class -- never from
+    `_scan_originals`, which is what is being measured.
+
+    A mark inside the value forces the skeleton comparison to be the one answering;
+    a mark outside it is what the category fold used to delete, taking the word
+    boundary with it. 1,230 marks, both sides at once.
+
+    The value is one word rather than two so that the *bounded forms* are what answer:
+    a multi-component value is caught by the separator-relaxing limb as well, which
+    hides whether the bounded forms can see this at all.
+    """
+    original = "Brightwater"
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    inside = "\u0301"  # COMBINING ACUTE ACCENT, class 230 -- the splice
+
+    # Non-vacuity 1: the derived class is most of the class-0 marks rather than a
+    # handful, so the loop below is a real sweep.
+    assert len(_BOUNDARY_MARKS) > 1000, "the derived boundary-mark set collapsed"
+    assert len(_BOUNDARY_MARKS) < len(_UNORDERED_MARKS), (
+        "every class-0 mark now survives the other folds -- re-derive the exclusions "
+        "rather than deleting them"
+    )
+
+    def payload(outside: str) -> str:
+        return f"Contact{outside}Bright{inside}water{outside}Corporation."
+
+    missed = [
+        mark
+        for mark in _BOUNDARY_MARKS
+        if gate._scan_originals(payload(mark), frozenset({original})) != 1
+    ]
+    assert not missed, (
+        "a mark beside a vaulted original defeats pass 1 by gluing the value to its "
+        "neighbour, so a value the skeleton form was built to find walks out: "
+        + " ".join(f"U+{ord(m):04X}" for m in missed[:20])
+    )
+
+    # Non-vacuity 2: pass 1 is not simply saying yes to anything with a mark in it.
+    # Put a LETTER where the boundary marks were and the same scan reports nothing --
+    # `ContactxBrightwaterxCorporation` is not an occurrence of the value.
+    assert gate._scan_originals(payload("x"), frozenset({original})) == 0
+
+
+async def test_a_reordering_mark_beside_a_spliced_value_is_a_declared_boundary(
+    tmp_path: Path,
+) -> None:
+    """What the two-view union does NOT close, measured rather than left to be found.
+
+    Both views delete a mark whose combining class is non-zero -- that is the whole
+    definition of the narrower one -- so a class-230 mark beside the value glues it
+    to the neighbour in *both*, and the boundary rule denies the occurrence in both.
+    A mark inside the value is what makes that reachable, since the unfolded forms
+    see the value otherwise.
+
+    This is **older than the widening rather than opened by it**: measured on the
+    same payload, the combining-class rule this gate shipped before, the category
+    rule that replaced it and the union of the two all release it. Differential fuzz
+    over 180,000 randomized cases reports zero regressions against either baseline,
+    and this shape is in the residual of all three.
+
+    U+0345 is the case that shows why no mark-preserving view can close it in
+    general: `normalize` casefolds it into a Greek iota *letter*, so it glues the two
+    words whether or not a fold removes it. Closing this class needs the removed
+    character to survive as a boundary *token* -- a sentinel the needle match skips --
+    which means threading one through
+    :func:`~secure_context_pipeline.textrules.occurs_as_a_unit`, the rule four
+    components share by design, to repair one component's haystack.
+
+    If this test ever fails the gate has *gained* coverage, which is good; delete the
+    entry from `_skeleton_views`'s residual note the same day.
+    """
+    original = "Brightwater"
+    inside, outside = "\u0301", "\u0316"  # classes 230 and 220: both views delete them
+    assert unicodedata.combining(outside) != 0, "premise: the narrow view deletes it too"
+    payload = f"Contact{outside}Bright{inside}water{outside}Corporation."
+
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    report = await gate.check(payload, "sess-mark-residual")
+    assert report.originals_scanned == 1, "premise: the original really was in scope"
+
+    # And the same payload with a class-0 mark outside blocks, so this is a
+    # class-of-mark hole rather than the beside-the-value comparison being broken.
+    with pytest.raises(EgressBlockedError):
+        await gate.check(
+            f"Contact\u0903Bright{inside}water\u0903Corporation.",
+            "sess-mark-residual",
+        )
+
+
+async def test_the_second_skeleton_keeps_two_spellings_of_a_value_distinct(
+    tmp_path: Path,
+) -> None:
+    """The asymmetry survives the second view, which is the thing a union can break.
+
+    `_skeleton_views` adds a haystack, never a needle transformation, so the property
+    `test_the_skeleton_form_does_not_collapse_jose_and_jose` pins for the category
+    view has to hold for the combining-class one as well: a vaulted value carrying a
+    mark must not match a payload that spells it without, in either. The mark here is
+    class 0 on purpose -- it is precisely the character the narrow view *keeps*, so
+    this is the view where a needle-side fold would have shown up.
+
+    The value is deliberately single-component. A multi-component one is *not* a test
+    of this property, and finding that out is worth recording: `_separator_needles`
+    strips every non-alphanumeric from the needle, so a mark between two components is
+    read as an interior separator and `Nathaniel<U+0E31> Brightwater` does block on a
+    payload saying `Nathaniel Brightwater`. That is a pre-existing behaviour of a
+    different limb -- measured identically on the rule before the widening, the
+    widened rule and this one -- and it errs towards blocking, which is the direction
+    this gate is allowed to err in.
+    """
+    vaulted = "Brightwater\u0e31"
+    gate = EgressGate(
+        vault=FakeVault({vaulted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+
+    # A payload spelling the name WITHOUT the mark is a different value: no block.
+    report = await gate.check("Contact Brightwater at reception.", "sess-two-views")
+    assert report.originals_scanned == 1, "premise: the original really was in scope"
+
+    # The value as vaulted still blocks, so the scan is not simply blind to it.
+    with pytest.raises(EgressBlockedError):
+        await gate.check(f"Contact {vaulted} at reception.", "sess-two-views")
+
+
+def test_the_two_skeleton_views_are_derived_only_when_they_can_differ() -> None:
+    """The pair's contract: what the second view is, and when it is not paid for.
+
+    The second derivation is a whole extra `normalize` pass over the payload, which
+    is the expensive half of pass 1's setup, so `_skeleton_views` returns ``None``
+    for it whenever it cannot differ from the first. Asserted here because both
+    halves are load-bearing and neither is visible from a behavioural test: the
+    ``None`` is a cost claim, and the non-``None`` is what closes the boundary leak.
+    """
+    ascii_payload = "Ordinary ASCII prose with no marks in it at all."
+    strict, narrow = _skeleton_views(ascii_payload)
+    assert strict == ascii_payload.casefold()
+    assert narrow is None, "an ASCII payload cannot carry a mark; the second pass is skipped"
+
+    # A payload carrying a class-0 mark: the two views disagree, and the narrow one
+    # is the one that still has a boundary character between the two words.
+    strict, narrow = _skeleton_views("Brightwater\u0e31Corporation")
+    assert narrow is not None
+    assert strict == "brightwatercorporation"
+    assert narrow == "brightwater\u0e31corporation"
+
+    # A payload whose only mark reorders: both views delete it, so there is nothing
+    # to compare twice.
+    assert _skeleton_views("Brightwater\u0301Corporation")[1] is None
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        pytest.param("%20", id="percent-encoded-space"),
+        pytest.param("%09", id="percent-encoded-tab"),
+        pytest.param("&nbsp;", id="html-named-entity"),
+        pytest.param("&#32;", id="html-decimal-reference"),
+        pytest.param("&#x20;", id="html-hex-reference"),
+        pytest.param("<br/>", id="html-line-break-tag"),
+    ],
+)
+async def test_the_separator_limb_blocks_transport_encoded_spellings(
+    tmp_path: Path, separator: str
+) -> None:
+    """The half of "any alteration of the separator" that was not true.
+
+    `_INTERIOR_SEPARATOR` is `[\\W_]*` -- a character CLASS -- so what the limb
+    actually tolerates is a run of non-alphanumeric characters. Every separator below
+    carries word characters (`20`, `nbsp`, `32`, `br`), so no character class can span
+    one, and each is an ordinary transport spelling of a space that a `.md`, `.txt` or
+    `.docx` upload carries verbatim: `%20` in any portal URL, the rest in anything
+    round-tripped through HTML or Word.
+
+    Reproduced end to end before the fix on a one-page encounter note:
+    `Marguerite Vandenberg` was detected, vaulted and tokenised out of the `Patient:`
+    line while the same whole name rode out in the chart link as
+    `?patient=Marguerite%20Vandenberg&view=summary`. `orchestrator.run` returned
+    normally, the provider was called once, `egress_rescan_warnings` was 0.0 and the
+    API returned 200 -- the silent case, where nothing downstream reports it. Under
+    pseudonymization it is worse than a leak: the prose said `Megan Padilla` while the
+    URL in the same payload said the real name, so the model gets the identity *and*
+    a decoy.
+
+    The encoding does not have to be applied by this pipeline, which is what the
+    module's residual gap 2 argued and why it filed the shape as unreachable. It only
+    has to be present in the **uploaded document**, and the pipeline then transports
+    it verbatim exactly as advertised.
+    """
+    original = "Marguerite Vandenberg"
+    payload = (
+        "Chart link: https://portal.example.org/records"
+        f"?patient=Marguerite{separator}Vandenberg&view=summary"
+    )
+
+    # Premises. The value is genuinely absent in every form that existed, and the
+    # separator genuinely carries the word characters the limb's class cannot span.
+    assert original not in payload
+    assert not _occurs_as_a_unit(_strip_invisible(normalize(original)), _strip_invisible(payload))
+    assert any(ch.isalnum() for ch in separator)
+    assert not re.search(_separator_needles(original)[0], normalize(payload))
+
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-transport")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+@pytest.mark.parametrize(
+    ("vaulted", "payload", "why"),
+    [
+        pytest.param(
+            "John Smith",
+            "Reference JohnQSmith &amp; associates filed the brief.",
+            "an alphanumeric BETWEEN the components is a different value, and this is "
+            "exactly why the separator class was not simply widened to allow them",
+            id="alphanumeric-between-components",
+        ),
+        pytest.param(
+            "José Ruiz",
+            "The witness Jose%20Ruiz was deposed &#8212; see exhibit 4.",
+            "decoding is applied to the HAYSTACK only, so the needle keeps its accent "
+            "and Jose and Jose-with-an-accent stay two people",
+            id="decoding-keeps-the-deaccent-asymmetry",
+        ),
+        pytest.param(
+            "chronic low back pain",
+            "History: chronic low back pains &lt;resolved&gt; per note.",
+            "the outer word boundaries survive decoding -- a plural is not the value",
+            id="outer-boundaries-survive-decoding",
+        ),
+    ],
+)
+async def test_transport_decoding_does_not_manufacture_a_false_block(
+    tmp_path: Path, vaulted: str, payload: str, why: str
+) -> None:
+    """The cost side of the decoded form, which is the reason it is a haystack fold.
+
+    A fifth haystack widens the scan, and a gate that blocks a clean payload is a
+    gate an operator turns off. Each payload here carries the escape characters that
+    trigger the decode -- so the form really does run rather than being skipped by
+    its own fast path -- and must still clear.
+    """
+    assert any(ch in payload for ch in "%&<"), (
+        "premise: this payload triggers the decoded form at all, otherwise it is "
+        "asserting the fast path rather than the fold"
+    )
+    gate = EgressGate(
+        vault=FakeVault({vaulted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    report = await gate.check(payload, "sess-transport-fp")
+    assert report.originals_scanned == 1, why
 
 
 async def test_a_modifier_letter_without_a_diacritic_decomposition_is_not_covered(

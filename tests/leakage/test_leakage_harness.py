@@ -24,8 +24,9 @@ Four assertions per run (build doc section 10.5):
    ``originals_for_session`` in raw, normalised, invisible-character-folded and
    combining-mark-skeleton form, plus the unbounded identifier needles, plus those
    four forms again per constituent of a composite original -- the same **six**
-   comparisons ``EgressGate._scan_originals`` makes, so the harness cannot
-   pass on a form the gate would catch -- and with no minimum length, so a short
+   comparisons ``EgressGate._scan_originals`` makes, over the same two views of the
+   payload it makes them against (as sent, and transport-decoded), so the harness
+   cannot pass on a form the gate would catch -- and with no minimum length, so a short
    value the gate skips still fails here. No span is exempt, including the
    pipeline's own output: a pseudonym that reproduces a real value verbatim puts
    that value on the wire wherever it sits. The run additionally asserts that no
@@ -172,11 +173,13 @@ import logging
 import re
 import secrets
 import unicodedata
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
+from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+from urllib.parse import unquote
 
 import pytest
 import pytest_asyncio
@@ -202,17 +205,16 @@ from secure_context_pipeline.models import (
     TokenRecord,
 )
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
+from secure_context_pipeline.pipeline import egress_gate
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import (
+    MIN_JOINED_ALNUM_LEN,
     MIN_ORIGINAL_LEN,
     EgressGate,
     _composite_needles,
-    _deaccent,
     _digits_only,
     _identifier_needles,
-    _occurs_with_flexible_separator,
     _regrouped_identifier_needle,
-    _strip_invisible,
 )
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
@@ -631,6 +633,328 @@ def _digit_skeleton_hit(folded: str, digits_hay: str) -> bool:
     return needle is not None and needle in digits_hay
 
 
+#: A tag-shaped run: ``<b>``, ``<br/>``, ``</span>``. Substituted with a **space**
+#: rather than deleted -- deleting would glue the two halves of ``Jane<br/>Doe`` into
+#: one alphanumeric run, and what the separators between components really are is the
+#: whole question this view exists to answer.
+_TRANSPORT_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def _decode_transport_encodings(text: str) -> str:
+    """``text`` with percent-escapes, character references and tags resolved.
+
+    The transports a document travels do not carry a space as a space. A note pasted
+    out of a portal URL carries ``Jane%20Doe``; one round-tripped through HTML or Word
+    carries ``Jane&nbsp;Doe``, ``Jane&#32;Doe`` or ``Jane<br/>Doe``. Every one of those
+    is the vaulted value on the wire -- a model reads all of them as the name -- and
+    every one defeats a separator rule written in terms of *non-alphanumeric*
+    characters, because ``20``, ``nbsp``, ``32`` and ``br`` are alphanumeric.
+
+    Applied as an **additional** view, never a replacement, for the same reason
+    :func:`_unescape_json_unicode` is: this is a tag pattern applied to text that need
+    not be markup, so ``a < b Marguerite Vandenberg > c`` loses its middle here and
+    keeps it in the raw view. Decoding can therefore hide a match, and
+    :func:`find_in_text` scans both views rather than choosing one.
+
+    Cheap on the common input, which matters because the 100 runs scan megabyte-scale
+    haystacks: each step is skipped outright when its marker character is absent, and a
+    payload carrying none of ``%``, ``&`` or ``<`` is returned unchanged without a pass
+    over it.
+
+    The local is called ``resolved`` rather than ``decoded`` for a reason a reader will
+    otherwise trip over. A membership test against a local of that name is one of
+    :data:`_FORBIDDEN_MEMBERSHIP_SNIPPETS` -- it is how ``find_in_bytes`` once decided a
+    leak with a bare ``in`` -- and the marker checks below would match it as source text.
+    They decide whether a transform is worth running rather than whether a value leaked,
+    so renaming the local is the honest fix; widening the guard to let them through is
+    not, because the guard is a rule about what this file may contain at all.
+    """
+    resolved = unquote(text) if "%" in text else text
+    if "&" in resolved:
+        resolved = unescape(resolved)
+    if "<" in resolved:
+        resolved = _TRANSPORT_TAG_RE.sub(" ", resolved)
+    return resolved
+
+
+#: The joined-alphanumeric floor for this module's own separator limb.
+#:
+#: ``min`` of two numbers, and neither half is decorative. Taking the gate's constant
+#: means the day the gate LOWERS its floor does not leave this module behind -- the
+#: harness must never be the weaker of the two. Keeping this module's own 8 means the
+#: day the gate RAISES its floor does not take the harness blind along with it, which
+#: is the exact failure this limb was rewritten to end: two views of one number are
+#: not two opinions.
+_HARNESS_JOINED_ALNUM_FLOOR = min(8, MIN_JOINED_ALNUM_LEN)
+
+
+def _alnum_components(value: str) -> list[str]:
+    """``value`` split into its maximal alphanumeric runs, by index arithmetic.
+
+    :meth:`str.isalnum` and a loop rather than ``groupby`` or a regex, because this is
+    half of a second opinion -- see :func:`_harness_separator_hit`.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    for ch in value.strip():
+        if ch.isalnum():
+            current.append(ch)
+        elif current:
+            parts.append("".join(current))
+            current = []
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def _harness_separator_hit(value: str, haystack: str) -> bool:
+    """``value`` present in ``haystack`` with its interior separators spelled anyhow.
+
+    **This module's own derivation, deliberately sharing nothing with the gate's.** It
+    answers the same question as ``egress_gate._occurs_with_flexible_separator`` and it
+    is written the other way round on purpose: explicit :meth:`str.find` walking and
+    :meth:`str.isalnum` here, a compiled ``[\\W_]*`` join there -- the same relationship
+    :func:`_reference_occurs_as_a_unit` has to the boundary rule.
+
+    **The import it replaces was a measured defect, not an untidiness.** This limb used
+    to *call* the gate's helper, so gate and harness were one opinion wearing two names.
+    The gate's own test file records the consequence: deleting ``_separator_needles``
+    outright "left the full suite green, including all 128 leakage tests". And the
+    inherited blind spot was live rather than theoretical --
+    :func:`test_the_scan_sees_a_separator_the_payload_transport_encoded` is four
+    payloads carrying a whole vaulted name that this module reported ``[]`` on, because
+    it was asking the gate.
+
+    The rule, in words, so the two derivations can be read against each other: *every
+    alphanumeric component of the value occurs in the haystack, in order, with nothing
+    but non-alphanumeric characters between consecutive components, and the characters
+    immediately outside the first and last components are not alphanumeric.*
+
+    Two guards before the walk, both floors rather than rules. A single-component value
+    has no interior separator to vary, so this limb has nothing to add to the bounded
+    forms; and a value whose components join to fewer than
+    :data:`_HARNESS_JOINED_ALNUM_FLOOR` alphanumerics is short enough that relaxing its
+    separators collides with ordinary prose.
+
+    The ``in`` pre-filter is a *filter*, not a decision: the walk below requires every
+    component as a literal, so the absence of the longest one is a sufficient reject,
+    and one C-level scan turns the overwhelmingly common miss away before the loop is
+    entered at all.
+    """
+    parts = _alnum_components(value)
+    if len(parts) < 2 or sum(len(p) for p in parts) < _HARNESS_JOINED_ALNUM_FLOOR:
+        return False
+    if max(parts, key=len) not in haystack:
+        return False
+    head, rest = parts[0], parts[1:]
+    start = 0
+    while True:
+        left = haystack.find(head, start)
+        if left < 0:
+            return False
+        start = left + 1
+        if left > 0 and haystack[left - 1].isalnum():
+            continue  # inside a longer run: the outer boundary rule denies it
+        pos = left + len(head)
+        for part in rest:
+            skip = pos
+            while skip < len(haystack) and not haystack[skip].isalnum():
+                skip += 1
+            if not haystack.startswith(part, skip):
+                break
+            pos = skip + len(part)
+        else:
+            if pos >= len(haystack) or not haystack[pos].isalnum():
+                return True
+
+
+# ---------------------------------------------------------------------------
+# The skeleton fold, re-derived here rather than imported
+# ---------------------------------------------------------------------------
+#
+# This module used to import the gate's ``_skeleton`` and ``_deaccent``, on an
+# argument written into ``_haystack_forms`` that looked airtight: a *fold* is
+# applied to the haystack only, so it can only ever WIDEN what the scan sees,
+# and sharing it costs nothing.
+#
+# **That argument is false, and a released payload is what proved it.** The fold
+# DELETES characters, and the forms that consume it decide with
+# :func:`occurs_as_a_unit`, a word-boundary rule evaluated on the folded string.
+# A combining mark sitting immediately beside a vaulted value is a
+# non-alphanumeric character -- a valid boundary. Remove it and the value is
+# glued to the neighbouring word, so the boundary rule now REJECTS the very
+# occurrence the skeleton exists to find. A fold feeding a decision is part of
+# the decision.
+#
+# The cost of having imported it was exact: when the gate's mark selection was
+# widened from combining CLASS to category ``M``, this module inherited the
+# change silently, went blind in the same 42 payloads, and still printed
+# ``100/100 runs clean, 0 leaks``. The headline number was not evidence about
+# the skeleton at all.
+#
+# So the semantics are re-derived below from :mod:`unicodedata` directly. The
+# ORDERING is copied deliberately and the reasoning restated -- that is the part
+# a second opinion should agree with, and getting it wrong made this module
+# weaker than the gate once already (see :func:`_haystack_forms`). The
+# IMPLEMENTATION is this module's own, so a future change to the gate's fold
+# makes the two disagree loudly instead of quietly.
+
+
+def _reference_is_mark(ch: str) -> bool:
+    """Every Unicode combining mark: general category ``M``. 2,408 codepoints."""
+    return unicodedata.category(ch)[0] == "M"
+
+
+def _reference_is_reordering_mark(ch: str) -> bool:
+    """Marks with a non-zero canonical combining class. A strict subset: 912."""
+    return unicodedata.combining(ch) != 0
+
+
+def _reference_is_invisible(ch: str) -> bool:
+    """Codepoints that render as nothing, so a payload can carry them for free.
+
+    Category ``Cf`` is the bulk of it. The rest are the zero-width codepoints
+    Unicode files under other categories -- fillers, variation selectors, the
+    combining grapheme joiner -- listed by name rather than borrowed.
+    """
+    if unicodedata.category(ch) == "Cf":
+        return True
+    return ch in _REFERENCE_EXTRA_INVISIBLE
+
+
+#: Zero-width codepoints that are NOT category Cf, so the check above misses them.
+_REFERENCE_EXTRA_INVISIBLE: frozenset[str] = frozenset(
+    "\u034f"  # combining grapheme joiner
+    "\u115f\u1160"  # Hangul choseong/jungseong fillers
+    "\u17b4\u17b5"  # Khmer inherent vowels
+    "\u180b\u180c\u180d\u180e\u180f"  # Mongolian variation selectors
+    "\u3164"  # Hangul filler
+    "\uffa0"  # halfwidth Hangul filler
+    + "".join(chr(cp) for cp in range(0xFE00, 0xFE10))  # variation selectors
+    + "".join(chr(cp) for cp in range(0xE0100, 0xE01F0))  # variation selectors sup.
+)
+
+
+def _reference_is_spacing_diacritic(ch: str) -> bool:
+    """Renders as a diacritic but is not a mark -- U+00B4, U+00A8 and their block.
+
+    Identified by the compatibility decomposition Unicode gives them, ``<compat>
+    0020 XXXX``: a space followed by the combining form. One property lookup, so
+    restating it here is a genuine second derivation rather than a copy.
+    """
+    return unicodedata.decomposition(ch).startswith("<compat> 0020 ")
+
+
+def _reference_fold_digits(value: str) -> str:
+    """Every Unicode decimal digit rewritten in its ASCII spelling."""
+    if value.isascii():
+        return value
+    return "".join(
+        str(digit) if (digit := unicodedata.decimal(ch, None)) is not None else ch
+        for ch in value
+    )
+
+
+def _reference_skeleton(
+    value: str, *, is_mark: Callable[[str], bool] = _reference_is_mark
+) -> str:
+    """``value`` reduced to the shape a spliced-in mark cannot hide inside.
+
+    The ordering is load-bearing and is the half worth agreeing with the gate
+    about, so it is restated rather than re-invented:
+
+    1. **Spacing diacritics first.** NFKC expands ``U+00B4`` into a space plus a
+       combining acute, so stripping marks after normalising leaves the injected
+       space behind and the needle still does not match.
+    2. **Marks off the RAW text next.** ``normalize`` collapses whitespace, and a
+       mark sitting between two spaces keeps them apart until it is removed --
+       measured on vaulted ``00000  0`` against payload ``00000 <U+0301> 0``,
+       where deriving in the other order reported CLEAN on a payload the gate
+       blocked.
+    3. Normalise, strip invisibles, then strip marks a **second** time, because
+       NFKC's own compatibility decompositions introduce marks that were not in
+       the raw text.
+    4. Fold non-ASCII decimal digits last.
+    """
+    without_spacing = "".join(
+        ch for ch in value if not _reference_is_spacing_diacritic(ch)
+    )
+    raw_deaccented = "".join(ch for ch in without_spacing if not is_mark(ch))
+    normalised = normalize(raw_deaccented)
+    visible = "".join(ch for ch in normalised if not _reference_is_invisible(ch))
+    return _reference_fold_digits("".join(ch for ch in visible if not is_mark(ch)))
+
+
+def _reference_strip_invisible(value: str) -> str:
+    """The folded form: invisibles removed, marks and case-folding left alone."""
+    return "".join(ch for ch in value if not _reference_is_invisible(ch))
+
+
+class _HaystackForms(NamedTuple):
+    """One haystack, in the five shapes the comparisons below need.
+
+    Derived once per view rather than once per original: the 100 runs scan
+    megabyte-scale blobs, and ``_digits_only`` alone is a full pass over one.
+    """
+
+    raw: str
+    normalized: str
+    folded: str
+    skeleton: str
+    #: The same skeleton under the combining-CLASS selection, which KEEPS the
+    #: 1,496 class-0 marks the category selection removes. Both views are needed
+    #: and neither is a superset: the category view catches a mark spliced INSIDE
+    #: a value, and this one keeps a mark BESIDE a value readable as the word
+    #: boundary it is. Deleting it glues the value to its neighbour and the
+    #: boundary rule then denies the occurrence. Mirrors the gate's
+    #: ``_Haystacks.boundary_skeleton``, derived independently.
+    boundary_skeleton: str
+    digits: str
+
+
+def _haystack_forms(haystack: str) -> _HaystackForms:
+    """The five derived shapes of ``haystack``. Names match the gate's ``_Haystacks``.
+
+    The skeleton is **this module's own** (:func:`_reference_skeleton`), and the
+    ordering below is the part deliberately agreed with the gate. This module once
+    derived it as
+    ``_deaccent(_strip_invisible(normalize(text)))``; the gate deaccents the RAW text
+    first, because ``normalize`` collapses whitespace and a mark sitting between two
+    spaces keeps them apart until it is removed. Measured, on the payload the fuzz below
+    shrank to -- vaulted ``00000  0``, payload ``00000 <U+0301> 0``::
+
+        this module's own ordering -> '00000  0'   (needle absent: two spaces)
+        the gate's ordering        -> '00000 0'    (needle present: gate blocks)
+
+    So the gate blocked a payload this module reported CLEAN, which is the exact
+    asymmetry :func:`test_the_harness_is_never_weaker_than_the_gate_on_generated_input`
+    exists to catch -- and it caught it.
+
+    That paragraph used to end by arguing importing was right *here* and wrong one
+    function down, because "a fold is applied to the haystack only and can therefore
+    only widen what the scan sees". **The argument was false and a released payload
+    proved it** -- see the block above :class:`_HaystackForms`. A fold that DELETES
+    characters can destroy a word boundary, and the forms consuming it decide with
+    :func:`occurs_as_a_unit`, so the fold is part of the decision. Fold and decision are
+    now both this module's own; see :func:`_harness_separator_hit` for what the same
+    lesson cost the separator limb, and :func:`_reference_occurs_as_a_unit` for how the
+    boundary rule pays it back.
+    """
+    norm_hay = normalize(haystack)
+    folded_hay = _reference_strip_invisible(norm_hay)
+    skeleton_hay = _reference_skeleton(haystack)
+    return _HaystackForms(
+        raw=haystack,
+        normalized=norm_hay,
+        folded=folded_hay,
+        skeleton=skeleton_hay,
+        boundary_skeleton=_reference_skeleton(
+            haystack, is_mark=_reference_is_reordering_mark
+        ),
+        digits=_digits_only(skeleton_hay),
+    )
+
+
 def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
     """Every original occurring in ``haystack``, in **every** comparison the gate makes.
 
@@ -687,10 +1011,31 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
     harness does not, so a short value the gate would wave through still fails here.
     That is the one direction in which the harness *should* be stricter than the
     gate, and it stays that way.
+
+    **Every one of them runs over two VIEWS of the haystack: as it arrived, and
+    transport-decoded.** A separator that carries word characters -- ``%20``,
+    ``&nbsp;``, ``&#32;``, ``<br/>`` -- defeats every one of them at once on the raw
+    view: the bounded forms keep the separator inside the needle, and the
+    separator-invariant limb describes a separator as *non-alphanumeric*, which ``20``,
+    ``nbsp``, ``32`` and ``br`` are not. A whole vaulted name spelled that way read
+    CLEAN through this module while it was on the wire --
+    ``?patient=Marguerite%20Vandenberg&view=summary`` -- and
+    :func:`test_the_scan_sees_a_separator_the_payload_transport_encoded` is the four
+    spellings of it.
+
+    Every limb sees the decoded view, not only the separator one, because once
+    ``Jane%20Doe`` decodes it is the *bounded* forms that see ``Jane Doe``. The view is
+    **additional**, never a replacement: :func:`_decode_transport_encodings` applies a
+    tag pattern to text that need not be markup, so it can destroy a match the raw view
+    holds, and a second view cannot lose a hit. It is applied here and not in
+    :func:`find_in_digit_heavy_text`, whose channels are a different false-positive
+    surface (see :data:`_HARNESS_RUN_FLOOR` for what that surface has already cost this
+    module) that this view has not been measured against.
     """
-    norm_hay = normalize(haystack)
-    folded_hay = _strip_invisible(norm_hay)
-    skeleton_hay = _deaccent(folded_hay)
+    views = [_haystack_forms(haystack)]
+    decoded = _decode_transport_encodings(haystack)
+    if decoded != haystack:
+        views.append(_haystack_forms(decoded))
 
     def bounded(value: str) -> bool:
         """Forms 1-4, for a whole original or for one composite constituent.
@@ -701,21 +1046,23 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
         cannot afford to hold only by habit.
         """
         normalised = normalize(value)
-        folded = _strip_invisible(normalised)
-        return (
-            occurs_as_a_unit(value, haystack)
-            or occurs_as_a_unit(normalised, norm_hay)
-            or occurs_as_a_unit(folded, folded_hay)
-            or occurs_as_a_unit(folded, skeleton_hay)
+        folded = _reference_strip_invisible(normalised)
+        return any(
+            occurs_as_a_unit(value, view.raw)
+            or occurs_as_a_unit(normalised, view.normalized)
+            or occurs_as_a_unit(folded, view.folded)
+            or occurs_as_a_unit(folded, view.skeleton)
+            or occurs_as_a_unit(folded, view.boundary_skeleton)
+            for view in views
         )
 
-    digits_hay = _digits_only(skeleton_hay)
-    found: list[str] = []
-    for original in originals:
-        folded = _strip_invisible(normalize(original))
-        if (
-            bounded(original)
-            or any(needle in skeleton_hay for needle in _identifier_needles(folded))
+    def unbounded(folded: str) -> bool:
+        """Forms 5-7, which need no boundary and are therefore per-view substring work."""
+        return any(
+            any(
+                needle in view.skeleton or needle in view.boundary_skeleton
+                for needle in _identifier_needles(folded)
+            )
             # The separator-invariant limb. Mirrors the gate's fifth comparison:
             # a multi-component original whose interior separator the payload
             # spells differently -- or not at all -- defeats all four bounded
@@ -726,13 +1073,18 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
             # BOTH haystacks, accent-preserving first. Handing this limb only the
             # deaccented one made it dead for every accented original -- the needle
             # keeps its accent by design, so it cannot occur in a deaccented
-            # haystack. This module imports the gate's own helper, so it inherited
-            # that blind spot exactly and reported 100/100 CLEAN on payloads the
-            # gate was releasing. Spelled out here rather than left to the shared
-            # helper, because a harness that can only be as strong as the thing it
-            # checks is the defect this file exists to avoid.
-            or _occurs_with_flexible_separator(folded, folded_hay)
-            or _occurs_with_flexible_separator(folded, skeleton_hay)
+            # haystack. This module used to import the gate's own helper, so it
+            # inherited that blind spot exactly and reported 100/100 CLEAN on
+            # payloads the gate was releasing. The decision is now this module's
+            # own -- :func:`_harness_separator_hit` -- rather than a second call
+            # into the thing under test. The transport-encoded separator this limb
+            # also used to miss is the DECODED view rather than a wider separator
+            # class: widening the class to admit alphanumerics would make
+            # `John Smith` match `JohnQSmith`, which is a false leak report on the
+            # headline assertion.
+            or _harness_separator_hit(folded, view.folded)
+            or _harness_separator_hit(folded, view.skeleton)
+            or _harness_separator_hit(folded, view.boundary_skeleton)
             # The digit-skeleton limb. Mirrors the gate's comparison for a
             # letter-free identifier: any regrouping of the same digits collapses
             # to the same string on both sides, which is what catches a vaulted
@@ -740,7 +1092,16 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
             # this harness is weaker than the gate, and
             # `test_the_harness_is_never_weaker_than_the_gate_on_generated_input`
             # is what said so -- it went red the moment the gate gained the limb.
-            or _digit_skeleton_hit(folded, digits_hay)
+            or _digit_skeleton_hit(folded, view.digits)
+            for view in views
+        )
+
+    found: list[str] = []
+    for original in originals:
+        folded_original = _reference_strip_invisible(normalize(original))
+        if (
+            bounded(original)
+            or unbounded(folded_original)
             or any(bounded(part) for part in _composite_needles(original))
         ):
             found.append(original)
@@ -810,12 +1171,12 @@ def find_in_digit_heavy_text(originals: frozenset[str], haystack: str) -> list[s
     and a boolean parameter is one mistaken default away from silently narrowing it.
     """
     norm_hay = normalize(haystack)
-    folded_hay = _strip_invisible(norm_hay)
-    skeleton_hay = _deaccent(folded_hay)
+    folded_hay = _reference_strip_invisible(norm_hay)
+    skeleton_hay = _reference_skeleton(haystack)
     found: list[str] = []
     for original in originals:
         normalised = normalize(original)
-        folded = _strip_invisible(normalised)
+        folded = _reference_strip_invisible(normalised)
         if (
             occurs_as_a_unit(original, haystack)
             or occurs_as_a_unit(normalised, norm_hay)
@@ -849,12 +1210,12 @@ def describe_hits(originals: list[str], haystack: str) -> list[str]:
     build doc section 16's rule and applies to test output like everything else.
     """
     norm_hay = normalize(haystack)
-    folded_hay = _strip_invisible(norm_hay)
-    skeleton_hay = _deaccent(folded_hay)
+    folded_hay = _reference_strip_invisible(norm_hay)
+    skeleton_hay = _reference_skeleton(haystack)
     described: list[str] = []
     for original in originals:
         normalised = normalize(original)
-        folded = _strip_invisible(normalised)
+        folded = _reference_strip_invisible(normalised)
         limbs = [
             name
             for name, fired in (
@@ -1481,7 +1842,8 @@ def test_the_scan_sees_an_invisible_character_bypass() -> None:
     # not disagree about whether this is an occurrence.
     zero_width = "The client Marguerite​ Vandenberg signed."
     assert occurs_as_a_unit(
-        _strip_invisible(normalize(name)), _strip_invisible(normalize(zero_width))
+        _reference_strip_invisible(normalize(name)),
+        _reference_strip_invisible(normalize(zero_width)),
     ), "the gate's folded comparison must see this too, or the two have diverged again"
 
     # And the false positive is still prevented in the folded form.
@@ -1821,6 +2183,114 @@ def test_the_scan_sees_an_identifier_glued_into_a_longer_run() -> None:
     )
 
 
+#: Ordinary spellings of a single space, in the transports a document actually travels
+#: through: a portal URL, an HTML mail body, a Word round-trip. Each of them carries
+#: **word characters**, which is what makes them invisible to a separator rule written
+#: as a character class -- ``20``, ``nbsp``, ``32`` and ``br`` are alphanumeric.
+_TRANSPORT_ENCODED_SPACES: tuple[tuple[str, str], ...] = (
+    ("percent-escape", "%20"),
+    ("named character reference", "&nbsp;"),
+    ("numeric character reference", "&#32;"),
+    ("markup break", "<br/>"),
+)
+
+
+def test_the_scan_sees_a_separator_the_payload_transport_encoded() -> None:
+    """A whole vaulted name on the wire, and this module reported CLEAN on it.
+
+    Not a hypothetical shape: ``?patient=Marguerite%20Vandenberg&view=summary`` is what
+    an uploaded portal note contains, the pipeline transports the document verbatim as
+    advertised, and the name reaches the provider entire. All four spellings below do
+    the same thing through a different transport.
+
+    Every limb in :func:`_find_in_one_view` misses it at once, which is why it survived
+    128 leakage tests. The four bounded forms keep the separator inside the needle, so
+    they are looking for a string the payload does not contain; the separator-invariant
+    limb relaxes the separator to *any non-alphanumeric run*, and ``20``, ``nbsp``,
+    ``32`` and ``br`` are alphanumeric. The identifier and composite limbs never look at
+    a letters-only name at all.
+
+    Asserted against **this module's own scan only**, deliberately: whether the gate
+    also blocks these is the gate's own test to keep, and the property that matters here
+    is that the harness does not depend on the answer. That was the whole defect -- this
+    limb used to be a call into the gate, so the two were one opinion wearing two names.
+    """
+    original = "Marguerite Vandenberg"
+    for label, separator in _TRANSPORT_ENCODED_SPACES:
+        payload = f"?patient=Marguerite{separator}Vandenberg&view=summary"
+        assert original not in payload, (
+            f"premise for {label}: the vaulted value is genuinely absent byte for byte, "
+            "so nothing here is caught by a plain substring test"
+        )
+        assert not occurs_as_a_unit(original, payload), f"premise for {label}: bounded forms miss"
+        folded = _reference_strip_invisible(normalize(original))
+        assert not _harness_separator_hit(folded, _reference_strip_invisible(normalize(payload))), (
+            f"premise for {label}: the separator limb alone misses it on the undecoded "
+            "haystack -- the decoded view is what closes this, not a wider separator "
+            "class, which would make `John Smith` match `JohnQSmith`"
+        )
+        assert find_in_text(frozenset({original}), payload) == [original], (
+            f"the {label} spelling of a space carries the whole vaulted name to the "
+            "provider, and this module is what reports whether it did"
+        )
+
+
+def test_the_separator_limb_does_not_ask_the_gate_for_its_answer() -> None:
+    """Sabotage the gate's separator machinery; this module must not go blind with it.
+
+    The recorded failure, from the gate's own test file: deleting ``_separator_needles``
+    outright "left the full suite green, including all 128 leakage tests", because the
+    harness *called* ``_occurs_with_flexible_separator``. Gate and harness lost the limb
+    in lockstep, so the check that exists to disagree with the gate could not.
+
+    ``test_the_harness_is_never_weaker_than_the_gate_on_generated_input`` cannot see
+    that: "never weaker" is satisfied when both are equally blind. This test asserts the
+    other half -- the harness is not merely as strong as the gate, its answer is *its
+    own* -- by killing the gate's separator limb outright and requiring this module to
+    go on reporting the leak.
+
+    Monkeypatched rather than edited: ``_separator_needles`` reads
+    ``_INTERIOR_SEPARATOR`` at call time, so stubbing the module attribute to a pattern
+    that can never match is the same thing as deleting the limb, and it is undone at
+    teardown.
+
+    **What each payload is doing here.** The first is the separator limb's own shape,
+    and it carries the two premises that make the sabotage mean something: the live gate
+    blocks it, and the stubbed gate does not. The second is the transport-encoded
+    spelling, asserted about **this module only** -- the gate's handling of that shape is
+    the gate's own business and its own test, and pinning a premise on it here would
+    couple this file to the thing it exists to disagree with all over again. The gate's
+    transport decode is stubbed alongside, ``raising=False``, so that if the gate does
+    hold such a limb it cannot be the reason anything below passes.
+    """
+    original = "Marguerite Vandenberg"
+    separator_payload = "reviewer Marguerite/Vandenberg filed"
+    encoded_payload = "?patient=Marguerite%20Vandenberg"
+
+    assert _gate_scan_hits(frozenset({original}), separator_payload) == 1, (
+        f"premise: the live gate blocks {separator_payload!r}. If it does not, this test "
+        "is sabotaging a limb that is already gone -- a finding about the gate"
+    )
+
+    with pytest.MonkeyPatch.context() as patch:
+        # `(?!)` is the empty negative lookahead: a valid pattern that matches nothing,
+        # whatever it is joined to. Anything the gate builds from it is dead.
+        patch.setattr(egress_gate, "_INTERIOR_SEPARATOR", "(?!)")
+        patch.setattr(egress_gate, "_decode_transport_escapes", lambda value: None, raising=False)
+
+        assert _gate_scan_hits(frozenset({original}), separator_payload) == 0, (
+            "premise: with its interior-separator pattern stubbed dead the gate is blind "
+            f"to {separator_payload!r}. It is not, so the sabotage missed the mechanism "
+            "and nothing below is evidence"
+        )
+        for payload in (separator_payload, encoded_payload):
+            assert find_in_text(frozenset({original}), payload) == [original], (
+                "this module reports a leak only because the gate does -- which is the "
+                "defect: 128 leakage tests stayed green through a whole vaulted name "
+                "on the wire, because the checker was asking the thing it checks"
+            )
+
+
 #: Payloads the gate's pass 1 blocks, one per comparison it makes, with the limb each
 #: one exists to exercise. Named rather than generated so a reader can see which limb
 #: is which, and so a limb that stops existing is a red with a name attached.
@@ -1858,6 +2328,16 @@ _GATE_BLOCKING_PAYLOADS: tuple[tuple[str, str, str], ...] = (
     ("folded (zero width)", "Marguerite Vandenberg", "client Marguerite​ Vandenberg signed"),
     ("folded (tag character)", "John Smith", "client Joh\U000e0041n Smith signed"),
     ("skeleton (combining mark)", "John Smith", "client Joh́n Smith signed"),
+    # The payload ONLY the skeleton's ORDERING catches, and the entry that says the
+    # ordering out loud. The mark sits between the value's two spaces, so a haystack
+    # that is normalised before it is deaccented keeps two spaces where the needle has
+    # one -- `normalize` collapses whitespace, and at that point the mark is still
+    # holding the run apart. This module derived its skeleton that way and read CLEAN
+    # while the gate blocked; see :func:`_haystack_forms`. A lab value rather than a
+    # name because the separator-invariant limb has an eight-alphanumeric floor, so a
+    # two-component value below it leaves the skeleton as the only limb in play -- with
+    # `John  Smith` here instead, the old ordering left this file green.
+    ("skeleton (ordering)", "HDL  28", "chart HDL ́ 28 flagged"),
     ("identifier (whole value)", "47-1234567", "routing tag batch47-1234567Alpha here"),
     ("identifier (digit run)", "MRN: 5567281", "chart row MRN5567281B reconciled"),
     ("identifier (bare run elsewhere)", "Account No. 100200300400", "ref 100200300400 posted"),
@@ -1940,6 +2420,14 @@ _MUTATIONS = (
     # the folded and skeleton comparisons both go quiet and only the normalised one is
     # left. Without it the fuzz stayed green through deleting that limb.
     "upper_zero_width_wrap",
+    # One interior separator re-spelled the way a transport spells it (`%20`, `&nbsp;`,
+    # `&#32;`, `<br/>`). Added because no other mutation here can reach the decoded view
+    # `find_in_text` scans: no `_FUZZ_VALUES` alphabet carries `%`, `&` or `<`, so no
+    # generated payload could ever hold a transport escape and the fuzz was structurally
+    # unable to see that view leave. Measured by deleting the decoded view outright:
+    # without this entry the test reported "3000 passing, 0 failing" and stayed green;
+    # with it, red, shrunk to original='00000 0' under this mutation.
+    "transport_escape",
 )
 
 
@@ -1958,6 +2446,14 @@ def _mutate(value: str, mutation: str, at: int) -> str:
         return value[: cut + 1] + "​" + value[cut + 1 :]
     if mutation == "line_break":
         return value[: cut + 1] + "\n" + value[cut + 1 :]
+    if mutation == "transport_escape":
+        # The FIRST non-alphanumeric character, re-spelled. A value that has none is
+        # returned unchanged, which is a `verbatim` draw rather than a wasted one.
+        for index, ch in enumerate(value):
+            if not ch.isalnum():
+                escape = _TRANSPORT_ENCODED_SPACES[at % len(_TRANSPORT_ENCODED_SPACES)][1]
+                return value[:index] + escape + value[index + 1 :]
+        return value
     return value
 
 
@@ -3162,3 +3658,93 @@ async def test_leakage_summary(
     assert ledger.leaks == 0, f"{ledger.leaks} leak(s) found across {ledger.runs} runs"
     assert await harness.audit.verify_chain() is True, "audit hash chain broken"
     print("\n" + ledger.summary())
+
+
+#: A vaulted value, and two payloads carrying it that ONLY a skeleton view finds.
+#:
+#: ``_INSIDE`` splices U+0E31 THAI CHARACTER MAI HAN-AKAT -- a category-``Mn`` mark
+#: with combining class **0** -- into the middle of the value. ``_BESIDE`` carries an
+#: interior U+0301 (class 230) *and* a class-0 U+0903 immediately after the value,
+#: followed by a letter. The second is the shape that regressed when the gate's fold
+#: was widened to category ``M``: removing the trailing mark glues ``Brightwater`` to
+#: ``Corporation``, and the word-boundary rule then denies the occurrence.
+_SKELETON_ONLY_VALUE = "Nathaniel Brightwater"
+_SKELETON_ONLY_PAYLOADS = (
+    # Written as escapes, not literals: these payloads exist to carry ONE exact
+    # codepoint each, and a literal makes the interesting character invisible in
+    # review (ruff RUF001 also flags U+0903, which renders like a colon).
+    (
+        "mark spliced inside the value",
+        "Attending: Nathan\u0e31iel Brightwater",  # Mn, combining class 0
+    ),
+    (
+        "mark beside the value",
+        "Contact Nathanie\u0301l Brightwater\u0903Corporation.",  # class 230 + class 0
+    ),
+)
+
+
+@pytest.mark.parametrize("label,payload", _SKELETON_ONLY_PAYLOADS)
+def test_the_skeleton_limb_does_not_ask_the_gate_for_its_answer(
+    monkeypatch: pytest.MonkeyPatch, label: str, payload: str
+) -> None:
+    """The harness must find a mark-spliced original with the gate's folds disabled.
+
+    This module imported the gate's ``_skeleton`` and ``_deaccent`` and justified it
+    in ``_haystack_forms`` with an argument that reads well and is wrong: a *fold* is
+    haystack-only, so it "can only widen what the scan sees". A fold that DELETES
+    characters cannot only widen -- the forms consuming it decide with
+    :func:`occurs_as_a_unit`, a word-boundary rule evaluated on the folded string, and
+    a deleted mark beside a value glues it to the next word so the rule denies it.
+
+    The bill came in two parts. The gate's mark selection tested combining CLASS, so
+    1,496 category-``M`` codepoints with class 0 were never stripped and a mark spliced
+    inside a vaulted value defeated pass 1 -- and this module, importing the same fold,
+    printed ``100/100 runs clean, 0 leaks`` on the payloads the gate was releasing.
+    Then the selection was widened to category ``M`` and 42 payloads that HEAD had
+    blocked began to release, for the boundary reason above -- and this module inherited
+    that too, still clean, still 0 leaks. Twice the headline number was not evidence
+    about the skeleton at all.
+
+    So the derivation is now :func:`_reference_skeleton`, written here from
+    :mod:`unicodedata` primitives. The ordering is deliberately the gate's and the
+    docstring says so -- that is the part a second opinion should agree with. The
+    implementation is this module's, which is what makes disagreement loud.
+
+    Modelled on :func:`test_the_separator_limb_does_not_ask_the_gate_for_its_answer`,
+    which exists because the separator limb learned the identical lesson first. Every
+    fold on the gate is replaced with identity, not just the one under discussion: a
+    checker that survives only because it happened to call a *different* borrowed
+    helper is not independent either. Measured -- with all five gate folds stubbed, the
+    harness still returns the original for both payloads; before this change it
+    returned ``[]`` for both with the gate fully intact.
+    """
+    for fold in ("_deaccent", "_skeleton", "_strip_invisible", "_strip_spacing_marks"):
+        monkeypatch.setattr(egress_gate, fold, lambda value, **kwargs: value)
+    monkeypatch.setattr(egress_gate, "_skeleton_views", lambda value: (value, None))
+
+    assert find_in_text(frozenset({_SKELETON_ONLY_VALUE}), payload) == [
+        _SKELETON_ONLY_VALUE
+    ], f"the harness lost {label!r} when the gate's folds were disabled"
+
+
+@pytest.mark.parametrize("label,payload", _SKELETON_ONLY_PAYLOADS)
+def test_the_harness_reports_the_mark_payloads_the_gate_blocks(
+    label: str, payload: str
+) -> None:
+    """Non-vacuity for the test above: these payloads are found with the gate intact.
+
+    Without this, a `_reference_skeleton` that returned its input unchanged would still
+    satisfy the sabotage test if the payloads happened to be findable some other way.
+    They are not: every one of the raw, normalised and folded forms misses them, which
+    is asserted here rather than assumed.
+    """
+    normalised = normalize(_SKELETON_ONLY_VALUE)
+    folded = _reference_strip_invisible(normalised)
+    assert not occurs_as_a_unit(_SKELETON_ONLY_VALUE, payload)
+    assert not occurs_as_a_unit(normalised, normalize(payload))
+    assert not occurs_as_a_unit(folded, _reference_strip_invisible(normalize(payload)))
+
+    assert find_in_text(frozenset({_SKELETON_ONLY_VALUE}), payload) == [
+        _SKELETON_ONLY_VALUE
+    ], f"premise: {label!r} is a leak the harness must see"

@@ -2292,6 +2292,13 @@ async def test_tokens_declare_every_surrogate_in_the_payload(env: Env, strategy:
 
     # A value that is BOTH detected here and reached by the sweep under another
     # surface form is one vault row, so it must be declared exactly once.
+    #
+    # This casing never reaches the dedupe, and cannot fail without it: the sweep
+    # orders surfaces (-len, value), so the equal-length "JOHN SMITH" detected here
+    # sorts ahead of the vaulted "John Smith" ("O" < "o") and claims BOTH mentions,
+    # leaving the prior-call surface unused and the swept-record list empty. The
+    # binding case is the other casing --
+    # ``test_a_value_both_detected_and_swept_is_declared_once`` below.
     third = "JOHN SMITH signed; John Smith countersigned."
     mixed = await env.engine.obfuscate(
         env.session_id, third, [span(third, "JOHN SMITH", "NAME")], strategy=strategy
@@ -2301,6 +2308,70 @@ async def test_tokens_declare_every_surrogate_in_the_payload(env: Env, strategy:
     assert len(mixed.tokens) == 1
     assert "John Smith" not in mixed.obfuscated_text
     assert "JOHN SMITH" not in mixed.obfuscated_text
+
+
+@pytest.mark.parametrize("strategy", BOTH_MODES)
+async def test_a_value_both_detected_and_swept_is_declared_once(env: Env, strategy: str) -> None:
+    """One vault row is one token, even when two surface forms reach the payload.
+
+    ``obfuscate`` appends the cross-call sweep's records to ``tokens`` and dedupes
+    them on token ID, and until this test that dedupe was bound by nothing:
+    dropping it -- ``tokens.extend(swept_records)`` -- left the whole suite green.
+    The manifest would then carry the SAME row twice, and the orchestrator hands
+    ``tokens`` on as three different things: the egress gate's set of "our own
+    output", the pseudonym restore map, and the issued-token-ID report. A doubled
+    row is a doubled restore-map entry and a doubled count of what this call
+    issued -- a manifest that misdescribes the payload it is the manifest of.
+
+    Reaching the duplicate takes a surface form this call detected and a DIFFERENT
+    surface form the vault holds, both normalizing to one row (build doc section 8:
+    NFKC, collapse whitespace, casefold), with the vaulted form the one that claims
+    a residual. ``_add_prior_session_surfaces`` offers a prior original whenever it
+    is not literally a key of this call's surfaces -- and ``surfaces`` is keyed by
+    raw detection text -- so a case-differing header is exactly that.
+
+    Casing direction is load-bearing here, which is why the neighbouring check in
+    ``test_tokens_declare_every_surrogate_in_the_payload`` cannot fail: the sweep
+    sorts ``(-len(surface), surface)``, so of two equal-length casings the one with
+    the uppercase letter sorts first. Vaulting the UPPERCASE form and detecting the
+    mixed-case one is what puts the prior-call surface in front, where it claims
+    the residual and lands in the swept-record list.
+
+    The residual span's score is the proof that it did: a prior-call surface enters
+    the sweep at 1.0 ("a value the vault already holds", not a detector guess),
+    while this call's surface carries the detector's 0.9. A residual scored 0.9
+    would mean this call's own surface claimed it, the swept-record list came back
+    empty, and the dedupe was never exercised at all.
+    """
+    first = "Header: JOHN SMITH, admitted today."
+    await env.engine.obfuscate(
+        env.session_id, first, [span(first, "JOHN SMITH", "NAME")], strategy=strategy
+    )
+    record = await env.vault.get_by_original(env.session_id, "NAME", "john smith")
+    assert record is not None
+
+    # Detected in its mixed casing, residual in a third one the detector missed.
+    second = "John Smith signed the release; john smith countersigned it."
+    result = await env.engine.obfuscate(
+        env.session_id, second, [span(second, "John Smith", "NAME")], strategy=strategy
+    )
+
+    ids = [item.token_id for item in result.tokens]
+    assert len(ids) == len(set(ids)), f"one vault row was declared twice: {ids}"
+    assert ids == [record.token_id]
+    assert await env.vault.row_count(env.session_id) == 1, "one value, one row"
+
+    # The payload really does carry both surface forms masked, so the manifest is
+    # describing two splices of one surrogate rather than a single one.
+    assert result.obfuscated_text.count(record.surrogate) == 2
+    assert "john smith" not in result.obfuscated_text.casefold()
+
+    assert len(result.spans) == 2
+    detected, residual = sorted(result.spans, key=lambda item: item.start)
+    assert second[detected.start : detected.end] == "John Smith"
+    assert second[residual.start : residual.end] == "john smith"
+    assert detected.score == 0.9, "this call's detection, at the score it was given"
+    assert residual.score == 1.0, "claimed by the vaulted surface -- the dedupe path ran"
 
 
 async def test_the_sweep_never_masks_an_original_it_cannot_resolve_to_a_record(

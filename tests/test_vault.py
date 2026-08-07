@@ -24,15 +24,18 @@ claim being made is about what an attacker with database write access can do.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import itertools
 import logging
+import re
 import secrets
 import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -396,6 +399,80 @@ async def test_aad_binding_across_token_ids(
     )
 
 
+async def test_a_cross_session_read_never_retrieves_the_other_sessions_row(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """The SQL scope is the *first* isolation layer, and it is asserted here on its own.
+
+    Isolation between sessions is two independent layers: the ``WHERE session_id
+    = ?`` in both row SELECTs, and the AAD binding that makes a row useless once
+    retrieved. Every cross-session test in this file -- ``test_aad_binding_across
+    _sessions``, ``test_cross_session_non_determinism``, ``test_concurrent_session
+    _isolation`` -- resolves through the second layer, because an authentication
+    failure and an absent row raise the identical ``VaultMissError`` on purpose
+    (the error must not be an oracle for "exists but is not yours"). So the
+    outcome is the same whichever layer refuses, and widening the predicate to
+    ``WHERE (session_id = ? OR 1=1) AND token_id = ?`` left the whole suite green
+    while the read path was being handed another session's ciphertext.
+
+    That is defence in depth rather than an open hole -- the per-session vault key
+    still refuses the row -- which is exactly why it needs its own assertion: a
+    layer whose only evidence is another layer is not evidence. This one looks at
+    what the SELECT *returned*, by recording the row handed to ``_decrypt_row``,
+    so it can tell "never retrieved" from "retrieved and rejected".
+    """
+    session_a, _ = await session_registry.create("test-user")
+    session_b, _ = await session_registry.create("test-user")
+    by_token = await put_value(vault, session_registry, session_a, VALUE_A)
+    by_surrogate = await put_value(vault, session_registry, session_a, VALUE_B)
+
+    # A cold instance: every read has to reach SQLite, which is the only path
+    # that reaches _decrypt_row at all.
+    cold = await SessionVault.open(db_path, session_registry)
+    try:
+        seen: list[sqlite3.Row | None] = []
+        real_decrypt = cold._decrypt_row
+
+        def recording_decrypt(
+            session_id: str,
+            session_key: bytes,
+            row: Any,
+            *,
+            token_id: str | None,
+        ) -> str:
+            seen.append(row)
+            return real_decrypt(session_id, session_key, row, token_id=token_id)
+
+        cold._decrypt_row = recording_decrypt  # type: ignore[method-assign]
+
+        # Control: in scope, the SELECT does return the row. Without this the
+        # assertions below would also pass against a SELECT that never matches.
+        assert read_row(db_path, session_a, by_token.token_id) is not None
+        assert await cold.get_by_token(session_a, by_token.token_id) == VALUE_A
+        assert seen[-1] is not None and str(seen[-1]["token_id"]) == by_token.token_id
+
+        with pytest.raises(VaultMissError):
+            await cold.get_by_token(session_b, by_token.token_id)
+        assert seen[-1] is None, (
+            "the token SELECT handed the read path another session's row; only the "
+            "AAD refused it, so the SQL scope is unasserted"
+        )
+
+        # The surrogate SELECT carries the same predicate and the same argument.
+        assert await cold.get_by_surrogate(session_a, by_surrogate.surrogate) == VALUE_B
+        assert seen[-1] is not None
+
+        with pytest.raises(VaultMissError):
+            await cold.get_by_surrogate(session_b, by_surrogate.surrogate)
+        assert seen[-1] is None, "the surrogate SELECT was not scoped to the session"
+
+        # Nothing was cached for session B by either attempt.
+        assert cold.originals_for_session(session_b) == frozenset()
+        assert session_b not in cold.cached_session_ids()
+    finally:
+        await cold.close()
+
+
 # ---------------------------------------------------------------------------
 # 3. cross-session non-determinism
 # ---------------------------------------------------------------------------
@@ -656,6 +733,136 @@ async def test_destroy_is_final_for_later_writes(
     assert vault.originals_for_session(session_id) == frozenset()
 
 
+async def test_a_late_note_unrestorable_cannot_resurrect_a_destroyed_session(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """The redact-band note is the *sixth* cache mutator, and it lands after logout too.
+
+    ``note_unrestorable`` is the one cache-creating entry point that is
+    synchronous and therefore cannot ``await self._registry.key(...)`` to
+    re-validate the session -- its own docstring says so, and the EgressGate's
+    read side is why. That makes its tombstone check the only thing standing
+    between "logout happened" and "a redact-band original is back in RAM", and
+    until this test nothing in the suite read it: ``grep -rn note_unrestorable
+    tests/`` returned no vault-side test at all, and deleting the two guard lines
+    left every other test in the repo green.
+
+    The window is the documented vault-first logout order that
+    ``test_destroy_is_final_for_later_writes`` pins for ``put``: ``vault.destroy()``
+    lands, the key is still live, and an obfuscation run already in flight calls
+    back in. Without the guard the call *re-creates* the ``_SessionCache`` --
+    ``setdefault`` is deliberately creating, because a document whose every
+    detection fell in the redact band has no cache otherwise -- and that rebuilt
+    cache holds the original for the life of the process. It survives
+    ``registry.destroy()`` too, because the registry has no reference to it, so
+    nothing downstream ever reports the leak: it is the silent direction.
+    """
+    session_id, _ = await session_registry.create("test-user")
+
+    # Non-vacuity: while the session is live the note really does reach the
+    # gate's needle set and really does create a cache. Otherwise every
+    # assertion below would hold for a method that does nothing at all.
+    vault.note_unrestorable(session_id, VALUE_A)
+    assert vault.originals_for_session(session_id) == frozenset({VALUE_A})
+    assert vault.cached_session_ids() == frozenset({session_id})
+
+    await vault.destroy(session_id)
+    assert vault.originals_for_session(session_id) == frozenset()
+    assert vault.cached_session_ids() == frozenset()
+
+    # The key is still live -- this is precisely the logout window.
+    assert await session_registry.key(session_id)
+    vault.note_unrestorable(session_id, VALUE_B)
+    assert vault.originals_for_session(session_id) == frozenset(), (
+        "a late redact-band note rebuilt a destroyed session's plaintext cache"
+    )
+    assert vault.cached_session_ids() == frozenset(), (
+        "a destroyed session was re-created by note_unrestorable"
+    )
+    assert VALUE_B not in f"{vault!r} {vault}"
+
+    # And once the key is gone the note is still refused. Nothing collects a
+    # cache created here: the registry entry it belonged to no longer exists.
+    assert await session_registry.destroy(session_id) is True
+    vault.note_unrestorable(session_id, VALUE_B)
+    assert vault.originals_for_session(session_id) == frozenset()
+    assert vault.cached_session_ids() == frozenset()
+
+
+def _is_self_caches(node: ast.expr) -> bool:
+    """Whether ``node`` is the expression ``self._caches``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "_caches"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def _cache_creating_methods() -> frozenset[str]:
+    """``SessionVault`` methods that can bring a ``_SessionCache`` into existence.
+
+    Found by walking the module's own AST for ``self._caches.setdefault(...)``
+    and ``self._caches[...] = ...``, which shares no helper and no constant with
+    the vault -- the enumeration is a second, independent reading of the source
+    rather than something the vault hands out about itself.
+    """
+    tree = ast.parse(inspect.getsource(vault_module))
+    class_def = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SessionVault"
+    )
+    found: set[str] = set()
+    for method in class_def.body:
+        if not isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(method):
+            creates = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "setdefault"
+                and _is_self_caches(node.func.value)
+            ) or (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Subscript) and _is_self_caches(target.value)
+                    for target in node.targets
+                )
+            )
+            if creates:
+                found.add(method.name)
+    return frozenset(found)
+
+
+def test_every_method_that_can_create_a_plaintext_cache_has_a_destroy_test() -> None:
+    """A newly added cache creator must not be able to join the class unnoticed.
+
+    Three methods can bring a ``_SessionCache`` into existence, and each one is a
+    route by which a session that was destroyed a moment ago gets its plaintext
+    back in RAM for the life of the process. Each has a test that lands a call in
+    the logout window and asserts the cache stays gone:
+
+    ==================  ======================================================
+    ``put``             ``test_destroy_is_final_for_later_writes``
+    ``_decrypt_row``    ``test_a_destroy_landing_mid_read_cannot_recache_the_session``
+    ``note_unrestorable``  ``test_a_late_note_unrestorable_cannot_resurrect_a_destroyed_session``
+    ==================  ======================================================
+
+    That correspondence is exactly the kind of thing that is true when written
+    and false a month later: ``note_unrestorable`` was itself added as a fourth
+    cache mutator with no destroy test, and it stayed that way through a full
+    green suite. This asserts the enumeration itself -- a fourth creator, or a
+    rename, fails here and forces the pairing to be re-stated rather than
+    silently lost.
+    """
+    covered = {"put", "_decrypt_row", "note_unrestorable"}
+    actual = _cache_creating_methods()
+    assert actual == covered, (
+        f"the methods that can create a plaintext cache are {sorted(actual)}; the ones "
+        f"with a test proving they refuse a destroyed session are {sorted(covered)}. "
+        f"Add the missing destroy test and update this list."
+    )
+
+
 async def test_surviving_row_cannot_repopulate_a_destroyed_cache(
     vault: SessionVault, session_registry: SessionRegistry, db_path: Path
 ) -> None:
@@ -768,12 +975,63 @@ async def test_close_releases_the_tombstone_set(
 
     await vault.close()
     assert vault._destroyed == set(), "tombstones survived close()"
+    # Vacuous as cache coverage and kept only as a consistency check: the
+    # ``destroy`` above already popped this session's cache, so this line holds
+    # whether or not ``close`` clears anything. The cache half of ``close`` is
+    # pinned by ``test_close_erases_a_live_sessions_plaintext`` below.
     assert vault.cached_session_ids() == frozenset()
 
     # And the session really is unreachable afterwards -- by closure, not by
     # tombstone: every accessor fails before it can consult one.
     with pytest.raises(PipelineError):
         await vault.row_count(session_id)
+
+
+async def test_close_erases_a_live_sessions_plaintext(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """``close`` must drop the caches of sessions that were never destroyed.
+
+    The session that matters here is the one nobody logged out. ``close`` is the
+    shutdown path -- the lifespan handler, ``__aexit__``, a reopen against the
+    same file -- and its docstring makes the erasure claim in full: "plaintext
+    lives exactly as long as the process holds a live session". A session with no
+    ``destroy`` behind it is the only case that tests that claim, because
+    ``destroy`` pops the cache itself.
+
+    ``test_close_releases_the_tombstone_set`` above looks like it covers this and
+    does not: it destroys first, so ``self._caches`` is already empty when
+    ``close`` runs and its ``cached_session_ids()`` assertion passes with
+    ``self._caches.clear()`` deleted outright. That is the shape this repo has
+    shipped before -- a test filtered to a set the bug empties by construction --
+    so the distinguishing case is asserted here instead.
+
+    The plaintext containers are read directly rather than through
+    ``cached_session_ids``/``originals_for_session``, which both derive from the
+    same dict: a leak here is originals sitting in a ``_SessionCache`` that no
+    accessor will ever hand out again, which is exactly the state no accessor can
+    report.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await put_value(vault, session_registry, session_id, VALUE_A)
+
+    # Non-vacuity: there is a populated cache to erase.
+    assert vault.cached_session_ids() == frozenset({session_id})
+    assert vault.originals_for_session(session_id) == frozenset({VALUE_A})
+    assert dict(vault.surrogates_for_session(session_id)) == {record.surrogate: VALUE_A}
+
+    await vault.close()
+
+    held = sorted(
+        value
+        for cache in vault._caches.values()
+        for value in (cache.view() | frozenset(cache.by_token.values()))
+    )
+    assert held == [], f"{len(held)} originals survived close() in the plaintext caches"
+    assert vault.cached_session_ids() == frozenset()
+    assert vault.originals_for_session(session_id) == frozenset()
+    assert dict(vault.surrogates_for_session(session_id)) == {}
+    assert VALUE_A not in f"{vault!r} {vault}"
 
 
 async def test_destroy_races_concurrent_writes(
@@ -1364,9 +1622,9 @@ async def test_the_collision_retry_budget_survives_eight_consecutive_collisions(
 
     stored = await vault.get_by_original(session_id, "PATIENT_NAME", normalize(victim))
     assert stored is not None
-    assert stored.token_id == derive_token_id(
-        session_key, "PATIENT_NAME", victim, counter=8
-    ), "the eighth re-derivation must still be inside the budget"
+    assert stored.token_id == derive_token_id(session_key, "PATIENT_NAME", victim, counter=8), (
+        "the eighth re-derivation must still be inside the budget"
+    )
     assert stored.token_id not in blocked
 
     # Nine rows, nine originals, none overwritten: a budget that ran out would
@@ -1613,6 +1871,144 @@ async def test_the_egress_view_is_rebuilt_by_a_read_through_that_follows_a_read(
         assert refreshed is not built, "a changed set must be a new object; callers key on identity"
     finally:
         await cold.close()
+
+
+async def test_the_egress_view_is_rebuilt_by_a_redact_band_note_that_follows_a_read(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """The third writer is ``add_gate_only``, and it is the one the gate needs most.
+
+    ``_SessionCache`` has three write paths into the memoised egress view --
+    ``add`` from ``put``, ``note`` from the read-through, and ``add_gate_only``
+    from ``note_unrestorable`` -- and the two tests above pin the first two.
+    Dropping ``self._view = None`` from ``add_gate_only`` left the whole suite
+    green, and the value it drops is precisely the one with no other line of
+    defence: a redact-band original has no token, no surrogate and no row, so the
+    gate needle *is* the control. Tokenized values that go missing from the view
+    are still caught downstream by the surrogate accounting; these are not.
+
+    The window is ordinary rather than contrived. ``_resolve_groups`` performs
+    every ``put`` for a turn *before* the splice loop, and ``note_unrestorable``
+    is called from inside that loop, so in a turn whose detections all land in the
+    redact band nothing between the gate's last read and the note invalidates
+    anything -- the memo built for the previous payload is still there and still
+    answers. Stale, it hands the gate a needle set that never contained the
+    redacted value, and the leak is the measured one in ``note_unrestorable``'s
+    own docstring: the same nine digits reaching the provider inside
+    ``ledgerref452189376x`` with the gate reporting clean.
+    """
+    # Synthetic, SSN-shaped: the redact band is where this method's leak lived.
+    unrestorable = "452189376"
+    session_id, _ = await session_registry.create("test-user")
+    record = await put_value(vault, session_registry, session_id, VALUE_A)
+
+    first = vault.originals_for_session(session_id)
+    assert first == frozenset({VALUE_A}), "the memo was not built by the first gate read"
+    assert vault.originals_for_session(session_id) is first, "the memo is not being reused"
+
+    vault.note_unrestorable(session_id, unrestorable)
+
+    second = vault.originals_for_session(session_id)
+    assert second == frozenset({VALUE_A, unrestorable}), (
+        "the gate would go on scanning a needle set that never saw the redacted value"
+    )
+    assert second is not first, "the write must hand out a new object, not mutate the old one"
+
+    # ...and the needle is still not a restore path: no token, no surrogate, no row.
+    assert dict(vault.surrogates_for_session(session_id)) == {record.surrogate: VALUE_A}
+    assert await vault.get_by_original(session_id, "SSN", normalize(unrestorable)) is None
+    with pytest.raises(VaultMissError):
+        await vault.get_by_surrogate(session_id, unrestorable)
+
+
+def _cache_writer_methods() -> frozenset[str]:
+    """``_SessionCache`` methods that add a value to one of the plaintext containers.
+
+    Read off the module's AST -- ``self.<container>[...] = ...`` and
+    ``self.<container>.add(...)`` -- so the enumeration is derived independently
+    of anything ``_SessionCache`` says about itself. Memo assignments
+    (``self._view = None``) are plain attribute stores and are deliberately not
+    matched: the point is to find the writers, not the invalidations.
+    """
+    tree = ast.parse(inspect.getsource(vault_module))
+    class_def = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "_SessionCache"
+    )
+    containers = {"by_token", "by_surrogate", "by_original", "originals", "gate_only"}
+
+    def _is_container(node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr in containers
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        )
+
+    found: set[str] = set()
+    for method in class_def.body:
+        if not isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(method):
+            writes = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add"
+                and _is_container(node.func.value)
+            ) or (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Subscript) and _is_container(target.value)
+                    for target in node.targets
+                )
+            )
+            if writes:
+                found.add(method.name)
+    return frozenset(found)
+
+
+async def test_every_session_cache_writer_invalidates_the_memoised_egress_view(
+    session_registry: SessionRegistry,
+) -> None:
+    """The invalidation is a property of *every* writer, asserted as one table.
+
+    The three tests above each pin one writer, which is how ``add_gate_only``
+    came to be the writer with no test: it was added later and the pattern was
+    not extended. Here the writers are enumerated from the class's own source, so
+    a fourth one cannot be added and left out -- the enumeration assertion goes
+    red before any leak does.
+
+    Driven directly against ``_SessionCache`` rather than through the vault
+    because the property belongs to the cache: a memo that survives a write is a
+    narrower needle set for the EgressGate, whichever call reached it.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await make_record(session_registry, session_id, VALUE_B)
+    index = ("PATIENT_NAME", normalize(VALUE_B))
+    writers: dict[str, Callable[[Any], None]] = {
+        "add": lambda cache: cache.add(index, record, VALUE_B),
+        "note": lambda cache: cache.note(record.token_id, record.surrogate, VALUE_B),
+        "add_gate_only": lambda cache: cache.add_gate_only(VALUE_B),
+    }
+
+    actual = _cache_writer_methods()
+    assert set(writers) == actual, (
+        f"_SessionCache writes plaintext from {sorted(actual)}; this table drives "
+        f"{sorted(writers)}. Every writer owes the gate a fresh view."
+    )
+
+    for name, write in writers.items():
+        cache = vault_module._SessionCache()
+        cache.add_gate_only(VALUE_A)
+        memo = cache.view()
+        assert memo == frozenset({VALUE_A}), f"{name}: the memo was not built before the write"
+
+        write(cache)
+        rebuilt = cache.view()
+        assert VALUE_B in rebuilt, f"{name} left a stale memo; the gate would not scan for it"
+        assert rebuilt is not memo, f"{name}: a changed set must be a new object"
+        assert VALUE_A in rebuilt, f"{name} dropped a value the gate already had"
 
 
 async def test_read_through_populates_both_lookup_indexes(
@@ -1979,8 +2375,7 @@ async def test_session_entry_itself_never_reveals_the_key_in_any_rendering(
     assert "test-user" in repr(entry)
 
     assert not isinstance(entry, tuple), (
-        "_Session must not be a tuple: the tuple protocol re-exposes the key "
-        "regardless of __repr__"
+        "_Session must not be a tuple: the tuple protocol re-exposes the key regardless of __repr__"
     )
 
 
@@ -2034,8 +2429,217 @@ async def test_vault_repr_holds_no_originals(
 
 
 # ---------------------------------------------------------------------------
+# 8c. the reaper's explanatory prose, pinned to the real call graph
+# ---------------------------------------------------------------------------
+
+#: ``_sweep_locked``'s docstring writes its caller count as an English word.
+_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _self_calls(function: ast.AST, attribute: str) -> bool:
+    """Whether ``function``'s body contains a ``self.<attribute>(...)`` call.
+
+    Derived from the AST of the module source, not from anything
+    ``session_registry.py`` exports. The point of this test is that the docstring
+    and the code are checked against each other by two independent readings; a
+    helper imported from the module under test would collapse them into one.
+    """
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attribute
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        for node in ast.walk(function)
+    )
+
+
+def _registry_methods() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    tree = ast.parse(inspect.getsource(registry_module))
+    class_def = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SessionRegistry"
+    )
+    return {
+        node.name: node
+        for node in class_def.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+
+def test_the_sweep_caller_enumeration_in_the_docstring_is_the_real_one() -> None:
+    """``_sweep_locked``'s docstring names its callers; those names must be real.
+
+    That docstring is the only place the reaper's failure mode is explained -- why
+    a method that returns a list every caller discards is nonetheless the hinge of
+    the destruction path -- so the enumeration in it is read by humans as fact. It
+    had drifted: it claimed **six** accessors and named ``expires_at``, which is a
+    ``_Session`` field and an element of ``create``'s return tuple but has never
+    been a method on ``SessionRegistry``, and ``belongs_to``, which does not call
+    ``_sweep_locked`` at all (it calls ``owner``, which does). The truth is five
+    direct callers: ``create``, ``sweep``, ``key``, ``owner``, ``active_ids``.
+
+    Both errors survived every green run because no assertion had ever read the
+    sentence. This one parses the names back out of the docstring and compares
+    them against call sites it locates itself, by walking the module's AST -- two
+    readings that share no code, so agreement is evidence rather than tautology.
+    The indirect claim is checked too, in both directions: ``belongs_to`` must
+    reach the sweep through the method the prose names, and must not be a direct
+    caller.
+    """
+    doc = registry_module.SessionRegistry._sweep_locked.__doc__
+    assert doc is not None, "the docstring under test was stripped (python -OO?)"
+
+    # The claim is one bolded sentence followed by a dash-delimited enumeration
+    # that ends at " -- so ". Split it into the direct names and the indirect aside.
+    bold = re.search(r"\*\*(.+?)\*\*", doc, re.S)
+    assert bold is not None, "the caller-count sentence is no longer bolded"
+    count_word = re.split(r"\s+", bold.group(1).strip())[0].lower()
+    assert count_word in _COUNT_WORDS, f"unparseable caller count {count_word!r}"
+
+    clause = doc.split("**")[2].partition(" -- so ")[0]
+    direct_part, _, indirect_part = clause.partition(", with ")
+    documented_direct = re.findall(r"``(\w+)``", direct_part)
+    documented_indirect = re.findall(r"``(\w+)``", indirect_part)
+    assert len(documented_direct) == len(set(documented_direct)), "a name is listed twice"
+
+    methods = _registry_methods()
+    actual_direct = sorted(
+        name
+        for name, node in methods.items()
+        if name != "_sweep_locked" and _self_calls(node, "_sweep_locked")
+    )
+
+    # Every name the prose uses must exist. This is the assertion `expires_at`
+    # would have failed; it is a property (the attribute resolves to a method),
+    # not a spelling, so widening or renaming the API cannot make it wrong.
+    for name in documented_direct + documented_indirect:
+        assert callable(getattr(registry_module.SessionRegistry, name, None)), (
+            f"the docstring names `{name}` as part of the sweep call graph, but "
+            f"SessionRegistry has no such method"
+        )
+
+    assert sorted(documented_direct) == actual_direct, (
+        f"the docstring lists {sorted(documented_direct)} as the direct callers of "
+        f"_sweep_locked; the module source actually calls it from {actual_direct}"
+    )
+    assert _COUNT_WORDS[count_word] == len(actual_direct), (
+        f"the docstring says {count_word} callers; there are {len(actual_direct)}"
+    )
+
+    # The aside: "<method> reaching it indirectly through <route>".
+    assert len(documented_indirect) == 2, "the indirect-caller aside no longer names two methods"
+    indirect_name, route = documented_indirect
+    assert indirect_name not in actual_direct, (
+        f"`{indirect_name}` is documented as an indirect caller but calls _sweep_locked directly"
+    )
+    assert _self_calls(methods[indirect_name], route), (
+        f"the docstring says `{indirect_name}` reaches the sweep through `{route}`, "
+        f"but it does not call `{route}`"
+    )
+    assert route in actual_direct, f"`{route}` is the documented route but does not sweep"
+
+
+def test_sweeps_inline_comment_names_the_other_sweepers_correctly() -> None:
+    """``sweep``'s body carries a second copy of the same enumeration; it rots too.
+
+    The comment above ``_drain_unreaped_locked()`` explains why ``sweep`` returns
+    everything outstanding rather than what this call observed, and it does so by
+    naming the *other* methods that may have dropped the session first. It said
+    "six other accessors" while five methods in total sweep -- the same miscount as
+    the docstring, in the one place a reader looking at the return value will see
+    it. Asserted as a property (the named set is exactly the direct callers other
+    than ``sweep`` itself) so rewording the comment cannot break it, only getting
+    the call graph wrong can.
+    """
+    methods = _registry_methods()
+    actual_direct = {
+        name
+        for name, node in methods.items()
+        if name != "_sweep_locked" and _self_calls(node, "_sweep_locked")
+    }
+    source = inspect.getsource(registry_module.SessionRegistry.sweep)
+
+    # Single-backtick names only: the lookarounds skip ``VAULT_DESTROY`` and any
+    # other reST double-backtick literal in the docstring above the comment.
+    named = re.findall(r"(?<!`)`(\w+)`(?!`)", source)
+    assert set(named) == actual_direct - {"sweep"}, (
+        f"sweep's comment names {sorted(set(named))} as the other methods that "
+        f"sweep; the module source says {sorted(actual_direct - {'sweep'})}"
+    )
+
+    count = re.search(r"\b(\w+) other\b", source)
+    assert count is not None, "sweep's comment no longer counts the other sweepers"
+    word = count.group(1).lower()
+    assert word in _COUNT_WORDS, f"unparseable count {word!r}"
+    assert _COUNT_WORDS[word] == len(actual_direct - {"sweep"}), (
+        f"sweep's comment says {word} other sweepers; there are {len(actual_direct - {'sweep'})}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 9. concurrent session isolation (build doc section 10.6)
 # ---------------------------------------------------------------------------
+
+
+async def test_surrogates_for_session_is_scoped_to_its_own_session(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """The collision guard's input must be one session's pairs, not the process's.
+
+    ``surrogates_for_session`` hands the Tier-1 pseudonymisation collision guard
+    ``surrogate -> original`` -- both halves, because whether a candidate fake
+    makes an already-issued surrogate un-restorable depends on how the
+    *originals* nest. Its whole appearance in the suite was
+    ``assert env.vault.surrogates_for_session(env.session_id) == {}`` in a session
+    that had vaulted nothing, which cannot distinguish "scoped correctly" from
+    "not scoped at all": replacing the body with a merge over every live session's
+    cache left the whole suite green.
+
+    The consequence is not a direct disclosure -- the guard only returns a bool --
+    but session B's fake selection would become a function of session A's
+    plaintext, which is the same cross-session coupling the vault key and the AAD
+    exist to prevent. Asserted here as exact mapping equality in two directions,
+    the shape ``test_cross_session_non_determinism`` already uses: a merged
+    mapping fails both halves.
+    """
+    session_a, _ = await session_registry.create("test-user")
+    session_b, _ = await session_registry.create("test-user")
+    record_a = await put_value(vault, session_registry, session_a, VALUE_A)
+    record_b = await put_value(vault, session_registry, session_b, VALUE_B)
+    assert record_a.surrogate != record_b.surrogate
+
+    assert dict(vault.surrogates_for_session(session_a)) == {record_a.surrogate: VALUE_A}
+    assert dict(vault.surrogates_for_session(session_b)) == {record_b.surrogate: VALUE_B}
+    assert dict(vault.surrogates_for_session("never-existed")) == {}
+
+    # Memoised like the egress view, and invalidated by the next write: a guard
+    # reading a stale mapping fails permissive, which is the quiet direction.
+    memo = vault.surrogates_for_session(session_a)
+    assert vault.surrogates_for_session(session_a) is memo, "the mapping is not memoised"
+    later = await put_value(vault, session_registry, session_a, "Marisol Quintanilla")
+    assert dict(vault.surrogates_for_session(session_a)) == {
+        record_a.surrogate: VALUE_A,
+        later.surrogate: "Marisol Quintanilla",
+    }
+    # ...and session B is untouched by A's write, in both directions.
+    assert dict(vault.surrogates_for_session(session_b)) == {record_b.surrogate: VALUE_B}
+
+    await vault.destroy(session_a)
+    assert dict(vault.surrogates_for_session(session_a)) == {}
+    assert dict(vault.surrogates_for_session(session_b)) == {record_b.surrogate: VALUE_B}
 
 
 async def test_concurrent_session_isolation(

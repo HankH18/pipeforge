@@ -232,8 +232,9 @@ class SessionRegistry:
         async with self._lock:
             self._sweep_locked()
             # Returns everything awaiting destruction, not merely what THIS call
-            # observed. Any of the six other accessors may have swept the session
-            # first; the caller of this method is the only one that finishes the job.
+            # observed. Any of the four other methods that sweep -- `create`, `key`,
+            # `owner`, `active_ids` -- may have dropped the session first; the caller
+            # of this method is the only one that finishes the job.
             return self._drain_unreaped_locked()
 
     # -- read --------------------------------------------------------------
@@ -312,13 +313,22 @@ class SessionRegistry:
         """Remove expired entries. Caller must hold ``self._lock``.
 
         Every ID dropped here is also recorded in :attr:`_unreaped`, and that is what
-        makes the rest of the destruction path reachable. **Six accessors call this
-        and throw the return value away** -- ``create``, ``key``, ``expires_at``,
-        ``owner``, ``active_ids`` and ``belongs_to`` -- so whichever of them happened
-        to observe an expiry first removed the ID permanently, and
-        ``deps.reap_expired_sessions`` (the one caller that *uses* the list) could
-        never see it again. The vault rows and the decrypted cache then survived to
-        process exit, which is exactly the state the reaper was added to prevent.
+        makes the rest of the destruction path reachable. **Five methods call this
+        and throw the return value away** -- ``create``, ``sweep``, ``key``, ``owner``
+        and ``active_ids``, with ``belongs_to`` reaching it indirectly through
+        ``owner`` -- so whichever of them happened to observe an expiry first removed
+        the ID permanently, and ``deps.reap_expired_sessions`` (the one caller that
+        *uses* the drained list) could never see it again. The vault rows and the
+        decrypted cache then survived to process exit, which is exactly the state the
+        reaper was added to prevent.
+
+        That enumeration is load-bearing prose, so it is pinned rather than trusted:
+        ``test_the_sweep_caller_enumeration_in_the_docstring_is_the_real_one`` parses
+        the names back out of this docstring and compares them against the call sites
+        it finds itself in the module source. An earlier revision claimed six callers
+        and named ``expires_at`` -- which is a ``_Session`` field and a ``create``
+        return element, never a method here -- and named ``belongs_to``, which does
+        not touch this at all. Both survived because nothing checked.
 
         It is not a rare race. The shipped ``Dockerfile`` polls ``GET /health`` every
         30 seconds, and that route calls ``active_ids`` -- so in the container the
