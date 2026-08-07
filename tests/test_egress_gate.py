@@ -602,10 +602,22 @@ def test_every_unicode_format_character_is_folded() -> None:
 #: list copied out of the implementation would agree with the implementation by
 #: construction and could never fail.
 _DEFAULT_IGNORABLE_RANGES = [
-    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
-    (0x17B4, 0x17B5), (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
-    (0x2060, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
-    (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
     (0xE0000, 0xE0FFF),
 ]
 
@@ -1393,7 +1405,9 @@ async def test_surrogate_spans_are_skipped(tmp_path: Path) -> None:
     surrogate = "Maria Torres"
     detector = FakeDetector([("SSN", surrogate, 0.99)])
     gate, audit = await _gate(tmp_path, detector=detector)
-    report = await gate.check(f"Patient {surrogate} is stable.", SESSION, surrogates=frozenset({surrogate}))
+    report = await gate.check(
+        f"Patient {surrogate} is stable.", SESSION, surrogates=frozenset({surrogate})
+    )
     assert report.rescan_warnings == 0
     await audit.close()
 
@@ -1648,8 +1662,7 @@ async def test_an_ssn_the_shipped_detector_scores_at_zero_still_blocks(
     found = [
         det
         for det in await real_detector.detect(payload, None)
-        if det.entity_type in HIGH_SEVERITY_TYPES
-        and det.score >= real_settings.threshold_obfuscate
+        if det.entity_type in HIGH_SEVERITY_TYPES and det.score >= real_settings.threshold_obfuscate
     ]
     assert not found, (
         "premise gone: the shipped detector now finds this, so the payload no "
@@ -1705,8 +1718,7 @@ async def test_pass_three_runs_after_pass_two_so_reason_codes_do_not_move(
     found = {
         det.entity_type
         for det in await real_detector.detect(payload, None)
-        if det.entity_type in HIGH_SEVERITY_TYPES
-        and det.score >= real_settings.threshold_obfuscate
+        if det.entity_type in HIGH_SEVERITY_TYPES and det.score >= real_settings.threshold_obfuscate
     }
     assert "SSN" in found, "premise: the detector does see this one"
 
@@ -1764,8 +1776,7 @@ async def test_the_space_separator_costs_pass_three_nothing_pass_two_did_not_alr
     already = {
         det.entity_type
         for det in await real_detector.detect(table_row, None)
-        if det.entity_type in HIGH_SEVERITY_TYPES
-        and det.score >= real_settings.threshold_obfuscate
+        if det.entity_type in HIGH_SEVERITY_TYPES and det.score >= real_settings.threshold_obfuscate
     }
     assert "SSN" in already, (
         "the premise for accepting the space separator is gone: pass 2 no longer "
@@ -2039,9 +2050,7 @@ async def test_a_hanging_audit_writer_does_not_hold_a_blocked_request_open(
     Drop the ``asyncio.timeout`` from ``_emit_block`` and this test hangs forever
     instead of failing, which is precisely the behaviour it exists to forbid.
     """
-    monkeypatch.setattr(
-        "secure_context_pipeline.pipeline.egress_gate.AUDIT_EMIT_TIMEOUT_S", 0.05
-    )
+    monkeypatch.setattr("secure_context_pipeline.pipeline.egress_gate.AUDIT_EMIT_TIMEOUT_S", 0.05)
     audit = await _open_audit(tmp_path / "audit.db", cls=HangingAudit)
     gate = EgressGate(
         vault=FakeVault(),
@@ -2068,9 +2077,7 @@ async def test_a_hanging_audit_writer_still_leaves_a_pass_blocked(
     block. The two paths bound the same failure differently on purpose -- a block we
     cannot record still blocks, a pass we cannot record does not release.
     """
-    monkeypatch.setattr(
-        "secure_context_pipeline.pipeline.egress_gate.AUDIT_EMIT_TIMEOUT_S", 0.05
-    )
+    monkeypatch.setattr("secure_context_pipeline.pipeline.egress_gate.AUDIT_EMIT_TIMEOUT_S", 0.05)
     audit = await _open_audit(tmp_path / "audit.db", cls=HangingAudit)
     gate = EgressGate(
         vault=FakeVault(),
@@ -2272,9 +2279,7 @@ class RecordingProvider:
         self.last_system: str | None = None
         self.last_user: str | None = None
 
-    async def complete(
-        self, system: str, user: str, *, model: str, timeout_s: float = 60.0
-    ) -> str:
+    async def complete(self, system: str, user: str, *, model: str, timeout_s: float = 60.0) -> str:
         return (await self.complete_detailed(system, user, model=model, timeout_s=timeout_s)).text
 
     async def complete_detailed(
@@ -2610,7 +2615,7 @@ async def test_the_gate_runs_before_the_provider_on_the_happy_path(tmp_path: Pat
 async def test_the_provider_is_not_reached_when_the_cleared_bytes_are_not_the_sent_bytes(
     tmp_path: Path,
 ) -> None:
-    """"The gate ran first" is not the guarantee. "The gate cleared what we sent" is.
+    """ "The gate ran first" is not the guarantee. "The gate cleared what we sent" is.
 
     A time-of-check-to-time-of-use test. The gate here passes cleanly -- nothing is
     blocked, the ordering is correct, and every existing ordering test would still
@@ -2786,9 +2791,7 @@ async def test_the_run_records_a_latency_for_every_timed_stage(tmp_path: Path) -
         assert result.stats[stage] >= 0.0
 
     # The fetch step's evidence rides on DETECT rather than an event of its own.
-    (detected,) = [
-        e for e in await audit.query(run_id=result.run_id) if e.event_type == DETECT
-    ]
+    (detected,) = [e for e in await audit.query(run_id=result.run_id) if e.event_type == DETECT]
     assert detected.detail["doc_id"] == "doc-1"
     assert "fetch_ms" in detected.detail
     await audit.close()
@@ -2892,7 +2895,10 @@ async def test_audit_seq_is_not_truncated_by_the_query_page_size(tmp_path: Path)
     for i in range(1200):
         await audit.emit(
             AuditEvent(
-                ts=float(i), session_id=SESSION, run_id=run_id, event_type=EGRESS_PASS,
+                ts=float(i),
+                session_id=SESSION,
+                run_id=run_id,
+                event_type=EGRESS_PASS,
                 detail={"i": i},
             )
         )
@@ -2943,7 +2949,9 @@ async def test_planted_original_blocks_even_though_detector_is_blind(tmp_path: P
     # would have made this test prove nothing.
     exotic = "ZXQQ-KLM-RSTV-WYNP"
     gate, audit = await _gate(
-        tmp_path, vault=FakeVault({exotic}), detector=FakeDetector()  # detector finds NOTHING
+        tmp_path,
+        vault=FakeVault({exotic}),
+        detector=FakeDetector(),  # detector finds NOTHING
     )
     with pytest.raises(EgressBlockedError) as exc:
         await gate.check(f"Reference number {exotic} follows.", SESSION, run_id="adv")
@@ -3033,8 +3041,7 @@ async def test_an_identifier_inside_a_token_shape_we_never_emit_is_still_rescann
     hits = [
         det
         for det in await real_detector.detect(payload, None)
-        if det.entity_type in HIGH_SEVERITY_TYPES
-        and det.score >= real_settings.threshold_obfuscate
+        if det.entity_type in HIGH_SEVERITY_TYPES and det.score >= real_settings.threshold_obfuscate
     ]
     assert hits, "the probe no longer plants a high-severity identifier"
 
@@ -3196,9 +3203,7 @@ def test_no_high_severity_entity_is_scoped_out_of_the_rescan() -> None:
     blind.
     """
     registry = load_registry(REGISTRY_PATH)
-    scoped = {
-        name for name, spec in registry.entities.items() if spec.only_in_doc_categories
-    }
+    scoped = {name for name, spec in registry.entities.items() if spec.only_in_doc_categories}
     assert scoped, "no entity is category-scoped any more -- this test guards nothing"
     blind_spot = sorted(scoped & HIGH_SEVERITY_TYPES)
     assert not blind_spot, (
@@ -3280,9 +3285,7 @@ async def _prompt_harness(
             detector=real_detector,
             engine=engine,
             injector=ContextInjector(),
-            gate=EgressGate(
-                vault=vault, detector=real_detector, settings=settings, audit=audit
-            ),
+            gate=EgressGate(vault=vault, detector=real_detector, settings=settings, audit=audit),
             provider=provider,
             restorer=Restorer(vault=vault, settings=settings, audit=audit),
             vault=vault,
@@ -3478,9 +3481,7 @@ async def test_the_prompt_is_masked_from_the_session_vault_not_only_by_its_own_d
             "isolates the session sweep"
         )
 
-        doc_id = await harness.store.put(
-            "prompt-user", "audit.txt", document.encode(), "general"
-        )
+        doc_id = await harness.store.put("prompt-user", "audit.txt", document.encode(), "general")
         result = await harness.orchestrator.run(
             harness.session_id, "prompt-user", doc_id, prompt, "tokenization"
         )
@@ -3490,16 +3491,12 @@ async def test_the_prompt_is_masked_from_the_session_vault_not_only_by_its_own_d
         surrogates = STRICT_TOKEN_RE.findall(half)
         assert surrogates, "the prompt carries no surrogate at all"
         # The SAME surrogate as the document's, or the cross-reference is broken.
-        document_half = result.obfuscated_payload[
-            result.obfuscated_payload.index("<DOCUMENT>") :
-        ]
+        document_half = result.obfuscated_payload[result.obfuscated_payload.index("<DOCUMENT>") :]
         assert STRICT_TOKEN_RE.search(half) is not None
         assert STRICT_TOKEN_RE.search(half).group(0) in document_half, (  # type: ignore[union-attr]
             "the prompt and the document use different surrogates for one value"
         )
-        assert await harness.vault.row_count(harness.session_id) == 1, (
-            "one value was vaulted twice"
-        )
+        assert await harness.vault.row_count(harness.session_id) == 1, "one value was vaulted twice"
     finally:
         await harness.close()
 
@@ -3539,14 +3536,12 @@ async def test_a_value_the_prompt_vaults_late_blocks_rather_than_leaks(
             "The ledger also lists 4419305 against the same account.\n"
         )
         prompt = "Is MRN 4419305 on file?"
-        assert "4419305" not in {
-            d.text for d in await real_detector.detect(document, "general")
-        }, "the document now detects the value on its own; this fixture proves nothing"
+        assert "4419305" not in {d.text for d in await real_detector.detect(document, "general")}, (
+            "the document now detects the value on its own; this fixture proves nothing"
+        )
         assert "MRN" in {d.entity_type for d in await real_detector.detect(prompt, "general")}
 
-        doc_id = await harness.store.put(
-            "prompt-user", "audit.txt", document.encode(), "general"
-        )
+        doc_id = await harness.store.put("prompt-user", "audit.txt", document.encode(), "general")
         with pytest.raises(EgressBlockedError) as exc:
             await harness.orchestrator.run(
                 harness.session_id, "prompt-user", doc_id, prompt, "tokenization"
@@ -3684,9 +3679,7 @@ async def test_the_restorer_is_told_about_the_tokens_the_prompt_issued(
             self, session_id: str, text: str, detections: object, **kwargs: object
         ) -> ObfuscationResult:
             is_prompt = "John Smith" in text
-            token_id, fake = (
-                ("1a2b3c4d", prompt_fake) if is_prompt else ("5e6f7a8b", document_fake)
-            )
+            token_id, fake = ("1a2b3c4d", prompt_fake) if is_prompt else ("5e6f7a8b", document_fake)
             return ObfuscationResult(
                 obfuscated_text=text.replace("John Smith" if is_prompt else "Ana Diaz", fake),
                 tokens=[
@@ -3702,9 +3695,7 @@ async def test_the_restorer_is_told_about_the_tokens_the_prompt_issued(
             )
 
     class RecordingRestorer(StubRestorer):
-        async def restore(
-            self, session_id: str, text: str, **kwargs: object
-        ) -> RestoreResult:
+        async def restore(self, session_id: str, text: str, **kwargs: object) -> RestoreResult:
             seen.update(kwargs)
             return await super().restore(session_id, text, **kwargs)
 
@@ -3828,9 +3819,7 @@ async def test_the_run_records_a_latency_and_a_count_for_the_prompt_stage(
     for count in ("prompt_entities_detected", "prompt_tokens_issued"):
         assert count in result.stats
 
-    (detected,) = [
-        e for e in await audit.query(run_id=result.run_id) if e.event_type == DETECT
-    ]
+    (detected,) = [e for e in await audit.query(run_id=result.run_id) if e.event_type == DETECT]
     assert detected.detail["prompt_chars"] == len("Summarise this.")
     assert detected.detail["prompt_count"] == 0
     assert "prompt_elapsed_ms" in detected.detail
@@ -4061,12 +4050,12 @@ async def test_a_high_severity_hit_in_the_redact_band_blocks(tmp_path: Path) -> 
         # pasted into this file is indistinguishable from a plain space to the next
         # reader of the very test that distinguishes them -- the same rule
         # `_INVISIBLE_RE` states about its own source.
-        "Countersigned: Marguerite\u200bVandenberg RN",   # zero-width space
-        "Countersigned: Marguerite-Vandenberg RN",        # hyphen
-        "Countersigned: Marguerite_Vandenberg RN",        # underscore
-        "Countersigned: Marguerite.Vandenberg RN",        # period
-        "Countersigned: MargueriteVandenberg RN",         # deleted entirely
-        "Countersigned: Marguerite\u00a0Vandenberg RN",   # non-breaking space
+        "Countersigned: Marguerite\u200bVandenberg RN",  # zero-width space
+        "Countersigned: Marguerite-Vandenberg RN",  # hyphen
+        "Countersigned: Marguerite_Vandenberg RN",  # underscore
+        "Countersigned: Marguerite.Vandenberg RN",  # period
+        "Countersigned: MargueriteVandenberg RN",  # deleted entirely
+        "Countersigned: Marguerite\u00a0Vandenberg RN",  # non-breaking space
     ],
 )
 async def test_the_separator_limb_blocks_plain_ascii_variance(
@@ -4157,9 +4146,7 @@ async def test_a_modifier_letter_without_a_diacritic_decomposition_is_not_covere
         settings=_settings(tmp_path),
         audit=None,
     )
-    report = await gate.check(
-        "Countersigned: Natha\u02c8niel Brightwater RN", "sess-spacing"
-    )
+    report = await gate.check("Countersigned: Natha\u02c8niel Brightwater RN", "sess-spacing")
     assert report.originals_scanned == 1, "premise: the original was in scope"
 
 
@@ -4357,9 +4344,7 @@ def _restate(value: str, zero: int) -> str:
     return "".join(chr(zero + int(ch)) if "0" <= ch <= "9" else ch for ch in value)
 
 
-@pytest.mark.parametrize(
-    "zero", list(_DIGIT_SCRIPT_ZEROS.values()), ids=list(_DIGIT_SCRIPT_ZEROS)
-)
+@pytest.mark.parametrize("zero", list(_DIGIT_SCRIPT_ZEROS.values()), ids=list(_DIGIT_SCRIPT_ZEROS))
 @pytest.mark.parametrize(
     ("vaulted", "spelling", "template"),
     [

@@ -66,7 +66,12 @@ from secure_context_pipeline.errors import (
 )
 from secure_context_pipeline.llm.base import LLMResponse, estimate_tokens
 from secure_context_pipeline.llm.mock_provider import MockProvider
-from secure_context_pipeline.models import Detection, EntityAction, EntityCategory
+from secure_context_pipeline.models import (
+    AuditEvent,
+    Detection,
+    EntityAction,
+    EntityCategory,
+)
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import EgressGate
@@ -1746,3 +1751,114 @@ async def test_a_prompt_pseudonym_restores_to_the_real_value(
     assert surrogate not in result.restored_text, "the invented name was left in the answer"
     assert name in result.restored_text
     assert result.stats["vault_misses"] == 0
+
+
+#: The audit events a passing run writes BEFORE the provider is called, in order.
+#: Measured, not asserted from the source: a tracing wrapper over ``audit.emit``
+#: recorded ``DETECT, OBFUSCATE, OBFUSCATE, EGRESS_PASS, LLM_CALL, DEOBFUSCATE``,
+#: and the provider call sits between ``EGRESS_PASS`` and ``LLM_CALL``.
+#:
+#: Three different components produce them -- the orchestrator writes ``DETECT``,
+#: the engine writes ``OBFUSCATE``, the gate writes ``EGRESS_PASS`` -- which is the
+#: reason the parametrisation below is worth its length: a change that makes one
+#: component's audit writes non-fatal leaves the other two still refusing, so a
+#: single-arm test passes while the guarantee is half gone. That is not
+#: hypothetical; it is what the first version of this test did.
+PRE_RELEASE_EVENTS: tuple[str, ...] = ("DETECT", "OBFUSCATE", "EGRESS_PASS")
+
+
+@pytest.mark.parametrize("failing_event", PRE_RELEASE_EVENTS)
+async def test_no_release_survives_an_audit_write_that_failed_before_it(
+    make_harness: HarnessFactory, failing_event: str
+) -> None:
+    """No release without a record, pinned per component. The off-box tripwire.
+
+    Two audit-failure escape hatches exist, both deliberate: ``EgressGate._emit_block``
+    and the orchestrator's two block paths. Their comments all say "the block itself
+    still stands", and that is right -- a run already being *refused* must not have its
+    typed ``EgressBlockedError`` replaced by whatever the log threw.
+
+    The complement is the guarantee, and nothing stated it before this test: on every
+    path that would **release**, an audit failure propagates and the provider is never
+    reached. Measured per event, by failing exactly one and watching the provider::
+
+        DETECT       fails -> refused (RuntimeError)        provider=0
+        OBFUSCATE    fails -> refused (RuntimeError)        provider=0
+        EGRESS_PASS  fails -> refused (EgressBlockedError)  provider=0
+        LLM_CALL     fails -> refused (RuntimeError)        provider=1   <- already sent
+        DEOBFUSCATE  fails -> refused (RuntimeError)        provider=1   <- already sent
+
+    ``EGRESS_PASS`` is the load-bearing one and the most interesting: it is the last
+    write before the call, and its failure surfaces as ``EgressBlockedError`` rather
+    than the raw error -- the gate refuses to release what it could not record. The
+    last two are listed to be honest about the boundary: by then the bytes are gone,
+    so an audit failure can only spoil the caller's response, not prevent the egress.
+    Anything claiming otherwise would be a guarantee this architecture cannot make.
+
+    **This is the test that should fail first if the audit log moves off-box** (S3
+    Object Lock, a WORM store, a managed audit service -- README section 5 Q5's stated
+    remedy for the tail-append residual). With a local SQLite write a failing emit is
+    rare. With a network write it is routine: a timeout, a throttle, an expired
+    credential, a partition. The obvious way to make a remote sink "resilient" is to
+    wrap emits in the same ``except Exception`` the block paths already use, which
+    would silently convert "refuses to release unaudited" into "releases whenever the
+    audit service is unavailable" -- the exact window an attacker who can reach the
+    sink would arrange.
+
+    Verified to bite: wrapping ``PipelineOrchestrator._emit`` in ``try/except`` reddens
+    the ``DETECT`` and ``OBFUSCATE`` arms; the ``EGRESS_PASS`` arm covers the gate,
+    which that change does not touch. The full suite is otherwise green under it --
+    2,071 passed -- so without this parametrisation nothing at all would notice.
+
+    If you are here because you just made that change, the decision is whether an
+    audit-sink outage should fail the request (keep this, and accept the sink is now in
+    the availability path) or degrade to a durable local spool reconciled later
+    (replace this with a test that the spool captured the event and that the reconciler
+    cannot silently drop it). Dropping the event and releasing anyway is not on the
+    table.
+    """
+    harness: Harness = await make_harness()
+    text = "Clinical note.\n\nPatient Marcus Webb, DOB 1970-02-11, was seen today.\n"
+    doc_id = await harness.upload(text, "medical", "audited.txt")
+
+    # Control: the identical run reaches the provider on a healthy log, and writes
+    # every event this test claims comes before the call. Without it, the assertion
+    # below could pass because the run broke somewhere that never reached an emit.
+    seen: list[str] = []
+    healthy = harness.audit.emit
+
+    async def tracing(event: AuditEvent) -> int:
+        seen.append(event.event_type)
+        return await healthy(event)
+
+    harness.audit.emit = tracing  # type: ignore[method-assign]
+    control_session, _ = await harness.sessions.create(USER_ID)
+    control = await harness.orchestrator.run(
+        control_session, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+    assert harness.provider.calls == 1, "premise: a healthy run reaches the provider"
+    assert "Marcus Webb" in control.restored_text
+    # A new pre-release event added later is caught here rather than going unpinned.
+    assert set(PRE_RELEASE_EVENTS) <= set(seen), (PRE_RELEASE_EVENTS, seen)
+    assert seen.index("EGRESS_PASS") < seen.index("LLM_CALL"), seen
+
+    attempts = 0
+
+    async def sink_is_down_for_one_event(event: AuditEvent) -> int:
+        nonlocal attempts
+        if event.event_type == failing_event:
+            attempts += 1
+            raise RuntimeError(f"audit sink is down for {failing_event}")
+        return await healthy(event)
+
+    harness.audit.emit = sink_is_down_for_one_event  # type: ignore[method-assign]
+    session_id, _ = await harness.sessions.create(USER_ID)
+    with pytest.raises(Exception) as caught:
+        await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+
+    assert attempts > 0, f"premise: the run really tried to write {failing_event}"
+    assert not isinstance(caught.value, AssertionError)
+    # Still one call -- the control's. The second run released nothing.
+    assert harness.provider.calls == 1, (
+        f"{failing_event} could not be recorded and the payload was sent anyway"
+    )

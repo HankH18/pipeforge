@@ -144,10 +144,26 @@ select = [
 ]
 ignore = [
     "S101",  # assert is used deliberately in post-restore assertions + tests
-    "E501",  # line length handled by formatter
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "T20"]
+# E501: same argument as fixtures/* below, and checked line by line rather than
+# assumed. Every long line left in this file is an ANNOTATED CORPUS DOCUMENT --
+# `<<NAME|Aurelio Santangelo>>  <<SSN|602 33 1194>>` and the CSV and letterhead
+# forms of the same -- carrying 1 to 5 `<<ENTITY|value>>` spans each. Wrapping one
+# is not a formatting change: the detector is fed these strings verbatim, so a
+# newline moves a span offset and changes what the recall table measures. The
+# lines are also inside triple-quoted blocks, where `# noqa` cannot reach. Every
+# other long line in this file WAS fixed rather than exempted.
+"tests/test_detection.py" = ["S", "T20", "E501"]
 "demo.py" = ["T20"]
-"fixtures/*" = ["S", "T20"]
+# E501: the long lines here are the PROSE OF THE GENERATED DOCUMENTS -- clinical
+# notes, privileged legal memoranda, settlement correspondence -- not code. Measured:
+# after `ruff format`, 88 of the 101 remaining long lines in the repository are in
+# this one file. Wrapping them is not a formatting change, it is a change to the
+# corpus: every fixture-derived expectation, the leakage corpus and the held-out
+# recall tables are computed from these strings. The alternative, implicit
+# concatenation across lines, makes the document text unreadable in the one place it
+# most needs to be readable.
+"fixtures/*" = ["S", "T20", "E501"]

@@ -266,7 +266,9 @@ def test_a_composite_offset_indexes_the_untrimmed_span() -> None:
     ("text", "why"),
     [
         pytest.param("03/11/2024, 12, 09/17/2024", "a two-character constituent", id="short-piece"),
-        pytest.param("03/11/2024, 1, 09/17/2024", "a one-character constituent", id="shorter-piece"),
+        pytest.param(
+            "03/11/2024, 1, 09/17/2024", "a one-character constituent", id="shorter-piece"
+        ),
         pytest.param("   ", "whitespace only", id="blank"),
     ],
 )

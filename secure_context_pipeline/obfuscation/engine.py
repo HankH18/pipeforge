@@ -244,9 +244,7 @@ class ObfuscationEngine:
                     self._vault.note_unrestorable(session_id, detection.text)
                 continue
             record = records[(detection.entity_type, normalize(detection.text))]
-            replacements.append(
-                _Replacement(detection.start, detection.end, record.surrogate)
-            )
+            replacements.append(_Replacement(detection.start, detection.end, record.surrogate))
             spans.append(_span(detection, EntityAction.OBFUSCATED, record.surrogate))
 
         swept, swept_records = await self._sweep_residual(
@@ -263,9 +261,7 @@ class ObfuscationEngine:
         # "John Smith"), and that is one vault row, so it is one token.
         tokens = [records[key] for key in _ordered_keys(planned, records)]
         declared = {record.token_id for record in tokens}
-        tokens.extend(
-            record for record in swept_records if record.token_id not in declared
-        )
+        tokens.extend(record for record in swept_records if record.token_id not in declared)
 
         await self._audit_result(session_id, run_id, planned, records, strategy)
 
@@ -357,6 +353,7 @@ class ObfuscationEngine:
         # Insertion-ordered, so the returned records follow sweep order and the
         # ``tokens`` list stays deterministic.
         used: dict[str, None] = {}
+
         # Total order: longest first, then lexicographic.
         #
         # Longest first is the load-bearing half: where "Smith" and "John Smith" both
@@ -508,9 +505,7 @@ class ObfuscationEngine:
             and self._is_enforceable(detection)
         ]
         entities = self._registry.entities
-        policy_types = frozenset(
-            name for name, spec in entities.items() if spec.action is not None
-        )
+        policy_types = frozenset(name for name, spec in entities.items() if spec.action is not None)
         pattern_types = frozenset(
             name for name, spec in entities.items() if spec.patterns or spec.gazetteer
         )
@@ -586,7 +581,9 @@ class ObfuscationEngine:
         spec = self._registry.get(entity_type)
         return spec is None or spec.allowed_in(doc_category)
 
-    def _classify(self, detection: Detection, *, band_score: float | None = None) -> _Planned | None:
+    def _classify(
+        self, detection: Detection, *, band_score: float | None = None
+    ) -> _Planned | None:
         """Registry action first, then the confidence band. No entity names here.
 
         ``band_score`` is the score the BAND is decided on -- the maximum across
@@ -655,9 +652,7 @@ class ObfuscationEngine:
                 continue
 
             token_id = await self._unique_token_id(session_id, session_key, group)
-            strategy = self._strategy_for(
-                group.entity_type, requested, session_key, strategies
-            )
+            strategy = self._strategy_for(group.entity_type, requested, session_key, strategies)
             strategy.reserved_originals = reserved
             surrogate = await strategy.make_surrogate(
                 group.first, token_id, self._vault, session_id=session_id
@@ -698,9 +693,7 @@ class ObfuscationEngine:
 
         return resolved
 
-    async def _unique_token_id(
-        self, session_id: str, session_key: bytes, group: _Group
-    ) -> str:
+    async def _unique_token_id(self, session_id: str, session_key: bytes, group: _Group) -> str:
         """A token ID unused in this session, re-derived with a counter on collision.
 
         This is *not* a duplicate of the vault's own collision handling. The

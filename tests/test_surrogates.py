@@ -311,7 +311,10 @@ PIPE_SHAPES = [
     (f"PHI_NAME_{TOKEN_ID} | stable, discharged.", f"PHI_NAME_{TOKEN_ID} "),
     (f"[PHI_NAME_{TOKEN_ID}|note (about the case) here]", f"[PHI_NAME_{TOKEN_ID}"),
     # ...and the shapes a real hint still has to claim in full.
-    (f"[PHI_MEDICATION_{TOKEN_ID}|oral-antidiabetic]", f"[PHI_MEDICATION_{TOKEN_ID}|oral-antidiabetic]"),
+    (
+        f"[PHI_MEDICATION_{TOKEN_ID}|oral-antidiabetic]",
+        f"[PHI_MEDICATION_{TOKEN_ID}|oral-antidiabetic]",
+    ),
     (
         f"[PHI_MEDICATION_{TOKEN_ID} | oral-antidiabetic]",
         f"[PHI_MEDICATION_{TOKEN_ID} | oral-antidiabetic]",
@@ -321,7 +324,9 @@ PIPE_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize(("text", "expected"), PIPE_SHAPES, ids=[case[0][:44] for case in PIPE_SHAPES])
+@pytest.mark.parametrize(
+    ("text", "expected"), PIPE_SHAPES, ids=[case[0][:44] for case in PIPE_SHAPES]
+)
 def test_the_match_extent_is_exactly_the_token(text: str, expected: str) -> None:
     match = TOKEN_RE.search(text)
     assert match is not None
@@ -451,9 +456,7 @@ def test_only_a_lowercase_eight_hex_id_is_emittable(token_id: str) -> None:
 
 @given(text=NASTY_TEXT, token_id=st.just(TOKEN_ID))
 @hypothesis_settings(max_examples=300)
-def test_extract_token_ids_agrees_with_the_matcher_on_any_text(
-    text: str, token_id: str
-) -> None:
+def test_extract_token_ids_agrees_with_the_matcher_on_any_text(text: str, token_id: str) -> None:
     """``extract_token_ids`` is the vault's key source; it must not drift from ``TOKEN_RE``."""
     haystack = f"{text}[PHI_NAME_{token_id}]{text}"
     assert extract_token_ids(haystack) == {

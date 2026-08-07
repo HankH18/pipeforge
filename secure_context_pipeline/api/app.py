@@ -139,8 +139,9 @@ real and unconditional, but it keys on the source address, which is the only
 caller identifier this tier has; behind a proxy or a shared NAT that is one
 bucket for many callers, and it is not a substitute for metering a *principal*.
 (This sentence used to say every route was "anonymous and unmetered", forty
-lines after documenting the meter and installing it.) CSRF protection for the browser client; and a signed,
-``HttpOnly`` session cookie in place of the ``X-Session-Id`` header.
+lines after documenting the meter and installing it.) CSRF protection for the
+browser client; and a signed, ``HttpOnly`` session cookie in place of the
+``X-Session-Id`` header.
 """
 
 from __future__ import annotations

@@ -204,9 +204,7 @@ class FakeClient:
         self.max_retries = 0
 
 
-def stubbed_provider(
-    settings: Settings, script: list[Any]
-) -> tuple[AnthropicProvider, FakeClient]:
+def stubbed_provider(settings: Settings, script: list[Any]) -> tuple[AnthropicProvider, FakeClient]:
     provider = AnthropicProvider(settings)
     fake = FakeClient(script)
     provider._client = fake  # type: ignore[assignment]
@@ -239,9 +237,7 @@ async def test_mock_provider_is_byte_identical_across_calls() -> None:
 
 async def test_mock_provider_determinism_is_independent_of_instance_and_call_count() -> None:
     provider = MockProvider()
-    outputs = [
-        await provider.complete("sys", TOKENIZED_PAYLOAD, model="mock-1") for _ in range(5)
-    ]
+    outputs = [await provider.complete("sys", TOKENIZED_PAYLOAD, model="mock-1") for _ in range(5)]
     assert len(set(outputs)) == 1
     assert outputs[0] == build_response(TOKENIZED_PAYLOAD)
 
@@ -418,9 +414,7 @@ async def test_quoted_lines_never_carry_a_token() -> None:
 
 async def test_quoting_is_still_deterministic_with_tokens_present() -> None:
     provider = MockProvider()
-    outputs = [
-        await provider.complete("sys", MIXED_TIER_PAYLOAD, model="mock-1") for _ in range(3)
-    ]
+    outputs = [await provider.complete("sys", MIXED_TIER_PAYLOAD, model="mock-1") for _ in range(3)]
     assert len(set(outputs)) == 1
     assert outputs[0] == build_response(MIXED_TIER_PAYLOAD)
 
@@ -727,7 +721,7 @@ async def test_wire_level_request_carries_the_expected_headers_and_no_streaming(
 async def test_wire_level_529_overloaded_is_retried_then_succeeds(
     settings_factory: Callable[..., Settings], sleep_recorder: list[float]
 ) -> None:
-    """"What happens on a 529?" answered through the real SDK, not a stub.
+    """ "What happens on a 529?" answered through the real SDK, not a stub.
 
     529 (overloaded) has no dedicated exception class in the SDK's status map, so
     it arrives as the generic ``>=500`` case. Classifying by status as well as by
@@ -739,7 +733,9 @@ async def test_wire_level_529_overloaded_is_retried_then_succeeds(
     def handler(request: httpx.Request) -> httpx.Response:
         if len(statuses) < 2:
             statuses.append(529)
-            return httpx.Response(529, json={"type": "error", "error": {"type": "overloaded_error"}})
+            return httpx.Response(
+                529, json={"type": "error", "error": {"type": "overloaded_error"}}
+            )
         statuses.append(200)
         return httpx.Response(
             200,
@@ -835,6 +831,7 @@ async def test_wire_level_truncated_answer_is_returned_and_flagged(
     beats no answer -- but it is logged distinctly, because a truncated response
     can end mid-token and leave debris no grammar will match.
     """
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -887,7 +884,9 @@ async def test_wire_level_400_is_not_retried(
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        return httpx.Response(400, json={"type": "error", "error": {"type": "invalid_request_error"}})
+        return httpx.Response(
+            400, json={"type": "error", "error": {"type": "invalid_request_error"}}
+        )
 
     settings = settings_factory(llm_provider="anthropic")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
@@ -923,9 +922,19 @@ async def test_no_payload_bytes_reach_the_logs_on_any_wire_outcome(
         ([httpx.Response(529, json={}) for _ in range(MAX_ATTEMPTS)], LLMTransportError),
         ([httpx.Response(400, json={})], LLMTransportError),
         (
-            [httpx.Response(200, json=_message_json(stop_reason="refusal", stop_details={
-                "type": "refusal", "category": "cyber", "explanation": secret_user,
-            }))],
+            [
+                httpx.Response(
+                    200,
+                    json=_message_json(
+                        stop_reason="refusal",
+                        stop_details={
+                            "type": "refusal",
+                            "category": "cyber",
+                            "explanation": secret_user,
+                        },
+                    ),
+                )
+            ],
             LLMRefusalError,
         ),
         ([httpx.Response(200, json=_message_json(content=[]))], LLMResponseError),
@@ -975,8 +984,7 @@ async def test_the_sdks_own_debug_stream_cannot_echo_the_request_body(
     settings = settings_factory(llm_provider="anthropic")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
         provider = AnthropicProvider(settings, http_client=http_client)
-        await provider.complete("SYSTEM Marisol Ferraro", "USER 123-45-6789",
-                                model="claude-opus-5")
+        await provider.complete("SYSTEM Marisol Ferraro", "USER 123-45-6789", model="claude-opus-5")
 
     assert "Request options" not in caplog.text
     assert "Marisol Ferraro" not in caplog.text
@@ -1065,9 +1073,7 @@ async def test_other_4xx_statuses_are_not_retried(
     status: int, settings_factory: Callable[..., Settings], sleep_recorder: list[float]
 ) -> None:
     settings = settings_factory(llm_provider="anthropic")
-    provider, fake = stubbed_provider(
-        settings, [status_error(anthropic.APIStatusError, status)]
-    )
+    provider, fake = stubbed_provider(settings, [status_error(anthropic.APIStatusError, status)])
     with pytest.raises(LLMTransportError):
         await provider.complete_detailed("s", "u", model="claude-opus-5")
     assert len(fake.messages.calls) == 1
@@ -1133,9 +1139,11 @@ def test_classification_uses_typed_exceptions_not_message_text() -> None:
         "timeout",
         None,
     )
-    assert classify_error(
-        anthropic.APIConnectionError(request=request)
-    ) == (True, "connection_error", None)
+    assert classify_error(anthropic.APIConnectionError(request=request)) == (
+        True,
+        "connection_error",
+        None,
+    )
 
 
 async def test_backoff_is_bounded_and_non_decreasing(
@@ -1282,9 +1290,7 @@ def test_transport_error_carries_only_machine_detail() -> None:
 
 
 @pytest.mark.real_llm
-@pytest.mark.skipif(
-    not os.getenv("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set"
-)
+@pytest.mark.skipif(not os.getenv("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
 async def test_real_llm_smoke() -> None:
     settings = Settings(master_key=MASTER_KEY, llm_provider="anthropic")
     provider = AnthropicProvider(settings)

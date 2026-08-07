@@ -165,9 +165,7 @@ def test_doc_and_vault_keys_are_the_section_8_hkdf_formulas() -> None:
         assert keys.MockKMSKeyProvider(settings).doc_key(user_id) == expected, user_id
 
     for session_id in ("sessA", "s-1234", "üsession"):
-        expected = _hkdf_sha256_rfc5869(
-            session_key, b"scp-v1", b"vault:" + session_id.encode(), 32
-        )
+        expected = _hkdf_sha256_rfc5869(session_key, b"scp-v1", b"vault:" + session_id.encode(), 32)
         assert keys.derive_vault_key(session_key, session_id) == expected, session_id
 
 
@@ -722,7 +720,9 @@ def test_token_id_rejects_an_unrepresentable_counter(counter: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad_key", [b"", b"short", secrets.token_bytes(31), secrets.token_bytes(33)])
+@pytest.mark.parametrize(
+    "bad_key", [b"", b"short", secrets.token_bytes(31), secrets.token_bytes(33)]
+)
 def test_hmac_derivations_reject_a_degenerate_session_key(bad_key: bytes) -> None:
     """A zero-length key silently turns every token ID into a *public* function.
 
@@ -802,7 +802,9 @@ def test_token_id_is_irreversible_without_the_key() -> None:
     sk = keys.new_session_key()
     tid = keys.derive_token_id(sk, "NAME", "John Smith")
     del sk
-    others = {keys.derive_token_id(keys.new_session_key(), "NAME", "John Smith") for _ in range(500)}
+    others = {
+        keys.derive_token_id(keys.new_session_key(), "NAME", "John Smith") for _ in range(500)
+    }
     assert tid not in others
 
 
@@ -979,7 +981,9 @@ def test_faker_seed_stable_per_session_and_type() -> None:
     sk = keys.new_session_key()
     assert keys.derive_faker_seed(sk, "NAME") == keys.derive_faker_seed(sk, "NAME")
     assert keys.derive_faker_seed(sk, "NAME") != keys.derive_faker_seed(sk, "ADDRESS")
-    assert keys.derive_faker_seed(sk, "NAME") != keys.derive_faker_seed(keys.new_session_key(), "NAME")
+    assert keys.derive_faker_seed(sk, "NAME") != keys.derive_faker_seed(
+        keys.new_session_key(), "NAME"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1275,7 +1279,7 @@ def test_every_span_model_enforces_the_shared_score_and_offset_bounds(
 
 @pytest.mark.parametrize("field", ["session_id", "run_id", "event_type", "entity_type", "token_id"])
 def test_audit_event_free_text_columns_are_capped(field: str) -> None:
-    """"No field capable of holding an original value" has to be true of every column.
+    """ "No field capable of holding an original value" has to be true of every column.
 
     ``detail`` was capped; the label columns were not, and ``entity_type`` /
     ``token_id`` are written from values parsed out of untrusted LLM output.
@@ -1606,7 +1610,10 @@ def test_no_control_this_strips_is_also_whitespace() -> None:
 @pytest.mark.parametrize(
     "control",
     [
-        "\x1c", "\x1d", "\x1e", "\x1f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x1f",
         # Non-Latin-1 whitespace, so the property is pinned outside the range the
         # class algebra above used to be restricted to.
         "\u2028",  # LINE SEPARATOR

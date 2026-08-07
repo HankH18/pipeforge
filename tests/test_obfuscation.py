@@ -312,7 +312,9 @@ async def test_pseudonym_format_preservation_needs_no_per_entity_table(env: Env)
     """A docket number keeps its punctuation and its detached label words."""
     text = "Filed under Case No. 1:23-cv-45678 last term."
     result = await env.engine.obfuscate(
-        env.session_id, text, [span(text, "Case No. 1:23-cv-45678", "CASE_ID")],
+        env.session_id,
+        text,
+        [span(text, "Case No. 1:23-cv-45678", "CASE_ID")],
         strategy="pseudonymization",
     )
     assert len(result.tokens) == 1
@@ -387,7 +389,9 @@ def test_the_structural_mask_replaces_every_identifying_character() -> None:
 async def test_pseudonym_email_is_never_a_deliverable_address(env: Env) -> None:
     text = "Reach him at john.smith@example.com any time."
     result = await env.engine.obfuscate(
-        env.session_id, text, [span(text, "john.smith@example.com", "EMAIL")],
+        env.session_id,
+        text,
+        [span(text, "john.smith@example.com", "EMAIL")],
         strategy="pseudonymization",
     )
     assert len(result.tokens) == 1
@@ -400,9 +404,7 @@ async def test_pseudonym_email_is_never_a_deliverable_address(env: Env) -> None:
     # address survived -- the local half is as identifying as the whole.
     assert result.obfuscated_text == f"Reach him at {fake} any time."
     assert "john.smith" not in result.obfuscated_text
-    assert await env.vault.get_by_surrogate(
-        env.session_id, fake
-    ) == "john.smith@example.com"
+    assert await env.vault.get_by_surrogate(env.session_id, fake) == "john.smith@example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -582,9 +584,9 @@ async def test_unparseable_date_falls_back_to_a_plain_token(env: Env) -> None:
     assert surrogate == f"[PII_DOB_{record.token_id}]"
     assert result.obfuscated_text == f"Follow-up {surrogate}, patient says."
     assert "sometime next spring" not in result.obfuscated_text
-    assert await env.vault.get_by_surrogate(
-        env.session_id, surrogate
-    ) == "sometime next spring", "unparseable must still mean restorable"
+    assert await env.vault.get_by_surrogate(env.session_id, surrogate) == "sometime next spring", (
+        "unparseable must still mean restorable"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -671,12 +673,20 @@ async def test_regenerating_one_component_does_not_desync_the_others(env: Env) -
     )
     strategy.reserved_originals = frozenset({normalize("Smith"), normalize("John Smith")})
     standalone_span = Detection(
-        entity_type="NAME", category=EntityCategory.PII, start=0, end=5,
-        text="Smith", score=0.9,
+        entity_type="NAME",
+        category=EntityCategory.PII,
+        start=0,
+        end=5,
+        text="Smith",
+        score=0.9,
     )
     full_span = Detection(
-        entity_type="NAME", category=EntityCategory.PII, start=0, end=10,
-        text="John Smith", score=0.9,
+        entity_type="NAME",
+        category=EntityCategory.PII,
+        start=0,
+        end=10,
+        text="John Smith",
+        score=0.9,
     )
 
     standalone = await strategy.make_surrogate(
@@ -743,7 +753,9 @@ async def test_name_component_linking_survives_a_collision_regeneration(env: Env
 async def test_name_passthrough_keeps_titles_and_replaces_only_the_name(env: Env) -> None:
     text = "Dr. Maria Garcia reviewed the chart."
     result = await env.engine.obfuscate(
-        env.session_id, text, [span(text, "Dr. Maria Garcia", "NAME")],
+        env.session_id,
+        text,
+        [span(text, "Dr. Maria Garcia", "NAME")],
         strategy="pseudonymization",
     )
     assert len(result.tokens) == 1
@@ -811,16 +823,22 @@ async def test_name_and_client_identity_pseudonymize_to_the_same_person(env: Env
     """One human, two registry types (legal docs remap PERSON), one pseudonym."""
     strategy = build_strategy("pseudonymization", env.context())
     as_name = Detection(
-        entity_type="NAME", category=EntityCategory.PII, start=0, end=10,
-        text="John Smith", score=0.9,
+        entity_type="NAME",
+        category=EntityCategory.PII,
+        start=0,
+        end=10,
+        text="John Smith",
+        score=0.9,
     )
     as_client = Detection(
-        entity_type="CLIENT_IDENTITY", category=EntityCategory.LEGAL, start=0, end=10,
-        text="John Smith", score=0.9,
+        entity_type="CLIENT_IDENTITY",
+        category=EntityCategory.LEGAL,
+        start=0,
+        end=10,
+        text="John Smith",
+        score=0.9,
     )
-    first = await strategy.make_surrogate(
-        as_name, "aaaaaaaa", env.vault, session_id=env.session_id
-    )
+    first = await strategy.make_surrogate(as_name, "aaaaaaaa", env.vault, session_id=env.session_id)
     second = await strategy.make_surrogate(
         as_client, "bbbbbbbb", env.vault, session_id=env.session_id
     )
@@ -841,8 +859,12 @@ async def test_name_and_client_identity_pseudonymize_to_the_same_person(env: Env
 async def test_collision_guard_regenerates_a_fake_equal_to_a_vault_original(env: Env) -> None:
     strategy = build_strategy("pseudonymization", env.context())
     detection = Detection(
-        entity_type="SSN", category=EntityCategory.PII, start=0, end=11,
-        text="123-45-6789", score=0.9,
+        entity_type="SSN",
+        category=EntityCategory.PII,
+        start=0,
+        end=11,
+        text="123-45-6789",
+        score=0.9,
     )
     first = await strategy.make_surrogate(
         detection, "aaaaaaaa", env.vault, session_id=env.session_id
@@ -896,13 +918,15 @@ async def test_a_fake_name_never_keeps_the_real_surname_it_replaces(env: Env) ->
     """
     strategy = build_strategy(
         "pseudonymization",
-        StrategyContext(
-            registry=env.registry, session_key=SURNAME_ECHO_KEY, settings=env.settings
-        ),
+        StrategyContext(registry=env.registry, session_key=SURNAME_ECHO_KEY, settings=env.settings),
     )
     detection = Detection(
-        entity_type="NAME", category=EntityCategory.PII, start=0, end=13,
-        text="Anna Williams", score=0.9,
+        entity_type="NAME",
+        category=EntityCategory.PII,
+        start=0,
+        end=13,
+        text="Anna Williams",
+        score=0.9,
     )
     strategy.reserved_originals = frozenset({normalize(detection.text)})
 
@@ -958,8 +982,12 @@ async def test_the_guard_forbids_its_own_value_with_no_help_from_the_caller(
 
     surrogate = await strategy.make_surrogate(
         Detection(
-            entity_type="NAME", category=EntityCategory.PII, start=0, end=10,
-            text="John Smith", score=0.9,
+            entity_type="NAME",
+            category=EntityCategory.PII,
+            start=0,
+            end=10,
+            text="John Smith",
+            score=0.9,
         ),
         "aaaaaaaa",
         env.vault,
@@ -1022,8 +1050,12 @@ async def test_the_guard_forbids_its_own_value_on_the_non_person_paths_too(
 
     surrogate = await strategy.make_surrogate(
         Detection(
-            entity_type="ADDRESS", category=EntityCategory.PII, start=0,
-            end=len(source), text=source, score=0.9,
+            entity_type="ADDRESS",
+            category=EntityCategory.PII,
+            start=0,
+            end=len(source),
+            text=source,
+            score=0.9,
         ),
         "aaaaaaaa",
         env.vault,
@@ -1074,8 +1106,12 @@ async def test_two_originals_are_never_issued_the_same_surrogate(env: Env) -> No
 
     def person(text: str) -> Detection:
         return Detection(
-            entity_type="NAME", category=EntityCategory.PII, start=0, end=len(text),
-            text=text, score=0.9,
+            entity_type="NAME",
+            category=EntityCategory.PII,
+            start=0,
+            end=len(text),
+            text=text,
+            score=0.9,
         )
 
     first = await strategy.make_surrogate(
@@ -1145,8 +1181,12 @@ async def _issue(
 
 def _person(text: str) -> Detection:
     return Detection(
-        entity_type="NAME", category=EntityCategory.PII, start=0, end=len(text),
-        text=text, score=0.9,
+        entity_type="NAME",
+        category=EntityCategory.PII,
+        start=0,
+        end=len(text),
+        text=text,
+        score=0.9,
     )
 
 
@@ -1196,9 +1236,7 @@ async def test_a_fake_nested_inside_an_issued_surrogate_is_refused(env: Env) -> 
     )
 
     outer = f"Marion {lone}"
-    await _issue(
-        env, session_id, token_id="beef0001", surrogate=outer, original=NESTING_PERSON
-    )
+    await _issue(env, session_id, token_id="beef0001", surrogate=outer, original=NESTING_PERSON)
 
     # Premises: no other layer can account for the result below.
     assert not occurs_as_a_unit(normalize(NESTING_PLACE), normalize(NESTING_PERSON)), (
@@ -1253,9 +1291,7 @@ async def test_a_fake_that_swallows_an_issued_surrogate_is_refused(env: Env) -> 
         == full
     )
 
-    await _issue(
-        env, session_id, token_id="beef0011", surrogate=tail, original=NESTING_PLACE
-    )
+    await _issue(env, session_id, token_id="beef0011", surrogate=tail, original=NESTING_PLACE)
 
     assert not occurs_as_a_unit(normalize(NESTING_PLACE), normalize(NESTING_PERSON))
     assert set(normalize(full).split()).isdisjoint(
@@ -1296,9 +1332,7 @@ async def test_name_component_linking_may_still_nest_its_own_surrogates(env: Env
         _person(NESTING_PERSON), "beef0020", env.vault, session_id=session_id
     )
     assert not STRICT_TOKEN_RE.fullmatch(full) and len(full.split()) == 2
-    await _issue(
-        env, session_id, token_id="beef0020", surrogate=full, original=NESTING_PERSON
-    )
+    await _issue(env, session_id, token_id="beef0020", surrogate=full, original=NESTING_PERSON)
 
     component = NESTING_PERSON.split()[-1]
     assert occurs_as_a_unit(normalize(component), normalize(NESTING_PERSON)), (
@@ -1358,8 +1392,12 @@ async def test_a_fake_equal_to_the_value_it_replaces_is_regenerated(env: Env) ->
 
     surrogate = await strategy.make_surrogate(
         Detection(
-            entity_type="MRN", category=EntityCategory.PHI, start=0, end=len(source),
-            text=source, score=0.9,
+            entity_type="MRN",
+            category=EntityCategory.PHI,
+            start=0,
+            end=len(source),
+            text=source,
+            score=0.9,
         ),
         "aaaaaaaa",
         env.vault,
@@ -1372,17 +1410,19 @@ async def test_a_fake_equal_to_the_value_it_replaces_is_regenerated(env: Env) ->
 
 
 @pytest.mark.parametrize("entity_type", ["NAME", "CLIENT_IDENTITY"])
-async def test_no_person_pseudonym_reproduces_a_real_name_word(
-    env: Env, entity_type: str
-) -> None:
+async def test_no_person_pseudonym_reproduces_a_real_name_word(env: Env, entity_type: str) -> None:
     """Swept across many session keys: zero shared words, not merely few.
 
     A single key proves the guard fires once; the sweep proves it is not
     probabilistic. The pre-fix rate on this sweep was ~1.9% of spans.
     """
     names = [
-        "Anna Williams", "John Smith", "Maria Garcia",
-        "David Nguyen", "Sarah Johnson", "Robert Wilson",
+        "Anna Williams",
+        "John Smith",
+        "Maria Garcia",
+        "David Nguyen",
+        "Sarah Johnson",
+        "Robert Wilson",
     ]
     offenders: list[tuple[str, str, list[str]]] = []
     degraded = 0
@@ -1412,9 +1452,7 @@ async def test_no_person_pseudonym_reproduces_a_real_name_word(
             if STRICT_TOKEN_RE.fullmatch(surrogate):
                 degraded += 1  # guard exhausted -> plain token, which leaks nothing
                 continue
-            shared = sorted(
-                set(normalize(surrogate).split()) & set(normalize(name).split())
-            )
+            shared = sorted(set(normalize(surrogate).split()) & set(normalize(name).split()))
             if shared:
                 offenders.append((name, surrogate, shared))
     assert offenders == [], f"{len(offenders)}/360 pseudonyms kept a real name word"
@@ -1438,8 +1476,12 @@ async def test_a_faked_place_never_reproduces_a_real_word(env: Env) -> None:
     assert isinstance(strategy, PseudonymizationStrategy)
     source = "Larkspur Valley"
     detection = Detection(
-        entity_type="ADDRESS", category=EntityCategory.PII, start=0, end=len(source),
-        text=source, score=0.9,
+        entity_type="ADDRESS",
+        category=EntityCategory.PII,
+        start=0,
+        end=len(source),
+        text=source,
+        score=0.9,
     )
 
     # What the generator produces with nothing forbidden.
@@ -1455,9 +1497,7 @@ async def test_a_faked_place_never_reproduces_a_real_word(env: Env) -> None:
     # invented-word check stands between the real word and the payload.
     other_original = f"{shared} General Hospital"
     assert normalize(other_original) != normalize(unguarded.text)
-    strategy.reserved_originals = frozenset(
-        {normalize(source), normalize(other_original)}
-    )
+    strategy.reserved_originals = frozenset({normalize(source), normalize(other_original)})
 
     surrogate = await strategy.make_surrogate(
         detection, "aaaaaaaa", env.vault, session_id=env.session_id
@@ -1512,8 +1552,12 @@ async def test_collision_guard_falls_back_to_a_token_rather_than_looping(env: En
     strategy = build_strategy("pseudonymization", env.context())
     assert isinstance(strategy, PseudonymizationStrategy)
     detection = Detection(
-        entity_type="SSN", category=EntityCategory.PII, start=0, end=11,
-        text="123-45-6789", score=0.9,
+        entity_type="SSN",
+        category=EntityCategory.PII,
+        start=0,
+        end=11,
+        text="123-45-6789",
+        score=0.9,
     )
     for attempt in range(MAX_FAKE_ATTEMPTS):
         poisoned = strategy._generate("SSN", detection.text, attempt).text
@@ -1595,8 +1639,12 @@ async def test_whole_string_collision_is_caught_even_when_no_invented_word_is(
     strategy = build_strategy("pseudonymization", env.context())
     assert isinstance(strategy, PseudonymizationStrategy)
     detection = Detection(
-        entity_type="MRN", category=EntityCategory.PHI, start=0, end=7,
-        text="MRN: 12", score=0.9,
+        entity_type="MRN",
+        category=EntityCategory.PHI,
+        start=0,
+        end=7,
+        text="MRN: 12",
+        score=0.9,
     )
 
     first = strategy._generate("MRN", detection.text, 0)
@@ -1651,15 +1699,20 @@ async def test_a_shifted_date_landing_on_another_real_date_degrades_to_a_token(
     assert source_text != other_text
 
     detection = Detection(
-        entity_type="DATE", category=EntityCategory.PHI, start=0, end=len(source_text),
-        text=source_text, score=0.9,
+        entity_type="DATE",
+        category=EntityCategory.PHI,
+        start=0,
+        end=len(source_text),
+        text=source_text,
+        score=0.9,
     )
 
     # Without the other real date present, the shift renders normally.
     strategy.reserved_originals = frozenset()
-    assert await strategy.make_surrogate(
-        detection, "aaaaaaaa", env.vault, session_id=env.session_id
-    ) == other_text
+    assert (
+        await strategy.make_surrogate(detection, "aaaaaaaa", env.vault, session_id=env.session_id)
+        == other_text
+    )
 
     # With it present, shifting would emit a verbatim original -- so it must not.
     strategy.reserved_originals = frozenset({normalize(other_text)})
@@ -1691,9 +1744,7 @@ async def test_a_shifted_date_that_re_renders_as_its_own_source_degrades(env: En
     """
     strategy = build_strategy(
         "pseudonymization",
-        StrategyContext(
-            registry=env.registry, session_key=SELF_SHIFT_KEY, settings=env.settings
-        ),
+        StrategyContext(registry=env.registry, session_key=SELF_SHIFT_KEY, settings=env.settings),
     )
     assert isinstance(strategy, PseudonymizationStrategy)
     session_id, _expires = await env.sessions.create("test-user")
@@ -1708,8 +1759,12 @@ async def test_a_shifted_date_that_re_renders_as_its_own_source_degrades(env: En
 
     def date_span(text: str) -> Detection:
         return Detection(
-            entity_type="DATE", category=EntityCategory.PHI, start=0, end=len(text),
-            text=text, score=0.9,
+            entity_type="DATE",
+            category=EntityCategory.PHI,
+            start=0,
+            end=len(text),
+            text=text,
+            score=0.9,
         )
 
     surrogate = await strategy.make_surrogate(
@@ -1720,9 +1775,12 @@ async def test_a_shifted_date_that_re_renders_as_its_own_source_degrades(env: En
 
     # ...and the fallback stays the exception. A month the shift really does move
     # is still shifted, so this did not simply disable Tier 2.
-    assert await strategy.make_surrogate(
-        date_span("April 2024"), "bbbbbbbb", env.vault, session_id=session_id
-    ) == "May 2024"
+    assert (
+        await strategy.make_surrogate(
+            date_span("April 2024"), "bbbbbbbb", env.vault, session_id=session_id
+        )
+        == "May 2024"
+    )
 
 
 async def test_a_shifted_date_that_renders_another_original_degrades(env: Env) -> None:
@@ -1860,13 +1918,18 @@ async def test_a_shifted_date_landing_inside_a_longer_original_degrades(env: Env
     # Control: with nothing vaulted, this date really does shift onto that slice.
     # Without it the test could pass because the shift went somewhere else entirely.
     detection = Detection(
-        entity_type="DATE", category=EntityCategory.PHI, start=0, end=len(source_text),
-        text=source_text, score=0.9,
+        entity_type="DATE",
+        category=EntityCategory.PHI,
+        start=0,
+        end=len(source_text),
+        text=source_text,
+        score=0.9,
     )
     strategy.reserved_originals = frozenset()
-    assert await strategy.make_surrogate(
-        detection, "aaaaaaaa", env.vault, session_id=env.session_id
-    ) == rendered
+    assert (
+        await strategy.make_surrogate(detection, "aaaaaaaa", env.vault, session_id=env.session_id)
+        == rendered
+    )
 
     # The real engine, over the document shape that produces it.
     unrelated = landing + timedelta(days=900)
@@ -2007,10 +2070,10 @@ async def test_token_id_collision_is_re_derived_and_both_values_resolve(
     """
     real = derive_token_id
 
-    def colliding(
-        session_key: bytes, entity_type: str, value: str, *, counter: int = 0
-    ) -> str:
-        return "cafe0001" if counter == 0 else real(session_key, entity_type, value, counter=counter)
+    def colliding(session_key: bytes, entity_type: str, value: str, *, counter: int = 0) -> str:
+        return (
+            "cafe0001" if counter == 0 else real(session_key, entity_type, value, counter=counter)
+        )
 
     monkeypatch.setattr(engine_module, "derive_token_id", colliding)
 
@@ -2040,8 +2103,9 @@ async def test_token_id_collision_is_re_derived_and_both_values_resolve(
     #    spliced over a span must round-trip to that span's own text.
     for item in result.spans:
         assert item.surrogate is not None
-        assert await env.vault.get_by_surrogate(env.session_id, item.surrogate) == (
-            text[item.start : item.end]
+        assert (
+            await env.vault.get_by_surrogate(env.session_id, item.surrogate)
+            == (text[item.start : item.end])
         )
 
     # 3. The text carries the RE-DERIVED id, not the one derived before the vault
@@ -2139,9 +2203,7 @@ async def test_repeated_value_is_one_vault_row_and_five_splices(env: Env, strate
 
 
 @pytest.mark.parametrize("strategy", BOTH_MODES)
-async def test_the_sweep_chases_values_vaulted_by_an_earlier_call(
-    env: Env, strategy: str
-) -> None:
+async def test_the_sweep_chases_values_vaulted_by_an_earlier_call(env: Env, strategy: str) -> None:
     """A session outlives one document, so "masked everywhere" must too.
 
     ``POST /ask`` runs per ``doc_id`` against a long-lived session. A name vaulted
@@ -2153,7 +2215,7 @@ async def test_the_sweep_chases_values_vaulted_by_an_earlier_call(
     await env.engine.obfuscate(
         env.session_id, first, [span(first, "John Smith", "NAME")], strategy=strategy
     )
-    surrogate = (await env.vault.get_by_original(env.session_id, "NAME", "john smith"))
+    surrogate = await env.vault.get_by_original(env.session_id, "NAME", "john smith")
     assert surrogate is not None
 
     # Second document, same session, detector returns NOTHING.
@@ -2215,9 +2277,7 @@ async def test_tokens_declare_every_surrogate_in_the_payload(env: Env, strategy:
     declared = {record.surrogate for record in result.tokens}
     in_payload = {item.surrogate for item in result.spans if item.surrogate is not None}
     assert in_payload, "the sweep spliced nothing, so this test verified nothing"
-    assert in_payload <= declared, (
-        f"{sorted(in_payload - declared)} reached the payload undeclared"
-    )
+    assert in_payload <= declared, f"{sorted(in_payload - declared)} reached the payload undeclared"
     # ...and nothing phantom in the other direction.
     for surrogate in declared:
         assert surrogate in result.obfuscated_text, surrogate
@@ -2438,13 +2498,39 @@ def test_the_sweep_and_the_gate_agree_on_what_counts_as_an_occurrence() -> None:
 
     # 2 + 3. Then the broad sweep over generated cases, three ways.
     needles = [
-        "John Smith", "Brown", "Ann", "MRN: 4471902", "(415) 555-0123",
-        "$1,234.56", "Ph.D.", "123-45-6789", "Case No. 1:23-cv-45678", "O'Brien",
+        "John Smith",
+        "Brown",
+        "Ann",
+        "MRN: 4471902",
+        "(415) 555-0123",
+        "$1,234.56",
+        "Ph.D.",
+        "123-45-6789",
+        "Case No. 1:23-cv-45678",
+        "O'Brien",
     ]
     haystacks = [
-        "{}", "_{}_", "*{}*", "__{}__", "a{}", "{}z", "({})", "[{}]", " {} ",
-        "x{}y", "{}.", ".{}", "tel{}", "USD{}", "{}degree", "-{}-", "{}_", "_{}",
-        "\n{}\n", "1{}", "{}9",
+        "{}",
+        "_{}_",
+        "*{}*",
+        "__{}__",
+        "a{}",
+        "{}z",
+        "({})",
+        "[{}]",
+        " {} ",
+        "x{}y",
+        "{}.",
+        ".{}",
+        "tel{}",
+        "USD{}",
+        "{}degree",
+        "-{}-",
+        "{}_",
+        "_{}",
+        "\n{}\n",
+        "1{}",
+        "{}9",
     ]
     vs_oracle: list[tuple[str, str]] = []
     vs_gate: list[tuple[str, str]] = []
@@ -2461,9 +2547,7 @@ def test_the_sweep_and_the_gate_agree_on_what_counts_as_an_occurrence() -> None:
         f"the sweep disagrees with the independent oracle on {len(vs_oracle)} "
         f"case(s): {vs_oracle[:5]}"
     )
-    assert vs_gate == [], (
-        f"sweep and gate disagree on {len(vs_gate)} case(s): {vs_gate[:5]}"
-    )
+    assert vs_gate == [], f"sweep and gate disagree on {len(vs_gate)} case(s): {vs_gate[:5]}"
 
 
 def test_the_occurrence_oracle_is_not_a_copy_of_the_rule_it_checks() -> None:
@@ -2474,15 +2558,14 @@ def test_the_occurrence_oracle_is_not_a_copy_of_the_rule_it_checks() -> None:
     the gate have actually been wrong about, it must disagree with them -- which is
     only possible if it is genuinely independent code.
     """
+
     def naive_word_chars(needle: str, haystack: str) -> bool:
         """The original broken rule: ``\\w`` on both sides, unconditionally."""
         return re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack) is not None
 
     def naive_unconditional(needle: str, haystack: str) -> bool:
         """The second broken rule: right alphanumeric class, but both sides always."""
-        return re.search(
-            r"(?<![^\W_])" + re.escape(needle) + r"(?![^\W_])", haystack
-        ) is not None
+        return re.search(r"(?<![^\W_])" + re.escape(needle) + r"(?![^\W_])", haystack) is not None
 
     # The markdown bypass: the oracle says "occurrence", the first broken rule says no.
     assert occurs_as_a_unit_oracle("John Smith", "_John Smith_") is True
@@ -2509,9 +2592,7 @@ async def test_a_prior_value_is_not_swept_inside_a_longer_word(env: Env) -> None
 
 
 @pytest.mark.parametrize("strategy", BOTH_MODES)
-async def test_a_prior_value_is_swept_when_only_its_case_differs(
-    env: Env, strategy: str
-) -> None:
+async def test_a_prior_value_is_swept_when_only_its_case_differs(env: Env, strategy: str) -> None:
     """The cross-call *probe* must be as case-blind as the sweep it feeds.
 
     Reaching a value vaulted on an earlier call takes two steps, and only the
@@ -2537,9 +2618,7 @@ async def test_a_prior_value_is_swept_when_only_its_case_differs(
     result = await env.engine.obfuscate(env.session_id, second, [], strategy=strategy)
 
     assert "JOHN SMITH" not in result.obfuscated_text
-    assert result.obfuscated_text == (
-        f"DISCHARGE SUMMARY FOR {record.surrogate}, SIGNED TODAY."
-    )
+    assert result.obfuscated_text == (f"DISCHARGE SUMMARY FOR {record.surrogate}, SIGNED TODAY.")
     assert len(result.spans) == 1
     assert second[result.spans[0].start : result.spans[0].end] == "JOHN SMITH"
     assert result.spans[0].surrogate == record.surrogate
@@ -2676,9 +2755,7 @@ async def test_the_sweep_lands_in_the_same_place_however_a_surface_arrived(
         strategy="tokenization",
     )
     same_spans = sorted(
-        (item.start - offset, item.end - offset)
-        for item in from_same.spans
-        if item.start >= offset
+        (item.start - offset, item.end - offset) for item in from_same.spans if item.start >= offset
     )
 
     assert prior_spans == same_spans, (
@@ -2700,9 +2777,7 @@ async def test_case_and_whitespace_variants_collapse_to_one_row(env: Env) -> Non
         span(text, "JOHN  SMITH", "NAME"),
         span(text, "john smith", "NAME"),
     ]
-    result = await env.engine.obfuscate(
-        env.session_id, text, detections, strategy="tokenization"
-    )
+    result = await env.engine.obfuscate(env.session_id, text, detections, strategy="tokenization")
     assert len(result.tokens) == 1
     assert await env.vault.row_count(env.session_id) == 1
     surrogate = result.tokens[0].surrogate
@@ -2717,9 +2792,7 @@ async def test_case_and_whitespace_variants_collapse_to_one_row(env: Env) -> Non
 
 
 @pytest.mark.parametrize("strategy", BOTH_MODES)
-async def test_second_call_in_one_session_reuses_the_first_mapping(
-    env: Env, strategy: str
-) -> None:
+async def test_second_call_in_one_session_reuses_the_first_mapping(env: Env, strategy: str) -> None:
     text = "Contact John Smith about 123-45-6789."
     detections = [span(text, "John Smith", "NAME"), span(text, "123-45-6789", "SSN")]
 
@@ -2964,9 +3037,7 @@ async def test_tier3_with_hint_false_emits_a_plain_token(env: Env) -> None:
     assert surrogate == f"[PHI_DIAGNOSIS_{record.token_id}]"
     # Only the hint went away: the term itself is still masked and still restorable.
     assert result.obfuscated_text == f"Assessment: {surrogate} today."
-    assert await env.vault.get_by_surrogate(
-        env.session_id, surrogate
-    ) == "diabetes mellitus"
+    assert await env.vault.get_by_surrogate(env.session_id, surrogate) == "diabetes mellitus"
 
 
 async def test_tier4_numerics_stay_plain_tokens(env: Env) -> None:
@@ -2989,8 +3060,7 @@ async def test_tier4_numerics_stay_plain_tokens(env: Env) -> None:
         # A plain token embeds nothing but the category, the type and the ID -- no
         # magnitude, no digit count, no rounded stand-in.
         assert record.surrogate == (
-            f"[{CATEGORY_OF[record.entity_type].value}_{record.entity_type}_"
-            f"{record.token_id}]"
+            f"[{CATEGORY_OF[record.entity_type].value}_{record.entity_type}_{record.token_id}]"
         )
     assert "7.2" not in result.obfuscated_text
     assert "250,000" not in result.obfuscated_text
@@ -3071,9 +3141,7 @@ async def test_dummy_strategy_plugs_in_with_zero_engine_changes(
     # splice and round-trip, none of which the strategy participates in.
     assert await env.vault.row_count(env.session_id) == 2
     by_type = surrogates_by_type(result.tokens)
-    assert result.obfuscated_text == (
-        f"Patient {by_type['NAME']}, SSN {by_type['SSN']}."
-    )
+    assert result.obfuscated_text == (f"Patient {by_type['NAME']}, SSN {by_type['SSN']}.")
     assert await env.vault.get_by_surrogate(env.session_id, by_type["NAME"]) == "John Smith"
     assert await env.vault.get_by_surrogate(env.session_id, by_type["SSN"]) == "123-45-6789"
 
@@ -3254,9 +3322,7 @@ async def test_privileged_marker_is_stripped_in_both_modes(env: Env, strategy: s
     assert len(result.stripped) == 1
     assert result.stripped[0].entity_type == "PRIVILEGED_MARKER"
 
-    stripped_span = next(
-        item for item in result.spans if item.entity_type == "PRIVILEGED_MARKER"
-    )
+    stripped_span = next(item for item in result.spans if item.entity_type == "PRIVILEGED_MARKER")
     assert stripped_span.action is EntityAction.STRIPPED
     assert stripped_span.surrogate is None
 
@@ -3270,7 +3336,9 @@ async def test_privileged_marker_is_stripped_in_both_modes(env: Env, strategy: s
 async def test_strip_does_not_leave_a_doubled_space(env: Env) -> None:
     text = "Memo marked attorney-client and sent on."
     result = await env.engine.obfuscate(
-        env.session_id, text, [span(text, "attorney-client", "PRIVILEGED_MARKER")],
+        env.session_id,
+        text,
+        [span(text, "attorney-client", "PRIVILEGED_MARKER")],
         strategy="tokenization",
     )
     assert result.obfuscated_text == "Memo marked and sent on."
@@ -3285,7 +3353,9 @@ async def test_strip_does_not_leave_a_doubled_space(env: Env) -> None:
 async def test_case_strategy_is_force_redacted_in_both_modes(env: Env, strategy: str) -> None:
     text = "Background. Our litigation strategy is to delay until discovery closes."
     detection = span(
-        text, "Our litigation strategy is to delay until discovery closes", "CASE_STRATEGY",
+        text,
+        "Our litigation strategy is to delay until discovery closes",
+        "CASE_STRATEGY",
         score=0.99,
     )
     result = await env.engine.obfuscate(
@@ -3387,9 +3457,7 @@ async def test_per_entity_threshold_override_is_honoured(env: Env) -> None:
 
 
 @pytest.mark.parametrize("strategy", BOTH_MODES)
-async def test_right_to_left_splice_survives_many_adjacent_spans(
-    env: Env, strategy: str
-) -> None:
+async def test_right_to_left_splice_survives_many_adjacent_spans(env: Env, strategy: str) -> None:
     values = [f"{index:03d}-45-6789" for index in range(101, 113)]
     text = "|".join(values) + "|tail"
     detections: list[Detection] = []
@@ -3428,17 +3496,23 @@ async def test_touching_spans_are_both_spliced(env: Env) -> None:
     text = "123-45-6789987-65-4321 concatenated."
     detections = [
         Detection(
-            entity_type="SSN", category=EntityCategory.PII, start=0, end=11,
-            text="123-45-6789", score=0.9,
+            entity_type="SSN",
+            category=EntityCategory.PII,
+            start=0,
+            end=11,
+            text="123-45-6789",
+            score=0.9,
         ),
         Detection(
-            entity_type="SSN", category=EntityCategory.PII, start=11, end=22,
-            text="987-65-4321", score=0.9,
+            entity_type="SSN",
+            category=EntityCategory.PII,
+            start=11,
+            end=22,
+            text="987-65-4321",
+            score=0.9,
         ),
     ]
-    result = await env.engine.obfuscate(
-        env.session_id, text, detections, strategy="tokenization"
-    )
+    result = await env.engine.obfuscate(env.session_id, text, detections, strategy="tokenization")
     assert len(result.tokens) == 2
     first, second = (record.surrogate for record in result.tokens)
     assert result.obfuscated_text == f"{first}{second} concatenated."
@@ -3507,8 +3581,11 @@ async def test_a_partially_overlapping_loser_is_absorbed_not_dropped(env: Env) -
     )
 
     result = await env.engine.obfuscate(
-        env.session_id, text, [strategy_span, name_span],
-        strategy="tokenization", doc_category="legal",
+        env.session_id,
+        text,
+        [strategy_span, name_span],
+        strategy="tokenization",
+        doc_category="legal",
     )
 
     assert "Priyanka" not in result.obfuscated_text, result.obfuscated_text
@@ -3538,13 +3615,21 @@ async def test_a_clipped_fragment_does_not_steal_the_label_from_its_container(
     text = "Chart shows MRN: 4471902 on the header."
     whole_start = text.index("MRN: 4471902")
     whole = Detection(
-        entity_type="MRN", category=EntityCategory.PHI, start=whole_start,
-        end=whole_start + len("MRN: 4471902"), text="MRN: 4471902", score=0.70,
+        entity_type="MRN",
+        category=EntityCategory.PHI,
+        start=whole_start,
+        end=whole_start + len("MRN: 4471902"),
+        text="MRN: 4471902",
+        score=0.70,
     )
     fragment_start = text.index("4471902")
     fragment = Detection(
-        entity_type="DATE", category=EntityCategory.PHI, start=fragment_start,
-        end=fragment_start + len("4471902"), text="4471902", score=0.85,
+        entity_type="DATE",
+        category=EntityCategory.PHI,
+        start=fragment_start,
+        end=fragment_start + len("4471902"),
+        text="4471902",
+        score=0.85,
     )
 
     result = await env.engine.obfuscate(
@@ -3586,8 +3671,12 @@ async def test_contained_and_disjoint_spans_are_left_alone(env: Env) -> None:
     text = "SSN 123-45-6789 and name John Smith on file."
     ssn = span(text, "123-45-6789", "SSN")
     inner = Detection(  # fully contained by the SSN span, lower ranked
-        entity_type="ACCOUNT_NUMBER", category=EntityCategory.FIN,
-        start=ssn.start, end=ssn.start + 6, text=text[ssn.start : ssn.start + 6], score=0.5,
+        entity_type="ACCOUNT_NUMBER",
+        category=EntityCategory.FIN,
+        start=ssn.start,
+        end=ssn.start + 6,
+        text=text[ssn.start : ssn.start + 6],
+        score=0.5,
     )
     name = span(text, "John Smith", "NAME")
 
@@ -3599,7 +3688,8 @@ async def test_contained_and_disjoint_spans_are_left_alone(env: Env) -> None:
     # The pattern-backed label wins over the presidio-backed one it sits inside.
     assert {item.entity_type for item in result.spans} == {"ACCOUNT_NUMBER", "NAME"}
     assert [(item.start, item.end) for item in result.spans] == [
-        (ssn.start, ssn.end), (name.start, name.end)
+        (ssn.start, ssn.end),
+        (name.start, name.end),
     ], "a contained loser must not widen its winner"
     assert "123-45-6789" not in result.obfuscated_text
     assert "John Smith" not in result.obfuscated_text
@@ -3608,20 +3698,26 @@ async def test_contained_and_disjoint_spans_are_left_alone(env: Env) -> None:
     # restores to the value that stood there. Asserting the label alone would let a
     # future ranking change silently trade a token for a redaction.
     assert [item.action for item in result.spans] == [
-        EntityAction.OBFUSCATED, EntityAction.OBFUSCATED
+        EntityAction.OBFUSCATED,
+        EntityAction.OBFUSCATED,
     ]
     for item in result.spans:
         assert item.surrogate is not None
-        assert await env.vault.get_by_surrogate(env.session_id, item.surrogate) == (
-            text[item.start : item.end]
+        assert (
+            await env.vault.get_by_surrogate(env.session_id, item.surrogate)
+            == (text[item.start : item.end])
         )
 
 
 async def test_out_of_range_spans_are_dropped(env: Env) -> None:
     text = "Short text."
     bogus = Detection(
-        entity_type="SSN", category=EntityCategory.PII, start=5, end=500,
-        text="123-45-6789", score=0.9,
+        entity_type="SSN",
+        category=EntityCategory.PII,
+        start=5,
+        end=500,
+        text="123-45-6789",
+        score=0.9,
     )
     result = await env.engine.obfuscate(env.session_id, text, [bogus])
     assert result.obfuscated_text == text
@@ -3896,7 +3992,9 @@ POLICY_TYPES_IN_PLAY = frozenset({"CASE_STRATEGY"})
 PATTERN_TYPES_IN_PLAY = frozenset({"CASE_STRATEGY", "EMAIL", "MRN"})
 
 #: ``(label, text, [(entity_type, start, end, score)], [(entity_type, start, end)])``
-OVERLAP_CASES: list[tuple[str, str, list[tuple[str, int, int, float]], list[tuple[str, int, int]]]] = [
+OVERLAP_CASES: list[
+    tuple[str, str, list[tuple[str, int, int, float]], list[tuple[str, int, int]]]
+] = [
     (
         "pattern-backed label survives a wider general NER span",
         "Email awhitlock@mailer.example for details.",
@@ -3973,7 +4071,10 @@ def test_overlap_resolution_is_one_implementation_not_two() -> None:
     ids=[case[0] for case in OVERLAP_CASES],
 )
 def test_the_detector_resolver_matches_the_written_expectation(
-    label: str, text: str, raw: list[tuple[str, int, int, float]], expected: list[tuple[str, int, int]]
+    label: str,
+    text: str,
+    raw: list[tuple[str, int, int, float]],
+    expected: list[tuple[str, int, int]],
 ) -> None:
     kept = detector_module.resolve_overlaps(
         text, overlap_case_spans(text, raw), POLICY_TYPES_IN_PLAY, PATTERN_TYPES_IN_PLAY
@@ -4024,9 +4125,7 @@ async def test_privileged_prose_swallowed_by_a_name_span_is_redacted_not_pseudon
     content preserved in the payload under a name-shaped pseudonym.
     """
     text = "AAAAAAAAAABBBBBBBBBBCCCCCCCCCC"
-    spans = overlap_case_spans(
-        text, [("CASE_STRATEGY", 0, 20, 0.70), ("NAME", 0, 30, 0.85)]
-    )
+    spans = overlap_case_spans(text, [("CASE_STRATEGY", 0, 20, 0.70), ("NAME", 0, 30, 0.85)])
 
     result = await env.engine.obfuscate(env.session_id, text, spans, strategy="tokenization")
 
@@ -4067,8 +4166,7 @@ async def test_the_token_collision_budget_survives_eight_consecutive_collisions(
     """
     victim = "Rowan Delacroix-Sung"
     blocked = [
-        derive_token_id(env.session_key, "NAME", victim, counter=counter)
-        for counter in range(8)
+        derive_token_id(env.session_key, "NAME", victim, counter=counter) for counter in range(8)
     ]
     assert len(set(blocked)) == 8
 

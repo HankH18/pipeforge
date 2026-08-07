@@ -139,7 +139,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _check(self) -> Settings:
         if not self.master_key:
-            raise ConfigError(reason="master_key_missing", hint="set_SCP_MASTER_KEY_see_env_example")
+            raise ConfigError(
+                reason="master_key_missing", hint="set_SCP_MASTER_KEY_see_env_example"
+            )
         try:
             raw = base64.b64decode(self.master_key, validate=True)
         except (binascii.Error, ValueError) as exc:

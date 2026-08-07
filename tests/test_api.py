@@ -227,7 +227,9 @@ async def test_session_lifecycle_create_upload_run_delete(client: AsyncClient) -
     assert after.json()["code"] == "SESSION_EXPIRED"
 
     # Logout is idempotent and oracle-free: deleting again is still 204.
-    assert (await client.delete(f"/sessions/{session_id}", params={"user_id": OWNER})).status_code == 204
+    assert (
+        await client.delete(f"/sessions/{session_id}", params={"user_id": OWNER})
+    ).status_code == 204
 
 
 async def test_session_accepted_via_x_session_id_header(client: AsyncClient) -> None:
@@ -431,9 +433,7 @@ async def test_a_session_is_useless_to_any_user_but_its_owner(client: AsyncClien
 
     # The binding is checked, not merely recorded: each owner still works.
     assert (await _run(client, alice_session, alice_doc, user_id=OWNER)).status_code == 200
-    assert (
-        await _run(client, mallory_session, mallory_doc, user_id=INTRUDER)
-    ).status_code == 200
+    assert (await _run(client, mallory_session, mallory_doc, user_id=INTRUDER)).status_code == 200
 
     # ... including via the header, which is the other way a session arrives.
     header_run = await _run(client, mallory_session, alice_doc, user_id=OWNER, use_header=True)
@@ -451,12 +451,8 @@ async def test_logout_cannot_destroy_another_users_session(client: AsyncClient) 
     alice_session = await _create_session(client, OWNER)
     alice_doc = await _upload(client, OWNER)
 
-    hostile = await client.delete(
-        f"/sessions/{alice_session}", params={"user_id": INTRUDER}
-    )
-    unknown = await client.delete(
-        f"/sessions/{uuid.uuid4().hex}", params={"user_id": INTRUDER}
-    )
+    hostile = await client.delete(f"/sessions/{alice_session}", params={"user_id": INTRUDER})
+    unknown = await client.delete(f"/sessions/{uuid.uuid4().hex}", params={"user_id": INTRUDER})
     assert hostile.status_code == unknown.status_code == 204
     assert hostile.content == unknown.content == b""
 
@@ -821,7 +817,9 @@ async def test_logout_pops_the_session_key_before_deleting_vault_rows(
     services.sessions.destroy = spy_session_destroy  # type: ignore[method-assign]
     services.vault.destroy = spy_vault_destroy  # type: ignore[method-assign]
     try:
-        assert (await client.delete(f"/sessions/{session_id}", params={"user_id": OWNER})).status_code == 204
+        assert (
+            await client.delete(f"/sessions/{session_id}", params={"user_id": OWNER})
+        ).status_code == 204
     finally:
         services.sessions.destroy = real_session_destroy  # type: ignore[method-assign]
         services.vault.destroy = real_vault_destroy  # type: ignore[method-assign]
@@ -889,7 +887,9 @@ async def test_audit_query_requires_a_scope_and_cannot_enumerate_sessions(
     assert by_run.status_code == 200
     assert by_run.json()["events"]
 
-    assert (await client.delete(f"/sessions/{session_id}", params={"user_id": OWNER})).status_code == 204
+    assert (
+        await client.delete(f"/sessions/{session_id}", params={"user_id": OWNER})
+    ).status_code == 204
     after_logout = await client.get("/audit", params={"session_id": session_id, "user_id": OWNER})
     assert after_logout.status_code == 200
     assert after_logout.json()["events"], "the demo prints the tail after destroying the session"
@@ -973,18 +973,16 @@ async def test_the_audit_log_is_not_a_credential_assembly_oracle(
     assert victim_session not in step1.text
     assert victim_doc not in step1.text
 
-    step2 = await client.get(
-        "/audit", params={"session_id": victim_session, "user_id": INTRUDER}
-    )
+    step2 = await client.get("/audit", params={"session_id": victim_session, "user_id": INTRUDER})
     assert step2.json()["events"] == [], "a session's events must not name its owner to a stranger"
     assert OWNER not in step2.text
 
     # Guessing the scope right is not enough, and neither is holding a live
     # session of one's own: the claim has to match the owner in the log.
     await _create_session(client, INTRUDER)
-    assert (
-        await client.get("/audit", params={"run_id": run_id, "user_id": INTRUDER})
-    ).json()["events"] == []
+    assert (await client.get("/audit", params={"run_id": run_id, "user_id": INTRUDER})).json()[
+        "events"
+    ] == []
 
     # Unreadable and non-existent are the same answer -- answering 403 to the
     # first would confirm the scope is real, which is the oracle the uniform
@@ -1020,9 +1018,7 @@ async def test_audit_verify_is_owner_scoped_and_gives_no_existence_oracle(
     doc_id = await _upload(client)
     assert (await _run(client, session_id, doc_id)).status_code == 200
 
-    owned = await client.get(
-        "/audit/verify", params={"session_id": session_id, "user_id": OWNER}
-    )
+    owned = await client.get("/audit/verify", params={"session_id": session_id, "user_id": OWNER})
     assert owned.status_code == 200
     assert owned.json()["valid"] is True
     assert owned.json()["length"] > 0
@@ -1092,9 +1088,9 @@ async def test_a_non_ascii_user_id_is_never_an_unhandled_500(client: AsyncClient
     assert (
         await client.get("/audit", params={"session_id": session_id, "user_id": accented})
     ).json()["events"], "the accented owner must still read their own trail"
-    assert (
-        await client.get("/audit", params={"session_id": session_id, "user_id": "é"})
-    ).json()["events"] == []
+    assert (await client.get("/audit", params={"session_id": session_id, "user_id": "é"})).json()[
+        "events"
+    ] == []
 
     # The owner's own logout still works, accent and all.
     assert (
@@ -1269,9 +1265,7 @@ def _copy_sources(copy_line: str) -> list[str]:
     the last position.
     """
     tokens = [
-        token.strip("[],\"'")
-        for token in copy_line.split()[1:]
-        if not token.startswith("--")
+        token.strip("[],\"'") for token in copy_line.split()[1:] if not token.startswith("--")
     ]
     return [(token.rstrip("/") or "/") for token in tokens[:-1]]
 
@@ -1356,9 +1350,7 @@ async def test_dockerfile_never_copies_the_working_tree_wholesale() -> None:
     # `data/` stays root-anchored on purpose, and this is the guard that stops a future
     # tidy-up sweeping it into `**/data/`: the gazetteers live under a nested data/ and
     # must still ship, or the detector loses every gazetteer-backed entity type.
-    assert not _dockerignored(
-        "secure_context_pipeline/detection/data/diagnoses.txt", dockerignore
-    )
+    assert not _dockerignored("secure_context_pipeline/detection/data/diagnoses.txt", dockerignore)
 
     # Nothing may bake a key into the image config either. Only the directives
     # that can actually put a value in a layer are searched -- ``ENV``, ``ARG``
@@ -1537,9 +1529,7 @@ async def test_the_demo_ui_sends_the_credentials_every_route_requires() -> None:
     table -- so the audit panel would just quietly stop working, which is exactly
     the sort of "still green, visibly broken" gap a live demo trips over.
     """
-    app_js = (REPO_ROOT / "secure_context_pipeline" / "ui" / "app.js").read_text(
-        encoding="utf-8"
-    )
+    app_js = (REPO_ROOT / "secure_context_pipeline" / "ui" / "app.js").read_text(encoding="utf-8")
     audit_call = app_js.split("'/audit?session_id='", 1)
     assert len(audit_call) == 2, "the UI must query the audit log"
     request = audit_call[1].split(";", 1)[0]
@@ -2614,9 +2604,7 @@ async def test_anonymous_durable_writes_are_bounded_and_the_body_is_never_read(
 
         # And a bogus-id DELETE -- no session, no credential, still a durable
         # audit write on the unmetered build -- is refused too.
-        deleted = await client.delete(
-            f"/sessions/{uuid.uuid4().hex}", params={"user_id": INTRUDER}
-        )
+        deleted = await client.delete(f"/sessions/{uuid.uuid4().hex}", params={"user_id": INTRUDER})
         assert deleted.status_code == 429, deleted.text
 
 
@@ -2635,9 +2623,7 @@ async def test_the_shipped_meters_are_pinned_to_absolute_numbers(app: FastAPI) -
     assert app_module.WRITE_BURST == 256, app_module.WRITE_BURST
     assert app_module.WRITE_REFILL_PER_SECOND == 8.0, app_module.WRITE_REFILL_PER_SECOND
     assert app_module.AUDIT_PROOF_BURST == 20, app_module.AUDIT_PROOF_BURST
-    assert app_module.AUDIT_PROOF_REFILL_PER_SECOND == 0.5, (
-        app_module.AUDIT_PROOF_REFILL_PER_SECOND
-    )
+    assert app_module.AUDIT_PROOF_REFILL_PER_SECOND == 0.5, app_module.AUDIT_PROOF_REFILL_PER_SECOND
     # The live app must actually be built from them.
     assert (limits.writes.capacity, limits.writes.refill_per_second) == (256, 8.0)
     assert (limits.audit_proofs.capacity, limits.audit_proofs.refill_per_second) == (20, 0.5)
@@ -2738,9 +2724,7 @@ async def test_resolving_an_audit_scope_costs_the_same_whether_the_run_exists(
         resolved = len(calls)
 
         calls.clear()
-        await app_module._resolve_audit_scope(
-            services, session_id=None, run_id=uuid.uuid4().hex
-        )
+        await app_module._resolve_audit_scope(services, session_id=None, run_id=uuid.uuid4().hex)
         absent = len(calls)
 
     assert resolved == absent == 2, (
@@ -2830,9 +2814,7 @@ async def test_the_dockerignore_matcher_agrees_with_a_real_docker_build() -> Non
     assert _dockerignored(".venv/lib/python3.11/site-packages/x.py", dockerignore)
     assert _dockerignored("audit.db", dockerignore)
     # Measured against the daemon: shipped.
-    assert not _dockerignored(
-        "secure_context_pipeline/detection/data/diagnoses.txt", dockerignore
-    )
+    assert not _dockerignored("secure_context_pipeline/detection/data/diagnoses.txt", dockerignore)
     assert not _dockerignored("entities.yaml", dockerignore)
     assert not _dockerignored("secure_context_pipeline/api/app.py", dockerignore)
 
@@ -2924,9 +2906,9 @@ async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image
             f"{relative} is required by entities.yaml and load_registry refuses to "
             f"start without it, but it is not on disk"
         )
-        assert any(
-            relative == source or relative.startswith(f"{source}/") for source in copied
-        ), f"no COPY in the Dockerfile brings {relative} into the image; copied={sorted(copied)}"
+        assert any(relative == source or relative.startswith(f"{source}/") for source in copied), (
+            f"no COPY in the Dockerfile brings {relative} into the image; copied={sorted(copied)}"
+        )
         assert not _dockerignored(relative, dockerignore), (
             f".dockerignore filters {relative} out of the build context, so the "
             f"container starts and immediately fails registry validation"

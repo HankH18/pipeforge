@@ -251,11 +251,11 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-2070 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
+2073 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
                              #   The skip is the real-network LLM smoke test.
                              #   Without node it is 35 skipped -- the 34 UI behaviour tests go
                              #   with it. See Path B above.
-                             #   2071 collected: 128 leakage - 5 bench - rest unit + integration
+                             #   2074 collected: 128 leakage - 5 bench - rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 98% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
@@ -285,6 +285,28 @@ checkable number is the one above.) The scope is stated rather than widened beca
 hits are the interesting residue: those tests are not exercising the enum the production path
 actually carries, which is a mild stub-blindness signal and a real next step rather than a
 one-line config change.
+
+**And the same question about the `ruff` line, which had a real hole in it until recently.**
+`ruff check .` is the *linter*. `ruff format` is the *formatter*, it is **not** in the gate, and
+`ruff format --check .` reports **25 files** that would be reformatted. That was cosmetic on its
+own; what made it a defect is that `pyproject.toml` disabled `E501` with the comment "line length
+handled by formatter" — so line length was enforced by the formatter, the formatter never ran,
+and the stated 100-column limit was enforced by nothing. There were **145** violations, four of
+them in the package.
+
+`E501` is now on, and the accounting is worth stating exactly because "we turned the rule on"
+can hide a blanket exemption. Of the 145: **33 lay outside the two files that carry generated
+document text, and all 33 are fixed** — most by a formatter pass scoped to just the offending
+files, six by hand. The remainder live in the two per-file exemptions, which are argued rather
+than blanket: `fixtures/*` (88 long lines) and `tests/test_detection.py` (7), whose long lines are
+**generated and annotated document text** — `<<NAME|Aurelio Santangelo>>  <<SSN|602 33 1194>>`,
+clinical notes, privileged memoranda. The detector is fed those strings verbatim, so wrapping one
+moves a span offset and changes what the recall table measures; they are also inside
+triple-quoted blocks, where `# noqa` cannot reach. Every other long line was fixed rather than
+exempted, and a planted 110-column line in `config.py` was confirmed to fail the gate, so the
+rule is enforced rather than merely configured. The remaining 25-file formatter divergence is
+left as a known, stated gap: reformatting the tree wholesale is a large cosmetic diff with no
+correctness content, and it is now the *only* thing `ruff` is not gating.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py`
@@ -1805,20 +1827,54 @@ the shared store never holds anything usable on its own.
   accepted residual by `test_a_correctly_hashed_tail_append_is_a_known_residual`, which asserts
   `verify_chain()` returns `True` and fails if that ever silently changes.
 
-  The practical shape of the gap is narrower than "the log is forgeable": an attacker who
-  cannot rewrite the whole chain still cannot **alter or remove** any record of what happened.
-  They can only **add** a record of something that did not. For an auditor asking "what did
-  this system do", events that are missing or edited are the dangerous ones, and those are the
-  ones that are covered.
-
   For the truncated tail specifically the cost is now four statements that must all land in
   step, and — the part that had been quietly missing — the evidence is **durable**: it used to
   expire on its own as soon as ordinary traffic reused the freed `seq` numbers, so an attacker
   needed only patience rather than a second statement. See the ladder in §5 Q5.
-  Closing it properly requires the verifier to hold something the application host does not:
-  an off-box append-only sink (S3 Object Lock, a WORM store, a managed audit service), or an
-  HMAC key held by the auditor rather than the writer. Both are production changes, and neither
-  is shipped here.
+
+  #### Which attacker the audit log stops, stated as tiers
+
+  "Tamper-evident" is not one property, and the useful question is *against whom*. Three tiers,
+  and the design answers them differently:
+
+  | | **T1 — has the DB**, not the app's secrets (stolen backup, mounted volume, compromised DB user) | **T2 — has the host** (env, process memory, DB writes) | **T3 — has deploy rights** (can change this code) |
+  |---|---|---|---|
+  | Alter or delete an existing event | **caught** | **caught** | not caught |
+  | Append a forged event at the tail | not caught | not caught | not caught |
+  | Rewrite the whole chain forward | **caught** — needs the whole log replaced in one consistent pass, which no partial write achieves | not caught | not caught |
+  | Stop events being written at all | n/a | not caught | not caught |
+
+  The single row that matters most is the first, and it is the one that holds: **an attacker who
+  cannot rewrite the entire chain cannot alter or remove any record of what happened.** They can
+  only *add* a record of something that did not. For an auditor asking "what did this system do",
+  missing and edited events are the dangerous ones, and those are covered at both T1 and T2.
+
+  What no in-process mechanism reaches is T2's append, and it is worth being exact about why,
+  because the obvious fix does not work. Keying the digest — HMAC instead of SHA-256 — moves T1's
+  row for append into "caught", since a backup thief cannot compute a valid tag. It does nothing
+  at T2, because the writer must hold the key in order to write, so the attacker who owns the host
+  owns the key. That is not a smaller version of the real fix; it is a different, narrower one,
+  and describing it as "the audit log is now tamper-proof" would be exactly the kind of overclaim
+  the rest of this document exists to avoid. It is not shipped for that reason: the tier it closes
+  overlaps heavily with the tier that already has `data/` and `.env`.
+
+  Closing T2 requires trust to live somewhere the writer is not, and there are two shapes of that:
+  an **off-box append-only sink** (S3 Object Lock, a WORM store, a managed audit service), or
+  **anchoring** — publishing the head hash periodically somewhere the app cannot rewrite, which
+  freezes everything before the last anchor and bounds forgery to the window since. Anchoring is
+  the cheaper idea and the one with nowhere to land here: this deployment is a single-host
+  `docker-compose`, and an anchor written next to the database is worth nothing, because it is the
+  same attacker and the same filesystem. Both are production changes; neither is shipped.
+
+  **If the off-box sink is ever adopted, the test that should fail first is
+  `test_no_release_survives_an_audit_write_that_failed_before_it`.** It pins, per component, that
+  no payload reaches the provider when the audit write that precedes it failed — measured event by
+  event, with `EGRESS_PASS` failing as `EgressBlockedError` because the gate refuses to release what
+  it could not record. A local SQLite write fails rarely; a network write fails routinely, and the
+  natural way to make a remote sink resilient is to wrap emits in the same `except Exception` the
+  *block* paths already use. That change would silently convert "refuses to release unaudited" into
+  "releases whenever the audit service is unavailable" — and it was verified that nothing else in
+  the suite notices: under that mutation 2,072 tests pass and only this one goes red.
 - Payload hashes prove *which* payload was sent but do not let anyone inspect *what* was sent.
   Retaining payloads would answer that — and would create exactly the sensitive-data store
   this system exists to avoid. That is a deliberate trade, not an oversight.

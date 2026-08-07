@@ -264,7 +264,9 @@ def test_token_re_hint_cannot_swallow_an_identifier() -> None:
         assert payload not in match.group(0), f"{length}-char run absorbed whole"
 
     # A hint we really do emit is still absorbed.
-    accepted = TOKEN_RE.search(format_surrogate("PHI", "MEDICATION", "2f4a1b3c", "oral-antidiabetic"))
+    accepted = TOKEN_RE.search(
+        format_surrogate("PHI", "MEDICATION", "2f4a1b3c", "oral-antidiabetic")
+    )
     assert accepted is not None
     assert accepted.group(4) == "oral-antidiabetic"
 

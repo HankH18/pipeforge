@@ -287,13 +287,13 @@ def load_registry(path: str | Path | None = None) -> EntityRegistry:
         # what made this one easy to miss.
         unknown = tuple(c for c in spec.only_in_doc_categories if c not in DOC_CATEGORIES)
         if unknown:
-            raise ConfigError(
-                reason="registry_unknown_doc_category", entity_type=spec.name[:64]
-            )
+            raise ConfigError(reason="registry_unknown_doc_category", entity_type=spec.name[:64])
         if spec.gazetteer and not (GAZETTEER_DIR / spec.gazetteer).is_file():
             raise ConfigError(reason="registry_gazetteer_missing", entity_type=spec.name[:64])
         if not spec.is_recognizer_backed:
-            raise ConfigError(reason="registry_entity_has_no_recognizer", entity_type=spec.name[:64])
+            raise ConfigError(
+                reason="registry_entity_has_no_recognizer", entity_type=spec.name[:64]
+            )
 
         entities[spec.name] = spec
 

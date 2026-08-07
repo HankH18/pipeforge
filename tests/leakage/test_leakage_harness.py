@@ -425,9 +425,7 @@ class CountingProvider:
         self.calls += 1
         self.last_system = system
         self.last_user = user
-        return await self._inner.complete_detailed(
-            system, user, model=model, timeout_s=timeout_s
-        )
+        return await self._inner.complete_detailed(system, user, model=model, timeout_s=timeout_s)
 
 
 # ---------------------------------------------------------------------------
@@ -900,10 +898,9 @@ def _unescape_json_unicode(text: str) -> str:
 
 #: Attributes every :class:`logging.LogRecord` carries. Anything outside this set
 #: arrived via ``extra=`` and is therefore *not* rendered into ``caplog.text``.
-_STANDARD_LOGRECORD_ATTRS: frozenset[str] = (
-    frozenset(vars(logging.LogRecord("n", 0, "p", 0, "m", None, None)))
-    | {"message", "asctime", "taskName"}
-)
+_STANDARD_LOGRECORD_ATTRS: frozenset[str] = frozenset(
+    vars(logging.LogRecord("n", 0, "p", 0, "m", None, None))
+) | {"message", "asctime", "taskName"}
 
 
 def log_haystack(caplog: pytest.LogCaptureFixture) -> str:
@@ -1022,9 +1019,7 @@ def find_in_bytes(originals: frozenset[str], haystack: bytes) -> list[str]:
     decoded = haystack.decode("utf-8", errors="replace")
     unescaped = _unescape_json_unicode(decoded)
     return sorted(
-        o
-        for o in originals
-        if occurs_as_a_unit(o, decoded) or occurs_as_a_unit(o, unescaped)
+        o for o in originals if occurs_as_a_unit(o, decoded) or occurs_as_a_unit(o, unescaped)
     )
 
 
@@ -1081,7 +1076,9 @@ def _gate_scan_hits(originals: frozenset[str], payload: str) -> int:
     return _reference_gate()._scan_originals(payload, originals)
 
 
-async def surrogate_map(harness: Harness, session_id: str, result: PipelineResult) -> dict[str, str]:
+async def surrogate_map(
+    harness: Harness, session_id: str, result: PipelineResult
+) -> dict[str, str]:
     """``surrogate -> original`` for everything this run issued.
 
     Read back out of the vault rather than carried along the run, so the map is
@@ -1267,9 +1264,7 @@ def test_the_failure_message_names_the_limb_and_never_the_value() -> None:
 
     # A value the byte limb found and the query view does not carry is labelled, not
     # silently rendered as an empty list.
-    assert describe_hits([name], "nothing to see here") == [
-        f"{mask(name)} via ['byte-limb-only']"
-    ]
+    assert describe_hits([name], "nothing to see here") == [f"{mask(name)} via ['byte-limb-only']"]
 
     # Section 16: the value never appears, in any of the three shapes.
     for rendered in (
@@ -1373,7 +1368,7 @@ def test_the_byte_limb_and_the_query_limb_of_the_audit_scan_see_different_things
     doing the other's job.
     """
     name = "Marguerite Vandenberg"
-    glued = b"sess-a1b2run-c3d4EGRESS_BLOCK" + name.encode() + b"deadbeef{\"count\":1}"
+    glued = b"sess-a1b2run-c3d4EGRESS_BLOCK" + name.encode() + b'deadbeef{"count":1}'
     quoted = json.dumps([{"entity_type": name, "detail": {"count": 1}}], ensure_ascii=False)
 
     assert name.encode() in glued, "premise: the value really is in the file, verbatim"
@@ -1646,9 +1641,9 @@ def test_a_partial_value_leak_is_outside_what_this_harness_claims() -> None:
 
     # The whole value is of course still caught, so this is a boundary and not a hole
     # in the primary claim.
-    assert find_in_text(
-        frozenset({original}), f"The client {original} signed the release."
-    ) == [original]
+    assert find_in_text(frozenset({original}), f"The client {original} signed the release.") == [
+        original
+    ]
 
 
 def test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims() -> None:
@@ -1702,9 +1697,9 @@ def test_a_value_glued_into_a_longer_word_is_outside_what_this_harness_claims() 
 
     # Separated by anything non-alphanumeric -- including our own output's ``]`` --
     # it is caught, which is the case the pipeline can actually produce.
-    assert find_in_text(
-        frozenset({original}), f"[PII_NAME_1a2b3c4d]{original} confirmed."
-    ) == [original]
+    assert find_in_text(frozenset({original}), f"[PII_NAME_1a2b3c4d]{original} confirmed.") == [
+        original
+    ]
 
 
 def test_the_scan_sees_a_combining_mark_spliced_into_a_value() -> None:
@@ -1809,9 +1804,7 @@ def test_the_scan_sees_an_identifier_glued_into_a_longer_run() -> None:
 
     # And the limb stays off values it is not for: a name has no digits.
     assert not _identifier_needles("Marguerite Vandenberg")
-    assert not find_in_text(
-        frozenset({"Marguerite Vandenberg"}), 'reviewer=Marguerite Vandenbergx'
-    )
+    assert not find_in_text(frozenset({"Marguerite Vandenberg"}), "reviewer=Marguerite Vandenbergx")
 
     # A six-digit run IS in scope for the gate, and is NOT in scope for this module.
     # That is the one place this file is deliberately narrower than the gate, and it
@@ -2091,9 +2084,7 @@ def _reference_occurs_as_a_unit(needle: str, haystack: str) -> bool:
     while start != -1:
         end = start + len(needle)
         left_ok = not needle[0].isalnum() or start == 0 or not haystack[start - 1].isalnum()
-        right_ok = (
-            not needle[-1].isalnum() or end == len(haystack) or not haystack[end].isalnum()
-        )
+        right_ok = not needle[-1].isalnum() or end == len(haystack) or not haystack[end].isalnum()
         if left_ok and right_ok:
             return True
         start = haystack.find(needle, start + 1)
@@ -2436,7 +2427,7 @@ _FORBIDDEN_MEMBERSHIP_SNIPPETS = (
     "in result.raw_llm_response",
     "in sent_payload",
     "in decoded",
-    ".encode(\"utf-8\") in haystack",
+    '.encode("utf-8") in haystack',
 )
 
 
@@ -2489,12 +2480,9 @@ def test_no_leak_comparison_in_this_module_bypasses_the_shared_rule() -> None:
     # cannot silently shrink again.
     skip: set[int] = set()
     for node in ast.walk(tree):
-        named_tuple = (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(t, ast.Name) and t.id == "_FORBIDDEN_MEMBERSHIP_SNIPPETS"
-                for t in node.targets
-            )
+        named_tuple = isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_FORBIDDEN_MEMBERSHIP_SNIPPETS"
+            for t in node.targets
         )
         this_test = (
             isinstance(node, ast.FunctionDef)
@@ -2713,9 +2701,7 @@ async def test_no_original_ever_leaves_the_process(
     # the real value under cover of being obfuscated, and every later check in
     # this test would happily pass. Compared on normalised forms, so a
     # case-mangled or re-spaced identity is caught too.
-    identity = sorted(
-        s for s, original in mapping.items() if normalize(s) == normalize(original)
-    )
+    identity = sorted(s for s, original in mapping.items() if normalize(s) == normalize(original))
     assert not identity, (
         f"run {index}: {len(identity)} surrogate(s) are identical to the value they "
         f"replace, so the value was never obfuscated at all: {[mask(v) for v in identity]}"
@@ -2852,9 +2838,7 @@ async def test_unknown_shape_value_blocks_egress_and_the_call_never_fires(
     document = generator.generate(SEED_BASE + RUNS, "financial") + PLANT_TEMPLATE.format(
         UNKNOWN_SHAPE_VALUE
     )
-    doc_id = await harness.store.put(
-        USER_ID, "planted.txt", document.encode("utf-8"), "financial"
-    )
+    doc_id = await harness.store.put(USER_ID, "planted.txt", document.encode("utf-8"), "financial")
     session_id, _expires_at = await harness.sessions.create("test-user")
 
     real_originals = harness.vault.originals_for_session
@@ -2869,9 +2853,7 @@ async def test_unknown_shape_value_blocks_egress_and_the_call_never_fires(
 
     calls_before = harness.provider.calls
     with pytest.raises(EgressBlockedError) as excinfo:
-        await harness.orchestrator.run(
-            session_id, USER_ID, doc_id, PROMPT, "tokenization"
-        )
+        await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
 
     error = excinfo.value
     assert error.detail["reason"] == "vault_original"

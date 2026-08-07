@@ -533,8 +533,11 @@ async def test_settlement_term_matches_the_amount_before_the_word(detector: Dete
 
 # (doc_id, doc_category, annotated text)
 RECALL_CORPUS: list[tuple[str, str | None, str]] = [
-# ---------------------------------------------------------------- medical
-("med_progress_note", "medical", """
+    # ---------------------------------------------------------------- medical
+    (
+        "med_progress_note",
+        "medical",
+        """
 Hospitalist Progress Note
 
 Patient: <<NAME|Marcus Delgado>>   DOB: <<DOB|04/18/1962>>   MRN: <<MRN|4471902>>
@@ -547,8 +550,12 @@ daily and <<MEDICATION|lisinopril>> 20 mg daily.
 
 Labs this morning: <<LAB_RESULT|creatinine of 1.8>>, <<LAB_RESULT|HbA1c 8.2>>.
 Reachable at <<PHONE|(415) 555-0182>> or <<EMAIL|m.delgado@example.com>>.
-"""),
-("med_discharge", "medical", """
+""",
+    ),
+    (
+        "med_discharge",
+        "medical",
+        """
 DISCHARGE SUMMARY
 
 Name: <<NAME|Priya Ramanathan>>
@@ -562,8 +569,12 @@ transitioned to oral <<MEDICATION|amoxicillin>> on day three. Discharge <<LAB_RE
 
 Follow-up has been arranged with her primary care physician Dr. <<NAME|Alan Whitfield>>.
 Questions may be directed to <<PHONE|206-555-0147>>.
-"""),
-("med_referral_letter", "medical", """
+""",
+    ),
+    (
+        "med_referral_letter",
+        "medical",
+        """
 Dear Dr. <<NAME|Chen>>,
 
 Thank you for seeing <<NAME|Robert Ellison>> in your clinic. His medical record number is
@@ -575,16 +586,24 @@ His social security number on file is <<SSN|412-88-7391>>. Please reach my offic
 
 Sincerely,
 Dr. <<NAME|Samuel Okafor>>
-"""),
-("med_nursing_note", "medical", """
+""",
+    ),
+    (
+        "med_nursing_note",
+        "medical",
+        """
 Nursing shift note. <<DATE|03/14/2024>> 22:15.
 
 Patient <<NAME|Yolanda Briggs>> (mrn <<MRN|6612045>>) rested comfortably. She reports her
 <<DIAGNOSIS|migraine>> has improved after <<MEDICATION|sumatriptan>> 50 mg. Blood glucose stable.
 Daughter <<NAME|Tanya Briggs>> called from <<PHONE|(312) 555-0198>> asking about visiting hours.
 Patient's d.o.b. is <<DOB|09/30/1948>>.
-"""),
-("med_telephone_encounter", "medical", """
+""",
+    ),
+    (
+        "med_telephone_encounter",
+        "medical",
+        """
 Telephone encounter documented by triage.
 
 Caller: <<NAME|Ethan Kowalski>>, DOB <<DOB|7/2/1990>>, chart MR # <<MRN|2201883>>.
@@ -592,16 +611,24 @@ He states his <<DIAGNOSIS|asthma>> is flaring and his rescue inhaler is empty. C
 prescriptions: <<MEDICATION|albuterol>>, <<MEDICATION|fluticasone>>. Callback number
 <<PHONE|503-555-0166>>. He also asked whether his insurance ID <<INSURANCE_ID|UHC44120933>>
 is still active.
-"""),
-("med_op_report", "medical", """
+""",
+    ),
+    (
+        "med_op_report",
+        "medical",
+        """
 Operative report.
 
 Surgeon: Dr. <<NAME|Helen Vasquez>>. Patient: <<NAME|Grant Sobieski>>, MRN MRN: <<MRN|7719204>>,
 date of surgery <<DATE|11/02/2023>>. Preoperative diagnosis <<DIAGNOSIS|appendicitis>>.
 Postoperative course uncomplicated. Discharged on <<MEDICATION|ibuprofen>> as needed.
 Patient date of birth <<DOB|1979-06-21>>.
-"""),
-("med_lab_followup", "medical", """
+""",
+    ),
+    (
+        "med_lab_followup",
+        "medical",
+        """
 Lab follow-up letter.
 
 <<NAME|Denise Achebe>> — record Medical Record No. <<MRN|4408812>> — your recent results are back.
@@ -609,8 +636,12 @@ Your <<LAB_RESULT|LDL is 162>> and your <<LAB_RESULT|A1C came back at 7.4>>, whi
 with <<DIAGNOSIS|type 2 diabetes>>. We would like to start <<MEDICATION|metformin>>.
 Please call <<PHONE|(602) 555-0121>> or write to <<EMAIL|labs@northside.example.org>>.
 Born on <<DOB|March 3, 1971>>.
-"""),
-("med_psych_intake", "medical", """
+""",
+    ),
+    (
+        "med_psych_intake",
+        "medical",
+        """
 Behavioral health intake.
 
 Client <<NAME|Aaron Whitlock>>, born <<DOB|12/08/1994>>, MRN MRN#<<MRN|5590231>>.
@@ -618,24 +649,36 @@ Reports symptoms consistent with <<DIAGNOSIS|major depressive disorder>> and
 <<DIAGNOSIS|generalized anxiety disorder>>. Trialed <<MEDICATION|sertraline>> 50 mg without
 benefit; now on <<MEDICATION|bupropion>>. Emergency contact <<NAME|Maria Whitlock>>,
 <<PHONE|(719) 555-0104>>. Email <<EMAIL|awhitlock@mailer.example>>.
-"""),
-("med_peds_note", "medical", """
+""",
+    ),
+    (
+        "med_peds_note",
+        "medical",
+        """
 Pediatric well-child visit on <<DATE|05/19/2024>>.
 
 Patient <<NAME|Sofia Marchetti>>, date of birth <<DOB|05/19/2019>>, MRN mrn: <<MRN|1120994>>.
 Mother <<NAME|Elena Marchetti>> reports intermittent <<DIAGNOSIS|eczema>>. Continue
 <<MEDICATION|hydrocortisone>> cream. Immunizations up to date. Contact <<PHONE|847-555-0173>>.
-"""),
-("med_oncology", "medical", """
+""",
+    ),
+    (
+        "med_oncology",
+        "medical",
+        """
 Oncology consult note.
 
 <<NAME|Harold Nkemdirim>>, MRN MRN <<MRN|9908123>>, DOB <<DOB|02/14/1955>>, referred for newly
 diagnosed <<DIAGNOSIS|breast cancer>>. He is also managed for <<DIAGNOSIS|hypothyroidism>>
 on <<MEDICATION|levothyroxine>>. Baseline <<LAB_RESULT|creatinine 0.9>>. SSN on the intake form
 was recorded as <<SSN|287-44-9012>>. Insurance <<INSURANCE_ID|AET1029384756>>.
-"""),
-# ---------------------------------------------------------------- legal
-("legal_memo", "legal", """
+""",
+    ),
+    # ---------------------------------------------------------------- legal
+    (
+        "legal_memo",
+        "legal",
+        """
 <<PRIVILEGED_MARKER|PRIVILEGED AND CONFIDENTIAL>> — <<PRIVILEGED_MARKER|ATTORNEY-CLIENT>> COMMUNICATION
 
 To: File
@@ -647,8 +690,12 @@ Re: <<CLIENT_IDENTITY|Angela Rosenthal>> v. Meridian Logistics, Case No. <<CASE_
 Opposing counsel is <<CLIENT_IDENTITY|Dev Ramaswamy>> of Halloran & Pike, reachable at
 <<EMAIL|dramaswamy@halloranpike.example>>. Our client's date of birth is <<DOB|08/09/1978>>
 and her direct line is <<PHONE|(646) 555-0129>>.
-"""),
-("legal_brief", "legal", """
+""",
+    ),
+    (
+        "legal_brief",
+        "legal",
+        """
 Plaintiff's opposition brief, filed in <<CASE_ID|1:23-cv-04567>>.
 
 The related matter, <<CASE_ID|22-CV-01188>>, was consolidated below.
@@ -657,8 +704,12 @@ March 4, 2022. <<CASE_STRATEGY|We recommend to move for partial summary judgment
 release issue>>.
 
 This document is <<PRIVILEGED_MARKER|work product>> and is not subject to disclosure.
-"""),
-("legal_engagement", "legal", """
+""",
+    ),
+    (
+        "legal_engagement",
+        "legal",
+        """
 Engagement letter.
 
 Dear Mr. <<CLIENT_IDENTITY|Okonkwo>>,
@@ -673,8 +724,12 @@ Please confirm receipt by email to <<EMAIL|billing@vantagelaw.example>> or by ph
 
 Very truly yours,
 <<CLIENT_IDENTITY|Naomi Vantage>>
-"""),
-("legal_deposition_summary", "legal", """
+""",
+    ),
+    (
+        "legal_deposition_summary",
+        "legal",
+        """
 Attorney <<PRIVILEGED_MARKER|work product>>.
 
 Deposition summary — <<CLIENT_IDENTITY|Terrence Vaughn>>, taken 09/12/2023.
@@ -685,8 +740,12 @@ therefore shift toward contributory negligence rather than notice>>. Related doc
 the cutoff>>.
 
 <<SETTLEMENT_TERM|settlement demand of $1,250,000>> remains outstanding.
-"""),
-("legal_settlement_letter", "legal", """
+""",
+    ),
+    (
+        "legal_settlement_letter",
+        "legal",
+        """
 <<PRIVILEGED_MARKER|Privileged & Confidential>>
 
 Re: <<CLIENT_IDENTITY|Bianca Ferreira>>, Case No. <<CASE_ID|4:21-cv-00877>>
@@ -696,8 +755,12 @@ Counsel,
 Our client will consider a <<SETTLEMENT_TERM|settlement in the amount of $475,000>>, inclusive of
 fees. <<CASE_STRATEGY|We are prepared to proceed to trial if that figure is not met>>.
 Ms. <<CLIENT_IDENTITY|Ferreira>> may be reached through this office at <<PHONE|305-555-0188>>.
-"""),
-("legal_client_intake", "legal", """
+""",
+    ),
+    (
+        "legal_client_intake",
+        "legal",
+        """
 New client intake form.
 
 Client name: <<CLIENT_IDENTITY|Gregory Halstead>>
@@ -708,8 +771,12 @@ Phone: <<PHONE|(770) 555-0192>>
 Matter: <<CASE_ID|1:24-cv-02201>>
 
 Retainer received; deposit to acct <<ACCOUNT_NUMBER|883012994571>>.
-"""),
-("legal_discovery_email", "legal", """
+""",
+    ),
+    (
+        "legal_discovery_email",
+        "legal",
+        """
 From: <<CLIENT_IDENTITY|Isabel Contreras>> <<<EMAIL|icontreras@vantagelaw.example>>>
 Subject: discovery status, Docket No. <<CASE_ID|5:23-cv-07781>>
 
@@ -717,9 +784,13 @@ Subject: discovery status, Docket No. <<CASE_ID|5:23-cv-07781>>
 
 <<CASE_STRATEGY|We plan to withhold the internal audit memo under the work-product doctrine>>.
 The consolidated action <<CASE_ID|21-CIV-04490>> is on the same schedule.
-"""),
-# ---------------------------------------------------------------- financial
-("fin_disclosure", "financial", """
+""",
+    ),
+    # ---------------------------------------------------------------- financial
+    (
+        "fin_disclosure",
+        "financial",
+        """
 Financial disclosure statement.
 
 Name: <<NAME|Rachel Osei>>
@@ -731,8 +802,12 @@ Primary checking Account No. <<ACCOUNT_NUMBER|100029384756>> held at Fifth Third
 Employer identification number <<TAX_ID|34-9182736>>.
 Transactions: deposit of <<AMOUNT|$12,400.00>> and a withdrawal of <<AMOUNT|$3,275.50>>.
 Contact <<EMAIL|rosei@example.net>> or <<PHONE|216-555-0139>>.
-"""),
-("fin_wire_instructions", "financial", """
+""",
+    ),
+    (
+        "fin_wire_instructions",
+        "financial",
+        """
 Wire instructions.
 
 Beneficiary: <<NAME|Thomas Iverson>>
@@ -741,40 +816,60 @@ Bank routing details on file.
 Payment amount <<AMOUNT|$88,000>>.
 Taxpayer ID <<TAX_ID|12-3456789>>.
 Questions to <<EMAIL|treasury@bridgeport.example>> or <<PHONE|(917) 555-0107>>.
-"""),
-("fin_loan_application", "financial", """
+""",
+    ),
+    (
+        "fin_loan_application",
+        "financial",
+        """
 Consumer loan application.
 
 Applicant <<NAME|Camila Restrepo>>, born <<DOB|1991-09-17>>, SSN <<SSN|647-30-2219>>.
 Existing balance on account #<<ACCOUNT_NUMBER|77012938465>> is <<AMOUNT|$4,912.33>>.
 Requested loan amount <<AMOUNT|$25,000>>. Home address is in <<ADDRESS|Denver>>.
 Best contact: <<PHONE|720-555-0116>>, <<EMAIL|c.restrepo@mailbox.example>>.
-"""),
-("fin_kyc_review", "financial", """
+""",
+    ),
+    (
+        "fin_kyc_review",
+        "financial",
+        """
 KYC periodic review.
 
 Customer <<NAME|Abdul Rahman Siddiqui>> (DOB <<DOB|03/22/1975>>) maintains
 a/c <<ACCOUNT_NUMBER|9910238475612>>. Source of funds documented. Tax identification number
 <<TAX_ID|91-2837465>>. A transaction of <<AMOUNT|$150,000>> on the account was reviewed and cleared.
 Registered email <<EMAIL|ar.siddiqui@corpmail.example>>.
-"""),
-("fin_statement", "financial", """
+""",
+    ),
+    (
+        "fin_statement",
+        "financial",
+        """
 Monthly statement summary.
 
 Account holder <<NAME|Lucia Bertrand>>. Account Number: <<ACCOUNT_NUMBER|3300192847>>.
 Opening balance <<AMOUNT|$18,220.14>>. Total deposits <<AMOUNT|$6,400.00>>. Total withdrawals
 <<AMOUNT|$2,118.76>>. Closing balance <<AMOUNT|$22,501.38>>.
 For disputes call <<PHONE|(888) 555-0164>> or email <<EMAIL|disputes@bankcorp.example>>.
-"""),
-("fin_fraud_report", "financial", """
+""",
+    ),
+    (
+        "fin_fraud_report",
+        "financial",
+        """
 Suspected fraud report.
 
 Reporting customer: <<NAME|Devon Pritchard>>, SSN <<SSN|713-55-0290>>, DOB <<DOB|10/05/1966>>.
 Unauthorized payment of <<AMOUNT|$2,340.00>> posted to acct: <<ACCOUNT_NUMBER|4400882913>>.
 Customer lives in <<ADDRESS|Sacramento>>. Callback <<PHONE|916-555-0122>>.
-"""),
-# ---------------------------------------------------------------- general
-("gen_hr_email", None, """
+""",
+    ),
+    # ---------------------------------------------------------------- general
+    (
+        "gen_hr_email",
+        None,
+        """
 From: <<NAME|Karen Iwuchukwu>> <<<EMAIL|k.iwuchukwu@company.example>>>
 Subject: onboarding paperwork
 
@@ -782,16 +877,24 @@ Hi team — our new analyst <<NAME|Peter Nakagawa>> starts Monday. His personal 
 <<EMAIL|pnakagawa@personal.example>> and his mobile is <<PHONE|(408) 555-0198>>. Payroll needs his
 social security number, which he provided as <<SSN|559-44-1023>>. He was born
 on <<DOB|14 July 1996>>.
-"""),
-("gen_support_ticket", None, """
+""",
+    ),
+    (
+        "gen_support_ticket",
+        None,
+        """
 Support ticket #44210.
 
 Reporter <<NAME|Alice Bergström>> writes: "I cannot log in." Account email is
 <<EMAIL|alice.bergstrom@customer.example>>; phone on file is <<PHONE|+1 (206) 555-0143>>.
 Verified identity using the last four of her SSN, full value <<SSN|602-19-4471>>, and her
 date of birth <<DOB|1988-12-01>>.
-"""),
-("gen_insurance_letter", None, """
+""",
+    ),
+    (
+        "gen_insurance_letter",
+        None,
+        """
 Dear Mr. <<NAME|Hollingsworth>>,
 
 We have received your claim. Your policy member ID is <<INSURANCE_ID|CIG9081726354>> and the claim
@@ -799,8 +902,12 @@ was filed under <<CASE_ID|24-ARB-00912>>. Please confirm your birth date, which 
 <<DOB|02/29/1988>>.
 
 Reply to <<EMAIL|claims@assurity.example>> or call <<PHONE|1-800-555-0177>>.
-"""),
-("gen_background_check", None, """
+""",
+    ),
+    (
+        "gen_background_check",
+        None,
+        """
 Background check request.
 
 Subject: <<NAME|Malik Johnson>>
@@ -809,15 +916,23 @@ DOB: <<DOB|07/19/1992>>
 Last known residence: street address in <<ADDRESS|Baltimore>>
 Contact phone <<PHONE|410-555-0159>>, email <<EMAIL|mjohnson@webmail.example>>.
 Prior civil matter: <<CASE_ID|1:19-cv-00443>>.
-"""),
-("gen_school_record", None, """
+""",
+    ),
+    (
+        "gen_school_record",
+        None,
+        """
 Student services memo.
 
 <<NAME|Hannah Lindqvist>>, born birth date <<DOB|04/02/2006>>, requires accommodations.
 Guardian <<NAME|Erik Lindqvist>> can be reached at <<PHONE|(651) 555-0134>> or
 <<EMAIL|erik.lindqvist@family.example>>. The guardian's SSN <<SSN|423-70-1188>> is on the FAFSA.
-"""),
-("adv_wrapped_strategy", "legal", """
+""",
+    ),
+    (
+        "adv_wrapped_strategy",
+        "legal",
+        """
 <<PRIVILEGED_MARKER|Privileged and Confidential>>
 
 Re: <<CLIENT_IDENTITY|Nadia Petrova>>, Case No. <<CASE_ID|1:24-cv-08812>>
@@ -827,8 +942,12 @@ Daubert ruling, then reassess based on how the court treats their causation expe
 
 <<CASE_STRATEGY|We are prepared to concede the notice issue if it buys us a favourable
 scheduling order on the remaining claims>>.
-"""),
-("adv_table_layout", "medical", """
+""",
+    ),
+    (
+        "adv_table_layout",
+        "medical",
+        """
 Patient summary table
 
 Field                  Value
@@ -841,16 +960,24 @@ Secondary diagnosis    <<DIAGNOSIS|chronic kidney disease>>
 Current medication     <<MEDICATION|warfarin>>
 Telephone              <<PHONE|(504) 555-0126>>
 Email                  <<EMAIL|o.adeyemi@patientportal.internal>>
-"""),
-("adv_internal_domains", None, """
+""",
+    ),
+    (
+        "adv_internal_domains",
+        None,
+        """
 Directory extract for the migration.
 
 Primary contact <<NAME|Ingrid Solberg>> at <<EMAIL|i.solberg@northwind.internal>>.
 Backup contact <<NAME|Devendra Iyer>> at <<EMAIL|d.iyer@northwind.corp>>.
 On-call pager routes to <<EMAIL|oncall@ops.northwind.local>> and the escalation line is
 <<PHONE|(425) 555-0111>>.
-"""),
-("adv_ocr_spacing", "medical", """
+""",
+    ),
+    (
+        "adv_ocr_spacing",
+        "medical",
+        """
 Scanned chart page, OCR output.
 
 PATIENT   <<NAME|Bernard Kowalczyk>>
@@ -860,58 +987,90 @@ MRN       <<MRN|7740219>>
 Assessment: worsening <<DIAGNOSIS|copd>> with superimposed <<DIAGNOSIS|bronchitis>>.
 Plan: continue <<MEDICATION|tiotropium>>, add <<MEDICATION|prednisone>> taper.
 Lab: <<LAB_RESULT|eGFR 48>>. Contact daughter at <<PHONE|814-555-0170>>.
-"""),
-("adv_prose_ids", "legal", """
+""",
+    ),
+    (
+        "adv_prose_ids",
+        "legal",
+        """
 The dispute arises out of the consolidated proceeding filed in <<CASE_ID|3:21-cv-00994>>,
 which the parties have referred to throughout as the Harborline matter. Counsel for
 <<CLIENT_IDENTITY|Vincent Aldridge>> entered an appearance shortly after the transfer order.
 A parallel arbitration, <<CASE_ID|21-AAA-00317>>, remains stayed.
-"""),
-("adv_narrative_med", "medical", """
+""",
+    ),
+    (
+        "adv_narrative_med",
+        "medical",
+        """
 The patient, <<NAME|Farida Haddad>>, is a pleasant woman born <<DOB|3 August 1977>> who was last
 seen in clinic six weeks ago. Her chart, medical record number <<MRN|6690135>>, documents a long
 history of <<DIAGNOSIS|rheumatoid arthritis>> managed with <<MEDICATION|methotrexate>>. She now
 reports new <<DIAGNOSIS|shortness of breath>> on exertion. We checked labs and her
 <<LAB_RESULT|creatinine was 1.1>>, unchanged. She can be reached at <<PHONE|(913) 555-0148>>.
-"""),
-("adv_multi_mention", "medical", """
+""",
+    ),
+    (
+        "adv_multi_mention",
+        "medical",
+        """
 Consult note.
 
 <<NAME|Gustavo Marroquin>> was seen today. Mr. <<NAME|Marroquin>> reports adherence to therapy.
 Since <<NAME|Gustavo Marroquin>> was last admitted, his <<DIAGNOSIS|congestive heart failure>>
 has been stable. MRN <<MRN|4419023>>, DOB <<DOB|12/25/1959>>.
-"""),
-("adv_financial_prose", "financial", """
+""",
+    ),
+    (
+        "adv_financial_prose",
+        "financial",
+        """
 The customer, <<NAME|Wendy Castellanos>>, called to dispute a charge. She confirmed her account,
 ending in the digits we hold on file as account no. <<ACCOUNT_NUMBER|6602119384>>, and verified
 her identity with her social security number <<SSN|305-77-1194>> and her date of birth,
 <<DOB|1 May 1984>>. The disputed transaction was for <<AMOUNT|$1,899.99>>. Her employer's tax
 identification number, <<TAX_ID|45-6677889>>, was also on the file.
-"""),
-("adv_uppercase_ids", "legal", """
+""",
+    ),
+    (
+        "adv_uppercase_ids",
+        "legal",
+        """
 CAPTION: <<CLIENT_IDENTITY|Marcus Thorne>> v. Delta Freight
 DOCKET: <<CASE_ID|2:23-CV-05510>>
 RELATED: <<CASE_ID|20-CIV-00881>>
 
 <<PRIVILEGED_MARKER|ATTORNEY WORK PRODUCT>> — internal only.
-"""),
-("adv_dob_formats", None, """
+""",
+    ),
+    (
+        "adv_dob_formats",
+        None,
+        """
 Verification worksheet.
 
 Applicant one: <<NAME|Georgina Ashworth>>, born <<DOB|Jan 9, 1973>>.
 Applicant two: <<NAME|Hiroshi Tanaka>>, D.O.B. <<DOB|1980/04/23>>.
 Applicant three: <<NAME|Nkechi Obi>>, birthdate <<DOB|17-Feb-1995>>.
 All three provided a phone number: <<PHONE|(559) 555-0181>>.
-"""),
-("adv_email_variants", None, """
+""",
+    ),
+    (
+        "adv_email_variants",
+        None,
+        """
 Contact sheet.
 
 <<EMAIL|first.last@acme-holdings.com>>, <<EMAIL|j_smith+billing@sub.domain.co.uk>>,
 <<EMAIL|helpdesk@it.university.edu>>, <<EMAIL|noreply@service.example.internal>>,
 <<EMAIL|Q.Zhao@lab.research.local>>.
 Escalation to <<NAME|Priya Venkatesan>> on <<PHONE|+1 (781) 555-0190>>.
-"""),
-("adv_legal_paraphrase", "legal", """
+""",
+    ),
+    (
+        "adv_legal_paraphrase",
+        "legal",
+        """
 <<PRIVILEGED_MARKER|Privileged & Confidential>>
 
 Memorandum regarding <<CASE_ID|1:22-cv-06623>>.
@@ -919,16 +1078,24 @@ Memorandum regarding <<CASE_ID|1:22-cv-06623>>.
 <<CASE_STRATEGY|Our negotiation approach should be to open low and signal flexibility only after
 their expert report lands>>. Client <<CLIENT_IDENTITY|Sandra Beauchamp>> has authorised a
 <<SETTLEMENT_TERM|settlement range up to $900,000>>.
-"""),
-("adv_mixed_category", "financial", """
+""",
+    ),
+    (
+        "adv_mixed_category",
+        "financial",
+        """
 Account maintenance request.
 
 Customer <<NAME|Elias Mwangi>>, SSN <<SSN|221-09-4478>>, DOB <<DOB|08/31/1970>>.
 Close acct # <<ACCOUNT_NUMBER|8801293746>> and transfer the balance of <<AMOUNT|$47,300.12>> to
 the new account. Mailing address is in <<ADDRESS|Portland>>. Confirmation to
 <<EMAIL|e.mwangi@banking.internal>> and <<PHONE|503-555-0136>>.
-"""),
-("adv_dense_clinical", "medical", """
+""",
+    ),
+    (
+        "adv_dense_clinical",
+        "medical",
+        """
 Problem list and reconciliation for <<NAME|Josefina Alvarez>>, MRN <<MRN|3301827>>, DOB
 <<DOB|06/11/1946>>.
 
@@ -937,107 +1104,180 @@ Problems: <<DIAGNOSIS|hypertension>>, <<DIAGNOSIS|osteoarthritis>>, <<DIAGNOSIS|
 Medications: <<MEDICATION|lisinopril>>, <<MEDICATION|atorvastatin>>, <<MEDICATION|omeprazole>>,
 <<MEDICATION|acetaminophen>>, <<MEDICATION|ferrous sulfate>>.
 Recent labs: <<LAB_RESULT|HDL 38>>, <<LAB_RESULT|LDL 141>>.
-"""),
+""",
+    ),
 ]
 
 # Same registers, zero sensitive values: ground truth is "return nothing".
 CLEAN_CORPUS: list[tuple[str, str | None, str]] = [
-("clean_med_policy", "medical", """
+    (
+        "clean_med_policy",
+        "medical",
+        """
 Infection control policy update. All clinical staff must perform hand hygiene before and after
 every patient encounter. Alcohol-based rub is preferred unless hands are visibly soiled, in which
 case soap and water are required. Isolation carts should be restocked each shift. Questions about
 this policy go to the unit educator during regular rounds.
-"""),
-("clean_med_quality", "medical", """
+""",
+    ),
+    (
+        "clean_med_quality",
+        "medical",
+        """
 Quality committee minutes. The committee reviewed readmission trends over the last twelve hours of
 reporting and agreed the sample was too small to act on. A revised dashboard will be circulated
 before the next meeting. Staffing ratios were discussed briefly. No action items were assigned.
-"""),
-("clean_legal_policy", "legal", """
+""",
+    ),
+    (
+        "clean_legal_policy",
+        "legal",
+        """
 Firm document retention policy. Matter files are retained for seven years after closure. Physical
 storage requests must be submitted through the records team. Electronic files are backed up nightly
 and replicated offsite. Departing personnel must return all firm property before their final day.
-"""),
-("clean_legal_cle", "legal", """
+""",
+    ),
+    (
+        "clean_legal_cle",
+        "legal",
+        """
 Continuing legal education announcement. This session covers recent developments in appellate
 procedure, including changes to briefing schedules and word limits. Attendance qualifies for one
 credit hour. Registration closes at the end of the month.
-"""),
-("clean_fin_policy", "financial", """
+""",
+    ),
+    (
+        "clean_fin_policy",
+        "financial",
+        """
 Expense reimbursement policy. Receipts must be submitted within thirty days of the expense being
 incurred. Meals during travel are reimbursed at the standard per diem rate. Personal expenses are
 never reimbursable. Approvals route to the department manager and then to finance.
-"""),
-("clean_fin_notice", "financial", """
+""",
+    ),
+    (
+        "clean_fin_notice",
+        "financial",
+        """
 Service notice. Online banking will be unavailable during a scheduled maintenance window this
 weekend. Card transactions and cash withdrawals are unaffected. We apologise for the inconvenience
 and appreciate your patience while we complete the upgrade.
-"""),
-("clean_gen_readme", None, """
+""",
+    ),
+    (
+        "clean_gen_readme",
+        None,
+        """
 Deployment runbook. Build the container, run the migration step, then restart the workers one at a
 time. Confirm the health endpoint returns success before moving to the next worker. Roll back by
 redeploying the previous tag. Alerting is configured to page on sustained error rates.
-"""),
-("clean_gen_newsletter", None, """
+""",
+    ),
+    (
+        "clean_gen_newsletter",
+        None,
+        """
 Company newsletter. The engineering team shipped a redesigned onboarding flow this quarter and
 reduced median setup time considerably. Support volume dropped as a result. Next quarter the focus
 moves to reliability work and paying down accumulated technical debt.
-"""),
-("clean_med_consent", "medical", """
+""",
+    ),
+    (
+        "clean_med_consent",
+        "medical",
+        """
 General consent for treatment. By signing this form the person named on the accompanying cover
 sheet consents to routine examination and to treatment considered necessary by the attending
 clinician. Consent may be withdrawn at any time. Separate consent is required for procedures
 involving sedation.
-"""),
-("clean_legal_engagement_terms", "legal", """
+""",
+    ),
+    (
+        "clean_legal_engagement_terms",
+        "legal",
+        """
 Standard terms of engagement. Fees are billed monthly in arrears. Disbursements are charged at
 cost. Either party may terminate the engagement on written notice. Any dispute about a bill is
 handled first through the firm's internal review process before any external process is started.
-"""),
-("clean_fin_disclosure_boiler", "financial", """
+""",
+    ),
+    (
+        "clean_fin_disclosure_boiler",
+        "financial",
+        """
 Important information about this document. Past performance is not a reliable indicator of future
 results. The value of an investment may fall as well as rise. This material is provided for
 information only and does not constitute advice. Please read the full terms before deciding.
-"""),
-("clean_gen_meeting", None, """
+""",
+    ),
+    (
+        "clean_gen_meeting",
+        None,
+        """
 Weekly sync notes. We agreed to move the review meeting later in the week so that more of the team
 can attend. The recruiting update was deferred. Everyone should update the shared tracker before
 Friday so the summary is accurate.
-"""),
-("clean_med_handoff", "medical", """
+""",
+    ),
+    (
+        "clean_med_handoff",
+        "medical",
+        """
 Shift handoff checklist. Confirm that every infusion pump has been checked against the order set and
 that alarm limits are set for the unit standard. Escalate any device fault to biomedical engineering
 rather than silencing it. Restock the code cart and sign the log. Report equipment shortages to the
 charge nurse before the end of the shift so the next team is not left short.
-"""),
-("clean_med_education", "medical", """
+""",
+    ),
+    (
+        "clean_med_education",
+        "medical",
+        """
 Patient education handout on managing a long-term condition. Take your medicines at the same time
 each day. Keep a written record of how you feel so you can discuss it at your next visit. Regular
 walking helps most people. Call the clinic if symptoms get worse rather than waiting for the next
 appointment.
-"""),
-("clean_legal_discovery_protocol", "legal", """
+""",
+    ),
+    (
+        "clean_legal_discovery_protocol",
+        "legal",
+        """
 Electronic discovery protocol. The parties will exchange documents in a searchable format with load
 files. Metadata fields agreed between the parties will be produced where available. Privileged
 material will be logged rather than produced. Disputes about scope will be raised with the court
 only after a meet and confer.
-"""),
-("clean_legal_ethics", "legal", """
+""",
+    ),
+    (
+        "clean_legal_ethics",
+        "legal",
+        """
 Conflicts checking procedure. Every prospective engagement is run through the conflicts system
 before any substantive discussion. Where a conflict appears, the matter is referred for review. No
 work may be opened until clearance is recorded. Waivers require written consent and partner
 approval.
-"""),
-("clean_fin_controls", "financial", """
+""",
+    ),
+    (
+        "clean_fin_controls",
+        "financial",
+        """
 Internal controls summary. Segregation of duties applies to all payment initiation and approval.
 Reconciliations are performed monthly and reviewed independently. Exceptions are tracked to closure.
 Access rights are recertified twice a year and removed promptly when someone changes role.
-"""),
-("clean_gen_incident", None, """
+""",
+    ),
+    (
+        "clean_gen_incident",
+        None,
+        """
 Incident review. The outage began when a configuration change was rolled out without the usual
 staged deployment. The change was reverted and service recovered. Follow-up work covers making the
 staged rollout mandatory and improving the alert that should have caught this sooner.
-"""),
+""",
+    ),
 ]
 
 _ANNOTATION = re.compile(r"<<([A-Z_]+)\|(.*?)>>", re.DOTALL)
@@ -1128,9 +1368,7 @@ class Residual(NamedTuple):
     def describe(self) -> str:
         if not self.covered:
             return f"{self.doc_id}: {self.entity_type} {self.value!r} not covered"
-        return (
-            f"{self.doc_id}: {self.entity_type} {self.value!r} labelled {list(self.labels)}"
-        )
+        return f"{self.doc_id}: {self.entity_type} {self.value!r} labelled {list(self.labels)}"
 
 
 async def measure_coverage(
@@ -1194,9 +1432,7 @@ def format_recall_table(tally: dict[str, list[int]]) -> str:
     lines = [f"{'ENTITY':<20}{'N':>5}{'COVERED':>9}{'TYPED':>8}"]
     for entity_type in sorted(tally):
         covered, typed, total = tally[entity_type]
-        lines.append(
-            f"{entity_type:<20}{total:>5}{covered / total:>8.0%}{typed / total:>8.0%}"
-        )
+        lines.append(f"{entity_type:<20}{total:>5}{covered / total:>8.0%}{typed / total:>8.0%}")
     total = sum(row[2] for row in tally.values())
     covered = sum(row[0] for row in tally.values())
     typed = sum(row[1] for row in tally.values())
@@ -1372,8 +1608,11 @@ async def test_over_detection_on_realistic_prose_stays_bounded(detector: Detecto
 # Reproduce with:  pytest tests/test_detection.py -k held_out -s
 
 HELD_OUT_CORPUS: list[tuple[str, str | None, str]] = [
-# ---------------------------------------------------------------- medical
-("ho_radiology", "medical", """
+    # ---------------------------------------------------------------- medical
+    (
+        "ho_radiology",
+        "medical",
+        """
 RADIOLOGY REPORT — CT ABDOMEN/PELVIS WITH CONTRAST
 
 Patient ID <<MRN|8814027>>        Accession 2024-CT-88140
@@ -1387,8 +1626,12 @@ No free fluid. Known <<DIAGNOSIS|cirrhosis>> is again noted with a nodular conto
 IMPRESSION: Indeterminate hepatic lesion; recommend MRI. Renal function adequate,
 <<LAB_RESULT|creatinine 1.0>>. Results phoned to the ordering clinician at
 <<PHONE|312.555.0164>>.
-"""),
-("ho_pathology", "medical", """
+""",
+    ),
+    (
+        "ho_pathology",
+        "medical",
+        """
 SURGICAL PATHOLOGY REPORT
 
 Chart No. <<MRN|2207731>>. Specimen received from <<NAME|Ingeborg Vasquez-Lund>>,
@@ -1400,8 +1643,12 @@ Final diagnosis: <<DIAGNOSIS|breast cancer>>, ER positive.
 The patient also carries a diagnosis of <<DIAGNOSIS|osteoporosis>> and takes
 <<MEDICATION|alendronate>> weekly. Please direct queries to the laboratory,
 <<EMAIL|histology@path.regionalhealth.internal>>, or <<PHONE|+44 20 7946 0958>>.
-"""),
-("ho_pharmacy_pa", "medical", """
+""",
+    ),
+    (
+        "ho_pharmacy_pa",
+        "medical",
+        """
 PHARMACY PRIOR AUTHORIZATION REQUEST — FAX COVER
 
 Member <<NAME|Terrance O'Loughlin>>          Member ID <<INSURANCE_ID|AETNA4412093>>
@@ -1414,8 +1661,12 @@ Requested drug: <<MEDICATION|insulin glargine>>. Prior therapy with
 
 Prescriber fax <<PHONE|(415) 555-0193>>; prescriber e-mail
 <<EMAIL|rx.desk@clinic-network.corp>>.
-"""),
-("ho_eob", "medical", """
+""",
+    ),
+    (
+        "ho_eob",
+        "medical",
+        """
 EXPLANATION OF BENEFITS — THIS IS NOT A BILL
 
 Subscriber: <<NAME|Rosalind Achterberg>>
@@ -1425,8 +1676,12 @@ Service date <<DATE|02-14-2024>>
 Charge submitted <<AMOUNT|$1,842.00>>. Plan allowance $912.30. You may owe $184.20.
 Claim questions: <<PHONE|1 (800) 555-0122>>, or write to
 <<EMAIL|member.services@payerco.example>>.
-"""),
-("ho_trial_ae", "medical", """
+""",
+    ),
+    (
+        "ho_trial_ae",
+        "medical",
+        """
 CLINICAL TRIAL — SERIOUS ADVERSE EVENT NARRATIVE
 
 Subject initials H.T.  Subject record <<MRN|4402198>>.
@@ -1439,8 +1694,12 @@ Study drug was withheld. Concomitant medication at the time included
 <<LAB_RESULT|WBC of 12.4>> on admission.
 
 Investigator contact <<PHONE|617-555-0128>> / <<EMAIL|pi.office@trialsite.local>>.
-"""),
-("ho_pt_progress", "medical", """
+""",
+    ),
+    (
+        "ho_pt_progress",
+        "medical",
+        """
 PHYSICAL THERAPY PROGRESS NOTE
 
 Pt: <<NAME|Anneliese van der Berg>> | mrn# <<MRN|7712340>> | dob <<DOB|12/4/1981>>
@@ -1450,8 +1709,12 @@ Objective: knee flexion 118 degrees. Continues <<MEDICATION|naproxen>> as needed
 Plan: two visits weekly for four weeks.
 
 Home number on file: <<PHONE|206 555 0175>>.
-"""),
-("ho_immunization", "medical", """
+""",
+    ),
+    (
+        "ho_immunization",
+        "medical",
+        """
 IMMUNIZATION RECORD EXPORT
 
 name,dob,mrn,vaccine,date
@@ -1460,8 +1723,12 @@ name,dob,mrn,vaccine,date
 
 Guardian e-mail: <<EMAIL|okonjo.family+records@mailhost.example>>
 Guardian phone: <<PHONE|(773) 555-0119>>
-"""),
-("ho_pt_visit", "medical", """
+""",
+    ),
+    (
+        "ho_pt_visit",
+        "medical",
+        """
 Physical therapy -- visit 4 of 12
 
 Client <<NAME|Dorothy Vaneck>> arrived on time and reports her
@@ -1473,8 +1740,12 @@ Plan: continue twice weekly for four more weeks, then reassess.
 
 Billing reference: chart <<MRN|5518044>>. Insurance on file is member
 <<INSURANCE_ID|AET88120334>>. Patient was born <<DOB|09.14.1958>>.
-"""),
-("ho_prior_auth_appeal", "medical", """
+""",
+    ),
+    (
+        "ho_prior_auth_appeal",
+        "medical",
+        """
 Re: Adverse determination -- request for reconsideration
 
 To whom it may concern,
@@ -1489,8 +1760,12 @@ escalation, and her chart number is <<MRN|4419307>>.
 
 I can be reached directly at <<EMAIL|k.morrisey@grovehealth.example>> should you require
 additional records before the appeal deadline.
-"""),
-("ho_ems_run", "medical", """
+""",
+    ),
+    (
+        "ho_ems_run",
+        "medical",
+        """
 EMS RUN SHEET -- UNIT 12
 
 DISP 0347. ARR 0356. PT: <<NAME|Rudolph Steinmetz>>, M, DOB <<DOB|3/9/62>>.
@@ -1499,8 +1774,12 @@ MEDS: <<MEDICATION|tiotropium>>, <<MEDICATION|apixaban>>.
 CC: increasing <<DIAGNOSIS|shortness of breath>> since the evening meal.
 TX: oxygen via non-rebreather, <<MEDICATION|albuterol>> nebuliser en route.
 Receiving facility chart MRN <<MRN|7702914>>. Spouse notified at <<PHONE|619-555-0128>>.
-"""),
-("ho_telehealth_chat", "medical", """
+""",
+    ),
+    (
+        "ho_telehealth_chat",
+        "medical",
+        """
 Telehealth session transcript
 
 [10:02] Clinician: Good morning, am I speaking with <<NAME|Beatrice Solano>>?
@@ -1514,8 +1793,12 @@ Telehealth session transcript
 [10:05] Patient: Yes, but it isn't helping much this week.
 [10:07] Clinician: Understood. Is <<PHONE|(801) 555-0169>> still the best number for you?
 [10:07] Patient: That's right.
-"""),
-("ho_portal_message", "medical", """
+""",
+    ),
+    (
+        "ho_portal_message",
+        "medical",
+        """
 Secure message -- from your care team
 
 Hello <<NAME|Terrence Boudreaux>>,
@@ -1529,8 +1812,12 @@ If anything looks wrong on your chart -- it should list record <<MRN|3308871>> a
 birth date of <<DOB|02-28-1974>> -- please tell the front desk when you next visit.
 
 Reply here or write to <<EMAIL|carecoordination@stmarks.internal>>.
-"""),
-("ho_hospice_plan", "medical", """
+""",
+    ),
+    (
+        "ho_hospice_plan",
+        "medical",
+        """
 Hospice plan of care -- interdisciplinary team review
 
 * Patient: <<NAME|Grace Okorie>>, record <<MRN|6612977>>
@@ -1540,8 +1827,12 @@ Hospice plan of care -- interdisciplinary team review
 * Comfort medications: <<MEDICATION|morphine>> concentrate, <<MEDICATION|lorazepam>>
 * Primary caregiver: her daughter, <<NAME|Charlotte Okorie>>, cell <<PHONE|443-555-0192>>
 * Caregiver email for the visit calendar: <<EMAIL|c.okorie@familymail.example>>
-"""),
-("ho_dental_note", "medical", """
+""",
+    ),
+    (
+        "ho_dental_note",
+        "medical",
+        """
 Dental chart entry.
 
 Patient <<NAME|Steven Halvorsen>> presented for recall prophylaxis. Health history was
@@ -1550,9 +1841,13 @@ and also takes <<MEDICATION|lisinopril>> daily. Blood pressure taken in the chai
 
 Radiographs: four bitewings. No new caries. Periodontal charting stable.
 Chart number <<MRN|2214880>>. Patient's mobile is <<PHONE|(505) 555-0175>>.
-"""),
-# ------------------------------------------------------------------ legal
-("ho_arbitration_award", "legal", """
+""",
+    ),
+    # ------------------------------------------------------------------ legal
+    (
+        "ho_arbitration_award",
+        "legal",
+        """
 FINAL AWARD OF THE ARBITRATOR
 
 In the matter of <<CLIENT_IDENTITY|Rowan Delacroix-Meyer>> and Sundial Freight LLC,
@@ -1563,8 +1858,12 @@ Having considered the evidence, the arbitrator awards claimant
 
 <<PRIVILEGED_MARKER|Attorney Work Product>> — the panel's deliberation notes are
 not part of this award.
-"""),
-("ho_subpoena", "legal", """
+""",
+    ),
+    (
+        "ho_subpoena",
+        "legal",
+        """
 SUBPOENA DUCES TECUM
 
 To: Custodian of Records
@@ -1576,8 +1875,12 @@ the above individual on or before <<DATE|03/28/2025>>.
 
 Service copy to <<EMAIL|records@courtservices.example>> and by telephone
 confirmation to <<PHONE|202-555-0146>>.
-"""),
-("ho_transcript", "legal", """
+""",
+    ),
+    (
+        "ho_transcript",
+        "legal",
+        """
 EXCERPT OF PROCEEDINGS — VOLUME II
 
 THE COURT: We are on the record in <<CASE_ID|2:24-cv-09931>>.
@@ -1586,8 +1889,12 @@ THE COURT: And your client is present?
 MR. ABERNATHY: <<CLIENT_IDENTITY|Yusuf Abdi-Rahman>> is seated at counsel table.
 THE COURT: Very well. <<CASE_STRATEGY|We intend to move to bifurcate liability
 from damages before the pretrial conference>>, counsel indicated in the joint report.
-"""),
-("ho_retainer_invoice", "legal", """
+""",
+    ),
+    (
+        "ho_retainer_invoice",
+        "legal",
+        """
 STATEMENT OF ACCOUNT — LEGAL SERVICES
 
 Bill to: <<CLIENT_IDENTITY|Margarethe Solheim>>
@@ -1600,8 +1907,12 @@ Professional fees this period <<AMOUNT|$18,750.00>>. Trust balance applied
 <<EMAIL|billing@solheimlaw.internal>>.
 
 Taxpayer identification number for our firm is <<TAX_ID|27-4419283>>.
-"""),
-("ho_cease_desist", "legal", """
+""",
+    ),
+    (
+        "ho_cease_desist",
+        "legal",
+        """
 <<PRIVILEGED_MARKER|PRIVILEGED & CONFIDENTIAL>>
 
 Dear Sir or Madam,
@@ -1613,8 +1924,12 @@ of the month>>.
 
 Related proceeding: <<CASE_ID|24-CIV-00771>>. Please respond to
 <<EMAIL|litigation@brandcounsel.example>> or <<PHONE|(628) 555-0187>>.
-"""),
-("ho_docketing_notice", "legal", """
+""",
+    ),
+    (
+        "ho_docketing_notice",
+        "legal",
+        """
 DOCKETING NOTICE
 
 The clerk has assigned <<CASE_ID|5:25-cr-00042>> to Judge Alvarez.
@@ -1622,8 +1937,12 @@ Counsel of record for the defendant is <<CLIENT_IDENTITY|Nnamdi Eze>>, whose dat
 birth appears in the sealed exhibit as <<DOB|1990/02/09>>.
 A settlement conference is set. <<SETTLEMENT_TERM|A settlement of $75,000 was
 discussed off the record>>.
-"""),
-("ho_will", "legal", """
+""",
+    ),
+    (
+        "ho_will",
+        "legal",
+        """
 LAST WILL AND TESTAMENT
 
 I, <<CLIENT_IDENTITY|Cornelius Ashby>>, being of sound mind, do hereby revoke all former
@@ -1640,8 +1959,12 @@ number <<CASE_ID|2:24-pr-00318>>, and whose taxpayer identification number is
 
 Executed this day in the presence of the witnesses named below.
 Witness contact: <<PHONE|(843) 555-0181>>.
-"""),
-("ho_closing_statement", "legal", """
+""",
+    ),
+    (
+        "ho_closing_statement",
+        "legal",
+        """
 SETTLEMENT STATEMENT -- REAL PROPERTY CLOSING
 
 Buyer: <<CLIENT_IDENTITY|Margaret Lindholm>>
@@ -1655,8 +1978,12 @@ and the file has been closed.
 Buyer's counsel may be reached at <<EMAIL|mlindholm@harborcounsel.example>> or on
 <<PHONE|(360) 555-0154>>. The buyer's date of birth, taken for title purposes, is
 <<DOB|1979/05/02>>.
-"""),
-("ho_parenting_plan", "legal", """
+""",
+    ),
+    (
+        "ho_parenting_plan",
+        "legal",
+        """
 PARENTING PLAN AND PARENTING TIME SCHEDULE
 
 The parties, <<CLIENT_IDENTITY|Delphine Marchetti>> and <<CLIENT_IDENTITY|Stefan Reyes>>,
@@ -1669,8 +1996,12 @@ agree as follows.
 
 Case number <<CASE_ID|4:23-dr-00250>>. The mediator's email is
 <<EMAIL|mediation@bitterrootadr.example>>.
-"""),
-("ho_expert_invoice", "legal", """
+""",
+    ),
+    (
+        "ho_expert_invoice",
+        "legal",
+        """
 INVOICE FOR EXPERT SERVICES
 
 Bill to: counsel of record, matter <<CASE_ID|5:22-cv-04471>>.
@@ -1681,9 +2012,13 @@ Services rendered: record review, 6.5 hours; deposition preparation, 3.0 hours.
 
 Remit by ACH to account number <<ACCOUNT_NUMBER|1102938475>>. Questions to
 <<EMAIL|billing@ballingerconsulting.example>> or <<PHONE|(650) 555-0119>>.
-"""),
-# -------------------------------------------------------------- financial
-("ho_invoice", "financial", """
+""",
+    ),
+    # -------------------------------------------------------------- financial
+    (
+        "ho_invoice",
+        "financial",
+        """
 COMMERCIAL INVOICE 88-2044
 
 Bill to: <<NAME|Ferdinand Oyelaran>>
@@ -1695,8 +2030,12 @@ Subtotal <<AMOUNT|$34,200.00>>. Freight <<AMOUNT|$1,150.00>>. Total due
 
 Accounts payable questions: <<EMAIL|ap@oyelaran-imports.corp>>,
 <<PHONE|+1-312-555-0138>>.
-"""),
-("ho_collections", "financial", """
+""",
+    ),
+    (
+        "ho_collections",
+        "financial",
+        """
 NOTICE OF DELINQUENCY
 
 <<NAME|Consuelo Ibarra-Nunez>>
@@ -1708,8 +2047,12 @@ social security number as <<SSN|530 41 8827>> and your date of birth as
 <<DOB|18-Mar-1979>> for identification purposes.
 
 Call <<PHONE|888.555.0154>> or e-mail <<EMAIL|collections@recoverypartners.example>>.
-"""),
-("ho_mortgage_payoff", "financial", """
+""",
+    ),
+    (
+        "ho_mortgage_payoff",
+        "financial",
+        """
 MORTGAGE PAYOFF STATEMENT
 
 Borrower: <<NAME|Bartholomew Achterberg>>
@@ -1721,8 +2064,12 @@ Principal balance <<AMOUNT|$214,880.42>>. Per diem interest $23.14. Good through
 verification at <<PHONE|(918) 555-0102>>.
 
 Borrower taxpayer id <<TAX_ID|44-8827193>>.
-"""),
-("ho_brokerage_confirm", "financial", """
+""",
+    ),
+    (
+        "ho_brokerage_confirm",
+        "financial",
+        """
 TRADE CONFIRMATION
 
 Registered owner <<NAME|Xiulan Zhao>>
@@ -1733,8 +2080,12 @@ Bought 400 shares at a principal amount of <<AMOUNT|$18,004.00>>; commission
 
 Statements are delivered to <<EMAIL|x.zhao@investormail.local>>. Service line
 <<PHONE|(646) 555-0173>>.
-"""),
-("ho_payroll_register", "financial", """
+""",
+    ),
+    (
+        "ho_payroll_register",
+        "financial",
+        """
 PAYROLL REGISTER — PERIOD ENDING <<DATE|03/15/2025>>
 
 Employee                 SSN               Net pay      Direct deposit
@@ -1743,8 +2094,12 @@ Employee                 SSN               Net pay      Direct deposit
 
 Employer identification number <<TAX_ID|59-1102847>>. Payroll questions to
 <<EMAIL|payroll@company-hq.internal>>.
-"""),
-("ho_tax_notice", "financial", """
+""",
+    ),
+    (
+        "ho_tax_notice",
+        "financial",
+        """
 NOTICE OF PROPOSED ASSESSMENT
 
 Taxpayer: <<NAME|Grigore Enescu>>
@@ -1756,8 +2111,12 @@ be made from your bank account <<ACCOUNT_NUMBER|880194728310>>.
 
 If you disagree, write to <<EMAIL|appeals@revenueoffice.example>> or telephone
 <<PHONE|1-877-555-0161>>.
-"""),
-("ho_card_dispute", "financial", """
+""",
+    ),
+    (
+        "ho_card_dispute",
+        "financial",
+        """
 CARDHOLDER DISPUTE FORM
 
 Cardholder <<NAME|Marguerite N'Diaye>>, date of birth <<DOB|4 Oct 1993>>, resides in
@@ -1768,8 +2127,12 @@ Disputed transaction of <<AMOUNT|$1,204.55>> posted to account
 transaction was not authorised.
 
 Callback <<PHONE|401-555-0130>>; e-mail <<EMAIL|m.ndiaye@personalbox.example>>.
-"""),
-("ho_collections_letter", "financial", """
+""",
+    ),
+    (
+        "ho_collections_letter",
+        "financial",
+        """
 NOTICE OF DELINQUENCY
 
 Dear <<NAME|Marisol Cabrera>>,
@@ -1783,8 +2146,12 @@ We hold your social security number as <<SSN|318-46-2207>> and your date of birt
 
 To arrange payment, call <<PHONE|(844) 555-0193>> or write to
 <<EMAIL|resolutions@pinnaclerecovery.example>>.
-"""),
-("ho_tax_cover", "financial", """
+""",
+    ),
+    (
+        "ho_tax_cover",
+        "financial",
+        """
 Transmittal letter -- individual return
 
 Enclosed please find the completed return for <<NAME|Ingrid Haugland>>, prepared from the
@@ -1796,8 +2163,12 @@ a/c <<ACCOUNT_NUMBER|8801927364>> you designated on the signature page.
 
 Please sign where indicated and return by email to <<EMAIL|returns@meridiantax.example>>.
 Our office line is <<PHONE|(612) 555-0102>>.
-"""),
-("ho_mortgage_servicing", "financial", """
+""",
+    ),
+    (
+        "ho_mortgage_servicing",
+        "financial",
+        """
 IMPORTANT NOTICE ABOUT YOUR LOAN
 
 The servicing of your mortgage is transferring to a new servicer.
@@ -1810,8 +2181,12 @@ Nothing else about your loan changes. Your payment, currently <<AMOUNT|$1,942.18
 month, stays exactly the same, and no action is required from you.
 
 Questions? Call <<PHONE|1-877-555-0112>> or email <<EMAIL|transfers@atlasloan.internal>>.
-"""),
-("ho_adjuster_note", "financial", """
+""",
+    ),
+    (
+        "ho_adjuster_note",
+        "financial",
+        """
 Claim file note -- adjuster entry.
 
 Insured <<NAME|Bartholomew Reed>>. DOB <<DOB|05/07/1977>>. SSN on file
@@ -1822,8 +2197,12 @@ Estimate written for <<AMOUNT|$8,940.55>>. Payment to be issued to the mortgagee
 insured jointly, deposited to account no. <<ACCOUNT_NUMBER|2200194837>>.
 
 Insured cell <<PHONE|(210) 555-0187>>. Email on file <<EMAIL|b.reed@webmail.example>>.
-"""),
-("ho_payroll_dispute", "financial", """
+""",
+    ),
+    (
+        "ho_payroll_dispute",
+        "financial",
+        """
 Payroll adjustment request
 
 Employee: <<NAME|Susan Torkelsen>>
@@ -1837,8 +2216,12 @@ been reversed.
 Corrected net pay of <<AMOUNT|$2,884.31>> will be released on the next cycle.
 Employee contact: <<PHONE|503-555-0141>>, <<EMAIL|s.torkelsen@company.internal>>.
 Employer identification number <<TAX_ID|93-1102847>>.
-"""),
-("ho_dunning_invoice", "financial", """
+""",
+    ),
+    (
+        "ho_dunning_invoice",
+        "financial",
+        """
 STATEMENT OF ACCOUNT -- 60 DAYS PAST DUE
 
 Customer <<NAME|Prosper Adeyinka>> owes a balance of <<AMOUNT|$27,510.00>> against
@@ -1849,9 +2232,13 @@ been received. A payment plan is available on request.
 
 Our tax identification number for your records is <<TAX_ID|41-9928374>>.
 Accounts receivable: <<EMAIL|ar@northgateindustrial.example>>, <<PHONE|(414) 555-0125>>.
-"""),
-# ---------------------------------------------------------------- general
-("ho_chat_log", None, """
+""",
+    ),
+    # ---------------------------------------------------------------- general
+    (
+        "ho_chat_log",
+        None,
+        """
 #support-escalations
 
 09:14  <<NAME|Priyanka Raghunathan>>: customer can't log in, verified last 4 of ssn
@@ -1859,21 +2246,33 @@ Accounts receivable: <<EMAIL|ar@northgateindustrial.example>>, <<PHONE|(414) 555
 09:15  <<NAME|Priyanka Raghunathan>>: <<SSN|385-22-9014>>, dob <<DOB|11/06/1987>>
 09:16  <<NAME|Tomas Bergqvist>>: found them, mail is <<EMAIL|k.svensson@clientdomain.lan>>
 09:17  <<NAME|Priyanka Raghunathan>>: phone on file <<PHONE|(415) 555-0109>>, calling now
-"""),
-("ho_voicemail_ext", None, """
+""",
+    ),
+    (
+        "ho_voicemail_ext",
+        None,
+        """
 VOICEMAIL TRANSCRIPTION — EXTENSION 4402
 
 "Hi, this is <<NAME|Eamonn Fitzgerald>> returning your call. You can reach me back on
 <<PHONE|503 555 0141>> any time today. My date of birth is <<DOB|Feb 3, 1975>> if you
 need to verify, and my e-mail is <<EMAIL|e.fitzgerald@homedomain.internal>>.
 Thanks, bye."
-"""),
-("ho_csv_export", None, """
+""",
+    ),
+    (
+        "ho_csv_export",
+        None,
+        """
 customer_id,full_name,email,phone,ssn,dob
 44120,<<NAME|Solveig Haraldsen>>,<<EMAIL|s.haraldsen@nordicmail.example>>,<<PHONE|+47 21 08 44 12>>,<<SSN|221-55-0084>>,<<DOB|1994-07-19>>
 44121,<<NAME|Rajesh Ramachandran>>,<<EMAIL|r.ramachandran@corp.intranet>>,<<PHONE|(972) 555-0166>>,<<SSN|609-14-3372>>,<<DOB|1982-01-05>>
-"""),
-("ho_json_payload", None, """
+""",
+    ),
+    (
+        "ho_json_payload",
+        None,
+        """
 {
   "applicant": {
     "name": "<<NAME|Zainab Al-Mansouri>>",
@@ -1884,8 +2283,12 @@ customer_id,full_name,email,phone,ssn,dob
   },
   "reference_case": "<<CASE_ID|1:24-cv-03310>>"
 }
-"""),
-("ho_cv", None, """
+""",
+    ),
+    (
+        "ho_cv",
+        None,
+        """
 CURRICULUM VITAE
 
 <<NAME|Oluwadamilare Adebayo-Fischer>>
@@ -1897,8 +2300,12 @@ Fifteen years in supply-chain analytics. Authorised to work without sponsorship.
 PERSONAL
 Date of birth: <<DOB|29 September 1979>>. Reference number for the background check
 was <<CASE_ID|1:22-cv-00551>>.
-"""),
-("ho_visa_letter", None, """
+""",
+    ),
+    (
+        "ho_visa_letter",
+        None,
+        """
 LETTER OF EMPLOYMENT VERIFICATION FOR VISA PURPOSES
 
 To whom it may concern,
@@ -1910,8 +2317,12 @@ Her social security number on our records is <<SSN|315-77-2048>> and she can be
 contacted at <<EMAIL|minh.chau@employer.corp>> or <<PHONE|+84 28 3555 0128>>.
 
 Human resources: <<PHONE|(206) 555-0117>>.
-"""),
-("ho_university_record", None, """
+""",
+    ),
+    (
+        "ho_university_record",
+        None,
+        """
 OFFICE OF THE REGISTRAR — ENROLMENT VERIFICATION
 
 Student: <<NAME|Cathal Ó Briain>>
@@ -1921,8 +2332,12 @@ Date of birth: <<DOB|22-11-2003>>
 The above named is enrolled full time for the current term. The student's social
 security number, <<SSN|498-31-7720>>, is retained on the financial-aid file, and a
 guardian may be reached at <<PHONE|614.555.0198>>.
-"""),
-("ho_hr_investigation", None, """
+""",
+    ),
+    (
+        "ho_hr_investigation",
+        None,
+        """
 CONFIDENTIAL HR INVESTIGATION MEMORANDUM
 
 Complainant: <<NAME|Ravindra Balasubramanian>>
@@ -1934,8 +2349,12 @@ personal contact details are <<EMAIL|r.bala@personal.lan>> and
 <<DIAGNOSIS|migraine>> which the complainant says was aggravated.
 
 No further identifying information is recorded in this memorandum.
-"""),
-("ho_slack_thread", None, """
+""",
+    ),
+    (
+        "ho_slack_thread",
+        None,
+        """
 #ops-escalations
 
 <<NAME|Tobias Wrenfield>>  9:14 AM
@@ -1953,8 +2372,12 @@ found them, the legacy record id is <<MRN|4471023>> which is odd for this tenant
 
 <<NAME|Tobias Wrenfield>>  9:18 AM
 ok escalating now
-"""),
-("ho_conference_reg", None, """
+""",
+    ),
+    (
+        "ho_conference_reg",
+        None,
+        """
 Registration confirmation -- Annual Symposium
 
 Attendee: <<NAME|Laura Bertolucci>>
@@ -1966,8 +2389,12 @@ Your registration has been received and a receipt has been sent to the address a
 If your badge shows the wrong name, please reply before the cutoff date. Accessibility
 requests may mention a relevant condition; this attendee disclosed
 <<DIAGNOSIS|multiple sclerosis>> and asked for seating near an exit.
-"""),
-("ho_vet_record", None, """
+""",
+    ),
+    (
+        "ho_vet_record",
+        None,
+        """
 Veterinary visit summary
 
 Owner: <<NAME|Fiona Shaughnessy>>
@@ -1980,8 +2407,12 @@ have the same condition.
 
 Bloodwork was sent to the outside laboratory. The balance was settled on the card held
 against account <<ACCOUNT_NUMBER|5580291837>>.
-"""),
-("ho_alumni_note", None, """
+""",
+    ),
+    (
+        "ho_alumni_note",
+        None,
+        """
 Class notes
 
 <<NAME|Gwendolyn Pryce>> writes in from abroad to say she has finally retired after
@@ -1991,8 +2422,12 @@ reached at <<EMAIL|gwen.pryce@alumnimail.example>>.
 Meanwhile <<NAME|Howard Park>>, born <<DOB|November 2, 1961>>, has taken up long distance
 cycling and reports covering three thousand miles this year. His new number is
 <<PHONE|(608) 555-0198>>.
-"""),
-("ho_it_escalation", None, """
+""",
+    ),
+    (
+        "ho_it_escalation",
+        None,
+        """
 Priority 1 escalation -- identity verification service
 
 Impact: password resets are failing for a subset of tenants.
@@ -2005,8 +2440,12 @@ customer social security number, <<SSN|657-21-9948>>, and that customer's date o
 <<DOB|1990-04-15>>. The ticket has since been restricted.
 
 Vendor case reference <<CASE_ID|24-SUP-00931>>.
-"""),
-("ho_survey_freetext", None, """
+""",
+    ),
+    (
+        "ho_survey_freetext",
+        None,
+        """
 Patient experience survey -- free text responses
 
 "The nurse who saw me, <<NAME|Kenneth Osei>>, was excellent. I have
@@ -2017,8 +2456,12 @@ Patient experience survey -- free text responses
 
 "Billing sent my statement to the wrong address. My email is
 <<EMAIL|d.osullivan@homemail.example>> and it has been for years."
-"""),
-("ho_incident_narrative", None, """
+""",
+    ),
+    (
+        "ho_incident_narrative",
+        None,
+        """
 INCIDENT NARRATIVE
 
 On the date in question the reporting party, <<NAME|Katherine Volkonsky>>, stated that
@@ -2031,115 +2474,188 @@ identification number <<TAX_ID|82-1937465>>.
 
 The reporting party's email for follow up is <<EMAIL|k.volkonsky@mailbox.example>>.
 A related civil matter, <<CASE_ID|3:25-cv-00218>>, is already on file.
-"""),
-("ho_voicemail_callback", None, """
+""",
+    ),
+    (
+        "ho_voicemail_callback",
+        None,
+        """
 Voicemail transcription (automated, low confidence)
 
 "Hi, um, this is <<NAME|Rosalind Kavanagh>> calling back about the paperwork. Uh, you
 asked for my social, it is <<SSN|205-63-8814>>, and I was born <<DOB|8/16/1993>>. You can
 get me at <<PHONE|(937) 555-0158>> most days, or on my email which is
 <<EMAIL|r.kavanagh@personalmail.example>>. Thanks, bye."
-"""),
+""",
+    ),
 ]
 
 # Held-out entity-free prose in the same new registers: ground truth is "return nothing".
 HELD_OUT_CLEAN_CORPUS: list[tuple[str, str | None, str]] = [
-("hoc_rad_protocol", "medical", """
+    (
+        "hoc_rad_protocol",
+        "medical",
+        """
 Contrast protocol standard. Screening for renal impairment is performed before every
 contrast-enhanced study. Where screening is not possible the study proceeds without
 contrast unless the clinical question requires otherwise. Scanner calibration is
 verified at the start of each working day.
-"""),
-("hoc_lab_qc", "medical", """
+""",
+    ),
+    (
+        "hoc_lab_qc",
+        "medical",
+        """
 Laboratory quality control summary. Control material is run at the start of every
 shift and after any instrument maintenance. Out-of-range controls require repeat
 testing before patient samples are released. Reagent lots are recorded in the
 instrument log rather than on paper.
-"""),
-("hoc_pt_gym", "medical", """
+""",
+    ),
+    (
+        "hoc_pt_gym",
+        "medical",
+        """
 Gym safety notice for the therapy suite. Wipe down equipment between users. Report any
 frayed resistance band to the lead therapist so that it can be replaced. Do not leave
 weights on the floor between sessions. The emergency pull cord is tested weekly.
-"""),
-("hoc_bereavement", "medical", """
+""",
+    ),
+    (
+        "hoc_bereavement",
+        "medical",
+        """
 Bereavement support is offered to families for thirteen months following a death. Groups
 meet twice monthly and are open to anyone who has been served by the agency. Attendance is
 voluntary and there is no charge. Individual counselling can be arranged where a group is
 not the right fit.
-"""),
-("hoc_arb_rules", "legal", """
+""",
+    ),
+    (
+        "hoc_arb_rules",
+        "legal",
+        """
 Arbitration rules, article twelve. The tribunal shall determine the procedure subject
 to the parties agreeing otherwise in writing. Hearings are private unless the parties
 agree to admit observers. The tribunal may proceed in the absence of a party that
 fails to appear without showing sufficient cause.
-"""),
-("hoc_court_notice", "legal", """
+""",
+    ),
+    (
+        "hoc_court_notice",
+        "legal",
+        """
 General notice to the bar. Filings submitted after four in the afternoon are entered
 on the following business day. Paper courtesy copies are no longer accepted for
 routine motions. Counsel should consult the standing orders before noticing any
 hearing.
-"""),
-("hoc_third_party_requests", "legal", """
+""",
+    ),
+    (
+        "hoc_third_party_requests",
+        "legal",
+        """
 Guidance for responding to third party requests. Route every request to the records team
 on the day it arrives. Do not produce anything before the response date has been
 calendared and the scope confirmed. Where a request appears overbroad, prepare objections
 rather than producing first and objecting later.
-"""),
-("hoc_closing_checklist", "legal", """
+""",
+    ),
+    (
+        "hoc_closing_checklist",
+        "legal",
+        """
 Pre closing checklist. Confirm the title commitment has been updated. Confirm the payoff
 figures are current through the anticipated funding date. Confirm the wire instructions
 were verified by telephone using a number obtained independently rather than one supplied
 in an email.
-"""),
-("hoc_ap_policy", "financial", """
+""",
+    ),
+    (
+        "hoc_ap_policy",
+        "financial",
+        """
 Accounts payable policy. Invoices are matched against a purchase order and a receipt
 before payment is scheduled. Payment runs occur twice a month. Any invoice without a
 matching purchase order is returned to the requesting department rather than held.
-"""),
-("hoc_aml_training", "financial", """
+""",
+    ),
+    (
+        "hoc_aml_training",
+        "financial",
+        """
 Anti-money-laundering refresher training. All staff complete the module annually.
 Escalation is through the nominated officer and not through line management. Records
 of training completion are retained for the period required by the regulator.
-"""),
-("hoc_escrow_policy", "financial", """
+""",
+    ),
+    (
+        "hoc_escrow_policy",
+        "financial",
+        """
 Escrow analysis is performed annually. Where a shortage is identified it may be spread
 over the following twelve months or paid as a lump sum at the borrower's election. A
 surplus above the threshold is refunded. Analyses are mailed at least thirty days before
 the new payment takes effect.
-"""),
-("hoc_collections_standards", "financial", """
+""",
+    ),
+    (
+        "hoc_collections_standards",
+        "financial",
+        """
 Collection call standards. Calls may not be placed before eight in the morning or after
 nine at night in the consumer's own time zone. A consumer who states in writing that they
 refuse to pay must not be contacted further except as the statute permits. Every call is
 recorded and reviewed on a sample basis.
-"""),
-("hoc_it_runbook", None, """
+""",
+    ),
+    (
+        "hoc_it_runbook",
+        None,
+        """
 Certificate rotation runbook. Generate the new key material, stage it alongside the
 existing certificate, then cut over during the maintenance window. Verify the chain
 from an external network before removing the old certificate. Roll back by restoring
 the previous bundle.
-"""),
-("hoc_office_notice", None, """
+""",
+    ),
+    (
+        "hoc_office_notice",
+        None,
+        """
 Building notice. The lifts in the south tower will be out of service while the
 controllers are replaced. Please use the stairs or the north tower lifts. Deliveries
 should be routed to the loading bay entrance for the duration of the works.
-"""),
-("hoc_voicemail_greeting", None, """
+""",
+    ),
+    (
+        "hoc_voicemail_greeting",
+        None,
+        """
 "You have reached our main line. Our offices are open on weekdays. Please listen carefully
 as our options have changed. To repeat this message, remain on the line. Otherwise, leave
 a message after the tone and someone will return your call on the next business day."
-"""),
-("hoc_slack_standup", None, """
+""",
+    ),
+    (
+        "hoc_slack_standup",
+        None,
+        """
 standup thread -- yesterday: finished the migration dry run and wrote up the rollback
 steps. today: pairing on the flaky integration test, then reviewing the deploy checklist.
 blockers: none, though the staging environment was slow again this morning.
-"""),
-("hoc_conference_cfp", None, """
+""",
+    ),
+    (
+        "hoc_conference_cfp",
+        None,
+        """
 Call for proposals. Submissions should describe work that has not been presented
 elsewhere. Sessions run forty minutes including questions. Reviewers score on relevance,
 originality and clarity. Notification is sent to every submitter whether or not the
 proposal is accepted.
-"""),
+""",
+    ),
 ]
 
 # Measured on the held-out corpus, not on the tuned one, and not adjusted afterwards.
@@ -2482,20 +2998,86 @@ async def test_held_out_incidental_masks_are_exactly_the_documented_ones(
 # (doc_id, doc_category, text, entity_type, the value that must be covered)
 DEV_IDENTIFIER_POSITIVES: list[tuple[str, str | None, str, str, str]] = [
     ("dev_rec_hash", "medical", "Intake desk: Rec # 552140 pulled for the visit.", "MRN", "552140"),
-    ("dev_file_no", "medical", "Attach the imaging to file no. 9081774 before Friday.", "MRN", "9081774"),
-    ("dev_patient_number", "medical", "Patient number 4471902 was merged with a duplicate.", "MRN", "4471902"),
-    ("dev_chart_ident", "medical", "chart ident 7788190 -- transcription pending.", "MRN", "7788190"),
-    ("dev_subject_hash", "medical", "Subject # 2019447 withdrew consent at week six.", "MRN", "2019447"),
+    (
+        "dev_file_no",
+        "medical",
+        "Attach the imaging to file no. 9081774 before Friday.",
+        "MRN",
+        "9081774",
+    ),
+    (
+        "dev_patient_number",
+        "medical",
+        "Patient number 4471902 was merged with a duplicate.",
+        "MRN",
+        "4471902",
+    ),
+    (
+        "dev_chart_ident",
+        "medical",
+        "chart ident 7788190 -- transcription pending.",
+        "MRN",
+        "7788190",
+    ),
+    (
+        "dev_subject_hash",
+        "medical",
+        "Subject # 2019447 withdrew consent at week six.",
+        "MRN",
+        "2019447",
+    ),
     ("dev_mrn_slash", "medical", "Ward list: MRN/8123094 admitted overnight.", "MRN", "8123094"),
     ("dev_rec_num", "medical", "rec num 6650321 flagged by the coder.", "MRN", "6650321"),
     ("dev_chart_ref", "medical", "See chart ref 4902118 for the prior study.", "MRN", "4902118"),
-    ("dev_chart_number_is", "medical", "The chart number is 3320815 on the wristband.", "MRN", "3320815"),
-    ("dev_record_id_is", "medical", "The legacy record id is 8871260 in the old system.", "MRN", "8871260"),
-    ("dev_column_gap", "medical", "Field      Value\nMRN        5512078\nWard       4 East", "MRN", "5512078"),
-    ("dev_acct_ident", "financial", "Remit to acct ident 448120993301 by close of business.", "ACCOUNT_NUMBER", "448120993301"),
-    ("dev_ac_ref", "financial", "Wire reference: a/c ref 77120044831 at the correspondent.", "ACCOUNT_NUMBER", "77120044831"),
-    ("dev_account_num", "financial", "Statement for account num 5540118822 enclosed.", "ACCOUNT_NUMBER", "5540118822"),
-    ("dev_account_number_is", "financial", "The account number is 100200300400 per the file.", "ACCOUNT_NUMBER", "100200300400"),
+    (
+        "dev_chart_number_is",
+        "medical",
+        "The chart number is 3320815 on the wristband.",
+        "MRN",
+        "3320815",
+    ),
+    (
+        "dev_record_id_is",
+        "medical",
+        "The legacy record id is 8871260 in the old system.",
+        "MRN",
+        "8871260",
+    ),
+    (
+        "dev_column_gap",
+        "medical",
+        "Field      Value\nMRN        5512078\nWard       4 East",
+        "MRN",
+        "5512078",
+    ),
+    (
+        "dev_acct_ident",
+        "financial",
+        "Remit to acct ident 448120993301 by close of business.",
+        "ACCOUNT_NUMBER",
+        "448120993301",
+    ),
+    (
+        "dev_ac_ref",
+        "financial",
+        "Wire reference: a/c ref 77120044831 at the correspondent.",
+        "ACCOUNT_NUMBER",
+        "77120044831",
+    ),
+    (
+        "dev_account_num",
+        "financial",
+        "Statement for account num 5540118822 enclosed.",
+        "ACCOUNT_NUMBER",
+        "5540118822",
+    ),
+    (
+        "dev_account_number_is",
+        "financial",
+        "The account number is 100200300400 per the file.",
+        "ACCOUNT_NUMBER",
+        "100200300400",
+    ),
 ]
 
 # A digit run NOT in identifier position. None of these may produce the entity.
@@ -2687,7 +3269,7 @@ SHARED_VOCABULARY_TYPES = frozenset({"DIAGNOSIS", "MEDICATION"})
 
 
 def test_held_out_corpus_shares_no_identifier_with_the_tuned_corpus() -> None:
-    """"Held out" has to be structurally true, not merely intended.
+    """ "Held out" has to be structurally true, not merely intended.
 
     The comparison the section above rests on is worth nothing if the two corpora
     overlap, and overlap is exactly what happens when a later author "refreshes" the
@@ -2971,10 +3553,16 @@ def test_chunking_is_lossless_under_adversarial_encodings(
 @pytest.mark.parametrize(
     ("label", "text"),
     [
-        ("utf8", "Zoë Bäcker 😀 seen today. Chart note: MRN: 4471902 filed.\n\n"
-                 "Prescribed metformin 500 mg. Her SSN is 412-33-7891."),
-        ("crlf", "Patient JANE DOE\r\n\r\nChart note: MRN: 4471902 filed.\r\n\r\n"
-                 "Prescribed metformin 500 mg.\r\n"),
+        (
+            "utf8",
+            "Zoë Bäcker 😀 seen today. Chart note: MRN: 4471902 filed.\n\n"
+            "Prescribed metformin 500 mg. Her SSN is 412-33-7891.",
+        ),
+        (
+            "crlf",
+            "Patient JANE DOE\r\n\r\nChart note: MRN: 4471902 filed.\r\n\r\n"
+            "Prescribed metformin 500 mg.\r\n",
+        ),
         ("astral-heavy", "😀" * 50 + "\r\nMRN: 4471902\r\n" + "Ω" * 50 + " metformin 500 mg"),
     ],
 )
@@ -3346,8 +3934,7 @@ async def test_declaration_order_wins_even_when_claimants_arrive_reversed(
         "fixture assumes aliases start in declaration order"
     )
     detector._aliases = {
-        builtin: tuple(reversed(claimants))
-        for builtin, claimants in detector._aliases.items()
+        builtin: tuple(reversed(claimants)) for builtin, claimants in detector._aliases.items()
     }
 
     hits = await detector.detect("Jane Doe signed today.")
@@ -3471,10 +4058,12 @@ async def test_no_detected_span_is_left_partially_uncovered(detector: Detector) 
     """The kept set must cover every span the analyzer proposed, not just the winners."""
     docs = [
         (LEAKY_STRATEGY_DOC, "legal"),
-        ("Our settlement posture is to open low and hold until we depose "
-         "their damages expert Bartholomew Fitzgerald-Hume at the hearing.", "legal"),
-        ("The settlement payment of $50,000.00 was wired on 2024-05-06 by Jane Doe.",
-         "financial"),
+        (
+            "Our settlement posture is to open low and hold until we depose "
+            "their damages expert Bartholomew Fitzgerald-Hume at the hearing.",
+            "legal",
+        ),
+        ("The settlement payment of $50,000.00 was wired on 2024-05-06 by Jane Doe.", "financial"),
     ]
     for text, category in docs:
         hits = await detector.detect(text, category)
@@ -3495,7 +4084,11 @@ def test_resolve_overlaps_absorbs_a_partially_overlapping_loser() -> None:
         entity_type="CASE_STRATEGY", category="LEGAL", start=0, end=14, text=text[0:14], score=0.7
     )
     loser = Detection(
-        entity_type="CLIENT_IDENTITY", category="LEGAL", start=10, end=20, text=text[10:20],
+        entity_type="CLIENT_IDENTITY",
+        category="LEGAL",
+        start=10,
+        end=20,
+        text=text[10:20],
         score=0.85,
     )
     kept = resolve_overlaps(text, [winner, loser], frozenset({"CASE_STRATEGY"}))
@@ -3763,16 +4356,35 @@ def test_duplicate_entity_name_is_rejected_at_load(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("reason", "body"),
     [
-        ("registry_entity_invalid", "categories: [PII]\nentities:\n  X: {category: PII, patterns: ['(unclosed']}\n"),
-        ("registry_unknown_category", "categories: [PII, NOPE]\nentities:\n  X: {category: PII, patterns: ['a']}\n"),
-        ("registry_category_not_declared", "categories: [PII]\nentities:\n  X: {category: PHI, patterns: ['a']}\n"),
-        ("registry_gazetteer_missing", "categories: [PHI]\nentities:\n  X: {category: PHI, gazetteer: nope.txt}\n"),
-        ("registry_entity_has_no_recognizer", "categories: [PII]\nentities:\n  X: {category: PII, context: [a]}\n"),
+        (
+            "registry_entity_invalid",
+            "categories: [PII]\nentities:\n  X: {category: PII, patterns: ['(unclosed']}\n",
+        ),
+        (
+            "registry_unknown_category",
+            "categories: [PII, NOPE]\nentities:\n  X: {category: PII, patterns: ['a']}\n",
+        ),
+        (
+            "registry_category_not_declared",
+            "categories: [PII]\nentities:\n  X: {category: PHI, patterns: ['a']}\n",
+        ),
+        (
+            "registry_gazetteer_missing",
+            "categories: [PHI]\nentities:\n  X: {category: PHI, gazetteer: nope.txt}\n",
+        ),
+        (
+            "registry_entity_has_no_recognizer",
+            "categories: [PII]\nentities:\n  X: {category: PII, context: [a]}\n",
+        ),
         # A typo here used to load CLEAN and disable the entity in every document,
         # including `general` and unclassified ones -- no detection, so no vault
         # entry, so no egress-gate backstop. The adjacent `category:` typo one row
         # up has always raised, which is what made this one easy to miss.
-        ("registry_unknown_doc_category", "categories: [PII]\nentities:\n  X: {category: PII, patterns: ['a'], only_in_doc_categories: [medial]}\n"),
+        (
+            "registry_unknown_doc_category",
+            "categories: [PII]\nentities:\n"
+            "  X: {category: PII, patterns: ['a'], only_in_doc_categories: [medial]}\n",
+        ),
         ("registry_no_entities", "categories: [PII]\nentities: {}\n"),
         ("registry_not_a_mapping", "- a\n- b\n"),
         ("registry_yaml_invalid", "categories: [PII\nentities:\n"),
@@ -4026,9 +4638,7 @@ def test_no_entity_name_is_hardcoded_in_detection_code(registry: EntityRegistry)
     names = {name for name in registry.entities}
     names |= {spec.presidio for spec in registry.entities.values() if spec.presidio}
     names |= {
-        category
-        for spec in registry.entities.values()
-        for category in spec.only_in_doc_categories
+        category for spec in registry.entities.values() for category in spec.only_in_doc_categories
     }
     assert len(names) > 20, "the registry should supply a meaningful set of names"
 
@@ -4236,9 +4846,9 @@ async def test_presidio_debug_stream_stays_muted_when_a_caller_re_enables_it(
 
     assert hits, "fixture should produce detections to log about"
     emitted = "\n".join(records)
-    assert not any(
-        record.startswith("Context list is") for record in records
-    ), f"a DEBUG record survived the {attack} attack"
+    assert not any(record.startswith("Context list is") for record in records), (
+        f"a DEBUG record survived the {attack} attack"
+    )
     for secret in ("9987651", "Jane Doe", "metformin", "type 2 diabetes"):
         assert secret not in emitted, "document content reached Presidio's debug stream"
 
@@ -4347,8 +4957,7 @@ def test_both_invariants_still_fire_with_assertions_disabled() -> None:
 #:
 #:     Prior ambulatory visits: {prior[0]}, {prior[1]}, and {prior[2]}.
 COMPOSITE_DATE_TEXT = (
-    "ENCOUNTER HISTORY\n"
-    "    Prior ambulatory visits: 03/11/2024, 09/17/2024, and 10/01/2024.\n"
+    "ENCOUNTER HISTORY\n    Prior ambulatory visits: 03/11/2024, 09/17/2024, and 10/01/2024.\n"
 )
 
 #: The single ``DATE`` span spaCy returns out of that line.
@@ -4554,9 +5163,7 @@ def test_the_composite_split_scope_and_the_temporal_tier_cannot_drift_apart(
     by the date recogniser, and there must be at least one, or the rule is scoped to
     nothing and every test above is vacuous.
     """
-    temporal = {
-        name for name, spec in registry.entities.items() if spec.tier == TIER_TEMPORAL
-    }
+    temporal = {name for name, spec in registry.entities.items() if spec.tier == TIER_TEMPORAL}
     assert temporal, "no entity is temporal, so the composite split is scoped to nothing"
     for name in temporal:
         assert registry.spec(name).presidio == "DATE_TIME", (
@@ -4593,9 +5200,7 @@ def test_the_composite_split_refuses_to_emit_a_detection_whose_offsets_have_drif
 
     assert detector._split_composite_dates(text, detection), "premise: it does split"
 
-    monkeypatch.setattr(
-        detector_module, "split_composite_date", lambda _text: ((1, 11), (13, 23))
-    )
+    monkeypatch.setattr(detector_module, "split_composite_date", lambda _text: ((1, 11), (13, 23)))
     with pytest.raises(DetectionInvariantError) as raised:
         detector._split_composite_dates(text, detection)
     assert raised.value.detail["reason"] == "composite_split_offset_drift"
@@ -4629,9 +5234,8 @@ def _looks_like_a_label_tail(span: str) -> bool:
 
 def _read_fixture(name: str) -> str:
     """Fixture text. Module-level and sync so the pathlib call is off the loop."""
-    return (Path(__file__).resolve().parent.parent / "fixtures" / name).read_text(
-        encoding="utf-8"
-    )
+    return (Path(__file__).resolve().parent.parent / "fixtures" / name).read_text(encoding="utf-8")
+
 
 @pytest.mark.parametrize(
     ("fixture", "category"),

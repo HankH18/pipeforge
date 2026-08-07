@@ -483,9 +483,9 @@ def test_an_omitted_categories_block_admits_every_category(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-
-
-def test_a_gazetteer_row_with_no_term_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_gazetteer_row_with_no_term_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A hint with no term must not become a detection term.
 
     `load_gazetteer` guards on an empty term, and that guard was unreachable: it

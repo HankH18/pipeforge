@@ -280,7 +280,10 @@ async def test_an_unmatchable_shorthand_token_never_trips_the_residue_assertion(
 
 async def test_hint_is_ignored_for_lookup(restorer: Restorer, vault: FakeVault) -> None:
     """Restore keys on the 8-hex hash alone -- the hint never reaches the vault."""
-    text = "Take [PHI_MEDICATION_2f4a1b3c|MANGLED-HINT] and [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic]."
+    text = (
+        "Take [PHI_MEDICATION_2f4a1b3c|MANGLED-HINT] and "
+        "[PHI_MEDICATION_2f4a1b3c|oral-antidiabetic]."
+    )
 
     result = await restorer.restore(SESSION, text, strategy=TOKENIZATION)
 
@@ -575,9 +578,7 @@ async def test_a_token_the_run_did_issue_is_classified_lost(
     distinguishable in the audit trail from a model that made a token up.
     """
     # The vault knows about MED_ID only; NAME_ID was issued and has vanished.
-    restorer = Restorer(
-        vault=FakeVault(tokens={MED_ID: MED_VALUE}), settings=settings, audit=audit
-    )
+    restorer = Restorer(vault=FakeVault(tokens={MED_ID: MED_VALUE}), settings=settings, audit=audit)
 
     result = await restorer.restore(
         SESSION,
@@ -603,9 +604,7 @@ async def test_a_token_the_run_did_issue_is_classified_lost(
 async def test_both_kinds_of_miss_are_separated_in_one_response(
     settings: Settings, audit: AuditLogger
 ) -> None:
-    restorer = Restorer(
-        vault=FakeVault(tokens={MED_ID: MED_VALUE}), settings=settings, audit=audit
-    )
+    restorer = Restorer(vault=FakeVault(tokens={MED_ID: MED_VALUE}), settings=settings, audit=audit)
 
     result = await restorer.restore(
         SESSION,
@@ -642,9 +641,7 @@ async def test_both_kinds_of_miss_are_separated_in_one_response(
     assert by_classification[MISS_FABRICATED].entity_type == "PHI_NAME"
 
 
-async def test_issued_matches_a_case_mangled_hash(
-    settings: Settings, audit: AuditLogger
-) -> None:
+async def test_issued_matches_a_case_mangled_hash(settings: Settings, audit: AuditLogger) -> None:
     """The model upper-cases hashes; classification must not flip because of it."""
     restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
 
@@ -890,9 +887,7 @@ async def test_a_bracketed_token_the_model_invented_still_degrades(
         run_id=RUN,
     )
 
-    assert result.text == (
-        f"Contact John Smith about {UNRESOLVED_ENTITY} and PHI-NAME-deadbeef."
-    )
+    assert result.text == (f"Contact John Smith about {UNRESOLVED_ENTITY} and PHI-NAME-deadbeef.")
     assert result.fabricated == ("deadbeef",)
     assert result.foreign_tokens == 1
     misses = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
@@ -1111,7 +1106,11 @@ async def test_post_restore_assertion_fires_on_residual_token(
     # stronger one -- there is no sample at all.
     assert "sample_token_id" not in excinfo.value.detail
     assert set(excinfo.value.detail) == {
-        "reason", "session_id", "run_id", "strategy", "residual",
+        "reason",
+        "session_id",
+        "run_id",
+        "strategy",
+        "residual",
     }
 
     events = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
@@ -1177,9 +1176,7 @@ async def test_the_failure_detail_cannot_carry_a_restored_original(
     red on the first assertion.
     """
     mrn = "MRN-40281993"
-    restorer = Restorer(
-        vault=FakeVault(tokens={MRN_ID: mrn}), settings=settings, audit=audit
-    )
+    restorer = Restorer(vault=FakeVault(tokens={MRN_ID: mrn}), settings=settings, audit=audit)
     caplog.set_level(logging.DEBUG, logger="secure_context_pipeline.deobfuscation.restorer")
 
     with pytest.raises(PipelineError) as excinfo:
@@ -1283,9 +1280,7 @@ async def test_longest_surrogate_wins(settings: Settings, audit: AuditLogger) ->
     restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
     text = "Dr. Torres-Blake and Lee Ann reviewed the notes from Torres and Lee."
 
-    result = await restorer.restore(
-        SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates
-    )
+    result = await restorer.restore(SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates)
 
     assert result.text == (
         "Dr. Smithson and Nguyen Marie reviewed the notes from Smith and Nguyen."
@@ -1326,9 +1321,7 @@ async def test_a_nested_fake_standing_for_an_unrelated_value_cannot_be_restored_
     restorer = Restorer(vault=FakeVault(), settings=settings)
     text = "Prepared by accountant Daniel White, reachable on request."
 
-    result = await restorer.restore(
-        SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates
-    )
+    result = await restorer.restore(SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates)
 
     assert result.text == "Prepared by accountant Thomas Duncan, reachable on request."
     # The loss, stated: the second value is gone and nothing in the result says so.
@@ -1456,13 +1449,39 @@ def test_the_restorer_and_the_gate_agree_on_what_counts_as_an_occurrence() -> No
     ``occurs_as_a_unit`` the way ``tests/test_obfuscation.py`` pins the sweep.
     """
     needles = [
-        "John Smith", "Brown", "Ann", "MRN: 4471902", "(415) 555-0123",
-        "$1,234.56", "Ph.D.", "123-45-6789", "Case No. 1:23-cv-45678", "O'Brien",
+        "John Smith",
+        "Brown",
+        "Ann",
+        "MRN: 4471902",
+        "(415) 555-0123",
+        "$1,234.56",
+        "Ph.D.",
+        "123-45-6789",
+        "Case No. 1:23-cv-45678",
+        "O'Brien",
     ]
     haystacks = [
-        "{}", "_{}_", "*{}*", "__{}__", "a{}", "{}z", "({})", "[{}]", " {} ",
-        "x{}y", "{}.", ".{}", "tel{}", "USD{}", "{}degree", "-{}-", "{}_", "_{}",
-        "\n{}\n", "1{}", "{}9",
+        "{}",
+        "_{}_",
+        "*{}*",
+        "__{}__",
+        "a{}",
+        "{}z",
+        "({})",
+        "[{}]",
+        " {} ",
+        "x{}y",
+        "{}.",
+        ".{}",
+        "tel{}",
+        "USD{}",
+        "{}degree",
+        "-{}-",
+        "{}_",
+        "_{}",
+        "\n{}\n",
+        "1{}",
+        "{}9",
     ]
     disagreements: list[tuple[str, str]] = []
     for needle in needles:
@@ -1504,9 +1523,7 @@ async def test_longest_first_survives_the_left_edge_partition(
     restorer = Restorer(vault=FakeVault(), settings=settings)
     text = "Call (415) 555-0123 ext 9 or (415) 555-0123; ask for Torres-Blake, not Torres."
 
-    result = await restorer.restore(
-        SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates
-    )
+    result = await restorer.restore(SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates)
 
     assert result.text == (
         "Call (212) 555-9999 ext 4 or (212) 555-9999; ask for Smithson, not Smith."
@@ -1533,7 +1550,9 @@ def test_the_surrogate_matcher_stays_linear_on_a_large_session() -> None:
     assert pattern.search(haystack) is None
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
-    assert elapsed_ms < 200.0, f"surrogate scan took {elapsed_ms:.0f} ms over {len(haystack):,} chars"
+    assert elapsed_ms < 200.0, (
+        f"surrogate scan took {elapsed_ms:.0f} ms over {len(haystack):,} chars"
+    )
 
 
 async def test_surrogate_respects_word_boundaries(settings: Settings) -> None:
@@ -1641,9 +1660,7 @@ async def test_a_fake_that_is_another_fake_plus_a_possessive_is_not_confused(
         surrogates=surrogates,
     )
 
-    assert result.text == (
-        "Admitted to Holy Cross Medical after Adaeze Okafor signed the consent."
-    )
+    assert result.text == ("Admitted to Holy Cross Medical after Adaeze Okafor signed the consent.")
     assert result.restored_count == 2
     # Specifically: the longer fake did not resolve through the shorter one.
     assert "Adaeze Okafor's" not in result.text
@@ -1709,7 +1726,9 @@ REFLOWED_TWO_WORD_FAKE = [
 ]
 
 
-@pytest.mark.parametrize("text", REFLOWED_TWO_WORD_FAKE, ids=[repr(t) for t in REFLOWED_TWO_WORD_FAKE])
+@pytest.mark.parametrize(
+    "text", REFLOWED_TWO_WORD_FAKE, ids=[repr(t) for t in REFLOWED_TWO_WORD_FAKE]
+)
 async def test_a_reflowed_two_word_fake_never_yields_a_half_real_name(
     settings: Settings, text: str
 ) -> None:
@@ -1729,9 +1748,7 @@ async def test_a_reflowed_two_word_fake_never_yields_a_half_real_name(
     surrogates = {"Angela Whitfield": "Maria Torres", "Whitfield": "Torres"}
     restorer = Restorer(vault=FakeVault(), settings=settings)
 
-    result = await restorer.restore(
-        SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates
-    )
+    result = await restorer.restore(SESSION, text, strategy=PSEUDONYMIZATION, surrogates=surrogates)
 
     # The half-real hybrid, named explicitly: this is the string that must never exist.
     assert "Angela" not in result.text, result.text
@@ -2090,10 +2107,7 @@ async def test_every_mutation_the_mock_emits_survives_restoration(
     ``plan_mutations`` is exported precisely so this can be asserted against the
     mock's real assignment rather than against a hand-copied list that drifts.
     """
-    tokens = {
-        f"{index:08x}": f"Value {index}"
-        for index in range(len(MUTATION_CLASSES) + 2)
-    }
+    tokens = {f"{index:08x}": f"Value {index}" for index in range(len(MUTATION_CLASSES) + 2)}
     payload = "\n".join(
         f"Field {index}: [PHI_NAME_{token_id}]" for index, token_id in enumerate(tokens)
     )
@@ -2144,9 +2158,7 @@ async def test_coreference_survives_alongside_a_restored_token(restorer: Restore
 
     result = await restorer.restore(SESSION, text, strategy=TOKENIZATION)
 
-    assert result.text == (
-        "John Smith was seen today. The patient's condition remains stable."
-    )
+    assert result.text == ("John Smith was seen today. The patient's condition remains stable.")
 
 
 # --------------------------------------------------------------------------

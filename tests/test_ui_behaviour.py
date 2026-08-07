@@ -129,7 +129,10 @@ def _run(tmp_path: Path, body: str) -> dict:
         HARNESS
         + "\n(async () => {\n"
         + body
-        + "\n})().catch((e) => { console.error((e && e.stack) || String(e)); process.exit(1); });\n",
+        + "\n})().catch((e) => {\n"
+        + "  console.error((e && e.stack) || String(e));\n"
+        + "  process.exit(1);\n"
+        + "});\n",
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -179,7 +182,7 @@ def test_render_original_splices_spans_from_the_highest_offset_down(tmp_path: Pa
         tmp_path,
         f"emit({{ html: UI.renderOriginal({json.dumps(text)}, [{dets[0]}, {dets[1]}]) }});",
     )["html"]
-    title = f'PERSON {MID} PSEUDO {MID} score 0.90 {MID} '
+    title = f"PERSON {MID} PSEUDO {MID} score 0.90 {MID} "
     assert out == (
         f'<mark class="c-PII" title="{title}Ann">Bob</mark>'
         " &amp; "
@@ -197,7 +200,7 @@ def test_render_original_escapes_the_title_attribute_it_builds(tmp_path: Path) -
     """
     dets = _det(start=0, end=3, surrogate='" onmouseover=x')
     out = _run(tmp_path, f'emit({{ html: UI.renderOriginal("Bob", [{dets}]) }});')["html"]
-    assert 'onmouseover=x' in out
+    assert "onmouseover=x" in out
     assert '" onmouseover' not in out
     assert "&quot; onmouseover=x" in out
 
@@ -347,8 +350,8 @@ def test_render_restored_trims_a_possessive_the_restorer_reattached(tmp_path: Pa
     """
     out = _run(
         tmp_path,
-        "emit({ html: UI.renderRestored(\"[PII_PERSON_1a2b3c4d]'s report\","
-        " \"Jane Roe's report\", []) });",
+        'emit({ html: UI.renderRestored("[PII_PERSON_1a2b3c4d]\'s report",'
+        ' "Jane Roe\'s report", []) });',
     )["html"]
     assert out == '<mark class="rest">Jane Roe&#39;s</mark> report'
 
@@ -376,7 +379,8 @@ def test_render_restored_falls_back_when_the_response_carries_no_token(tmp_path:
     """
     out = _run(
         tmp_path,
-        'emit({ html: UI.renderRestored("No tokens here at all.", "No tokens here at all.", []) });',
+        'emit({ html: UI.renderRestored('
+        '"No tokens here at all.", "No tokens here at all.", []) });',
     )["html"]
     assert out == "No tokens here at all."
 
@@ -438,9 +442,7 @@ def test_esc_neutralises_every_character_that_can_open_markup(tmp_path: Path) ->
     """
     payload = "<img src=x onerror=\"alert('1')\"> & done"
     out = _run(tmp_path, f"emit({{ esc: UI.esc({json.dumps(payload)}) }});")["esc"]
-    assert out == (
-        "&lt;img src=x onerror=&quot;alert(&#39;1&#39;)&quot;&gt; &amp; done"
-    )
+    assert out == ("&lt;img src=x onerror=&quot;alert(&#39;1&#39;)&quot;&gt; &amp; done")
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +457,9 @@ def test_render_stats_uses_the_pipeline_order_and_formats_durations(tmp_path: Pa
     and "12.345".
     """
     stats = {"total_ms": 12.34, "detect_ms": 1.0, "later_addition": 2.6}
-    out = _run(tmp_path, f"UI.renderStats({json.dumps(stats)}); emit({{ html: el('stats').innerHTML }});")
+    out = _run(
+        tmp_path, f"UI.renderStats({json.dumps(stats)}); emit({{ html: el('stats').innerHTML }});"
+    )
     assert out["html"] == (
         '<span class="stat"><i>detect_ms</i>1.0 ms</span>'
         '<span class="stat"><i>total_ms</i>12.3 ms</span>'
@@ -575,7 +579,9 @@ el('strategy').value = 'pseudonymize';
 el('file').files = [{ name: 'note.txt', size: 3, lastModified: 11 }];
 """
 
-RUN_BODY = RUN_SETUP + """
+RUN_BODY = (
+    RUN_SETUP
+    + """
 await UI.run();
 await UI.run();
 emit({
@@ -590,6 +596,7 @@ emit({
   busy: UI.S.busy,
 });
 """
+)
 
 
 def test_a_run_fills_all_four_panels_from_one_pipeline_response(tmp_path: Path) -> None:
@@ -600,12 +607,13 @@ def test_a_run_fills_all_four_panels_from_one_pipeline_response(tmp_path: Path) 
     what panel 1 contains. The counters are pinned alongside because they are what a
     reviewer reads to confirm the panels are not showing the same string twice.
     """
-    out = _run(tmp_path, RUN_BODY.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }"))
+    out = _run(
+        tmp_path, RUN_BODY.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+    )
     title = f"PERSON {MID} PSEUDO {MID} score 0.90 {MID} Ann"
     assert out["p1"] == f'<mark class="c-PII" title="{title}">Bob</mark> met Carl.'
     assert out["p2"] == (
-        '<mark class="tok c-PII">Ann</mark> met '
-        '<mark class="tok c-RED">[REDACTED_PERSON]</mark>.'
+        '<mark class="tok c-PII">Ann</mark> met <mark class="tok c-RED">[REDACTED_PERSON]</mark>.'
     )
     assert out["p3"] == "Ann met Carl."
     assert out["p4"] == '<mark class="rest">Bob</mark> met Carl.'
@@ -626,7 +634,9 @@ def test_a_run_sends_the_session_document_and_strategy_it_was_configured_with(
     checked for reuse: the same file must not be re-uploaded on a second run, or every
     click leaves another copy of the document on the server.
     """
-    out = _run(tmp_path, RUN_BODY.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }"))
+    out = _run(
+        tmp_path, RUN_BODY.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+    )
     assert len(out["pipeline"]) == 2
     assert json.loads(out["pipeline"][0]) == {
         "session_id": "sess-1",
@@ -696,7 +706,9 @@ def test_a_run_with_nothing_to_run_on_is_refused_before_any_request(tmp_path: Pa
     missing. Letting either through costs an upload or a pipeline call that can only
     fail, and the failure it produces names neither field.
     """
-    body = RUN_SETUP + """
+    body = (
+        RUN_SETUP
+        + """
 const out = {};
 el('prompt').value = '   ';
 await UI.run();
@@ -708,6 +720,7 @@ out.noFile = el('banner').innerHTML;
 out.requests = calls.length;
 emit(out);
 """
+    )
     out = _run(tmp_path, body.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }"))
     assert out["noPrompt"] == "<b>NO_PROMPT</b> Enter a prompt."
     assert out["noFile"] == "<b>NO_FILE</b> Choose a document first (fixtures/ or any file)."
@@ -722,7 +735,9 @@ def test_choosing_a_different_file_invalidates_the_upload_cache(tmp_path: Path) 
     picks another one. Without it the run silently pipelines the wrong file, which the
     panels cannot show because they render whatever the server returned for that id.
     """
-    body = RUN_SETUP + """
+    body = (
+        RUN_SETUP
+        + """
 await UI.run();
 fire('file', 'change');
 const cleared = { doc: UI.S.docId, key: UI.S.uploadKey };
@@ -730,6 +745,7 @@ el('file').files = [{ name: 'other.txt', size: 9, lastModified: 22 }];
 await UI.run();
 emit({ cleared: cleared, uploads: calls.filter((c) => c.path === '/documents').length });
 """
+    )
     out = _run(tmp_path, body.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }"))
     assert out["cleared"] == {"doc": None, "key": None}
     assert out["uploads"] == 2
@@ -814,7 +830,9 @@ def test_enter_in_the_prompt_box_starts_a_run_and_other_keys_do_not(tmp_path: Pa
     and a pipeline call -- the most expensive possible way to break a demo, and one no
     static reading of the file would catch.
     """
-    body = RUN_SETUP + """
+    body = (
+        RUN_SETUP
+        + """
 fire('prompt', 'keydown', { key: 'a' });
 await settle();
 const afterLetter = calls.length;
@@ -822,6 +840,7 @@ fire('prompt', 'keydown', { key: 'Enter' });
 await settle();
 emit({ afterLetter: afterLetter, ran: calls.filter((c) => c.path === '/pipeline/run').length });
 """
+    )
     out = _run(tmp_path, body.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }"))
     assert out["afterLetter"] == 0
     assert out["ran"] == 1
@@ -893,7 +912,9 @@ def test_a_failed_audit_lookup_empties_the_panel_instead_of_stranding_it(
     """
     body = """
 respond((path) => {
-  if (path.indexOf('/audit') === 0) return { status: 403, body: { code: 'FORBIDDEN', detail: 'no' } };
+  if (path.indexOf('/audit') === 0) {
+    return { status: 403, body: { code: 'FORBIDDEN', detail: 'no' } };
+  }
   return { status: 200, body: {} };
 });
 UI.S.sessionId = 'sess-xyz';
