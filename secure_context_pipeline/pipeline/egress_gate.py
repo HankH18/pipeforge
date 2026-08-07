@@ -765,11 +765,6 @@ class EgressGate:
         # `_occurs_as_a_unit`'s guards, the identifier limb through a needle that
         # carries a class-0 mark of its own and can only be found in a haystack that
         # kept it.
-        skeletons: tuple[str, ...] = (
-            (payload_skeleton,)
-            if payload_boundary is None
-            else (payload_skeleton, payload_boundary)
-        )
         decoded = _decode_transport_escapes(payload)
         if decoded is None:
             payload_decoded: str | None = None
@@ -780,6 +775,43 @@ class EgressGate:
                 payload_decoded = None
             if payload_decoded_boundary == payload_boundary:
                 payload_decoded_boundary = None
+        # ONE tuple of every skeleton-family haystack, and every limb below iterates
+        # THIS rather than picking its own subset.
+        #
+        # That is a fix for a class, not for the instance that exposed it. The
+        # instance: `skeletons` held the two `_skeleton_views` forms and the decoded
+        # views were offered separately, so the separator limb was handed
+        # `decoded` and never `decoded_boundary` -- the one haystack that can see a
+        # value whose payload carries BOTH a transport escape and a class-0 mark
+        # beside it. Measured over 300,000 differential cases, that left 25 payloads
+        # the pre-widening rule blocked and this code released:
+        #
+        #     vault  {'Nathaniel Brightwater'}
+        #     wire   'Portal: /q?v=lab%20NathanielBrightwater<U+0903>Ref -- ...'
+        #     combining-class rule : BLOCKED     shipped code : RELEASED
+        #
+        # The class: four haystacks and three limbs is twelve decisions to keep in
+        # step by hand, and the eleven that were right made the twelfth invisible.
+        # Iterating one tuple makes "which limb sees which haystack" unanswerable in
+        # the wrong direction -- a new haystack reaches every limb the day it is
+        # added, and a new limb gets all of them.
+        #
+        # The identifier limb gains the decoded views here too. It never had them
+        # under any of the three behaviours, so it was not part of the regression,
+        # but it is the same omission: a vaulted identifier written `%20`-separated
+        # is a true occurrence, and finding it is what the decoded view is for.
+        scan_skeletons: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                form
+                for form in (
+                    payload_skeleton,
+                    payload_boundary,
+                    payload_decoded,
+                    payload_decoded_boundary,
+                )
+                if form is not None
+            )
+        )
         haystacks = _Haystacks(
             raw=payload,
             normalized=payload_norm,
@@ -802,7 +834,7 @@ class EgressGate:
             if any(
                 needle in skeleton
                 for needle in _identifier_needles(folded)
-                for skeleton in skeletons
+                for skeleton in scan_skeletons
             ):
                 hits += 1
                 continue
@@ -828,10 +860,8 @@ class EgressGate:
             # `_decode_transport_escapes` for the reproduction.
             if (
                 _occurs_with_flexible_separator(folded, haystacks.folded)
-                or any(_occurs_with_flexible_separator(folded, s) for s in skeletons)
-                or (
-                    haystacks.decoded is not None
-                    and _occurs_with_flexible_separator(folded, haystacks.decoded)
+                or any(
+                    _occurs_with_flexible_separator(folded, s) for s in scan_skeletons
                 )
             ):
                 hits += 1
@@ -1556,16 +1586,40 @@ def _skeleton_views(value: str) -> tuple[str, str | None]:
 
     So the repair is a union rather than a third rule. Both elements are
     haystack-only folds of the same payload, the needle is untouched, and pass 1
-    hits if the value occurs as a unit in *either* -- so this can only ever find more
-    than either view alone and cannot regress either direction. Measured the same
-    way, the same 60,000 cases against both baselines, as blocks-more / blocks-less:
-    **16,430 / 0** against the old rule and **213 / 0** against the widened one --
-    the union exactly, with zero regressions in either direction, and one case more
-    than either (a U+0345 splice with a class-0 mark beside it, which needs the
-    raw-side strip of one view and the class-0 boundary of the other). Repeated at
-    100,000 cases on three seeds and with spacing diacritics, invisibles, non-ASCII
-    digits and transport-escaped separators mixed into the generator: 0 regressions
-    against either baseline every time.
+    hits if the value occurs as a unit in *either*.
+
+    **That is a property of the union, not of the module, and the difference cost a
+    live release.** This docstring used to say the union "can only ever find more
+    than either view alone and cannot regress either direction", and cited 0
+    regressions over 100,000 cases on three seeds. The claim was true of
+    :func:`_occurs_in_any_bounded_form`, which is the only limb the union was
+    actually threaded through. The separator limb was handed ``decoded`` and never
+    ``decoded_boundary``; the identifier limb saw neither decoded view. An
+    independent differential fuzz over 300,000 cases then found **25 payloads the
+    pre-widening combining-class rule blocked and this code released** -- every one
+    of them carrying a transport escape *and* a class-0 mark, the combination that
+    needs the one haystack no limb was offered::
+
+        vault  {'Nathaniel Brightwater'}
+        wire   'Portal: /q?v=lab%20NathanielBrightwater<U+0903>Ref -- summarise.'
+        combining-class rule : BLOCKED (vault_original)
+        the union as shipped : RELEASED, EGRESS_PASS recorded
+
+    Two lessons, and the second is the one worth keeping. A union is only
+    non-regressing where it is *applied* -- "additive by construction" says nothing
+    about a limb that was never given the second view. And a fuzz proves a property
+    only over the shapes it generates: the generator that reported 0 regressions did
+    mix transport escapes in, but never crossed one with a class-0 mark in the same
+    payload, so the interaction was outside the space it searched. A clean fuzz is
+    evidence about its generator before it is evidence about the code.
+
+    :meth:`EgressGate._scan_originals` now builds ONE ``scan_skeletons`` tuple that
+    every limb iterates, so the omission cannot recur limb by limb. Re-measured
+    against both baselines over 120,000 cases on three seeds after that change:
+    0 regressions against either, blocking ~3,600 more than the old rule and ~2,100
+    more than the widened one. Pinned by
+    ``test_every_skeleton_haystack_reaches_every_limb_that_scans_one``, which fails
+    if any limb is handed a subset.
 
     The alternative considered and not taken was replacing each mark with a
     non-alphanumeric sentinel and teaching the needle match to skip it. That is

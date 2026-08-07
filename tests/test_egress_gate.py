@@ -5139,3 +5139,82 @@ async def test_the_comma_grouped_identifier_blocks_in_both_directions(
     with pytest.raises(EgressBlockedError) as raised:
         await gate.check(payload, "sess-grouped")
     assert raised.value.detail["reason"] == "vault_original"
+
+
+#: A transport escape and a class-0 mark, together. Neither alone reaches this limb.
+#:
+#: `%20` makes the value's interior separator a word-character run, which every
+#: bounded form keeps in the needle -- so only the flexible-separator limb can see
+#: it, and only in the DECODED haystack. U+0903 DEVANAGARI SIGN VISARGA (category
+#: Mc, combining class 0) sits immediately after the value followed by a letter, so
+#: only a haystack that KEPT the mark reads a word boundary there. The one haystack
+#: that satisfies both is the combining-class view of the decoded payload.
+_ESCAPED_AND_MARKED = "Portal: /q?v=lab%20NathanielBrightwater\u0903Ref -- summarise."
+
+
+def test_every_skeleton_haystack_reaches_every_limb_that_scans_one() -> None:
+    """A payload carrying BOTH a transport escape and a class-0 mark must not release.
+
+    `_skeleton_views` closed a boundary regression by deriving the skeleton under two
+    mark selections and comparing against both -- but the union was threaded through
+    `_occurs_in_any_bounded_form` only. The separator limb was handed `decoded` and
+    never `decoded_boundary`, and the identifier limb saw neither decoded view. Four
+    haystacks and three limbs is twelve decisions kept in step by hand, and the eleven
+    that were right made the twelfth invisible.
+
+    Measured over 300,000 differential cases by an independent verifier: 25 payloads
+    that the pre-widening combining-class rule BLOCKED and the union RELEASED --
+    proving the union was not, as its own docstring claimed, incapable of regressing.
+    Minimised to `%20NathanielBrightwater<U+11CA9>a`; through the real `check()`:
+
+        combining-class rule : BLOCKED (vault_original)
+        shipped union        : RELEASED, EGRESS_PASS recorded
+
+    The fix is structural rather than one more clause: every skeleton-family haystack
+    goes into one tuple and every limb iterates it, so a new haystack reaches every
+    limb the day it is added and a new limb gets all of them.
+
+    This test asserts the PROPERTY -- the value does not leave -- against the payload
+    shape that needs the last haystack, rather than asserting that some tuple has four
+    entries. A future refactor that reorganises the haystacks entirely still has to
+    pass it. The three single-mechanism controls below are what stop it passing for an
+    unrelated reason.
+    """
+    gate = object.__new__(EgressGate)
+    originals = frozenset({"Nathaniel Brightwater"})
+
+    assert EgressGate._scan_originals(gate, _ESCAPED_AND_MARKED, originals) == 1, (
+        "a vaulted original carrying a transport escape AND a class-0 mark "
+        "was released to the provider"
+    )
+
+    # Non-vacuity: each mechanism alone is already caught, so the assertion above is
+    # about their COMBINATION and not about the gate merely working at all.
+    for label, payload in (
+        ("escape only", "Portal: v=Nathaniel%20Brightwater today."),
+        ("mark only", "Contact Nathaniel Brightwater\u0903Corporation."),
+        ("neither", "Contact Nathaniel Brightwater today."),
+    ):
+        assert EgressGate._scan_originals(gate, payload, originals) == 1, label
+
+    # The escape-only control keeps a space after the value ON PURPOSE. Written with
+    # the glued `...BrightwaterRef` tail the payload under test uses, it reports 0 --
+    # correctly, because with no mark and no space there is no word boundary anywhere
+    # for any haystack to find. That is the mechanism in one line: the mark is not
+    # noise the scan has to survive, it is what CREATES the boundary, and the class
+    # view is the only form that keeps it.
+    assert (
+        EgressGate._scan_originals(
+            gate, "Portal: /q?v=lab%20NathanielBrightwaterRef -- summarise.", originals
+        )
+        == 0
+    )
+
+    # And the limb is not simply matching everything: an unrelated payload with the
+    # same escape and the same mark must NOT report a hit.
+    assert (
+        EgressGate._scan_originals(
+            gate, "Portal: /q?v=lab%20SomebodyElse\u0903Ref -- summarise.", originals
+        )
+        == 0
+    )
