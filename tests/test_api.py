@@ -64,6 +64,7 @@ from secure_context_pipeline.api.app import (
     _read_capped,
     create_app,
 )
+from secure_context_pipeline.api.routes.audit import MAX_AUDIT_OFFSET
 from secure_context_pipeline.api.schemas import MAX_ID_LEN
 from secure_context_pipeline.audit.logger import (
     DETECT,
@@ -1331,10 +1332,33 @@ async def test_dockerfile_never_copies_the_working_tree_wholesale() -> None:
                 f"blanket COPY re-introduces the secret leak: {copy_line}"
             )
 
-    # And the deny-list backstop names the two things that must never ship.
-    dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").split()
-    assert ".env" in dockerignore
-    assert "data/" in dockerignore
+    # And the deny-list backstop: asked of the MATCHER, not of the file's spelling.
+    #
+    # This used to read the file, split it on whitespace and assert the literal token
+    # ".env" was among the pieces. That had two faults. It tokenised prose, so a
+    # comment containing the word "data/" satisfied it with no rule present at all;
+    # and it pinned an exact spelling, so it went red when the rules were rewritten
+    # `**/.env` -- a change that denies strictly MORE. Docker anchors a pattern to the
+    # context root unless it starts with `**/`, so `.env` covered ./.env only. An
+    # assertion that reddens when a deny-list is STRENGTHENED is testing the spelling
+    # rather than the property, and the property is what must never regress.
+    #
+    # `_dockerignored` is the matcher pinned against a real daemon build further down
+    # this file, so this asks the same question the daemon answers.
+    dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    assert _dockerignored(".env", dockerignore)
+    # The nested case, which is what the `**/` rewrite actually closed and which the
+    # old literal check could never have covered: a seeded secure_context_pipeline/.env
+    # shipped in the tagged image while the root .env was correctly excluded.
+    assert _dockerignored("secure_context_pipeline/.env", dockerignore)
+    assert _dockerignored("secure_context_pipeline/crypto/tls.key", dockerignore)
+    assert _dockerignored("data/blob.enc", dockerignore)
+    # `data/` stays root-anchored on purpose, and this is the guard that stops a future
+    # tidy-up sweeping it into `**/data/`: the gazetteers live under a nested data/ and
+    # must still ship, or the detector loses every gazetteer-backed entity type.
+    assert not _dockerignored(
+        "secure_context_pipeline/detection/data/diagnoses.txt", dockerignore
+    )
 
     # Nothing may bake a key into the image config either. Only the directives
     # that can actually put a value in a layer are searched -- ``ENV``, ``ARG``
@@ -1905,6 +1929,119 @@ async def test_the_audit_page_ceiling_is_an_absolute_number_of_rows(
         DEFAULT_AUDIT_PAGE,
         MAX_AUDIT_PAGE,
     )
+
+
+async def test_an_audit_offset_past_sqlites_integer_range_is_refused_with_the_headers_on(
+    client: AsyncClient,
+) -> None:
+    """``limit`` had a ceiling; ``offset`` was ``Query(ge=0)`` with none.
+
+    ``AuditLogger.query`` binds ``offset`` straight into SQLite, whose
+    ``INTEGER`` is signed 64-bit. Measured on this build:
+    ``offset=9223372036854775807`` answered ``200`` and an empty page, and that
+    value ``+1`` raised ``OverflowError: Python int too large to convert to
+    SQLite INTEGER``. ``_register_handlers`` registers ``PipelineError``,
+    ``ApiError``, ``RequestValidationError`` and ``HTTPException`` -- nothing
+    covers ``OverflowError`` -- so it left the app entirely and Starlette's
+    ``ServerErrorMiddleware``, which sits *outside* ``_SecurityHeaders``,
+    answered a bare ``text/plain`` ``500 Internal Server Error`` and logged a
+    full traceback. Two anonymous requests reached it: ``POST /sessions`` mints a
+    session for any ``user_id`` named, and ``GET`` is not in ``METERED_METHODS``
+    while a *successful* scope proof charges no meter, so the repeat was free.
+
+    **The headers are asserted, not just the status**, and that is the whole
+    point of this test rather than padding: the 500 carried no
+    ``content-security-policy``, no ``x-content-type-options`` and no
+    ``referrer-policy``, because the failure mode was specifically an exception
+    escaping the middleware stack. A test that checked only for "not a 500"
+    would pass against a 500 that had merely been given a nicer body.
+
+    The probes are absolute integers, deliberately not written in terms of
+    ``MAX_AUDIT_OFFSET`` -- an assertion phrased relative to the constant is
+    exactly what raising the constant satisfies, which is the same trap
+    ``test_the_audit_page_ceiling_is_an_absolute_number_of_rows`` records.
+    """
+    session_id = await _create_session(client)
+    scope = {"session_id": session_id, "user_id": OWNER}
+
+    at_the_ceiling = await client.get(
+        "/audit", params={**scope, "offset": 9_223_372_036_854_775_807}
+    )
+    assert at_the_ceiling.status_code == 200, at_the_ceiling.text
+    assert at_the_ceiling.json()["offset"] == 9_223_372_036_854_775_807
+
+    for offset in (9_223_372_036_854_775_808, 18_446_744_073_709_551_616, 10**30):
+        refused = await client.get("/audit", params={**scope, "offset": offset})
+        assert refused.status_code == 422, (offset, refused.status_code, refused.text)
+        assert refused.json() == {
+            "code": "VALIDATION_ERROR",
+            "detail": {"errors": 1, "fields": "query.offset"},
+        }, (offset, refused.text)
+        assert refused.headers["content-type"].startswith("application/json"), offset
+        assert "frame-ancestors 'none'" in refused.headers["content-security-policy"], offset
+        assert refused.headers["x-content-type-options"] == "nosniff", offset
+        assert refused.headers["referrer-policy"] == "no-referrer", offset
+
+    assert MAX_AUDIT_OFFSET == 9_223_372_036_854_775_807, MAX_AUDIT_OFFSET
+
+
+async def test_a_nan_audit_window_is_refused_rather_than_silently_dropped(
+    client: AsyncClient,
+) -> None:
+    """``since``/``until`` were bare ``float | None``, and pydantic accepts ``nan``.
+
+    Python's ``sqlite3`` driver binds a ``NaN`` as SQL ``NULL``, so the guard
+    ``(:since IS NULL OR ts >= :since)`` evaluated ``TRUE`` for every row and the
+    bound was dropped entirely -- the request that asked for a window got the
+    whole unfiltered page instead of the empty set a ``NaN`` comparison implies.
+
+    Measured on this build against a session with one row: no window returned 1,
+    ``since=9e99`` returned 0, ``since=inf`` returned 0, ``until=-inf`` returned
+    0, and ``since=nan`` returned **1**. Every other value behaved; ``NaN`` was
+    the single input where a compliance read reported a filter it was not
+    applying, which is worse than refusing it.
+
+    So the assertion that bites is not the status code but that the response is
+    *not the unfiltered page*: a fix that answered 200-and-zero-rows would also
+    be acceptable, and a regression back to 200-and-every-row is what this
+    catches. ``inf``/``-inf`` are refused with ``nan`` because an infinite bound
+    is expressible as no bound at all, and because ``canonical_json`` already
+    refuses non-finite floats on the write side of this same log.
+    """
+    session_id = await _create_session(client)
+    scope = {"session_id": session_id, "user_id": OWNER}
+
+    unfiltered = await client.get("/audit", params=scope)
+    assert unfiltered.status_code == 200, unfiltered.text
+    assert unfiltered.json()["returned"] >= 1, unfiltered.text
+
+    # A finite window still filters, and a finite window in the future is empty.
+    future = await client.get("/audit", params={**scope, "since": 4_102_444_800.0})
+    assert future.status_code == 200, future.text
+    assert future.json()["returned"] == 0, future.text
+
+    for param, value in (
+        ("since", "nan"),
+        ("since", "NaN"),
+        ("until", "nan"),
+        ("since", "inf"),
+        ("until", "-inf"),
+    ):
+        refused = await client.get("/audit", params={**scope, param: value})
+        assert refused.status_code == 422, (param, value, refused.status_code, refused.text)
+        assert refused.json() == {
+            "code": "VALIDATION_ERROR",
+            "detail": {"errors": 1, "fields": f"query.{param}"},
+        }, (param, value, refused.text)
+        # The defect was never the status code -- it was that `nan` answered 200
+        # with every row the unscoped read returns.
+        assert refused.text != unfiltered.text, (param, value)
+        assert "frame-ancestors 'none'" in refused.headers["content-security-policy"], (
+            param,
+            value,
+        )
+        assert refused.headers["x-content-type-options"] == "nosniff", (param, value)
+        assert refused.headers["referrer-policy"] == "no-referrer", (param, value)
 
 
 async def test_an_audit_scope_with_no_recorded_owner_reads_as_empty(

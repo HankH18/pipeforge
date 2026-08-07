@@ -61,12 +61,25 @@ from collections.abc import Callable, Mapping
 from enum import Enum
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from secure_context_pipeline import config as config_module
 from secure_context_pipeline import models
+from secure_context_pipeline.api import schemas as api_schemas
+from secure_context_pipeline.api.schemas import AuditQueryResponse
 from secure_context_pipeline.config import Settings
-from secure_context_pipeline.models import MASK, EntityCategory, SpanOut, TokenRecord
+from secure_context_pipeline.errors import (
+    MAX_DETAIL_VALUE_LEN,
+    PipelineError,
+    VaultMissError,
+)
+from secure_context_pipeline.models import (
+    MASK,
+    AuditEvent,
+    EntityCategory,
+    SpanOut,
+    TokenRecord,
+)
 
 #: Distinctive enough that a substring match cannot be a coincidence, and short
 #: enough to satisfy every length cap in the module (``AuditEvent`` string columns
@@ -860,4 +873,228 @@ def test_models_and_config_docstrings_describe_the_third_exit() -> None:
             f"{module.__name__}'s module docstring mentions only {present} of the "
             f"attribute-access exit's mechanisms {list(tokens)}. A docstring that describes "
             "only repr() and model_dump() overstates the guarantee; see THIRD_EXIT_LEAKS."
+        )
+
+
+# ---------------------------------------------------------------------------
+# The exception detail ceiling, which claimed parity with AuditEvent.detail
+# ---------------------------------------------------------------------------
+
+#: 408 characters of clinical note, encoded as a single 983-digit integer. This is
+#: the shape that walked past `errors.py`: the check was `isinstance(value, str)`
+#: and `DetailValue` is `int | float | str | None`, so an integer had no length to
+#: measure. `models.py` had already closed the same hole on `AuditEvent.detail`
+#: (with a 1,540-char note and a 3,709-digit int) while `errors.py`'s docstring
+#: still called itself "the identical guard".
+_NOTE = (
+    "Patient John Smith, MRN 4823910, DOB 1978-03-02, dx metastatic "
+    "pancreatic carcinoma, SSN 123-45-6789. " * 4
+)
+_NOTE_AS_INT = int.from_bytes(_NOTE.encode("utf-8"), "big")
+
+
+def test_a_document_encoded_as_an_integer_is_refused_by_a_pipeline_error() -> None:
+    """The exception ceiling must measure the RENDERED width, in every type.
+
+    The counterpart of ``test_audit.py::test_a_document_encoded_as_an_integer_is_
+    refused_by_the_model``. The audit side had that test; the exception side had
+    none, which is exactly why the two guards drifted apart under a docstring
+    asserting they were identical.
+
+    This is not a theoretical surface. ``api/errors.py`` writes
+    ``dict(exc.detail)`` straight into the HTTP response body, and
+    ``PipelineError.__init__`` renders every detail value into ``str(exc)`` -- so a
+    document that clears the ceiling is both in the body and in any log line that
+    interpolates the exception. Measured before the fix: the 408-character note
+    below was accepted as a 983-digit int and produced a 1,004-character
+    ``str(exc)`` from which the full text came back with one ``to_bytes``.
+
+    Asserted over three payloads, because a fix that special-cased ``int`` would
+    satisfy the interesting half and still be type-conditional. ``float`` is
+    deliberately *not* one of them: ``str()`` of any Python float is at most 24
+    characters (``str(-sys.float_info.max)`` is 24; the unsigned
+    ``sys.float_info.max`` is 23), so no float can breach a
+    64-char ceiling and a float case would be a test that cannot fail. The third
+    payload is a ``list`` -- ``**detail: DetailValue`` is a type hint and nothing
+    enforces it at runtime, so a future call site that passes ``entity_types=[...]``
+    where the shipped one passes a joined string renders its whole contents into
+    the body. That is the "future call site cannot do so silently" case the module
+    docstring says this guard exists for.
+    """
+    with pytest.raises(ValueError, match="must not carry content"):
+        PipelineError(note=_NOTE)
+    with pytest.raises(ValueError, match="must not carry content"):
+        PipelineError(note=_NOTE_AS_INT)
+    with pytest.raises(ValueError, match="must not carry content"):
+        PipelineError(entity_types=[_NOTE])  # type: ignore[arg-type]
+
+    # The recovery that makes it a disclosure rather than a curiosity: the premise
+    # is that the integer really is the document, not merely a large number.
+    recovered = _NOTE_AS_INT.to_bytes((_NOTE_AS_INT.bit_length() + 7) // 8, "big").decode()
+    assert recovered.startswith("Patient John Smith"), "premise: the int really is the note"
+
+
+def test_a_pipeline_error_bounds_the_detail_KEY_as_well_as_the_value() -> None:
+    """Both halves of a detail entry reach the response body, so both are bounded.
+
+    ``AuditEvent`` bounds its detail keys for this reason and ``PipelineError`` did
+    not, so a 500-character key was accepted here and refused there. No shipped
+    call site builds a dynamic key -- they all arrive as kwargs literals -- so this
+    closes a hardening gap rather than a live leak, which is the kind that survives
+    precisely because nothing exercises it.
+    """
+    with pytest.raises(ValueError, match="must not carry content"):
+        PipelineError(**{"k" * (MAX_DETAIL_VALUE_LEN + 1): 1})
+
+
+def test_the_tightened_exception_ceiling_still_admits_real_structured_detail() -> None:
+    """The positive control: bounding every type must not break the actual callers.
+
+    A ceiling measured on ``str(value)`` now applies to ``None``, ints and floats,
+    which no previous version of this guard touched. Every shipped detail value is
+    one of these shapes -- ``str(None)`` is 4 characters, a latency renders to ~20 --
+    so this pins that the fix costs the real call sites nothing. Without it, a
+    later over-tightening (say, rejecting ``None``) would look like a passing test
+    run for the two tests above.
+    """
+    error = PipelineError(
+        session_id="a" * MAX_DETAIL_VALUE_LEN,
+        token_id=None,
+        reason="egress_vault_original",
+        hit_count=3,
+        elapsed_ms=12.345678901234567,
+    )
+    assert error.detail["token_id"] is None
+    assert error.detail["hit_count"] == 3
+    assert VaultMissError(session_id="s", token_id=None).detail["token_id"] is None
+
+
+def test_the_two_detail_ceilings_are_the_same_guard_and_not_merely_documented_so() -> None:
+    """``errors.py`` claims parity with ``AuditEvent.detail``; check the parity.
+
+    The docstring said "mirroring the identical guard" for as long as the two were
+    *not* identical, and nothing compared them -- each side had its own tests and
+    each passed. So the claim itself is the assertion here: the same payload, in
+    every renderable type and on both halves of the entry, must be refused by both
+    or accepted by both.
+
+    Quantified over the payloads rather than written as four hand-paired cases for
+    the usual reason: the string case is the one an author remembers, and it was
+    the only one that agreed.
+    """
+    payloads: tuple[object, ...] = (
+        "x" * (MAX_DETAIL_VALUE_LEN + 1),
+        _NOTE_AS_INT,
+        [_NOTE],
+    )
+    for payload in payloads:
+        audit_refused = True
+        try:
+            AuditEvent(ts=0.0, session_id="s", event_type="X", detail={"n": payload})  # type: ignore[dict-item]
+        except ValidationError:
+            pass
+        else:
+            audit_refused = False
+
+        error_refused = True
+        try:
+            PipelineError(n=payload)  # type: ignore[arg-type]
+        except ValueError:
+            pass
+        else:
+            error_refused = False
+
+        assert audit_refused == error_refused, (
+            f"{type(payload).__name__} payload: AuditEvent.detail "
+            f"{'refused' if audit_refused else 'ACCEPTED'} it and PipelineError "
+            f"{'refused' if error_refused else 'ACCEPTED'} it. errors.py's docstring "
+            "calls these the identical guard; make them identical or stop saying so."
+        )
+
+    long_key = "k" * (MAX_DETAIL_VALUE_LEN + 1)
+    with pytest.raises(ValidationError):
+        AuditEvent(ts=0.0, session_id="s", event_type="X", detail={long_key: 1})
+    with pytest.raises(ValueError, match="must not carry content"):
+        PipelineError(**{long_key: 1})
+
+
+# ---------------------------------------------------------------------------
+# The retracted "cannot hold an original value" claim, on the response model
+# that hands audit rows to an outside reader
+# ---------------------------------------------------------------------------
+
+
+def test_the_audit_response_model_does_serialize_a_short_original() -> None:
+    """The measurement behind the retraction, pinned so the overclaim cannot return.
+
+    ``api/schemas.py`` used "``AuditEvent`` cannot hold an original value by
+    construction" as the stated reason ``GET /audit`` needs no further filtering.
+    ``audit/logger.py`` and the README both retract that claim, and this is the one
+    line that disproves it: a name, an MRN, an SSN and an e-mail all fit inside the
+    64-character detail ceiling and the 128-character label ceiling, and the real
+    response model serialises every one of them.
+
+    Like ``test_the_third_exit_leaks_exactly_what_the_docstrings_claim_it_leaks``,
+    this asserts that something **does** come out. It is not endorsing it -- no call
+    site writes these values, and the leakage harness measures that on every run.
+    It refuses to let the boundary schema justify itself with a guarantee the rest
+    of the repository has already withdrawn.
+    """
+    event = AuditEvent(
+        ts=1.0,
+        session_id="s",
+        event_type="DETECT",
+        entity_type="MRN 4823910",
+        token_id="john.smith@example.com",
+        detail={"v": "John Smith", "ssn": "123-45-6789"},
+    )
+    body = AuditQueryResponse(events=[event], returned=1, limit=10, offset=0).model_dump_json()
+    for original in ("MRN 4823910", "john.smith@example.com", "John Smith", "123-45-6789"):
+        assert original in body, (
+            f"{original!r} did not survive into the GET /audit body. If a real ceiling now "
+            "stops it, that is good news and the fix is to update this test AND the honest "
+            "prose in api/schemas.py, audit/logger.py and the README together."
+        )
+
+    # What the ceilings *do* buy, and the half of the claim that is true.
+    with pytest.raises(ValidationError):
+        AuditEvent(ts=1.0, session_id="s", event_type="X", detail={"note": _NOTE})
+
+
+def test_the_boundary_schema_docstrings_state_the_retracted_claim_honestly() -> None:
+    """``api/schemas.py`` must not re-derive its safety from the withdrawn guarantee.
+
+    The overclaim was retracted in three places (README, ``audit/logger.py``,
+    ``test_audit.py``) and left standing in the boundary schema, where it was
+    load-bearing rather than decorative -- it was the stated reason the audit body
+    is returned unfiltered. Prose that contradicts the prose one module away is how
+    a retraction gets quietly un-retracted.
+
+    Checked as "the false sentence is gone AND the honest mechanism is named",
+    because deleting the claim without replacing it would leave the response model
+    with no stated argument at all. The token check follows
+    ``test_models_and_config_docstrings_describe_the_third_exit``: mechanisms, not
+    exact sentences, so a rewording survives and a rewrite back to "by
+    construction" does not.
+    """
+    module_doc = api_schemas.__doc__ or ""
+    class_doc = AuditQueryResponse.__doc__ or ""
+
+    for name, doc in (("module", module_doc), ("AuditQueryResponse", class_doc)):
+        assert "structurally incapable of holding one" not in doc, (
+            f"api/schemas.py's {name} docstring still asserts the retracted "
+            "'incapable of holding an original' guarantee; audit/logger.py retracts it."
+        )
+
+    assert "cannot hold an original value by construction" not in class_doc, (
+        "AuditQueryResponse still justifies the unfiltered audit body with the claim "
+        "the README calls disprovable in one line."
+    )
+    for token in ("content", "correlation", "leakage harness", "call site"):
+        assert token in class_doc.lower(), (
+            f"AuditQueryResponse's docstring no longer mentions {token!r}. The honest "
+            "argument has three parts -- content cannot get in, a short identifier is "
+            "kept out by call site and measured, and the correlation risk is handled by "
+            "the proved scope in routes/audit.py -- and dropping one turns the remaining "
+            "two back into an overclaim."
         )

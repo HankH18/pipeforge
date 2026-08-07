@@ -2433,3 +2433,242 @@ async def test_an_oversized_detail_key_is_refused_at_the_write_boundary(tmp_path
         assert await log.length() == 0
     finally:
         await log.close()
+
+
+# --------------------------------------------------------------------------
+# 10. The write boundary re-enforces the model's TYPE rule, not only its widths.
+#
+# `_reject_content_sized_fields` exists because `model_construct` skips the model.
+# It skips all of the model, so re-checking only the ceilings left the other half of
+# `detail`'s contract -- `Mapping[str, int | float | str]` -- unenforced on the one
+# path that needs it. The consequence is worse than a leak: a value the *writer*
+# accepts and the *reader* refuses turns `verify_chain()` False forever, on a row
+# this package wrote itself.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("shape", "value"),
+    [
+        ("nested dict", {"a": 1}),
+        ("list", [1, 2, 3]),
+        ("null", None),
+    ],
+)
+async def test_a_non_scalar_detail_value_is_refused_at_the_write_boundary(
+    tmp_path: Path, shape: str, value: object
+) -> None:
+    """A container `detail` value was written, and then poisoned the chain forever.
+
+    The width check could not see it, and that is the whole mechanism: `{"k": {"a":
+    1}}` renders as 13 characters of JSON and `{"k": [1,2,3]}` as 13 -- both far
+    under the 64-character ceiling -- so a width-only boundary passed them and the
+    INSERT ran. `_load_detail` then refused the stored column ("not a detail map"),
+    which `verify_chain` reports as `detail_not_json`, so the verifier called the log
+    tampered from that row onward for the rest of its life while `query()` handed the
+    same row back with `detail={}` and reported nothing. `None` is the same shape by a
+    different route: `str(None)` is 4 characters, and JSON `null` is not a detail
+    value either.
+
+    That is a self-inflicted denial of the audit trail's only security property, and
+    it is the reverse of fail-closed: refusing the write costs one event, while
+    accepting it costs every later verification. `detail` is typed `Mapping[str, int
+    | float | str]`, so the type rule is as much of the contract as the ceiling, and
+    the boundary now re-enforces both.
+
+    No shipped call site uses `model_construct`, so this is a hardening gap inside the
+    threat model `_reject_content_sized_fields` declares for itself -- which is
+    exactly the kind that survives, because nothing exercises it.
+    """
+    log = await AuditLogger.open(tmp_path / "audit.db")
+    try:
+        await log.emit(make_event(detail={"ok": 1}))
+        assert await log.verify_chain() is True, "premise: a clean log verifies"
+
+        event = AuditEvent.model_construct(
+            ts=2.0,
+            session_id="sess-1",
+            event_type=DETECT,
+            detail={"k": value},
+        )
+        with pytest.raises(PipelineError) as raised:
+            await log.emit(event)
+        assert raised.value.detail["reason"] == "audit_detail_value_not_scalar", shape
+        assert raised.value.detail["value_type"] == type(value).__name__
+        assert await log.length() == 1, "nothing was written"
+
+        # The reason refusing matters, asserted rather than described: had the row
+        # landed, this assertion would be False here and on every later call.
+        await log.emit(make_event(detail={"ok": 2}))
+        assert await log.verify_chain() is True, (
+            "a row this module wrote itself must never be one its own verifier "
+            "refuses to parse"
+        )
+    finally:
+        await log.close()
+
+
+async def test_a_non_string_detail_key_is_refused_with_a_typed_error(tmp_path: Path) -> None:
+    """A non-string key crashed the boundary on `len(key)` instead of refusing it.
+
+    `TypeError: object of type 'int' has no len()` fails closed -- nothing is written
+    -- but it is a raw interpreter error escaping a function whose documented
+    contract is a `PipelineError`, and `api/errors.py` maps only the latter. The
+    neighbouring key-ceiling test asserts the typed shape for an oversized *string*
+    key; an integer key never reached that check at all.
+    """
+    log = await AuditLogger.open(tmp_path / "audit.db")
+    try:
+        event = AuditEvent.model_construct(
+            ts=1.0,
+            session_id="sess-key",
+            event_type=DETECT,
+            detail={7: 1},
+        )
+        with pytest.raises(PipelineError) as raised:
+            await log.emit(event)
+        assert raised.value.detail["reason"] == "audit_detail_key_not_a_string"
+        assert raised.value.detail["key_type"] == "int"
+        assert await log.length() == 0, "nothing was written"
+    finally:
+        await log.close()
+
+
+async def test_an_integer_too_large_to_render_is_refused_as_a_ceiling_breach(
+    tmp_path: Path,
+) -> None:
+    """The document-as-an-integer ceiling, past the size Python will render at all.
+
+    `test_a_document_encoded_as_an_integer_is_refused_at_the_write_boundary` uses a
+    1,540-character note, which encodes to 3,709 digits -- just under CPython's 4,300
+    digit cap on `int` -> `str`. Triple the note and `str(value)` itself raises
+    `ValueError: Exceeds the limit (4300 digits) for integer string conversion`, from
+    inside the very expression that measures the width. So the *larger* smuggled
+    document produced a bare interpreter error where the smaller one produced the
+    documented `PipelineError` -- a boundary that gets less typed as the payload gets
+    worse.
+
+    Refusing past the interpreter's own rendering limit is a fortiori refusing past 64
+    characters, so it carries the same `reason`. The exact rendered width cannot be
+    reported without raising a global interpreter limit, so the floor is reported
+    instead of a guess.
+    """
+    log = await AuditLogger.open(tmp_path / "audit.db")
+    try:
+        huge = int.from_bytes((_DOC * 3).encode("utf-8"), "big")
+        with pytest.raises(ValueError, match="4300 digits"):
+            str(huge)  # premise: this is the int the old code measured with len(str(...))
+
+        event = AuditEvent.model_construct(
+            ts=1.0,
+            session_id="sess-huge",
+            event_type=DETECT,
+            detail={"n": huge},
+        )
+        with pytest.raises(PipelineError) as raised:
+            await log.emit(event)
+        assert raised.value.detail["reason"] == "audit_detail_exceeds_ceiling"
+        assert raised.value.detail["min_length"] == sys.get_int_max_str_digits()
+        assert await log.length() == 0, "nothing was written"
+    finally:
+        await log.close()
+
+
+# --------------------------------------------------------------------------
+# 11. The residual in the scoped verify: erasure by relabelling.
+# --------------------------------------------------------------------------
+
+
+async def _relabelled_log(path: Path, where: str) -> AuditLogger:
+    """Build a six-row two-session log, then move rows out of `sess-a` behind its back."""
+    log = await AuditLogger.open(path)
+    for i in range(6):
+        await log.emit(make_event(ts=8000.0 + i, session_id="sess-a" if i % 2 == 0 else "sess-b"))
+    assert await log.verify_chain() is True, "premise: a clean log verifies"
+    await log.close()
+
+    async with aiosqlite.connect(path) as conn:
+        await conn.execute(f"UPDATE audit_events SET session_id = 'sess-z' WHERE {where}")
+        await conn.commit()
+    return await AuditLogger.open(path)
+
+
+async def test_relabelling_a_session_out_of_itself_is_a_known_residual(tmp_path: Path) -> None:
+    """`verify_chain("sess-a")` is True after every one of sess-a's rows was rewritten away.
+
+    Asserted rather than described, in the same spirit as
+    `test_a_correctly_hashed_tail_append_is_a_known_residual`: the boundary of a
+    security claim should be a fact the suite states.
+
+    `UPDATE audit_events SET session_id='sess-z' WHERE session_id='sess-a'` erases
+    sess-a's history as completely as `DELETE` does, and unlike `DELETE` it moves
+    nothing -- every `prev_hash` link and every `seq` still holds. The structural
+    checks are global precisely so a deletion is visible from the victim's scope, and
+    here they have nothing to report.
+
+    The relabelled rows do fail their own `entry_hash`, because `session_id` is inside
+    the hashed payload, and *both* checks that can see that failure report it: the
+    unscoped walk, and the scope of the session the rows were moved into. Only the
+    victim's own scope answers True.
+
+    That is not a patchable oversight. A relabelled row is, column for column, a row
+    whose stored `session_id` names another session and whose hash does not recompute
+    -- the identical input class as an ordinary tampered row genuinely belonging to
+    that other session, which `test_tamper_is_scoped_to_the_affected_session` pins as
+    *not* failing an unrelated scope. The pre-tamper `session_id` is inside the digest
+    the tamper destroyed, so no walk can recover it and no rule can tell the two
+    apart. Charging every unattributable hash break against every scope would close
+    this and would flip that test's third assertion: a different design, not a fix.
+
+    So the scoped form's honest contract is "the rows *labelled* with this session are
+    intact, and the log they sit in is structurally whole" -- not "no record of this
+    session has been taken out of it". Only the unscoped form answers the second.
+    """
+    log = await _relabelled_log(tmp_path / "audit.db", "session_id = 'sess-a'")
+    try:
+        # The checks that can see it, and must keep seeing it.
+        assert await log.verify_chain() is False, (
+            "the whole-log answer is the one a compliance check must rely on"
+        )
+        assert await log.verify_chain(session_id="sess-z") is False, (
+            "the receiving scope holds rows whose hashes do not recompute"
+        )
+        # An untouched bystander is unaffected, which is the scoping rule working.
+        assert await log.verify_chain(session_id="sess-b") is True
+
+        # The residual, asserted rather than described.
+        assert await log.length(session_id="sess-a") == 0, "premise: sess-a was erased"
+        assert await log.verify_chain(session_id="sess-a") is True, (
+            "erasure-by-relabel is now detected from the victim's own scope -- if that "
+            "is a deliberate improvement, delete this test and update the "
+            "verify_chain docstring and README section 5 Q5, which document the gap "
+            "it pins"
+        )
+    finally:
+        await log.close()
+
+
+async def test_a_partial_relabel_is_invisible_to_the_scope_it_left(tmp_path: Path) -> None:
+    """Two of sess-a's three rows moved away, and sess-a still verifies True.
+
+    This exists to kill the tempting narrow fix. "The scope has no rows left, so it
+    has no positive evidence about itself" looks like a usable signal -- it is the
+    difference between the deletion case (caught globally, by structure) and the
+    relabel case -- and it would close the total erasure in the test above.
+
+    It closes nothing. Relabel two of a session's three rows and the survivor is still
+    in scope, still hashes correctly, and still links, so an emptiness rule never
+    fires while two thirds of the session's history has been rewritten away. The
+    scoped answer degrades continuously, not at zero, which is why the residual is a
+    property of what a hashed `session_id` can be asked after it has been overwritten
+    and not a threshold anyone can pick.
+    """
+    log = await _relabelled_log(tmp_path / "audit.db", "seq IN (1, 3)")
+    try:
+        assert await log.length(session_id="sess-a") == 1, "premise: one row was left behind"
+        assert await log.verify_chain() is False, "the whole-log answer still catches it"
+        assert await log.verify_chain(session_id="sess-a") is True, (
+            "a non-empty in-scope slice is why 'the scope is empty' cannot be the rule"
+        )
+    finally:
+        await log.close()

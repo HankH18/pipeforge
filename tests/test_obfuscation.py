@@ -32,6 +32,7 @@ from secure_context_pipeline.api.schemas import MAX_PROMPT_CHARS, PipelineRunReq
 from secure_context_pipeline.audit.logger import OBFUSCATE, REDACT, STRIP, AuditLogger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.keys import derive_token_id, normalize
+from secure_context_pipeline.deobfuscation.restorer import Restorer
 from secure_context_pipeline.detection import detector as detector_module
 from secure_context_pipeline.detection.registry import GAZETTEER_DIR, EntityRegistry, EntitySpec
 from secure_context_pipeline.errors import ConfigError, PipelineError, VaultMissError
@@ -58,7 +59,10 @@ from secure_context_pipeline.obfuscation.strategies.pseudonymization import (
     parse_source_date,
 )
 from secure_context_pipeline.pipeline import egress_gate
-from secure_context_pipeline.pipeline.orchestrator import _assert_surrogates_are_distinct
+from secure_context_pipeline.pipeline.orchestrator import (
+    PipelineOrchestrator,
+    _assert_surrogates_are_distinct,
+)
 from secure_context_pipeline.surrogates import (
     STRICT_TOKEN_RE,
     extract_token_ids,
@@ -621,8 +625,25 @@ async def test_name_component_linking_gives_a_consistent_fake_surname(env: Env) 
 
     assert full.split()[-1] == standalone, (full, standalone)
     assert full.split()[0] != standalone
-    assert "Smith" not in result.obfuscated_text
-    assert "John" not in result.obfuscated_text
+    # Word-bounded, not substring -- and the difference is a real 2.7% flake, not
+    # pedantry. These read `assert "John" not in result.obfuscated_text`, which asks
+    # whether the four characters occur ANYWHERE. Under pseudonymization the surrogate
+    # is a generated human name, and `conftest` mints a fresh random `master_key` per
+    # test, so Faker eventually draws a surname that contains them: measured at 4
+    # failures in 150 runs of this test alone, on `Johnson`, `Johnston` and `Johns`.
+    #
+    # Every one of those is a FAKE the engine invented. Reading them as a leak of the
+    # original inverts what the test is for -- it fails precisely when obfuscation
+    # worked and the replacement happened to be spelled inconveniently. The contract
+    # is that the ORIGINAL does not survive as a value, and a value is a word.
+    #
+    # A plain `\b` rather than `textrules.word_bounded_pattern`: this is a test of the
+    # engine's output, and borrowing the product's own boundary rule to check it would
+    # make a shared bug invisible to both.
+    for original in ("Smith", "John"):
+        assert not re.search(rf"\b{re.escape(original)}\b", result.obfuscated_text), (
+            f"the original {original!r} survived as a word: {result.obfuscated_text!r}"
+        )
 
 
 #: A session key where Faker's ``NAME:first:john`` draw on step 0 is literally
@@ -3100,6 +3121,110 @@ async def test_per_entity_strategy_override_is_config_only(env: Env) -> None:
     for original in ("John Smith", "123-45-6789"):
         assert original not in result.obfuscated_text
     assert await env.vault.get_by_surrogate(env.session_id, fakes["SSN"]) == "123-45-6789"
+
+
+@pytest.mark.parametrize(
+    ("run_strategy", "overridden", "override"),
+    [
+        ("pseudonymization", "SSN", "tokenization"),
+        ("tokenization", "NAME", "pseudonymization"),
+    ],
+)
+async def test_a_per_entity_strategy_override_restores_in_both_directions(
+    env: Env, run_strategy: str, overridden: str, override: str
+) -> None:
+    """A ``strategy:`` override must survive the *restore*, whichever way it points.
+
+    The test above stops at ``ObfuscationEngine.obfuscate`` and exercises one
+    direction: ``strategy: tokenization`` on SSN inside a pseudonymization run.
+    That is the direction that could not fail. The opposite one --
+    ``strategy: pseudonymization`` on NAME inside a **tokenization** run -- is the
+    same registry mechanism pointed the other way, and it was silently broken,
+    because restoring a pseudonym is not keyed on the run's strategy at all: it is
+    keyed on the caller handing :meth:`Restorer.restore` a surrogate map.
+    ``PipelineOrchestrator._surrogate_map`` used to short-circuit on the run's
+    strategy string, so under tokenization it returned ``None``, the surrogate pass
+    never ran, and the invented name reached the caller as the answer.
+
+    Both rows below arrive at the **same payload shape from opposite
+    configurations** -- NAME a pseudonym, SSN a hash token -- and that symmetry is
+    the whole argument. One observed pair (the fakes are session-keyed, so the
+    names differ per run): row 1 emitted ``Todd Santos, SSN [PII_SSN_2f04d083].``
+    and row 2 emitted ``Ashley Thomas, SSN [PII_SSN_b7567176].`` -- two payloads a
+    reader cannot tell apart, one of which used to restore and one of which did
+    not. The run's strategy string is therefore the wrong thing to decide
+    restoration by, and the *shape of what was actually emitted* is the only thing
+    that cannot drift from what the payload contains.
+
+    Nothing in the broken direction had a shape to notice it by, which is why it
+    needed a test rather than a counter. A leftover ``[PII_SSN_...]`` is visibly
+    wrong and trips ``_assert_no_tokens``; a leftover pseudonym is a well-formed
+    human name in a sentence about a patient. Measured with the map withheld from
+    the restorer, row 2 answered ``Summary: Mark Ramos, SSN 123-45-6789.`` -- the
+    SSN correct, the patient a person who does not exist -- carrying
+    ``restored_count=1``, ``vault_misses=0``, ``surrogate_misses=0``,
+    ``surrogates_seen=0`` and ``surrogates_suspected_unrestored=0``. Every counter
+    built to catch this was silent, because the pass that would have looked never
+    ran.
+
+    The map is built by the pipeline's own ``_surrogate_map`` rather than rebuilt
+    here, and that is deliberate: a local copy of the rule would keep this test
+    green in exactly the case it exists to catch -- the shipped orchestrator
+    handing the restorer nothing.
+    """
+    registry = with_spec(env.registry, overridden, strategy=override)
+    engine = ObfuscationEngine(
+        registry=registry,
+        vault=env.vault,
+        session_registry=env.sessions,
+        settings=env.settings,
+        audit=env.audit,
+    )
+    text = "John Smith, SSN 123-45-6789."
+    result = await engine.obfuscate(
+        env.session_id,
+        text,
+        [span(text, "John Smith", "NAME"), span(text, "123-45-6789", "SSN")],
+        strategy=run_strategy,
+    )
+    fakes = surrogates_by_type(result.tokens)
+    # The premise, asserted rather than assumed: both rows really did land on the
+    # same payload shape, or the two directions are not being compared at all.
+    assert not STRICT_TOKEN_RE.fullmatch(fakes["NAME"]), fakes["NAME"]
+    assert STRICT_TOKEN_RE.fullmatch(fakes["SSN"]), fakes["SSN"]
+    assert result.obfuscated_text == f"{fakes['NAME']}, SSN {fakes['SSN']}."
+    for original in ("John Smith", "123-45-6789"):
+        assert original not in result.obfuscated_text
+
+    # Unbound: `_surrogate_map` reads nothing off `self`, and building a real
+    # PipelineOrchestrator here would drag in the store, detector, injector, gate
+    # and provider for a pure function over TokenRecords.
+    surrogates = PipelineOrchestrator._surrogate_map(None, result.tokens)  # type: ignore[arg-type]
+    assert surrogates == {fakes["NAME"]: ""}, (
+        f"{run_strategy} run: the map handed to the restorer must be the pseudonym, "
+        "and only the pseudonym"
+    )
+
+    restorer = Restorer(vault=env.vault, settings=env.settings, audit=env.audit)
+    restored = await restorer.restore(
+        env.session_id,
+        f"Summary: {result.obfuscated_text}",
+        strategy=run_strategy,
+        # Exactly what `PipelineOrchestrator.run` passes at step 8, so the test is
+        # asking what the shipped pipeline gets back, not what the restorer can do.
+        surrogates=surrogates,
+        issued={record.token_id for record in result.tokens},
+    )
+    assert restored.text == "Summary: John Smith, SSN 123-45-6789."
+    # Stated separately from the equality above because this is the half that fails
+    # silently: the fake is an ordinary name, so its survival changes nothing a
+    # reader could see.
+    assert fakes["NAME"] not in restored.text
+    assert restored.restored_count == 2
+    assert restored.vault_misses == 0
+    assert restored.surrogates_seen == 1
+    assert restored.tokens_seen == 1
+    assert restored.surrogates_suspected_unrestored == 0
 
 
 # ---------------------------------------------------------------------------

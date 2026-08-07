@@ -15,9 +15,24 @@ Each stage is failed in turn here and the unwind is checked against the live
 ``aiosqlite.Connection`` *threads* -- the thing that actually holds the process
 open -- rather than against any internal flag.
 
-The failures are forced by patching exactly one name in
-``secure_context_pipeline.api.lifespan`` at a time; nothing else is faked, and
-the connections that do get opened are the real ones.
+Every failure here is placed with a thin ``_Stage`` shim rather than a fake. All
+three resource classes in ``secure_context_pipeline.api.lifespan`` --
+``AuditLogger``, ``EncryptedDocumentStore``, ``SessionVault`` -- are wrapped on
+every run, because the assertions need a handle on whatever actually opened;
+exactly one shim is armed to raise and every other one calls straight through to
+the real class. The provider stage replaces a fourth name, ``build_provider``,
+which is a function rather than a class. So the connections that do get opened
+are real aiosqlite connections and the closers the unwind runs are the real bound
+``close`` methods -- the leak this file is about is not something the harness can
+fake away. The one genuine stub is the spaCy warm-up (the ``no_model`` fixture):
+it costs tens of seconds, it runs before the first connection exists, and no
+unwind test analyses a document.
+
+That paragraph used to read "by patching exactly one name ... nothing else is
+faked", which measured as three names on every run, four on the provider run, and
+``warm_up`` on top. Overstating how little a harness fakes changes what its green
+means, so ``test_this_docstring_matches_the_harness`` now pins the prose to the
+measurement.
 """
 
 from __future__ import annotations
@@ -46,6 +61,7 @@ from secure_context_pipeline.api import lifespan as lifespan_module
 from secure_context_pipeline.api.app import create_app
 from secure_context_pipeline.audit.logger import AuditLogger
 from secure_context_pipeline.config import Settings
+from secure_context_pipeline.detection.detector import warm_up as real_warm_up
 from secure_context_pipeline.errors import PipelineError
 from secure_context_pipeline.models import EntityCategory, TokenRecord
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
@@ -181,6 +197,24 @@ def _stage_the_failure(
         monkeypatch.setattr(lifespan_module, "build_provider", _fails_with(error))
 
 
+def _names_replaced_in_lifespan(failing_stage: str) -> frozenset[str]:
+    """Which attributes of the lifespan module ``_stage_the_failure`` replaces.
+
+    Measured by diffing the module namespace across a real ``MonkeyPatch``
+    context rather than by reading the helper's source, so a patch someone adds
+    later is counted whether or not the paragraph at the top of this file gets
+    updated with it.
+    """
+    before = {name: getattr(lifespan_module, name) for name in dir(lifespan_module)}
+    with pytest.MonkeyPatch.context() as patcher:
+        _stage_the_failure(patcher, failing_stage, [], RuntimeError("never raised: nothing runs"))
+        return frozenset(
+            name
+            for name, original in before.items()
+            if getattr(lifespan_module, name) is not original
+        )
+
+
 @pytest.fixture
 def no_model(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Skip the spaCy warm-up. The unwind tests never analyse a document."""
@@ -300,6 +334,38 @@ async def test_health_reports_degraded_when_the_audit_database_is_unreachable(
 # ---------------------------------------------------------------------------
 # Transactional startup
 # ---------------------------------------------------------------------------
+@pytest.mark.usefixtures("no_model")
+# Awaits nothing, but the file-wide ``pytestmark`` marks every test asyncio and
+# pytest-asyncio warns on a sync function carrying that mark.
+async def test_this_docstring_matches_the_harness() -> None:
+    """The paragraph at the top of this file is what a reviewer reads instead of
+    re-deriving the harness, and it was wrong: it said each failure is forced "by
+    patching exactly one name ... nothing else is faked" while
+    ``_stage_the_failure`` replaced three names on every run and four on the
+    provider run, with ``no_model`` stubbing ``warm_up`` besides. A claim that
+    overstates how little a harness fakes changes what its green run means, so
+    the prose is pinned here: every name the harness replaces has to be measured
+    and then named in the docstring.
+    """
+    shimmed = frozenset({"AuditLogger", "EncryptedDocumentStore", "SessionVault"})
+    assert {stage: _names_replaced_in_lifespan(stage) for stage in STAGES} == {
+        "audit": shimmed,
+        "store": shimmed,
+        "vault": shimmed,
+        "provider": shimmed | {"build_provider"},
+    }
+
+    # The fake the old wording missed entirely: `no_model` is active for every
+    # unwind test in this section.
+    assert lifespan_module.warm_up is not real_warm_up, (
+        "the no_model fixture no longer stubs the warm-up, so the docstring is stale again"
+    )
+
+    doc = __doc__ or ""
+    for faked in sorted(shimmed | {"build_provider", "warm_up"}):
+        assert faked in doc, f"the harness replaces {faked} and the docstring does not say so"
+
+
 @pytest.mark.parametrize("failing_stage", STAGES)
 @pytest.mark.usefixtures("no_model")
 async def test_a_failed_startup_closes_every_connection_it_had_already_opened(

@@ -33,7 +33,12 @@ The chain is *global*, not per-session: that is what makes deletion or
 reordering of any row detectable. ``verify_chain(session_id=...)`` still walks
 the whole chain (it has to, to know each row's expected predecessor) but only
 asserts on rows belonging to that session, so it answers "is this session's
-slice intact" rather than "is the whole log intact".
+slice intact" rather than "is the whole log intact". Stated that precisely
+because the difference is load-bearing and one shape of it is a residual:
+rewriting a row's ``session_id`` moves it out of a session as completely as
+``DELETE`` removes it, and the *scoped* form cannot see that. Only the unscoped
+form answers "was anything in this log altered"; see
+:meth:`AuditLogger.verify_chain` for why no scoped rule can close it.
 
 Concurrency, stated precisely because the previous wording was wrong. ``emit`` is
 safe under ``asyncio.gather``: reading the previous hash, computing the new one,
@@ -59,6 +64,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from types import TracebackType
@@ -468,7 +474,8 @@ class AuditLogger:
         The supplied ``event`` is not mutated; ``seq``/``prev_hash``/``entry_hash``
         on it are ignored. Read ``query()`` back for the persisted form.
 
-        Raises :class:`PipelineError` if any string field exceeds its ceiling -- see
+        Raises :class:`PipelineError` if any field exceeds its ceiling, or if a
+        ``detail`` key is not a string or a ``detail`` value is not a scalar -- see
         :func:`_reject_content_sized_fields`, which re-checks at the write boundary
         because the schema's own validators are bypassable by assignment.
 
@@ -695,6 +702,37 @@ class AuditLogger:
           it lives in has a hole would be exactly the wrong answer. Before this was
           global, deleting every row of session X made ``verify_chain("X")`` return
           ``True`` -- erasure read as cleanliness.
+
+        **Erasure by relabelling is a residual of that split, and is not closed.** An
+        ``UPDATE`` against the events table that rewrites ``session_id`` from ``X`` to
+        ``Y`` erases X's history exactly as a ``DELETE`` of those rows does, and unlike
+        a ``DELETE`` it moves nothing: every link and every ``seq`` still holds, so the
+        structural checks have nothing to report. The relabelled rows do fail their own
+        ``entry_hash``
+        (``session_id`` is inside the hashed payload), and both checks that can see
+        that report it -- the unscoped walk returns ``False``, and so does
+        ``verify_chain("Y")``, the scope the rows were moved into. What returns
+        ``True`` is ``verify_chain("X")``, and the reason is not an oversight in the
+        rule above but an absence of information. A relabelled row is, column for
+        column, a row whose stored ``session_id`` names some other session and whose
+        hash does not recompute -- the *identical* input class as an ordinary
+        tampered row that genuinely belongs to that other session, which the content
+        rule deliberately does not charge against an unrelated scope. The pre-tamper
+        ``session_id`` is inside the digest the tamper invalidated, so nothing in the
+        walk can recover it, and no rule can separate the two cases. Failing every
+        scope on any unattributable hash break would close this and would also make
+        one session's edited ``detail`` fail every other session -- a different
+        design, not a fix, and the opposite of what the content bullet argues for.
+
+        So the honest reading of the scoped form is "the rows *labelled* with this
+        session are intact, and the log they sit in is structurally whole" -- never
+        "no record of this session has been taken out of it". That second question
+        has one answer here and it is the unscoped one. Pinned by
+        ``test_relabelling_a_session_out_of_itself_is_a_known_residual`` and
+        ``test_a_partial_relabel_is_invisible_to_the_scope_it_left`` -- the second
+        because it rules out the tempting narrow fix: an empty in-scope slice is
+        *not* the signal, since moving two of a session's three rows leaves the
+        third behind and the scope still answers ``True``.
 
         Finally the tail is checked against the **watermark** -- the highest ``seq``
         ever allocated, according to two bookkeeping rows in two different tables
@@ -981,7 +1019,7 @@ def _log_break(seq: int, reason: str) -> None:
 
 
 def _reject_content_sized_fields(event: AuditEvent) -> None:
-    """Re-check the size ceilings at the write boundary, where they are enforceable.
+    """Re-check the model's ``detail`` contract at the write boundary, where it is enforceable.
 
     :class:`AuditEvent` declares them -- ``max_length`` on every string column and a
     validator on ``detail`` -- and that is the right place to *state* the invariant.
@@ -1002,6 +1040,16 @@ def _reject_content_sized_fields(event: AuditEvent) -> None:
     full of original. Every legitimate value here is small and bounded -- registry
     type names, 8-hex token IDs, uuid4 hex identifiers, event-type constants,
     latencies, counts and sha256 digests -- so this only ever fires on content.
+
+    **The whole contract, not only the ceilings.** What ``model_construct`` skips is
+    the model, so re-checking only the ceilings leaves the type rule -- ``detail`` is
+    ``Mapping[str, int | float | str]`` -- unenforced on the one path that needs it.
+    See the comments below: a nested dict, a list, or a ``None`` has a short rendered
+    width, passed a width-only check, and reached the INSERT, after which
+    :func:`_load_detail` refused the stored column and :meth:`AuditLogger.verify_chain`
+    reported the log as tampered forever. Every refusal here is a typed
+    :class:`PipelineError` and leaves the chain untouched; see
+    ``test_a_refused_event_does_not_disturb_the_chain``.
     """
     for field, value in (
         ("session_id", event.session_id),
@@ -1015,6 +1063,25 @@ def _reject_content_sized_fields(event: AuditEvent) -> None:
                 reason="audit_field_exceeds_ceiling", field=field, length=len(value)
             )
     for key, detail_value in event.detail.items():
+        # TYPE BEFORE WIDTH, and the order is the fix rather than a tidy-up.
+        #
+        # `model_construct` skips the *whole* model, not just the ceilings, and this
+        # function used to re-enforce only the half of the contract that is about
+        # length. `AuditEvent.detail` is typed `Mapping[str, int | float | str]`, so
+        # the type rule is as much a part of the contract as the 64-character one --
+        # and a container value slipped past a width-only check because its rendered
+        # width is tiny: `detail={"k": {"a": 1}}` is 13 characters of JSON. It was
+        # accepted, chained, and INSERTed, and then `_load_detail` refused the stored
+        # column as "not a detail map" on every later read -- so `verify_chain()`
+        # returned `False` *permanently*, on a row this module wrote itself, while
+        # `query()` handed the row back with `detail={}` and said nothing. A write
+        # boundary that admits a value the reader cannot parse does not fail closed;
+        # it manufactures the tamper evidence it exists to report. `None` had the
+        # same shape (`str(None)` is 4 chars, `null` is not a detail value).
+        if not isinstance(key, str):
+            raise PipelineError(
+                reason="audit_detail_key_not_a_string", key_type=type(key).__name__
+            )
         # The key is bounded here as well as in `AuditEvent`'s validator, and the
         # duplication is the point: this is the last check before the row is written,
         # and a caller can reach it with an event built by `model_construct` (which
@@ -1026,15 +1093,41 @@ def _reject_content_sized_fields(event: AuditEvent) -> None:
                 field=key[:MAX_DETAIL_VALUE_LEN],
                 length=len(key),
             )
+        if not isinstance(detail_value, int | float | str):
+            raise PipelineError(
+                reason="audit_detail_value_not_scalar",
+                field=key[:MAX_DETAIL_VALUE_LEN],
+                value_type=type(detail_value).__name__,
+            )
         # Rendered width, every type -- see `AuditEvent._reject_long_values`. This is
         # the write boundary, reachable with an event built by `model_construct`,
         # which skips the model validator entirely; a ceiling enforced in only one of
         # the two places is a ceiling the other path does not have.
-        if len(str(detail_value)) > MAX_DETAIL_VALUE_LEN:
+        try:
+            rendered_len = len(str(detail_value))
+        except ValueError:
+            # An integer too large for Python to render *at all*: `str()` refuses
+            # past `sys.get_int_max_str_digits()` (4,300 by default) and raises
+            # `ValueError`, which escaped this function raw. That is the same
+            # document-encoded-as-an-integer shape the ceiling exists for, only
+            # larger than the 3,709-digit fixture
+            # `test_a_document_encoded_as_an_integer_is_refused_at_the_write_boundary`
+            # uses -- so the bigger document got a bare interpreter error where the
+            # smaller one got the documented `PipelineError`. Refusing past the
+            # interpreter's own rendering limit is a fortiori refusing past 64
+            # characters, so it is the same `reason`. The exact width is unknowable
+            # without raising a global interpreter limit, so the floor is reported
+            # rather than a guess.
             raise PipelineError(
                 reason="audit_detail_exceeds_ceiling",
                 field=key[:MAX_DETAIL_VALUE_LEN],
-                length=len(str(detail_value)),
+                min_length=sys.get_int_max_str_digits(),
+            ) from None
+        if rendered_len > MAX_DETAIL_VALUE_LEN:
+            raise PipelineError(
+                reason="audit_detail_exceeds_ceiling",
+                field=key[:MAX_DETAIL_VALUE_LEN],
+                length=rendered_len,
             )
 
 

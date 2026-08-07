@@ -31,11 +31,13 @@ from secure_context_pipeline.audit.logger import (
     DEFAULT_DB_FILENAME as AUDIT_DB_FILENAME,
 )
 from secure_context_pipeline.audit.logger import (
+    EGRESS_PASS,
+    LLM_CALL,
     SESSION_CREATE,
     AuditLogger,
 )
 from secure_context_pipeline.config import Settings
-from secure_context_pipeline.errors import ConfigError, PipelineError
+from secure_context_pipeline.errors import ConfigError, EgressBlockedError, PipelineError
 from secure_context_pipeline.llm.mock_provider import MockProvider
 from secure_context_pipeline.models import AuditEvent
 
@@ -69,6 +71,39 @@ NO_ENTITY_DOCUMENT = (
     "No further action is required at this time.\n"
 )
 
+#: Every assertion ``python demo.py`` with no arguments must make, in order.
+#:
+#: The section headings the demo prints come from :func:`demo.section` calls and
+#: survive the work under them being deleted, so a smoke test that greps for
+#: headings is not evidence that any demonstration ran. Measured: with the whole
+#: pseudonymization leg and the whole fail-closed section removed from
+#: ``run_demo``, all three headings were still printed, the banner still read
+#: ``PASS -- 10/10 checks passed, 0 failures`` and the exit status was still 0.
+#: The ledger is what cannot be faked -- it is also the thing the exit code is
+#: computed from -- so the smoke test asserts the ledger.
+FULL_RUN_LEDGER = (
+    "[tokenization] vault holds entities -- the leak scan is not vacuous",
+    "[tokenization] ZERO originals in the outbound payload",
+    "[tokenization] ZERO originals in the raw provider response",
+    "[tokenization] ZERO residual surrogate tokens in the restored output",
+    "[tokenization] EGRESS_PASS is audited before the provider call",
+    "[tokenization] egress gate scanned the exact bytes that were sent",
+    "[pseudonymization] vault holds entities -- the leak scan is not vacuous",
+    "[pseudonymization] ZERO originals in the outbound payload",
+    "[pseudonymization] ZERO originals in the raw provider response",
+    "[pseudonymization] ZERO residual surrogate tokens in the restored output",
+    "[pseudonymization] EGRESS_PASS is audited before the provider call",
+    "[pseudonymization] egress gate scanned the exact bytes that were sent",
+    "EGRESS GATE BLOCKS a payload that still carries an original",
+    "the provider was NEVER called for the blocked run",
+    "control: the same session's passing runs DO reach the provider",
+    "the block itself leaks nothing -- the refused value is not in the error",
+    "restoration WORKS before destruction (control for the next check)",
+    "restoration FAILS after destruction (irreversible across sessions)",
+    "vault reports zero originals for the destroyed session",
+    "audit hash chain verifies (whole log and this session's slice)",
+)
+
 
 @pytest.fixture
 async def harness(settings: Settings) -> AsyncIterator[Any]:
@@ -78,6 +113,45 @@ async def harness(settings: Settings) -> AsyncIterator[Any]:
         yield built
     finally:
         await built.close()
+
+
+@pytest.fixture(autouse=True)
+def wire_dump_under_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect ``WIRE_DUMP_PATH`` so no test in this module can write the real file.
+
+    The module docstring promises nothing is written to ``wire_dump.txt``. That
+    promise was prose: ``demo.WIRE_DUMP_PATH`` is ``REPO_ROOT / "wire_dump.txt"``
+    and no code path in the repository ever builds a ``wire_dump.txt`` under
+    ``data_dir``, so the assertion that used to back it named a path nothing could
+    create. A ``run_demo`` that wrote the real repo-root file passed that
+    assertion and left the file in the working tree.
+
+    Autouse rather than per-test because the claim is module-wide, and structural
+    rather than asserted: with the path pointed at ``tmp_path`` a test *cannot*
+    write the repository's copy even if the assertion is later removed.
+    """
+    redirected = tmp_path / "wire_dump.txt"
+    monkeypatch.setattr(demo, "WIRE_DUMP_PATH", redirected)
+    return redirected
+
+
+def capture_ledger(monkeypatch: pytest.MonkeyPatch) -> list[list[Any]]:
+    """Record the ``CheckList`` behind every banner ``run_demo`` prints.
+
+    ``main`` returns only an exit code and prints only a rendering, so a test that
+    wants the assertions themselves has to take them off the object the exit code
+    is computed from. Returns a list appended to once per :meth:`CheckList.banner`
+    call; the last entry is the run's final ledger.
+    """
+    banners: list[list[Any]] = []
+    original = demo.CheckList.banner
+
+    def _recording_banner(self: Any, elapsed_s: float) -> int:
+        banners.append(list(self.records))
+        return original(self, elapsed_s)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(demo.CheckList, "banner", _recording_banner)
+    return banners
 
 
 def _fake_outcome(
@@ -464,6 +538,162 @@ async def test_a_document_with_nothing_to_detect_is_a_warning_not_a_failure(
 
 
 # ---------------------------------------------------------------------------
+# run_case's negative direction -- one sabotage per graded condition
+#
+# The green run above records six passing checks, which is satisfied just as well
+# by a check whose condition is the literal ``True``. Four of the six were exactly
+# that: replacing ``payload_scan.leaks == 0``, ``response_scan.leaks == 0``, the
+# EGRESS_PASS/LLM_CALL ordering expression and the ``payload_sha256`` comparison
+# with ``True`` left all 41 tests in this file passing. Each test below arranges
+# the world so that one of those conditions is false and asserts that *that named
+# check* -- and only it -- goes red, which no hardwired condition can do.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("leaking_scan", "expected_failure"),
+    [
+        (0, "[tokenization] ZERO originals in the outbound payload"),
+        (1, "[tokenization] ZERO originals in the raw provider response"),
+    ],
+)
+async def test_run_case_fails_the_check_whose_scan_reported_a_leak(
+    harness: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    leaking_scan: int,
+    expected_failure: str,
+) -> None:
+    """A leak the scanner found has to reach the ledger as a failed assertion.
+
+    ``run_case`` scans twice -- the outbound payload first, the raw provider
+    response second -- and the two are separate claims. Making exactly one of the
+    two report a leak pins each check to its own scan: a check that graded the
+    other scan's result, or graded nothing at all, cannot produce this ledger.
+    """
+    real_scan = demo.scan_for_originals
+    scans_done = 0
+
+    def _scan(haystack: str, originals: frozenset[str]) -> Any:
+        nonlocal scans_done
+        index = scans_done
+        scans_done += 1
+        if index == leaking_scan:
+            return demo.ScanResult(hits=1, scanned=1, skipped_short=0)
+        return real_scan(haystack, originals)
+
+    monkeypatch.setattr(demo, "scan_for_originals", _scan)
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    checks = demo.CheckList()
+
+    await demo.run_case(
+        harness,
+        checks,
+        session_id=session_id,
+        path=demo.PRIMARY_FIXTURE,
+        category=demo.PRIMARY_CATEGORY,
+        strategy="tokenization",
+        prompt=demo.DEFAULT_PROMPT,
+        panes=False,
+        nonvacuity_fatal=True,
+    )
+
+    assert scans_done == 2
+    assert [c.name for c in checks.records if not c.ok] == [expected_failure]
+    assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
+async def test_run_case_fails_when_the_provider_call_was_audited_before_the_gate_pass(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """"Gate before provider" is an ordering claim, so it is pinned out of order.
+
+    The two events exist on every run; only their ``seq`` order carries the
+    property. Swapping the first ``EGRESS_PASS`` with the first ``LLM_CALL`` in
+    what the log returns leaves every other check's inputs untouched -- including
+    the ``payload_sha256`` check, which reads the same event list -- so exactly
+    one check may move.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    real_query = harness.audit.query
+
+    async def _reordered_query(**kwargs: Any) -> list[AuditEvent]:
+        events = await real_query(**kwargs)
+        gate = min(
+            (e.seq for e in events if e.event_type == EGRESS_PASS and e.seq is not None),
+            default=None,
+        )
+        call = min(
+            (e.seq for e in events if e.event_type == LLM_CALL and e.seq is not None),
+            default=None,
+        )
+        if gate is None or call is None:
+            return events
+        swapped = {gate: call, call: gate}
+        return [e.model_copy(update={"seq": swapped.get(e.seq, e.seq)}) for e in events]
+
+    monkeypatch.setattr(harness.audit, "query", _reordered_query)
+    checks = demo.CheckList()
+
+    await demo.run_case(
+        harness,
+        checks,
+        session_id=session_id,
+        path=demo.PRIMARY_FIXTURE,
+        category=demo.PRIMARY_CATEGORY,
+        strategy="tokenization",
+        prompt=demo.DEFAULT_PROMPT,
+        panes=False,
+        nonvacuity_fatal=True,
+    )
+
+    assert [c.name for c in checks.records if not c.ok] == [
+        "[tokenization] EGRESS_PASS is audited before the provider call"
+    ]
+    assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
+async def test_run_case_fails_when_no_audited_digest_matches_the_payload_that_was_sent(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The byte-identity check is what makes the leak scans about the *sent* bytes.
+
+    Without it the demo could scan a payload the gate never saw. Rewriting every
+    audited ``payload_sha256`` to a digest of nothing is the exact regression --
+    the gate scanned something other than what went out -- and it must be the only
+    check that moves, since the ordering check reads the same events.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    real_query = harness.audit.query
+
+    async def _rewritten_query(**kwargs: Any) -> list[AuditEvent]:
+        events = await real_query(**kwargs)
+        return [
+            e.model_copy(update={"detail": {**e.detail, "payload_sha256": "0" * 64}})
+            if "payload_sha256" in e.detail
+            else e
+            for e in events
+        ]
+
+    monkeypatch.setattr(harness.audit, "query", _rewritten_query)
+    checks = demo.CheckList()
+
+    await demo.run_case(
+        harness,
+        checks,
+        session_id=session_id,
+        path=demo.PRIMARY_FIXTURE,
+        category=demo.PRIMARY_CATEGORY,
+        strategy="tokenization",
+        prompt=demo.DEFAULT_PROMPT,
+        panes=False,
+        nonvacuity_fatal=True,
+    )
+
+    assert [c.name for c in checks.records if not c.ok] == [
+        "[tokenization] egress gate scanned the exact bytes that were sent"
+    ]
+    assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
+# ---------------------------------------------------------------------------
 # The two demonstrations the live review turns on
 # ---------------------------------------------------------------------------
 async def test_the_gate_refuses_a_payload_carrying_a_planted_original(
@@ -505,6 +735,186 @@ async def test_the_gate_refuses_a_payload_carrying_a_planted_original(
     assert all(demo.LEAK_SENTINEL not in c.detail for c in added)
     assert "caller receives:" in out
     assert "EGRESS_BLOCKED" in out
+
+
+# ---------------------------------------------------------------------------
+# The fail-closed section's negative direction
+#
+# The test above asserts four check *names* and that none of them is red, which
+# is satisfied by four checks whose conditions are the literal ``True`` -- and all
+# four survived being replaced by it. Sabotaging the behaviour instead (never
+# planting the sentinel) is caught, but that is the demonstration failing, not the
+# assertion noticing. Each test below falsifies one condition while leaving the
+# other three true, so the ledger it asserts is reachable only by a check that
+# still computes something.
+# ---------------------------------------------------------------------------
+async def _passing_run(harness: Any, checks: Any, session_id: str) -> None:
+    """One green run_case, so the fail-closed control has a provider call to find."""
+    await demo.run_case(
+        harness,
+        checks,
+        session_id=session_id,
+        path=demo.PRIMARY_FIXTURE,
+        category=demo.PRIMARY_CATEGORY,
+        strategy="tokenization",
+        prompt=demo.DEFAULT_PROMPT,
+        panes=False,
+        nonvacuity_fatal=True,
+    )
+
+
+async def test_the_fail_closed_checks_go_red_when_the_gate_releases_the_payload(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gate that lets the planted payload through must fail, loudly, by name.
+
+    The sentinel is planted in the vault and read out of ``LEAK_SENTINEL``, but
+    ``LEAK_DOC`` interpolated the *original* value at import time. Repointing
+    ``LEAK_SENTINEL`` therefore vaults a value the document does not contain --
+    the gate has nothing to match, releases the payload, and the run completes.
+    That is precisely "the gate did not refuse", staged without touching the gate.
+
+    Three of the four checks are then false together, because with no
+    ``EgressBlockedError`` there is no blocked run to query and no error to scan.
+    The fourth stays green: the session's earlier run really did reach the
+    provider, which is the control doing its job.
+    """
+    monkeypatch.setattr(demo, "LEAK_SENTINEL", "9ZY-OMEGA-0000")
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    checks = demo.CheckList()
+    await _passing_run(harness, checks, session_id)
+    before = len(checks.records)
+
+    await demo.demonstrate_fail_closed(
+        harness, checks, session_id=session_id, prompt=demo.DEFAULT_PROMPT
+    )
+
+    added = checks.records[before:]
+    assert [c.name for c in added if not c.ok] == [
+        "EGRESS GATE BLOCKS a payload that still carries an original",
+        "the provider was NEVER called for the blocked run",
+        "the block itself leaks nothing -- the refused value is not in the error",
+    ]
+    assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
+async def test_the_never_called_check_goes_red_when_the_blocked_run_reached_the_provider(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate blocking is not the property; the provider not being called is.
+
+    A gate that raised ``EGRESS_BLOCKED`` *after* handing the payload to the
+    provider would satisfy every other check in the section. Here the blocked
+    run's own audit slice is made to carry an ``LLM_CALL``, so only the check that
+    reads that slice may move -- the session-scoped control query is left alone.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    checks = demo.CheckList()
+    await _passing_run(harness, checks, session_id)
+    before = len(checks.records)
+    real_query = harness.audit.query
+
+    async def _query_with_a_provider_call(**kwargs: Any) -> list[AuditEvent]:
+        events = await real_query(**kwargs)
+        run_id = kwargs.get("run_id")
+        if isinstance(run_id, str):
+            events.append(
+                AuditEvent(
+                    ts=time.time(),
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type=LLM_CALL,
+                    detail={"planted_by": "test"},
+                )
+            )
+        return events
+
+    monkeypatch.setattr(harness.audit, "query", _query_with_a_provider_call)
+
+    await demo.demonstrate_fail_closed(
+        harness, checks, session_id=session_id, prompt=demo.DEFAULT_PROMPT
+    )
+
+    added = checks.records[before:]
+    assert [c.name for c in added if not c.ok] == [
+        "the provider was NEVER called for the blocked run"
+    ]
+    assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
+async def test_the_control_check_goes_red_when_no_run_in_the_session_reached_the_provider(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control exists because an unwired provider also produces no LLM_CALL.
+
+    With the session's ``LLM_CALL`` history emptied, "no provider call for the
+    blocked run" is no longer evidence of anything -- and the check whose whole
+    job is to say so has to be the one that goes red.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    checks = demo.CheckList()
+    await _passing_run(harness, checks, session_id)
+    before = len(checks.records)
+    real_query = harness.audit.query
+
+    async def _query_hiding_the_provider_calls(**kwargs: Any) -> list[AuditEvent]:
+        if kwargs.get("event_type") == LLM_CALL:
+            return []
+        return await real_query(**kwargs)
+
+    monkeypatch.setattr(harness.audit, "query", _query_hiding_the_provider_calls)
+
+    await demo.demonstrate_fail_closed(
+        harness, checks, session_id=session_id, prompt=demo.DEFAULT_PROMPT
+    )
+
+    added = checks.records[before:]
+    assert [c.name for c in added if not c.ok] == [
+        "control: the same session's passing runs DO reach the provider"
+    ]
+    assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
+async def test_the_no_leak_check_goes_red_when_the_error_detail_carries_the_value(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A block that names the value it refused is a worse hole than the one it closed.
+
+    ``EgressBlockedError`` already has a field that could carry it --
+    ``entity_types`` is a free string -- so the regression is one careless line in
+    the gate, not a hypothetical. The real error is caught and re-raised with the
+    sentinel in that field, preserving ``run_id`` so the audit-backed checks are
+    untouched and only the leak check may move.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    checks = demo.CheckList()
+    await _passing_run(harness, checks, session_id)
+    before = len(checks.records)
+    real_run = harness.orchestrator.run
+
+    async def _leaky_run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await real_run(*args, **kwargs)
+        except EgressBlockedError as exc:
+            raise EgressBlockedError(
+                session_id=str(exc.detail["session_id"]),
+                reason=str(exc.detail["reason"]),
+                hit_count=int(exc.detail["hit_count"]),
+                entity_types=demo.LEAK_SENTINEL,
+                run_id=str(exc.detail["run_id"]),
+            ) from None
+
+    monkeypatch.setattr(harness.orchestrator, "run", _leaky_run)
+
+    await demo.demonstrate_fail_closed(
+        harness, checks, session_id=session_id, prompt=demo.DEFAULT_PROMPT
+    )
+
+    added = checks.records[before:]
+    assert [c.name for c in added if not c.ok] == [
+        "the block itself leaks nothing -- the refused value is not in the error"
+    ]
+    assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
 
 
 async def test_a_restore_that_worked_a_moment_ago_is_impossible_after_destruction(
@@ -593,6 +1003,55 @@ async def test_a_pseudonym_is_also_unrestorable_once_the_session_is_destroyed(
     assert destruction.banner(1.0) == demo.EXIT_OK
 
 
+async def test_the_pre_destroy_control_goes_red_when_the_restore_put_nothing_back(
+    harness: Any,
+) -> None:
+    """The control's own condition, which was as unpinned as the thing it controls.
+
+    ``demonstrate_destruction`` says the pre-destroy restore is what stops
+    "restoration failed" from meaning "there was nothing to restore" -- and then
+    graded that control with ``before.restored_count > 0``, which could be
+    replaced with ``True`` without a single test noticing. A probe whose text
+    carries no surrogate restores zero occurrences, which is exactly the degenerate
+    case the control exists to reject, so it has to be recorded as a failure.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    checks = demo.CheckList()
+    outcome = await demo.run_case(
+        harness,
+        checks,
+        session_id=session_id,
+        path=demo.PRIMARY_FIXTURE,
+        category=demo.PRIMARY_CATEGORY,
+        strategy="tokenization",
+        prompt=demo.DEFAULT_PROMPT,
+        panes=False,
+        nonvacuity_fatal=True,
+    )
+    real_probe = demo.build_probe([outcome])
+    assert real_probe is not None and real_probe.token_id is not None
+    empty_probe = demo.DestroyProbe(
+        token_id=real_probe.token_id,
+        surrogate=None,
+        text="This answer carries nothing the restorer would look up.",
+        strategy="tokenization",
+        surrogate_map=None,
+        minted=real_probe.minted,
+        source="degenerate probe: a response with nothing to restore",
+    )
+
+    destruction = demo.CheckList()
+    await demo.demonstrate_destruction(
+        harness, destruction, session_id=session_id, probe=empty_probe
+    )
+
+    control = destruction.records[0]
+    assert control.name == "restoration WORKS before destruction (control for the next check)"
+    assert control.ok is False
+    assert control.detail == "0 occurrence(s) restored from the vault"
+    assert destruction.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
 async def test_destruction_records_a_failure_when_no_probe_was_produced(harness: Any) -> None:
     """No probe means the destruction claim was never tested -- that is a failure.
 
@@ -608,6 +1067,55 @@ async def test_destruction_records_a_failure_when_no_probe_was_produced(harness:
     assert checks.records[0].ok is False
     assert checks.records[0].fatal is True
     assert checks.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+
+# ---------------------------------------------------------------------------
+# print_audit_tail -- the demo's last check, and the one with no test at all
+# ---------------------------------------------------------------------------
+async def test_the_audit_chain_check_passes_on_an_intact_log_and_fails_on_an_edited_row(
+    harness: Any, settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Both directions of the demo's final assertion, over a log this test wrote.
+
+    ``print_audit_tail`` records ``whole and scoped`` and was reached by nothing in
+    the suite -- no test named it, so replacing that condition with ``True`` left
+    every test green while the demo's closing claim, that the log a reviewer is
+    about to read verifies, became unconditional.
+
+    The tamper is an ``UPDATE`` from a second connection, the shape a reviewer
+    would try by hand: the log is WAL with one connection per logger, so the
+    harness's own reader sees the edited row on its next query rather than a
+    cached copy of the clean one.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    for index in range(3):
+        await harness.audit.emit(
+            AuditEvent(
+                ts=time.time(),
+                session_id=session_id,
+                event_type=SESSION_CREATE,
+                detail={"n": index},
+            )
+        )
+
+    intact = demo.CheckList()
+    await demo.print_audit_tail(harness, intact, session_id)
+
+    assert [c.name for c in intact.records] == [
+        "audit hash chain verifies (whole log and this session's slice)"
+    ]
+    assert intact.records[0].ok is True
+    assert "verify_chain()" in capsys.readouterr().out
+
+    with sqlite3.connect(Path(settings.data_dir) / AUDIT_DB_FILENAME) as conn:
+        conn.execute("UPDATE audit_events SET detail = ? WHERE seq = 2", ('{"n": 99}',))
+        conn.commit()
+
+    tampered = demo.CheckList()
+    await demo.print_audit_tail(harness, tampered, session_id)
+
+    assert tampered.records[0].ok is False
+    assert tampered.banner(1.0) == demo.EXIT_ASSERTION_FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +1172,38 @@ async def test_dump_wire_fails_on_a_readable_original_and_passes_on_a_substring(
     assert "Headers are deliberately NOT captured" in written
     assert "Countersigned by Brown on Tuesday." in written
     assert "----- request 2 " in written
+
+
+async def test_dump_wire_carries_substring_only_hits_across_every_captured_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The false-positive suppression has to survive a wire with more than one body.
+
+    ``dump_wire`` folds each body's scan into a running total, and ``leaks`` is
+    ``hits - substring_only``. Summing ``hits`` while keeping only the *last*
+    body's ``substring_only`` is not a rounding error -- it turns every earlier
+    body's coincidence into a counted leak. Measured on the two bodies below with
+    the carry dropped: ``1 found`` instead of ``0 found``, one recorded failure,
+    and ``--real --dump-wire`` exits 1 on a wire that disclosed nothing.
+
+    The single-body case above cannot see this: with one body the accumulator has
+    nothing to carry, so both the shipped code and the broken code agree.
+    """
+    monkeypatch.setattr(demo, "WIRE_DUMP_PATH", tmp_path / "wire_dump.txt")
+    clean = demo.WireCapture()
+    clean.bodies = [
+        b'{"text":"Prepared by accountant Alan Browning."}',
+        b'{"text":"Reviewed by auditor Dana Brownlee."}',
+    ]
+    checks = demo.CheckList()
+
+    await demo.dump_wire(clean, checks, frozenset({"Brown"}))
+
+    assert checks.failures == []
+    assert checks.banner(1.0) == demo.EXIT_OK
+    detail = checks.records[0].detail
+    assert "0 found" in detail
+    assert "2 more present only inside a longer word" in detail
 
 
 async def test_dump_wire_fails_when_nothing_was_captured(
@@ -871,11 +1411,20 @@ def test_the_whole_demo_runs_green_and_prints_no_secret(
 ) -> None:
     """``python demo.py`` on the shipped fixtures: exit 0, every check passed.
 
+    "Every check passed" is asserted against the ledger, not against the screen.
+    The headings below come from :func:`demo.section` and the banner recomputes
+    itself from whatever records happen to exist, so both go on reading green when
+    a demonstration is deleted outright: with RUN B and the fail-closed section
+    removed the run still printed all three headings, still reported
+    ``PASS -- 10/10 checks passed, 0 failures`` and still exited 0.
+    :data:`FULL_RUN_LEDGER` is the part that cannot be satisfied by less work.
+
     Also the printing rules from build doc section 16, checked on the real output
     rather than argued: the master key never appears, and neither does the value
     the fail-closed section plants in the vault.
     """
     monkeypatch.setenv("SCP_DATA_DIR", str(tmp_path / "data"))
+    ledger = capture_ledger(monkeypatch)
 
     code = demo.main([])
 
@@ -886,9 +1435,20 @@ def test_the_whole_demo_runs_green_and_prints_no_secret(
     assert "== 2-5. RUN A: TOKENIZATION" in out
     assert "== 6. RUN B: PSEUDONYMIZATION" in out
     assert "== 6C. FAIL-CLOSED" in out
+    assert len(ledger) == 1, "run_demo banners exactly once"
+    assert tuple(c.name for c in ledger[0]) == FULL_RUN_LEDGER
+    assert [c.name for c in ledger[0] if not c.ok] == []
     assert os.environ["SCP_MASTER_KEY"] not in out
     assert demo.LEAK_SENTINEL not in out
-    assert not (tmp_path / "data" / "wire_dump.txt").exists()
+    # Narrowed from `not (tmp_path / "data" / "wire_dump.txt").exists()`, which
+    # could not fail: WIRE_DUMP_PATH is REPO_ROOT / "wire_dump.txt" and no code
+    # path in the repository ever builds a wire_dump.txt under data_dir, so the
+    # old form asserted the absence of a file nothing could create. A run_demo
+    # that wrote the real wire dump on the mock path passed it and left the file
+    # in the working tree. `wire_dump_under_tmp_path` puts the path demo.py
+    # actually writes under tmp_path, so this now checks the module docstring's
+    # guarantee instead of restating it.
+    assert not demo.WIRE_DUMP_PATH.exists()
 
 
 def test_a_failed_check_makes_the_process_exit_nonzero(
@@ -911,6 +1471,35 @@ def test_a_failed_check_makes_the_process_exit_nonzero(
     assert "[FAIL]" in out
     assert "ZERO residual surrogate tokens in the restored output" in out
     assert "assertion(s) failed" in out
+
+
+def test_the_vault_zero_check_goes_red_when_the_session_was_never_destroyed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``run_demo``'s own closing assertion, asserted against from the outside.
+
+    "The vault reports zero originals for the destroyed session" is recorded by
+    ``run_demo`` itself rather than by either demonstration, so no test of
+    ``demonstrate_destruction`` could reach it and the condition survived being
+    replaced with ``True``. Skipping the destruction leaves the session's vault
+    rows in place -- the fixture run holds tens of them -- so the check has the
+    one input that makes it false, and it must be the only check that moves.
+    """
+    monkeypatch.setenv("SCP_DATA_DIR", str(tmp_path / "data"))
+    ledger = capture_ledger(monkeypatch)
+
+    async def _skip_destruction(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(demo, "demonstrate_destruction", _skip_destruction)
+
+    code = demo.main([])
+
+    out = capsys.readouterr().out
+    assert code == demo.EXIT_ASSERTION_FAILED, out[-3000:]
+    assert [c.name for c in ledger[-1] if not c.ok] == [
+        "vault reports zero originals for the destroyed session"
+    ]
 
 
 def test_the_file_strategy_and_category_flags_reach_run_case(
@@ -955,3 +1544,76 @@ def test_the_file_strategy_and_category_flags_reach_run_case(
     assert call["prompt"] == "Who is involved?"
     # A reviewer's own file may legitimately contain nothing to detect.
     assert call["nonvacuity_fatal"] is False
+
+
+async def test_the_destruction_check_goes_red_when_nothing_was_actually_destroyed(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The demo's central security claim, which was the one condition still unpinned.
+
+    ``demonstrate_destruction`` grades irreversibility with
+    ``not successes and bool(refusals)``, and that expression could be replaced with
+    the literal ``True`` while the entire suite stayed green -- measured: 53 passed.
+    Every other graded condition in ``demo.py`` is killed by some test; this one, the
+    claim the whole demonstration exists to make, was not. A demo that destroyed
+    nothing would have printed ``PASS`` and exited 0.
+
+    Its sibling ``test_the_pre_destroy_control_goes_red_when_the_restore_put_nothing_back``
+    pins the *control* -- "there was something to restore" -- which is a different
+    claim, and its own docstring says the control "was as unpinned as the thing it
+    controls". The thing it controls is pinned here.
+
+    The sabotage is the honest one: leave the run completely real and neuter only the
+    erasure, so the probe, the token and the response are exactly what a genuine run
+    produces and the only difference is that the key was never popped. Restoration
+    then succeeds, which is precisely the state the check exists to report as a
+    failure. Patching the restorer instead would prove nothing -- it would test the
+    test.
+    """
+    session_id, _expires = await harness.sessions.create(demo.USER_ID)
+    checks = demo.CheckList()
+    outcome = await demo.run_case(
+        harness,
+        checks,
+        session_id=session_id,
+        path=demo.PRIMARY_FIXTURE,
+        category=demo.PRIMARY_CATEGORY,
+        strategy="tokenization",
+        prompt=demo.DEFAULT_PROMPT,
+        panes=False,
+        nonvacuity_fatal=True,
+    )
+    probe = demo.build_probe([outcome])
+    assert probe is not None and probe.token_id is not None, "premise: a real probe"
+
+    # Neuter BOTH halves of the erasure. Popping the key alone would still make the
+    # vault unreadable, so a half-sabotage would leave the check green and prove
+    # nothing about what it grades.
+    async def no_destroy_session(_session_id: str) -> bool:
+        return True
+
+    async def no_destroy_vault(_session_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(harness.sessions, "destroy", no_destroy_session)
+    monkeypatch.setattr(harness.vault, "destroy", no_destroy_vault)
+
+    destruction = demo.CheckList()
+    await demo.demonstrate_destruction(
+        harness, destruction, session_id=session_id, probe=probe
+    )
+
+    graded = {record.name: record for record in destruction.records}
+    irreversible = graded["restoration FAILS after destruction (irreversible across sessions)"]
+    assert irreversible.ok is False, (
+        "the session was never destroyed and the check still passed: "
+        f"{irreversible.detail}"
+    )
+    assert "unexpectedly succeeded" in irreversible.detail
+    assert destruction.banner(1.0) == demo.EXIT_ASSERTION_FAILED
+
+    # And the control stays GREEN -- it reads the pre-destroy restore, which the
+    # sabotage does not touch. That is what makes this test about irreversibility
+    # alone rather than about the whole section going red together.
+    control = graded["restoration WORKS before destruction (control for the next check)"]
+    assert control.ok is True, control.detail

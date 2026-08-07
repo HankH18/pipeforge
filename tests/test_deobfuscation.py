@@ -427,6 +427,18 @@ PROSE_AFTER_A_MANGLED_HINT = [
         "Patients: PHI_NAME_1a2b3c4d | stable, discharged.",
         "Patients: John Smith | stable, discharged.",
     ),
+    # No pipe anywhere, so the mop-up must not run at all -- the precondition
+    # stated one sentence above the four bounds in `_consume_unclosed_tail`, and
+    # the only one of the five that no case here reached. Everything past the hash
+    # is prose, and `/500mg]` satisfies all four bounds on its own: one unbroken
+    # run, well under the cap, ending in the bracket that balances the opener, no
+    # second token. Drop the precondition and the answer silently becomes "Take
+    # Metformin daily." -- the dose deleted, with nothing left on screen to say so.
+    # A stray "]" is cosmetic; a dose that vanishes from a clinical answer is not.
+    (
+        "Take [PHI_MEDICATION_2f4a1b3c/500mg] daily.",
+        "Take Metformin/500mg] daily.",
+    ),
     # And the shape a real hint still has to keep absorbing: closer present.
     (
         "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic] daily.",
@@ -975,6 +987,73 @@ async def test_a_token_id_colliding_with_a_restored_value_never_substitutes(
     assert "Dr. Evelyn Reyes" not in result.text
     assert vault.token_calls == []
     assert result.restored_count == 1
+
+
+#: ``(original the vault hands back, extra IDs this run minted)`` for the test
+#: below. Same shape as the collision test above -- a vaulted value that is itself
+#: a whole token match -- differing only in whether its 8-hex tail collides with a
+#: live ID, which is what decides between a wrong count and a 500.
+TOKEN_SHAPED_ORIGINALS = [
+    ("FIN-ACCOUNT-deadbeef", ()),
+    ("FIN-ACCOUNT-40281993", ("40281993",)),
+]
+
+
+@pytest.mark.parametrize(
+    ("original", "extra_issued"),
+    TOKEN_SHAPED_ORIGINALS,
+    ids=["tail this run never minted", "tail equal to a live token ID"],
+)
+async def test_a_protected_span_is_excused_in_the_coordinates_it_ends_up_in(
+    settings: Settings, original: str, extra_issued: tuple[str, ...]
+) -> None:
+    """The residue assertion needs OUTPUT coordinates, or it excuses the wrong bytes.
+
+    Sibling of the collision test above, with the one addition that makes the
+    coordinates matter: a token is restored *in front of* the token-shaped
+    original, so the token pass commits a length-changing edit ahead of the
+    protected span -- ``[PHI_NAME_1a2b3c4d]`` (19 characters) becomes
+    ``John Smith`` (10), moving every later offset 9 to the left. ``_shift_spans``
+    is what applies that drift, and without it ``_assert_no_tokens`` looks 9
+    characters past the value it is meant to excuse.
+
+    Both legs then break, the second one fatally:
+
+    * a tail this run never minted is merely counted, so a clean answer reports
+      ``foreign_tokens=1`` about text the restorer itself wrote; and
+    * a tail equal to an ID this run DID mint makes the residue *ours*, and the
+      request dies with ``residual_token_after_restore`` -- an HTTP 500 raised
+      after the provider was called and billed, over our own output.
+
+    Reaching this end to end needs a vaulted value that is a whole token match,
+    which the shipped ``entities.yaml`` identifier patterns do not produce: they
+    use ``\\K`` and capture the digits alone (``48273910``, never
+    ``PHI-MRN-48273910``), so the manufactured match straddles the splice instead
+    and is correctly reported -- the case
+    ``test_a_token_shaped_original_does_not_fail_the_run_it_belongs_to`` pins. The
+    map is caller-supplied though (build doc section 9.4), so the shape arrives
+    from a custom entity type or a direct library caller, and the exclusion has to
+    be right for it either way. That gap is exactly why ``_shift_spans`` returned
+    its input unchanged on every call the suite made before this test.
+    """
+    vault = FakeVault(tokens={NAME_ID: NAME_VALUE})
+    restorer = Restorer(vault=vault, settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        f"[PHI_NAME_{NAME_ID}] reviewed FIN-ACCOUNT-58382910 this morning.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"FIN-ACCOUNT-58382910": original},
+        issued=[NAME_ID, *extra_issued],
+    )
+
+    assert result.text == f"{NAME_VALUE} reviewed {original} this morning."
+    assert result.restored_count == 2
+    # The restored original is this module's own output, so it is neither re-read
+    # by the token pass nor reported by the assertion that follows it.
+    assert result.restored_collisions == 1
+    assert result.foreign_tokens == 0
+    assert vault.token_calls == [NAME_ID]
 
 
 async def test_a_token_the_model_wrote_next_to_a_restored_fake_still_restores(
@@ -1856,6 +1935,81 @@ async def test_restored_original_may_contain_another_fake(settings: Settings) ->
     )
 
     assert result.text == "Maria Torres chaired the review."
+
+
+async def test_a_fake_inside_a_later_restored_original_is_excused_too(
+    settings: Settings,
+) -> None:
+    """The exclusion walk has to advance, not just look at the first splice.
+
+    The test above pins the same exclusion with exactly one splice in the answer,
+    where the cursor never has to move: ``spliced[0]`` is already the span the
+    residue lies in. Two splices is the ordinary case -- one answer naming two
+    people -- and there the excusing span is ``spliced[1]``. Freeze the cursor at
+    zero and the assertion tests ``Torres`` against the span holding
+    ``Karen Vance``, finds it outside, and fails a perfectly restored run with
+    ``residual_surrogate_after_restore``: an HTTP 500 raised after the provider
+    was called and billed, on an answer that was correct.
+
+    The third fake is a surname another entity was issued. That is not a
+    contrivance -- fakes are drawn from the same name space as the originals, so
+    one landing inside another entity's restored value is routine, which is the
+    premise of the whole exclusion.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+
+    result = await restorer.restore(
+        SESSION,
+        "Alvin Reyes and Jane Alderton signed off.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={
+            "Alvin Reyes": "Karen Vance",
+            "Jane Alderton": "Maria Torres",
+            "Torres": "Rodriguez",
+        },
+    )
+
+    assert result.text == "Karen Vance and Maria Torres signed off."
+    assert result.restored_count == 2
+    assert result.surrogates_suspected_unrestored == 0
+
+
+async def test_a_fake_reassembled_across_a_splice_boundary_still_fails_the_run(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """Excused means *wholly inside* a splice. Touching one is still a residue.
+
+    This is the only shape that can reach the failure path while the surrogate
+    pass is working normally, and it had no test: the two cases that make the
+    assertion fire sabotage ``_restore_surrogates`` into returning no splices at
+    all, which skips the containment test entirely and proves nothing about it.
+    So the predicate could be replaced with "always excuse" -- disarming the
+    assertion on every real run -- and the whole suite stayed green.
+
+    The shape is reachable because detection is partial. ``Torres Rodriguez`` in
+    the document with only the surname vaulted sends ``Alderton Rodriguez`` to the
+    provider, and the model echoes it; restoring the surname reassembles
+    ``Torres Rodriguez``, which is also the fake this session issued for someone
+    else, because fakes come from the same name space as originals. The restorer
+    cannot tell "the real name, half of which we just put back" from "a live fake
+    that survived", so it fails closed rather than hand the user an answer with an
+    issued fake in it.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+
+    with pytest.raises(PipelineError) as excinfo:
+        await restorer.restore(
+            SESSION,
+            "Alderton Rodriguez reviewed the chart.",
+            strategy=PSEUDONYMIZATION,
+            surrogates={"Alderton": "Torres", "Torres Rodriguez": "Karen Vance"},
+            run_id=RUN,
+        )
+
+    assert excinfo.value.detail["reason"] == "residual_surrogate_after_restore"
+    assert excinfo.value.detail["residual"] == 1
+    events = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert [event.detail["outcome"] for event in events] == ["assertion_failed"]
 
 
 # --------------------------------------------------------------------------

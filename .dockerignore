@@ -1,54 +1,81 @@
-# The Dockerfile uses an explicit COPY allow-list, so nothing here is load-bearing
-# for what ends up in the image. This file exists for the other half of the
-# problem: everything below is otherwise uploaded to the daemon as build context
-# on every build (the host virtualenv alone is ~750 MB), and it keeps a future
-# `COPY . .` from silently re-introducing a secret.
+# EVERY PATTERN IN THIS FILE IS ANCHORED TO THE CONTEXT ROOT UNLESS IT STARTS
+# WITH `**/`. That is Docker's grammar, not git's, and one line below --
+# `data/` -- depends on it. Everything else here is written `**/` on purpose,
+# because reading Docker's grammar as git's is what went wrong:
+#
+#   `__pycache__/` and `*.py[cod]` looked like "no bytecode anywhere" and meant
+#   "no bytecode in ./". `COPY secure_context_pipeline/ secure_context_pipeline/`
+#   copies an allow-listed directory *whole*, so every nested `__pycache__` the
+#   developer's working tree happened to hold rode in with it: 38 `.pyc` files in
+#   the tagged `secure-context-pipeline:1.0.0`, 65 in a probe build of the tree
+#   as it stands. They were not inert. `python -v -c 'import
+#   secure_context_pipeline.config'` in that image prints `code object from
+#   '/app/secure_context_pipeline/__pycache__/config.cpython-311.pyc'`, so the
+#   container ran bytecode compiled on a macOS host instead of bytecode derived
+#   from the source it shipped. `PYTHONDONTWRITEBYTECODE=1` in the Dockerfile
+#   cannot help: it stops the image from *writing* .pyc files, and these arrive
+#   already written.
+#
+# The same anchoring made the secrets block inert below the root, which is the
+# half that would have hurt: a probe context with a seeded
+# `secure_context_pipeline/.env` and `secure_context_pipeline/crypto/tls.key`,
+# built with this repository's own `COPY secure_context_pipeline/` line, shipped
+# both -- while the root `.env` was correctly excluded. So the allow-list is not
+# a reason to be relaxed here; it narrows the doorway, it does not close it.
+#
+# The other job of this file is size: everything below is otherwise uploaded to
+# the daemon as build context on every build (the host virtualenv alone is
+# ~750 MB), and it keeps a future `COPY . .` from silently re-introducing a
+# secret at any depth.
 
 # secrets -- must never reach a layer, a build cache, or a registry
-.env
-.env.*
-!.env.example
-*.pem
-*.key
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
 
 # runtime data: encrypted blobs, the session vault, the audit chain.
 #
-# `data/` here is NOT the same rule as `data/` in `.gitignore`, and the
-# difference is load-bearing rather than trivia. Docker anchors every pattern to
-# the context root, so this line removes `./data` and nothing else. Git's
-# grammar makes the identical line match a directory called `data` at ANY depth
-# -- including `secure_context_pipeline/detection/data/`, where the gazetteers
+# `data/` is the one rule here that is anchored on purpose, and it is NOT the
+# same rule as `data/` in `.gitignore` even though the two lines are identical.
+# Docker anchors an un-`**`-ed pattern to the context root, so this line removes
+# `./data` and nothing else. Git's grammar makes the identical line match a
+# directory called `data` at ANY depth -- including
+# `secure_context_pipeline/detection/data/`, where the gazetteers
 # `entities.yaml` requires live, and `load_registry` refuses to start without
-# them. Do not "harmonise" the two files by writing `**/data/` here: that ships
-# an image whose container boot-fails on registry validation. Pinned by
+# them. Do not "harmonise" the two files, and do not sweep this line up with the
+# `**/` conversion above: `**/data/` here ships an image whose container
+# boot-fails on registry validation. Pinned by
 # `test_every_runtime_asset_the_registry_needs_actually_reaches_the_image`, whose
 # expectations were measured against a real build rather than reasoned about.
 data/
-*.db
-*.db-wal
-*.db-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm
 
 # host virtualenv -- wrong platform, and ~750 MB of build context
-.venv/
-venv/
+**/.venv/
+**/venv/
 
-# vcs + agent/editor state
-.git/
-.gitignore
-.claude/
-.DS_Store
+# vcs + agent/editor state. `.DS_Store` is `**/` for a reason of its own: Finder
+# writes one into every directory it opens, not just the root.
+**/.git/
+**/.gitignore
+**/.claude/
+**/.DS_Store
 
 # python build artefacts and caches
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/build/
+**/dist/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
 
 # demo artefacts
-wire_dump*.txt
+**/wire_dump*.txt

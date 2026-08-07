@@ -3,11 +3,23 @@
 HARD REQUIREMENT (build doc section 16): no exception may ever carry an original
 entity value. Constructors here accept *structured* detail only -- token IDs,
 entity types, counts, latencies. The base class enforces a 64-character ceiling
-on every string value as defense in depth, mirroring the identical guard on
-``AuditEvent.detail`` in :mod:`secure_context_pipeline.models`.
+on **both halves of every detail entry, measured on the rendered width**, which
+is the same guard ``AuditEvent.detail`` applies in
+:mod:`secure_context_pipeline.models` -- deliberately the same, because
+``api/errors.py`` writes ``dict(exc.detail)`` straight into the HTTP body, so
+this map is a wire surface with the same exposure shape as an audit row.
+
+"Mirroring the identical guard" is what this docstring said while the two had
+already diverged: ``models.py`` moved to ``len(str(value))`` and grew a key
+bound, and this module was still testing ``isinstance(value, str)`` on the value
+alone. That gap was reachable in exactly the shape ``models.py`` documents -- a
+408-character clinical note encodes to a 983-digit int, which passed the ceiling
+here and rendered verbatim into ``str(exc)``, recoverable with one ``to_bytes``.
 
 The real control is that no call site passes an original; this guard exists so
-that a future call site which tries to cannot do so silently.
+that a future call site which tries to cannot do so silently -- which a
+type-conditional check cannot deliver, since silence for every non-``str``
+member of ``DetailValue`` is precisely the failure it is supposed to prevent.
 
 **Where the rest of the hierarchy lives.** This module holds the errors that cross
 package boundaries. Three subpackages define their own ``PipelineError`` subclasses
@@ -51,10 +63,39 @@ class PipelineError(Exception):
 
     def __init__(self, **detail: DetailValue) -> None:
         for key, value in detail.items():
-            if isinstance(value, str) and len(value) > MAX_DETAIL_VALUE_LEN:
+            # Both halves of the entry, both measured on the RENDERED width --
+            # the same two checks `AuditEvent._reject_long_values` runs, in the
+            # same order. They are re-derived here rather than asserted to be
+            # equivalent because the two had already drifted apart underneath a
+            # docstring that said they were identical, and nothing compared them.
+            #
+            # `isinstance(value, str)` was the whole check, and `DetailValue` is
+            # `int | float | str | None`. An int has no length, so the payload the
+            # audit model refuses walked through here: 408 characters of clinical
+            # note becomes a 983-digit int, which `__init__` accepted and
+            # `super().__init__` rendered into a 1,004-character `str(exc)` --
+            # and `api/errors.py` puts `dict(exc.detail)` into the response body.
+            # A ceiling that only bites the encoding an honest caller would have
+            # used is not a ceiling.
+            #
+            # The KEY is bounded for the same reason it is in `models.py`: it is
+            # serialised into the body alongside the value, so bounding one of
+            # them bounds nothing. No shipped call site builds a dynamic key (they
+            # all arrive as kwargs literals), so this is a hardening gap rather
+            # than a live leak -- which is the kind that survives, because nothing
+            # exercises it.
+            #
+            # `str(None)` is 4 chars, so an absent optional detail still passes.
+            if len(key) > MAX_DETAIL_VALUE_LEN:
+                raise ValueError(
+                    f"{type(self).__name__}: detail key {key!r} exceeds "
+                    f"{MAX_DETAIL_VALUE_LEN} chars; exceptions must not carry content"
+                )
+            if len(str(value)) > MAX_DETAIL_VALUE_LEN:
                 raise ValueError(
                     f"{type(self).__name__}: detail field {key!r} exceeds "
-                    f"{MAX_DETAIL_VALUE_LEN} chars; exceptions must not carry content"
+                    f"{MAX_DETAIL_VALUE_LEN} chars when rendered; exceptions must "
+                    "not carry content"
                 )
         self.detail: dict[str, DetailValue] = detail
         rendered = ", ".join(f"{k}={v!r}" for k, v in detail.items())

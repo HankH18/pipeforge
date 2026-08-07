@@ -921,6 +921,18 @@ class Restorer:
         correct: did any fake survive in the model's own prose? The token
         assertion needs no such exclusion (see :meth:`_assert_no_tokens`).
 
+        Wholly inside, not merely touching. With the pass working normally that
+        leaves exactly one shape that can still fire -- a fake reassembled half
+        out of a splice and half out of the model's prose ("Torres" restored in
+        front of the model's "Rodriguez", where "Torres Rodriguez" is a fake this
+        session issued for someone else) -- and it fails closed, because nothing
+        here can tell that reading from a fake that survived. The other way in is
+        a pass that failed outright. Both are pinned in
+        ``tests/test_deobfuscation.py``, and before they existed nothing could
+        tell this predicate from "excuse everything": the only two tests that made
+        the assertion fire sabotaged the pass into splicing nothing, and an empty
+        splice list skips the exclusion instead of exercising it.
+
         Both lists are in ascending order, so one linear walk covers them.
         """
         index = 0
@@ -1106,9 +1118,17 @@ def _consume_unclosed_tail(text: str, match: re.Match[str]) -> int:
     * it must contain no second token, so a run-on like
       ``[PHI_NAME_aaaaaaaa|PHI_NAME_bbbbbbbb]`` can never eat its neighbour.
 
+    The separator requirement in the paragraph above is a fifth bound and carries
+    its own weight, because the four are satisfiable without it:
+    ``[PHI_MEDICATION_2f4a1b3c/500mg]`` is one unbroken run, well inside the cap,
+    ends in the bracket that balances the opener and holds no second token. Drop
+    it and the mop-up swallows ``/500mg]`` -- the dose gone from a clinical
+    answer, with nothing left on screen to say so.
+
     Fail the tail rather than over-consume: a visible ``|MANGLED HINT]`` remnant
     is cosmetic, whereas deleting a clause the model wrote silently changes the
-    answer the user reads.
+    answer the user reads. All five bounds are pinned by the
+    ``PROSE_AFTER_A_MANGLED_HINT`` table in ``tests/test_deobfuscation.py``.
     """
     end = match.end()
     matched = match.group(0)
@@ -1160,6 +1180,20 @@ def _shift_spans(
     edit -- that is what ``protected`` means -- so its own bytes are untouched and
     only the drift accumulated by earlier edits applies. Both lists are ascending,
     so one merge walk does it.
+
+    Where the drift can change an answer, stated honestly: only a restored
+    original that is *itself* a whole token match can be excused by containment in
+    :meth:`Restorer._assert_no_tokens`, and the shipped ``entities.yaml``
+    identifier patterns capture the digits alone (``48273910``, never
+    ``PHI-MRN-48273910``), so on registry-detected values this returns its input
+    unchanged. The surrogate map is the caller's (build doc section 9.4), so the
+    shape still arrives from a custom entity type or a direct library caller, and
+    a stale offset then costs either a spurious ``foreign_tokens`` count or --
+    when the original's 8-hex tail equals an ID this run minted -- a
+    ``PipelineError`` raised after the provider was called and billed, over our
+    own output. That is also why this helper went uncovered for so long: it
+    returned its input unchanged on every call the suite made until
+    ``test_a_protected_span_is_excused_in_the_coordinates_it_ends_up_in``.
     """
     if not spans or not edits:
         return spans

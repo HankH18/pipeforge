@@ -32,17 +32,28 @@
     <span id="session-badge" class="badge muted">no session</span>
   </div>
 
+  <!-- Build doc section 9.10 calls this an "upload fixture dropdown". It is not one,
+       and cannot be from here: a browser cannot read a path off disk, and nothing
+       serves fixtures/ over HTTP -- _mount_ui mounts this directory alone, so
+       GET /fixtures/medical_note.txt is a 404. Labelled "fixture", sitting next to
+       a list of fixture filenames, it promised the upload and did half the job in
+       silence: selecting medical_note.txt and pressing Run issued zero requests and
+       answered NO_FILE, on the first control a reviewer touches. The label and the
+       hint now say what it does -- preset the doc_category each bundled document must
+       be scanned under, and name the path to hand the picker. Recorded in README
+       section 8's deviation ledger; the hint text lives in app.js so the idle and
+       chosen states have one source. -->
   <div class="grp">
-    <label for="fixture">fixture</label>
+    <label for="fixture">fixture preset</label>
     <select id="fixture">
-      <option value="">— pick a file —</option>
+      <option value="">— none —</option>
       <option value="medical_note.txt" data-cat="medical">medical_note.txt</option>
       <option value="legal_memo.txt" data-cat="legal">legal_memo.txt</option>
       <option value="financial_disclosure.txt" data-cat="financial">financial_disclosure.txt</option>
       <option value="legal_brief_large.txt" data-cat="legal">legal_brief_large.txt</option>
     </select>
     <input type="file" id="file" accept=".txt,.md,.pdf,.docx">
-    <span class="hint">choose the fixture from <code>fixtures/</code>, or any file</span>
+    <span class="hint" id="fixture-hint"></span>
   </div>
 
   <div class="grp">

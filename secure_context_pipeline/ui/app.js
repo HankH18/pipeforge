@@ -345,6 +345,22 @@
     } catch (e) { $('health').textContent = 'health: unreachable'; }
   }
 
+  // ---------- the fixture preset ----------
+  // Build doc section 9.10 asks for an "upload fixture dropdown". This control
+  // cannot upload: a browser cannot read a path off disk, and nothing serves
+  // `fixtures/` over HTTP -- `_mount_ui` mounts `secure_context_pipeline/ui/`
+  // alone, so `GET /fixtures/medical_note.txt` answers 404. Labelled "fixture"
+  // and wired to set `doc_category` and nothing else, it promised the upload and
+  // withheld it silently: picking `medical_note.txt` and pressing Run issued zero
+  // requests and answered `NO_FILE`. The hint carries the half a dropdown can
+  // still do -- naming the path to hand the file picker -- and both strings live
+  // here rather than in the markup so the idle text and the reset are one value.
+  // See README section 8's deviation ledger for the row against section 9.10.
+  const HINT_IDLE = 'a preset, not an upload: it sets doc_category; the picker takes the file';
+  const hintFor = (name) => (name
+    ? 'now pick fixtures/' + name + ' with the file button'
+    : HINT_IDLE);
+
   // ---------- wiring ----------
   $('btn-session').addEventListener('click', createSession);
   $('btn-destroy').addEventListener('click', destroySession);
@@ -353,8 +369,10 @@
   $('fixture').addEventListener('change', (ev) => {
     const opt = ev.target.selectedOptions[0];
     if (opt && opt.dataset.cat) $('category').value = opt.dataset.cat;
+    $('fixture-hint').textContent = hintFor(opt && opt.value);
   });
   $('file').addEventListener('change', () => { S.docId = null; S.uploadKey = null; });
   $('prompt').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') run(); });
+  $('fixture-hint').textContent = HINT_IDLE;
   health();
 })();

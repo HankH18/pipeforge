@@ -24,6 +24,7 @@ is the behavioural layer on top of it.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -32,6 +33,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_JS = REPO_ROOT / "secure_context_pipeline" / "ui" / "app.js"
+INDEX_HTML = REPO_ROOT / "secure_context_pipeline" / "ui" / "index.html"
 NODE = shutil.which("node")
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -750,6 +752,59 @@ emit({ chosen: chosen, afterBlank: el('category').value });
     out = _run(tmp_path, body)
     assert out["chosen"] == "medical"
     assert out["afterBlank"] == "medical"
+
+
+def test_the_fixture_preset_names_the_path_the_file_picker_still_needs(
+    tmp_path: Path,
+) -> None:
+    """The dropdown cannot upload, so it has to say which file to hand the picker.
+
+    Build doc section 9.10 asks for an "upload fixture dropdown". This is not one:
+    a browser cannot read a path off disk, and nothing serves ``fixtures/`` over
+    HTTP -- ``_mount_ui`` mounts ``secure_context_pipeline/ui/`` alone, measured
+    ``GET /fixtures/medical_note.txt`` -> 404. Labelled "fixture" and wired to set
+    ``doc_category`` and nothing else, it did half the job in silence: selecting
+    ``medical_note.txt`` and pressing Run issued **zero** requests and answered
+    ``NO_FILE``, on the first control a reviewer touches. Reselecting the blank
+    option must put the idle text back, or the page goes on naming a file the user
+    has just deselected.
+    """
+    body = """
+const out = { idle: el('fixture-hint').textContent };
+fire('fixture', 'change', { target: { selectedOptions: [
+  { value: 'medical_note.txt', dataset: { cat: 'medical' } }] } });
+out.picked = el('fixture-hint').textContent;
+out.category = el('category').value;
+fire('fixture', 'change', { target: { selectedOptions: [{ value: '', dataset: {} }] } });
+out.cleared = el('fixture-hint').textContent;
+emit(out);
+"""
+    out = _run(tmp_path, body)
+    assert out["picked"] == "now pick fixtures/medical_note.txt with the file button"
+    assert out["category"] == "medical", "the preset half must keep working"
+    assert "not an upload" in out["idle"], out["idle"]
+    assert "doc_category" in out["idle"], out["idle"]
+    assert out["cleared"] == out["idle"], "deselecting must not leave a stale path up"
+
+
+def test_every_element_the_ui_addresses_exists_in_the_page() -> None:
+    """``$('...')`` in ``app.js`` and ``id="..."`` in ``index.html`` have to agree.
+
+    Nothing checked that, and the harness above structurally cannot: its DOM stub
+    mints an element for any id asked of it, which is what makes the render helpers
+    drivable and also what makes a typo invisible to every test in this file. In a
+    browser ``$('fixture-hnt')`` is ``null`` and the first property access on it
+    throws, taking the rest of that listener with it -- and the ``change`` listener
+    is where the fixture preset now lives, so the failure would be "the dropdown
+    does nothing", which is exactly the defect this pair of files was just fixed
+    for. Static, so it does not need node; it sits here because it guards a
+    behaviour rather than the escaping control ``test_api_ui_escaping.py`` owns.
+    """
+    addressed = set(re.findall(r"\$\('([^']+)'\)", APP_JS.read_text(encoding="utf-8")))
+    declared = set(re.findall(r'\bid="([^"]+)"', INDEX_HTML.read_text(encoding="utf-8")))
+    assert addressed, "the id extraction found nothing -- the pattern no longer matches"
+    assert "fixture-hint" in addressed, "the preset hint is no longer wired"
+    assert addressed <= declared, sorted(addressed - declared)
 
 
 def test_enter_in_the_prompt_box_starts_a_run_and_other_keys_do_not(tmp_path: Path) -> None:

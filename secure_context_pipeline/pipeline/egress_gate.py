@@ -10,7 +10,8 @@ Three passes, of which only the first two were ever independent of the detector:
 
 1. **Original-value scan.** The fully serialized outbound payload is searched for
    every original in the session vault, in raw, normalised, format-character-folded
-   and combining-mark-folded form, plus -- for values whose disclosure is carried by
+   (which also writes every Unicode decimal digit in its ASCII spelling) and
+   combining-mark-folded form, plus -- for values whose disclosure is carried by
    a long digit run -- with no word-boundary requirement at all
    (:func:`_identifier_needles`), plus -- for an original that is itself a *list* of
    digit-bearing values -- the same four bounded forms again per constituent
@@ -94,7 +95,7 @@ to punctuation, markdown, brackets and currency symbols, and including a value
 interrupted by any character that renders as nothing: every Unicode format (``Cf``)
 codepoint and every default-ignorable, from the zero-width space to the tag block
 that carries the ASCII-smuggling vector (see :data:`_INVISIBLE_RE`). It *also*
-blocks three shapes that used to walk through, each of which was reachable from an
+blocks four shapes that used to walk through, each of which was reachable from an
 ordinary uploaded document and each of which was reproduced end-to-end before being
 closed:
 
@@ -131,6 +132,16 @@ closed:
    rely on that, and derives a needle per constituent itself. The rule is narrow on
    purpose -- see :func:`_composite_needles` for exactly what is excluded and what each
    exclusion costs if it is dropped.
+4. *An identifier restated in another decimal digit script.* A vaulted MRN
+   ``5567281`` reached the provider as the same seven digits written in Arabic-Indic,
+   extended Arabic-Indic, Devanagari, Bengali, N'Ko or Osmanya, with all three passes
+   silent, while the fullwidth spelling of the same number blocked -- because NFKC
+   folds compatibility variants and leaves 580 of the 660 codepoints that carry a
+   decimal value exactly as they are. It is not the homoglyph gap below and the
+   confusables table named there would not have closed it: these are not look-alikes
+   of ASCII digits, they are different characters with the same numeric value. Both
+   sides of the comparison now write decimal digits in ASCII
+   (:func:`_fold_decimal_digits`).
 
 Two gaps remain:
 
@@ -298,15 +309,35 @@ MIN_IDENTIFIER_RUN_DIGITS: Final = 6
 #: the behaviour against, and it told them a narrower rule protects them than the one
 #: that runs.
 #:
-#: **What eight buys, and what it costs -- both measured.** On the generator corpus
-#: (26 seeds, four document kinds, 8,143 distinct planted originals) 8,073 are
-#: multi-component and the floor excludes 343 of them, 4.2%.
+#: **What eight buys, and what it costs -- both re-measured**, because the three counts
+#: that stood here (8,143 planted / 8,073 multi-component / 343 excluded) reproduce as
+#: none of those, and a number a reader cannot re-derive is worse than no number. On the
+#: generator corpus -- 26 seeds x four document kinds -- there are 8,462 distinct planted
+#: values (8,472 distinct type-and-value pairs, so ten values are planted under two
+#: types). 8,390 of them are multi-component, and the floor excludes **358**: 4.3%.
 #:
-#: The cost is not only lab values. It includes ordinary two-word person names:
-#: ``Amy Cox`` and ``Ann Lee`` are six alphanumerics, ``Jo Ann`` is five, and for all
-#: of them this limb is dead -- so a payload that respells the space walks the whole
-#: name out. That is a real open boundary and it is named as the fourth entry in the
-#: README's list rather than left implied here.
+#: **What is in that residual matters more than its size, and the composition was wrong
+#: too.** It was described as "overwhelmingly lab values like ``HDL 28``". Counted by
+#: entity type it is 286 ``AMOUNT``, 69 ``LAB_RESULT`` and 3 ``NAME`` -- and the floor is
+#: not the last word on any of them, so the number that actually states the exposure is
+#: how many are left with only the four bounded forms:
+#:
+#:     267 of the 358 still get an unbounded needle from another limb -- every
+#:         seven-digit amount (``$10,107.07`` is seven digits, so
+#:         :func:`_identifier_needles` takes the whole value and
+#:         :func:`_regrouped_identifier_needle` takes its skeleton)
+#:      91 get nothing beyond the bounded forms: 19 ``AMOUNT`` under seven digits
+#:         (``$1,370.22``), 69 ``LAB_RESULT`` (``HDL 28``, letters and two digits) and
+#:         3 ``NAME`` -- ``Gene Lee``, ``Paul Lee``, ``Ryan Ray``
+#:
+#: The three names are the part that matters, and they are not a corpus accident:
+#: ordinary two-word person names sit under this floor generally -- ``Amy Cox`` and
+#: ``Ann Lee`` are six alphanumerics, ``Jo Ann`` is five -- so for all of them this limb
+#: is dead and a payload that respells the space walks the whole name out. A digit-free
+#: value below the floor keeps the four bounded forms and nothing else; the digit-bearing
+#: majority above does not, which is why "4.3% excluded" on its own reads as a much
+#: larger hole than the one that ships. That name-shaped residual is a real open boundary
+#: and it is named as the fourth entry in the README's list rather than left implied here.
 #:
 #: **It is not closeable by lowering the number, and that was measured rather than
 #: assumed.** Real short names and common English phrases occupy the same length
@@ -584,10 +615,16 @@ class EgressGate:
         2. **normalised** -- NFKC, whitespace collapsed, casefolded, so a splice bug
            that changed case or broke a value across a line still trips;
         3. **folded** -- normalised with every character that renders as nothing
-           removed (:data:`_INVISIBLE_RE`). Those characters are invisible to a
-           human reader and to the model, so ``Joh<U+200B>n Smith`` on the wire
-           discloses exactly what ``John Smith`` discloses. Without this form, one
-           zero-width space is a complete bypass of pass 1.
+           removed (:data:`_INVISIBLE_RE`) and every Unicode decimal digit rewritten
+           in its ASCII spelling (:func:`_fold_decimal_digits`). The first half is
+           invisible to a human reader and to the model, so ``Joh<U+200B>n Smith`` on
+           the wire discloses exactly what ``John Smith`` discloses; without it, one
+           zero-width space is a complete bypass of pass 1. The second half is
+           visible and still the same disclosure: a vaulted MRN restated in
+           Arabic-Indic or Devanagari digits is the same number, and NFKC does not
+           fold those. That fold is applied to the needle as well, which is the one
+           deliberate exception to the rule the next form states -- see
+           :func:`_fold_decimal_digits` for why digits earn it and marks do not.
         4. **skeleton** -- the folded needle against a folded payload with every
            combining mark removed (:func:`_deaccent`), which is what catches a mark
            spliced into a value. Asymmetric on purpose: only the *haystack* is
@@ -633,12 +670,14 @@ class EgressGate:
         Aho-Corasick automaton built incrementally per session (README Q1).
         """
         payload_norm = normalize(payload)
-        payload_folded = _strip_invisible(payload_norm)
+        payload_folded = _fold_decimal_digits(_strip_invisible(payload_norm))
         # The skeleton is derived from the RAW payload with spacing diacritics
         # removed first -- see `_strip_spacing_marks` for why the order matters.
         # NFKC expands one into a space plus a combining mark, so folding the mark
         # afterwards leaves the space and the value stays broken.
-        payload_skeleton = _deaccent(_strip_invisible(normalize(_strip_spacing_marks(payload))))
+        payload_skeleton = _fold_decimal_digits(
+            _deaccent(_strip_invisible(normalize(_strip_spacing_marks(payload))))
+        )
         haystacks = _Haystacks(
             raw=payload,
             normalized=payload_norm,
@@ -654,7 +693,7 @@ class EgressGate:
             if _occurs_in_any_bounded_form(original, haystacks):
                 hits += 1
                 continue
-            folded = _strip_invisible(normalize(original))
+            folded = _fold_decimal_digits(_strip_invisible(normalize(original)))
             if any(needle in payload_skeleton for needle in _identifier_needles(folded)):
                 hits += 1
                 continue
@@ -1167,6 +1206,79 @@ def _deaccent(value: str) -> str:
     return unicodedata.normalize("NFC", stripped)
 
 
+def _fold_decimal_digits(value: str) -> str:
+    """``value`` with every Unicode decimal digit rewritten in its ASCII spelling.
+
+    The one fold in this module applied to the NEEDLE and the HAYSTACK alike, and the
+    asymmetry the others keep is not being relaxed here -- digits are a different
+    question. :func:`_deaccent` strips one side only because ``José`` and ``Jose`` are
+    two different people, so collapsing them would manufacture blocks on documents
+    carrying both spellings. U+0665 ARABIC-INDIC DIGIT FIVE and ``5`` are not two
+    different anything: a decimal digit's identity *is* its numeric value, so two
+    values that fold together denote the same number and a block on either is a true
+    positive. Folding both sides is also what makes this cover the reverse direction --
+    a value vaulted from a document written in Devanagari digits, restated in ASCII.
+
+    **The leak this closes was reproduced end to end before it was written.** A vaulted
+    MRN ``5567281`` reached the provider inside ``Chart cross-reference ... filed with
+    billing.`` with its seven digits written in Arabic-Indic, and all three passes
+    silent -- and the same again through extended Arabic-Indic, Devanagari, Bengali,
+    N'Ko and Osmanya (which is outside the BMP). An ``ACCOUNT_NUMBER`` of
+    ``100200300400`` walked out the same way. The model reads every one of those as the
+    number, and so does a human reading the wire dump.
+
+    **This is not the declared homoglyph boundary, and that boundary's stated remedy
+    would not have closed it.** These codepoints are not visual confusables of ASCII
+    digits -- they are differently-drawn characters with the same decimal value -- so a
+    UTS-39 confusables table has nothing to say about them. The remedy is a property
+    :mod:`unicodedata` already ships.
+
+    **Why NFKC did not already do it**, measured against the Unicode 14.0 database this
+    interpreter carries: 660 codepoints have a decimal value, and NFKC folds 80 of them
+    to the ASCII digit -- the ASCII digits themselves, the fullwidth forms, the five
+    mathematical alphabets and the segmented digits, all of which are *compatibility*
+    variants. The other 580, across 58 digit families, it leaves untouched, because a
+    Devanagari digit is not a compatibility variant of anything. That is exactly the
+    shape the reproduction had: the fullwidth spelling of the vaulted MRN blocked and
+    the Devanagari spelling of the same seven digits did not, so the payload that looked
+    more contrived was the one already caught.
+
+    The class comes from a Unicode property rather than a hand-picked list, for the
+    reason :data:`_INVISIBLE_RE` and :func:`_is_spacing_diacritic` give: a script a
+    future release adds is covered the day it lands. :func:`unicodedata.decimal` is
+    the *decimal* property specifically -- the digits that carry positional notation --
+    so it takes Arabic-Indic and Devanagari and leaves alone Ethiopic ``፭``, which
+    has a digit value but is an additive numeral with no zero, and the enclosed forms
+    (``⑴``), which NFKC has already rewritten to ``(1)`` by the time this runs.
+
+    The map is one codepoint to one codepoint, which is what makes it safe to apply
+    inside the folded forms rather than as a fifth one: it preserves length, so no
+    :data:`MIN_ORIGINAL_LEN` check moves, and it maps alphanumeric to alphanumeric, so
+    no boundary assertion in :func:`_occurs_as_a_unit` changes class. A needle that
+    occurred in a haystack before therefore still occurs in it after.
+
+    **Where it does not reach**, stated rather than left to be discovered:
+    :func:`_composite_needles` splits the *raw* original, so a detector span that is a
+    list of values written in a non-ASCII script yields no constituent needles -- it
+    keeps the whole-value forms and nothing more.
+
+    Free on the payloads that do not need it, and cheap on the ones that do:
+    ``str.isascii`` is a flag check on the string object, so every ASCII payload and
+    every ASCII original returns the *same object* before the loop is entered -- 0.2
+    microseconds on a 54 KB payload. One carrying a single accent takes the loop, at
+    3.0 ms for the same 54 KB; that is twice per ``check()`` (the folded and skeleton
+    haystacks) and once per original, against a pass 1 that takes roughly a second at
+    20k originals and a budget of :data:`DEFAULT_TIMEOUT_S`.
+    """
+    if value.isascii():
+        return value
+    folded = "".join(
+        str(digit) if (digit := unicodedata.decimal(ch, None)) is not None else ch
+        for ch in value
+    )
+    return value if folded == value else folded
+
+
 class _Haystacks(NamedTuple):
     """The four payload forms pass 1 compares against, derived once per scan.
 
@@ -1197,10 +1309,11 @@ def _occurs_in_any_bounded_form(value: str, haystacks: _Haystacks) -> bool:
 
     :data:`MIN_ORIGINAL_LEN` is re-checked per *derived* form, not once on the input:
     normalising and folding both shrink a needle and can drop it below the floor after
-    the fact.
+    the fact. The digit fold is the one derivation that cannot move that floor, because
+    it replaces a codepoint rather than removing one.
     """
     normalized = normalize(value)
-    folded = _strip_invisible(normalized)
+    folded = _fold_decimal_digits(_strip_invisible(normalized))
     forms = [
         (value, haystacks.raw),
         (normalized, haystacks.normalized),
@@ -1384,12 +1497,26 @@ def _separator_needles(value: str) -> tuple[str, ...]:
     separator *variants* of an identifier, which :func:`_identifier_needles` covers
     only when a single contiguous run already clears its floor.
 
-    This list previously also claimed ``5,567,281`` against ``5567281``, and that one
-    is **false**: it joins to seven characters, one below
-    :data:`MIN_JOINED_ALNUM_LEN`, so this limb produces no needle for it at all. It
-    is covered instead by :func:`_identifier_needles`, whose digit-run floor is six.
-    An example that does not do what the paragraph says it does is worse than no
-    example, because it is the sentence a reader checks the behaviour against.
+    This list previously also claimed ``5,567,281`` against ``5567281``, and it is not
+    this limb's example -- but the correction that replaced it was wrong in turn, which
+    is worth recording rather than quietly fixing: a paragraph whose whole job is to
+    stop a reader trusting a wrong example had been the wrong example twice.
+
+    Neither direction produces a needle **here**, for two different reasons. Vaulted
+    ``5567281`` is a single component, so the ``len(parts) < 2`` return fires before any
+    floor is consulted; vaulted ``5,567,281`` has three components that join to seven
+    characters, one below :data:`MIN_JOINED_ALNUM_LEN`.
+
+    The correction said :func:`_identifier_needles` covers it, "whose digit-run floor is
+    six". It does not, in either direction, and that is measured rather than reasoned
+    about: the needles are ``('5567281',)`` and ``('5,567,281',)`` respectively -- the
+    whole value, plus digit runs, and ``5,567,281``'s longest run is three -- so the
+    needle from each spelling is absent from the other. What covers it is
+    :func:`_regrouped_identifier_needle`, added later than that paragraph: both
+    spellings reduce to the digit skeleton ``5567281``, seven digits with no letter.
+    Pinned in both directions, limb by limb, by
+    ``test_the_comma_grouped_identifier_blocks_in_both_directions`` -- an attribution
+    that only prose asserts is one that goes stale the next time a limb moves.
 
     Returns a **pattern source string**, not a literal, because "any separator or
     none" is not expressible as a substring. It is the one needle in pass 1 with no

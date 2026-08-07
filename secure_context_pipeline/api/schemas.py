@@ -9,17 +9,25 @@ original entity value could escape. Two rules govern the whole module:
    after a successful per-user-key decrypt) and
    ``PipelineResult.restored_text`` (defined in :mod:`~secure_context_pipeline.models`,
    the whole point of the round trip). Error bodies, audit responses, and health
-   output are structurally incapable of holding one.
+   output are structurally incapable of holding **content** -- a paragraph, a
+   note, a document, which is the bulk-exfiltration shape -- because every field
+   they can carry is length-capped. They are *not* structurally incapable of
+   holding an original, which this docstring used to claim: 64 characters fits
+   ``"John Smith"``, ``"MRN 4823910"``, an SSN and an e-mail, and no length check
+   can recognise a name. That half of rule 1 holds by call site and is measured,
+   not declared -- see :class:`AuditQueryResponse` and :class:`ErrorResponse`.
 2. **Errors carry structured detail only.** :class:`ErrorResponse.detail` mirrors
    the ``detail`` map of :class:`~secure_context_pipeline.errors.PipelineError`,
-   which the exception hierarchy already caps at 64 characters per string value.
+   which the exception hierarchy caps at 64 characters per detail entry -- key and
+   value, measured on the rendered width, so an int-encoded payload is refused too.
    Reasons, counts, and identifiers -- never a matched value, never a payload.
 
 ``PipelineResult``, ``SpanOut`` and ``AuditEvent`` are re-used as response models
 directly from :mod:`secure_context_pipeline.models` rather than re-declared here:
-those are the types the pipeline already guarantees are content-free (``SpanOut``
-has offsets but no ``text`` field; ``AuditEvent`` has no free-text field at all),
-and duplicating them would create a second schema that could drift into leaking.
+those are the types the pipeline already keeps free of *content* (``SpanOut`` has
+offsets but no ``text`` field; ``AuditEvent``'s only free-text field, ``detail``,
+is bounded at 64 characters per entry and its label columns at 128), and
+duplicating them would create a second schema that could drift into leaking.
 """
 
 from __future__ import annotations
@@ -47,8 +55,9 @@ __all__ = [
 
 #: Ceiling on caller-supplied identifiers. Identifiers are echoed into structured
 #: error details, and :class:`~secure_context_pipeline.errors.PipelineError` caps
-#: every string detail at 64 characters -- rejecting an over-long ID at the schema
-#: is a clearer 422 than a ``ValueError`` from deep inside the error constructor.
+#: every detail entry at 64 rendered characters -- rejecting an over-long ID at the
+#: schema is a clearer 422 than a ``ValueError`` from deep inside the error
+#: constructor.
 MAX_ID_LEN = 64
 
 #: Ceiling on the user's question. The document is not bounded here (that is the
@@ -122,9 +131,33 @@ class PipelineRunRequest(BaseModel):
 class AuditQueryResponse(BaseModel):
     """``GET /audit``. Paginated slice of the hash-chained log.
 
-    ``AuditEvent`` cannot hold an original value by construction (build doc
-    section 9.8), so this response is safe to expose to a compliance reader
-    without further filtering.
+    **The safety argument is not "``AuditEvent`` cannot hold an original value by
+    construction".** This docstring said exactly that, and used it as the reason
+    the body needs no further filtering -- which made a retracted claim
+    load-bearing on the one response model that hands audit rows to an outside
+    reader. ``audit/logger.py`` and the README both retract it, and it is
+    disprovable in one line: ``detail`` bounds a value at 64 characters and the
+    label columns at 128, so ``"John Smith"``, ``"MRN 4823910"``, an SSN and an
+    e-mail all fit, and this model serialises them into the body without
+    complaint.
+
+    What is actually true, in two parts:
+
+    * **Content cannot get here.** The ceilings make an audit row incapable of
+      holding a paragraph, a note or a document -- the bulk-exfiltration shape --
+      and they are enforced at the model *and* again at the write boundary, where
+      ``model_construct()`` cannot skip them.
+    * **A short identifier is kept out by call site, and that is measured.** Every
+      ``emit`` in the package writes counts, latencies, digests, entity *type*
+      names and 8-hex token IDs; the 100-run leakage harness scans the raw SQLite
+      file as bytes against every vaulted original.
+
+    Neither part is about *correlation*, which is the risk this body actually
+    carries: a row names its ``session_id``, a ``SESSION_CREATE`` row names the
+    owning ``user_id``, and a ``DETECT`` row names the ``doc_id`` that was read --
+    the credentials for irreversible session erasure and for original document
+    text. That is handled before this model is ever built, by the proved-ownership
+    scope in :mod:`secure_context_pipeline.api.routes.audit`, not by anything here.
     """
 
     events: list[AuditEvent]
@@ -166,7 +199,13 @@ class ErrorResponse(BaseModel):
 
     ``code`` is the domain error's machine code (``SESSION_EXPIRED``,
     ``EGRESS_BLOCKED``, ``NOT_FOUND``, ...). ``detail`` is the exception's
-    structured detail map: reasons, counts, identifiers. **Never content.**
+    structured detail map: reasons, counts, identifiers. **Never content** --
+    ``PipelineError`` refuses any detail entry, key or value, whose rendered width
+    exceeds 64 characters, so a paragraph cannot reach this body under any
+    encoding. "Never an original" is the narrower claim and rests on the call
+    sites: what they pass is machine codes, counts, latencies and clamped
+    identifiers, and the ``PipelineError`` subclass walk in ``test_crypto.py``
+    checks that none of them lands a full value in ``str``/``repr``/``detail``.
     """
 
     code: str

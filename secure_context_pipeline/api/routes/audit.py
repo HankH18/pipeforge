@@ -28,6 +28,34 @@ from secure_context_pipeline.api.schemas import AuditQueryResponse, AuditVerifyR
 
 router = APIRouter()
 
+#: Ceiling on ``GET /audit?offset=``. The literal is the top of SQLite's signed
+#: 64-bit ``INTEGER`` range, which is exactly where this parameter stopped being
+#: data and became a crash. Measured on this build: ``offset=9223372036854775807``
+#: answered ``200`` with an empty page, and ``+1`` raised ``OverflowError: Python
+#: int too large to convert to SQLite INTEGER`` out of :meth:`AuditLogger.query`
+#: at the ``conn.execute`` that binds it.
+#:
+#: No handler in :func:`_register_handlers` is registered for ``OverflowError``,
+#: so it fell through to Starlette's ``ServerErrorMiddleware`` -- which sits
+#: *outside* the app's own ``_SecurityHeaders`` middleware. The answer was a bare
+#: ``text/plain`` ``500 Internal Server Error``: not the ``{code, detail}`` shape
+#: ``api/errors.py`` claims of *every* non-2xx body, and carrying none of the
+#: three security headers ``api/app.py`` claims of every response. A full
+#: traceback was logged with it. ``GET`` is not in :data:`METERED_METHODS` and a
+#: *successful* scope proof charges no meter, so one session -- and ``POST
+#: /sessions`` mints one for any ``user_id`` an anonymous caller names -- bought
+#: unbounded repeats of that traceback in two requests.
+#:
+#: Bounding the parameter is what closes it here: an over-range ``offset`` is now
+#: refused by the same pydantic validation that already refuses an over-range
+#: ``limit``, so it answers ``422 VALIDATION_ERROR`` through
+#: :func:`_validation_handler`, inside the middleware, with the headers on. The
+#: refusal is pinned to the absolute literal in ``tests/test_api.py`` rather than
+#: to this name, for the reason :data:`MAX_AUDIT_PAGE` records: an assertion
+#: phrased in terms of the constant keeps agreeing with itself when the constant
+#: moves.
+MAX_AUDIT_OFFSET = 2**63 - 1
+
 
 @router.get(
     "/audit",
@@ -43,10 +71,16 @@ async def query_audit(
     session_id: OptionalIdQuery = None,
     run_id: OptionalIdQuery = None,
     event_type: OptionalIdQuery = None,
-    since: Annotated[float | None, Query(description="Inclusive epoch-seconds lower bound.")] = None,
-    until: Annotated[float | None, Query(description="Inclusive epoch-seconds upper bound.")] = None,
+    since: Annotated[
+        float | None,
+        Query(allow_inf_nan=False, description="Inclusive epoch-seconds lower bound."),
+    ] = None,
+    until: Annotated[
+        float | None,
+        Query(allow_inf_nan=False, description="Inclusive epoch-seconds upper bound."),
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=MAX_AUDIT_PAGE)] = DEFAULT_AUDIT_PAGE,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=MAX_AUDIT_OFFSET)] = 0,
 ) -> AuditQueryResponse:
     """Compliance reporting. Ordered by ``seq``, i.e. chain order.
 
@@ -91,6 +125,20 @@ async def query_audit(
     log rather than the registry for exactly that reason: the trail must stay
     readable after the session is destroyed, which is what the vault-miss demo
     and ``demo.py``'s closing audit tail do (build doc section 9.11).
+
+    **``since``/``until`` refuse non-finite bounds**, and the one that mattered
+    is ``NaN``. Bare ``float`` accepts the literal string ``nan``, and Python's
+    ``sqlite3`` driver binds a ``NaN`` as SQL ``NULL`` -- so ``(:since IS NULL OR
+    ts >= :since)`` evaluates ``TRUE`` for every row and the window is dropped
+    entirely. Measured on this build against a one-row session: ``since=9e99``
+    and ``since=inf`` returned 0 rows, ``until=-inf`` returned 0 rows, and
+    ``since=nan`` returned **1** -- the whole unfiltered page, where a ``NaN``
+    comparison implies the empty set. That is the one input where this route
+    reported a window it was not applying, and a compliance read that silently
+    ignores its own filter is worse than one that refuses it. ``inf``/``-inf``
+    are refused with it rather than kept: an infinite bound is expressible as no
+    bound, so nothing is lost, and it matches ``canonical_json``'s
+    ``allow_nan=False`` on the write side of this same log.
     """
     if not session_id and not run_id:
         raise ApiError(

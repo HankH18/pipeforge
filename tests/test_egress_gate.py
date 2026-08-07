@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import contextlib
 import hashlib
 import random
@@ -64,8 +65,10 @@ from secure_context_pipeline.pipeline.egress_gate import (
     EgressGate,
     _composite_needles,
     _deaccent,
+    _fold_decimal_digits,
     _identifier_needles,
     _occurs_as_a_unit,
+    _regrouped_identifier_needle,
     _separator_needles,
     _strip_invisible,
 )
@@ -4179,6 +4182,90 @@ def test_the_joined_alnum_floor_is_the_one_the_limb_applies() -> None:
     )
 
 
+def _components(value: str) -> list[str]:
+    """The alphanumeric runs of `value`, split by hand rather than by the gate's rule.
+
+    `_separator_needles` splits with `groupby(..., key=str.isalnum)`. Re-importing that
+    would make the measurement below agree with the limb by construction -- the
+    failure this repository has already paid for twice, where a checker sharing the
+    checked code's helper turns a green into no evidence at all. This is index
+    arithmetic over the same specification in words: a component is a maximal run of
+    characters `str.isalnum` accepts.
+    """
+    parts: list[str] = []
+    current = ""
+    for ch in value.strip():
+        if ch.isalnum():
+            current += ch
+        elif current:
+            parts.append(current)
+            current = ""
+    if current:
+        parts.append(current)
+    return parts
+
+
+def test_the_floor_s_corpus_measurement_is_the_one_the_docstring_quotes() -> None:
+    """`MIN_JOINED_ALNUM_LEN`'s cost paragraph, re-derived instead of believed.
+
+    The three counts that stood in that docstring -- 8,143 planted values, 8,073
+    multi-component, 343 excluded -- reproduce as none of those, and nothing in the
+    suite could tell: a measurement quoted in prose is a claim with no test behind it,
+    which is precisely the shape of defect that paragraph's own history is made of. So
+    the numbers are pinned here, and a corpus change that moves them is a red that says
+    "re-measure and rewrite the docstring" rather than a docstring that quietly rots.
+
+    The percentage is the least interesting number in it, which is why the split at the
+    end is asserted too: most of the excluded set is digit-bearing and still reachable
+    by the unbounded limbs, and what is genuinely left with only the four bounded forms
+    is 91 values -- three of them person names.
+    """
+    # Imported here rather than at module scope: this is the only test in the file that
+    # needs the generator, and importing it pulls Faker into every run of a suite whose
+    # other 239 tests are unit-scale.
+    from fixtures.generator import KINDS, expected_entities
+
+    pairs = {
+        (entity_type, value)
+        for seed in range(26)
+        for kind in KINDS
+        for entity_type, values in expected_entities(seed, kind).items()
+        for value in values
+    }
+    assert len(pairs) == 8472, "distinct (type, value) pairs across 26 seeds x 4 kinds"
+    assert len({value for _, value in pairs}) == 8462, (
+        "distinct planted VALUES -- ten of them are planted under two entity types, "
+        "which is why this is not the count above"
+    )
+
+    multi = {(t, v) for t, v in pairs if len(_components(v)) >= 2}
+    excluded = {(t, v) for t, v in multi if sum(map(len, _components(v))) < MIN_JOINED_ALNUM_LEN}
+    assert len({v for _, v in multi}) == 8390, "multi-component distinct values"
+    assert len(excluded) == 358, "values the floor refuses a separator needle"
+    assert round(100 * len(excluded) / len({v for _, v in multi}), 1) == 4.3
+
+    by_type = collections.Counter(t for t, _ in excluded)
+    assert dict(by_type) == {"AMOUNT": 286, "LAB_RESULT": 69, "NAME": 3}, (
+        "the docstring called this residual 'overwhelmingly lab values' when it is "
+        "four fifths amounts and contains person names"
+    )
+    assert sorted(v for t, v in excluded if t == "NAME") == [
+        "Gene Lee",
+        "Paul Lee",
+        "Ryan Ray",
+    ]
+
+    # What the floor actually costs: the excluded values another limb still reaches
+    # versus the ones left with the four bounded forms and nothing else.
+    reached = {
+        (t, v)
+        for t, v in excluded
+        if _identifier_needles(v) or _regrouped_identifier_needle(v) or _composite_needles(v)
+    }
+    assert len(reached) == 267, "excluded by the floor, still scanned unbounded"
+    assert len(excluded) - len(reached) == 91, "excluded and reached by no other limb"
+
+
 @pytest.mark.parametrize(
     ("vaulted", "spelling"),
     [
@@ -4247,3 +4334,235 @@ async def test_a_short_two_word_original_is_the_fourth_declared_boundary(
     )
     with pytest.raises(EgressBlockedError):
         await longer.check("Countersigned: Marguerite-Vandenberg RN", "sess-short")
+
+
+# The zero codepoint of each decimal digit script the cases below restate an
+# identifier in. Given as codepoints rather than as pasted glyphs for the reason
+# `_INVISIBLE_RE`'s own source gives: U+0665 and U+06F5 are both "five" and both look
+# like an Arabic five, and *which block a character came from* is the entire subject
+# of these tests. Osmanya is here because it is outside the BMP -- a projection that
+# assumed one codepoint is one UTF-16 unit would mangle it rather than fold it.
+_DIGIT_SCRIPT_ZEROS = {
+    "arabic-indic": 0x0660,
+    "extended-arabic-indic": 0x06F0,
+    "devanagari": 0x0966,
+    "bengali": 0x09E6,
+    "nko": 0x07C0,
+    "osmanya": 0x104A0,
+}
+
+
+def _restate(value: str, zero: int) -> str:
+    """``value`` with each ASCII digit rewritten in the script whose zero is ``zero``."""
+    return "".join(chr(zero + int(ch)) if "0" <= ch <= "9" else ch for ch in value)
+
+
+@pytest.mark.parametrize(
+    "zero", list(_DIGIT_SCRIPT_ZEROS.values()), ids=list(_DIGIT_SCRIPT_ZEROS)
+)
+@pytest.mark.parametrize(
+    ("vaulted", "spelling", "template"),
+    [
+        # The whole value as a unit -- the shape that was reproduced first.
+        ("5567281", "5567281", "Chart cross-reference {} filed with billing."),
+        # Glued to a letter, which the four bounded forms refuse by design. Only the
+        # unbounded identifier limb can see this one, and only if the digit RUN folded.
+        ("5567281", "5567281", "Internal routing tag: MRN{}B must match the ledger."),
+        # Re-scripted AND regrouped: the digit-skeleton limb, whose payload projection
+        # counted ASCII digits and therefore saw an empty string here.
+        ("100200300400", "1002-0030-0400", "wire reference {} for the beneficiary"),
+        # Re-scripted AND re-separated: the separator-invariant limb, whose needle and
+        # haystack are both derived from the folded form.
+        ("512-24-8710", "512 24 8710", "Member SSN {} verified against records."),
+    ],
+)
+async def test_a_vaulted_identifier_restated_in_another_digit_script_is_blocked(
+    tmp_path: Path, vaulted: str, spelling: str, template: str, zero: int
+) -> None:
+    """The gap that was neither closed nor declared: a digit written in another script.
+
+    `_ANY_DIGIT_RE`, `_DIGIT_RUN_RE` and `_digits_only` were all `[0-9]`, and NFKC does
+    not fold a script digit to ASCII -- it folds *compatibility* variants, which is 80
+    of the 660 codepoints that carry a decimal value. So the fullwidth spelling of a
+    vaulted MRN blocked while `5567281` in Arabic-Indic, extended Arabic-Indic,
+    Devanagari, Bengali, N'Ko or Osmanya digits reached the provider with all three
+    passes silent, measured on the real gate:
+
+        ON THE WIRE: 'Chart cross-reference [the same seven digits] filed with billing.'
+
+    It is not the declared homoglyph boundary and the confusables table that boundary
+    names would not have closed it: these are not look-alikes of ASCII digits, they are
+    different characters with the same numeric value, which is why an LLM decodes them
+    perfectly and a UTS-39 table has nothing to say about them.
+
+    Every limb that reads digits is exercised, not just the one the reproduction used,
+    because the fold lives in the derivation of the folded forms and a partial
+    application would leave three of the four limbs still ASCII-only.
+    """
+    payload = template.format(_restate(spelling, zero))
+    assert payload != template.format(spelling), "premise: the restatement changed bytes"
+    gate = EgressGate(
+        vault=FakeVault({vaulted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-digit-script")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+async def test_the_digit_fold_is_symmetric_so_a_scripted_original_blocks_ascii(
+    tmp_path: Path,
+) -> None:
+    """The other direction, which needle-side folding is what buys.
+
+    Every other fold in the module is haystack-only, because folding the needle would
+    collapse two distinct values -- `José` and `Jose` are two people. Decimal digits are
+    not that: the codepoint's identity IS its value, so U+0665 and `5` denote one
+    number and a block on either is a true positive. Folding both sides is therefore
+    safe here, and it is what covers a value vaulted from a document written in another
+    digit script and then restated in ASCII on the wire -- the direction a haystack-only
+    fold would have left open.
+    """
+    scripted = _restate("5567281", _DIGIT_SCRIPT_ZEROS["devanagari"])
+    gate = EgressGate(
+        vault=FakeVault({scripted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check("Chart cross-reference 5567281 filed with billing.", "sess-rev")
+    assert raised.value.detail["reason"] == "vault_original"
+
+    # And glued, so the unbounded limb is exercised from the scripted side too: the
+    # needle's digit run only exists at all once the needle itself has folded.
+    with pytest.raises(EgressBlockedError):
+        await gate.check("Internal routing tag: MRN5567281B must match.", "sess-rev")
+
+
+async def test_the_digit_fold_does_not_manufacture_a_block(tmp_path: Path) -> None:
+    """The guard on the fix: folding the haystack must not make every number a hit.
+
+    A fold that only ever widens is still a denial engine if it widens onto the wrong
+    values. Two controls, both of which a fold that mapped digits by position rather
+    than by value would fail: a different seven-digit number written in the same
+    script, and a neighbouring ASCII number one digit away.
+    """
+    gate = EgressGate(
+        vault=FakeVault({"5567281"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    other = _restate("4444444", _DIGIT_SCRIPT_ZEROS["arabic-indic"])
+    report = await gate.check(f"Chart cross-reference {other} filed.", "sess-digit-fp")
+    assert report.originals_scanned == 1, "premise: the original really was in scope"
+
+    near = await gate.check("Chart cross-reference 5567280 filed.", "sess-digit-fp")
+    assert near.originals_scanned == 1
+
+
+def test_the_digit_fold_maps_each_script_digit_to_its_own_value() -> None:
+    """The projection itself, against a hand-written table rather than its own oracle.
+
+    `_fold_decimal_digits` asks `unicodedata.decimal`, so a test that re-derived the
+    expectation from `unicodedata.decimal` would agree with a fold that was wrong in
+    the same direction -- it would only catch a mistyped loop. These expectations are
+    written out by hand from the block charts, and the two boundary cases are asserted
+    as boundaries rather than left implied.
+
+    Escapes rather than pasted glyphs, for the reason every other Unicode case in this
+    file gives: an Arabic-Indic five and a Latin `o` are confusable enough that ruff
+    refuses the literal, and a reader cannot tell U+0665 from U+06F5 by looking.
+    """
+    # Arabic-Indic five-zero-nine, Devanagari five-zero-nine, Osmanya five.
+    assert _fold_decimal_digits("\u0665\u0660\u0669") == "509"
+    assert _fold_decimal_digits("\u096b\u0966\u096f") == "509"
+    assert _fold_decimal_digits("\U000104a5") == "5", "a non-BMP digit folds too"
+    # Everything that is not a decimal digit is left exactly as it is.
+    assert _fold_decimal_digits("MRN-\u0665\u0665") == "MRN-55"
+    # U+136D ETHIOPIC DIGIT FIVE has a digit value but no DECIMAL value: Ethiopic
+    # numerals are additive and have no zero, so a run of them is not positional
+    # notation. Outside the class, and asserted so widening it is a deliberate act.
+    assert _fold_decimal_digits("\u136d") == "\u136d"
+    # No letter moves, accented or not, and an ASCII string is returned unchanged
+    # without entering the loop -- the fast path every ordinary payload takes.
+    plain = "Nathaniel Brightwater 5567281"
+    assert _fold_decimal_digits(plain) is plain
+    assert _fold_decimal_digits("José Ruiz") == "José Ruiz"
+
+
+def test_the_digit_fold_covers_every_codepoint_python_itself_reads_as_a_digit() -> None:
+    """Completeness, checked against `int()` rather than against the fold's own source.
+
+    `int()` on an Arabic-Indic five (U+0665) returns 5: CPython's integer parser
+    accepts the decimal digits of every script, by a different code path than
+    `unicodedata.decimal`. So it is an independent oracle for both directions of the
+    claim, and a hand-picked block list -- the shape this module keeps finding it got
+    wrong -- fails it the day Unicode adds a script.
+
+    Both directions matter. A fold that missed a script leaves a leak; a fold that
+    touched a codepoint `int()` does not read as a digit is rewriting payload text on
+    a rule nobody stated, which is how a false block gets manufactured.
+    """
+    for cp in range(sys.maxunicode + 1):
+        ch = chr(cp)
+        folded = _fold_decimal_digits(ch)
+        if folded != ch:
+            try:
+                value = int(ch)
+            except ValueError:
+                raise AssertionError(
+                    f"U+{cp:04X} is not a digit to int() and was rewritten to {folded!r}"
+                ) from None
+            assert folded == str(value), f"U+{cp:04X} folded to {folded!r}, not {value}"
+            continue
+        if ch.isascii():
+            continue
+        try:
+            value = int(ch)
+        except ValueError:
+            continue
+        raise AssertionError(f"U+{cp:04X} reads as the digit {value} and did not fold")
+
+
+@pytest.mark.parametrize(
+    ("vaulted", "payload"),
+    [
+        ("5567281", "Chart cross-reference 5,567,281 filed with billing."),
+        ("5,567,281", "Chart cross-reference 5567281 filed with billing."),
+    ],
+)
+async def test_the_comma_grouped_identifier_blocks_in_both_directions(
+    tmp_path: Path, vaulted: str, payload: str
+) -> None:
+    """`_separator_needles`'s worked example, pinned rather than asserted in prose.
+
+    That docstring carries a paragraph whose whole job is to stop a reader trusting a
+    wrong example, and it named the wrong limb: it said `5,567,281` against `5567281`
+    is "covered instead by `_identifier_needles`, whose digit-run floor is six". It is
+    not, in either direction -- the needles are the whole values, and neither string
+    occurs in the other spelling. What covers it is `_regrouped_identifier_needle`,
+    which compares digit skeletons on both sides.
+
+    Asserted limb by limb as well as end to end, because the sentence being pinned is
+    an attribution: an end-to-end block alone would stay green if the coverage moved
+    to a different limb and the docstring went stale again.
+    """
+    assert _separator_needles(vaulted) == (), "the separator limb produces nothing here"
+    assert not [n for n in _identifier_needles(vaulted) if n in payload], (
+        "no identifier needle occurs in the payload"
+    )
+    assert _regrouped_identifier_needle(vaulted) == "5567281"
+
+    gate = EgressGate(
+        vault=FakeVault({vaulted}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-grouped")
+    assert raised.value.detail["reason"] == "vault_original"
