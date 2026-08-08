@@ -31,6 +31,7 @@ from secure_context_pipeline.config import Settings
 from secure_context_pipeline.deobfuscation.restorer import (
     _HINT_TAIL_RE,
     _MAX_LABEL_LEN,
+    _MAX_MISS_ROWS,
     MISS_FABRICATED,
     MISS_INDETERMINATE,
     MISS_LOST,
@@ -51,6 +52,7 @@ from secure_context_pipeline.llm.mock_provider import (
 from secure_context_pipeline.pipeline import egress_gate
 from secure_context_pipeline.surrogates import (
     MAX_ENTITY_TYPE_LEN,
+    MAX_HINT_LEN,
     TOKEN_RE,
     format_surrogate,
 )
@@ -553,6 +555,135 @@ async def test_mangled_hint_mopup_never_eats_the_models_prose(
 
 
 # --------------------------------------------------------------------------
+# The hint stranded on a token that lost BOTH brackets -- LEFT ALONE.
+#
+# `_consume_unclosed_tail` terminates on the closer that BALANCES the opener, so
+# it never runs on a token carrying neither -- section 9.6's `bracket_dropped`
+# mutation applied twice. The hint therefore survives into the answer welded to
+# the restored original: with a vault of {'2f4a1b3c': 'Metformin'} the user reads
+# "Metformin|oral-antidiabetic", while the bracketed spelling of the same token
+# reads "Metformin". That asymmetry is visible in panel 4 of the demo and it is
+# ACCEPTED, not overlooked.
+#
+# A mop-up for it was written and reverted. Without a bracket there is no
+# delimiter, so the only thing left to bound a deletion by is the hint ALPHABET,
+# `[a-z0-9-]{1,24}` -- which is also ordinary English. The three rows marked
+# WHY IT WAS REVERTED are the model's own words that the mop-up deleted, measured
+# against that implementation with all of its table-cell and length guards in
+# place. The only honest bound is the finite gazetteer hint vocabulary, and
+# `restorer.py` cannot reach it (it is handed a vault and settings, never a
+# registry, and `orchestrator._surrogate_map` carries pseudonyms only) -- nor
+# would it close the hole, since "cardiovascular", "renal" and "insulin" are all
+# real class hints and all real English. See `_consume_unclosed_tail`'s docstring.
+#
+# Same shape as the table above: the second element is the FULL expected output,
+# because the failure this guards against is a DELETION and a substring check
+# cannot see one.
+# --------------------------------------------------------------------------
+
+STRANDED_HINT_IS_LEFT_ALONE = [
+    # The stranded hint itself. Cosmetic, visible, and the user can see it is
+    # there -- which is the whole of why it is preferred to the alternative.
+    (
+        "The chart mentions PHI_MEDICATION_2f4a1b3c|oral-antidiabetic.",
+        "The chart mentions Metformin|oral-antidiabetic.",
+    ),
+    (
+        "Started PHI_MEDICATION_2f4a1b3c|oral-antidiabetic and improved.",
+        "Started Metformin|oral-antidiabetic and improved.",
+    ),
+    # WHY IT WAS REVERTED (1): an ordinary conjunction is in the hint alphabet.
+    # The mop-up ate "|and" and the answer became "John Smith the rest follows."
+    (
+        "PHI_NAME_1a2b3c4d|and the rest follows.",
+        "John Smith|and the rest follows.",
+    ),
+    # WHY IT WAS REVERTED (2): so is an ordinary hyphenated adjective. "|per-protocol"
+    # went, and no reader of the answer could tell a word had been removed.
+    (
+        "PHI_NAME_1a2b3c4d|per-protocol review pending.",
+        "John Smith|per-protocol review pending.",
+    ),
+    # WHY IT WAS REVERTED (3): a COMPACT markdown table -- no outer pipes, which is
+    # how a model writes a two-column summary. The mop-up's table-cell guard looks
+    # for a pipe on either side of the run and finds none here, so it ate "|active"
+    # and the Status column vanished. Same harm as the spaced-out rows of
+    # PROSE_AFTER_A_MANGLED_HINT, through a door those rows do not cover.
+    (
+        "name|status\nPHI_NAME_1a2b3c4d|active\n",
+        "name|status\nJohn Smith|active\n",
+    ),
+    # The bracketed spellings are NOT affected by the revert: `_consume_unclosed_tail`
+    # owns those and its behaviour is unchanged. Both directions are kept so the
+    # revert cannot be mistaken for a widening of the mop-up.
+    (
+        "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic] daily.",
+        "Take Metformin daily.",
+    ),
+    (
+        "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic tomorrow.",
+        "Take Metformin|oral-antidiabetic tomorrow.",
+    ),
+    # A possessive still lands on the VALUE and not past the hint: the possessive
+    # walk runs off the end of the match, which the revert leaves at the hash.
+    (
+        "PHI_NAME_1a2b3c4d's chart.",
+        "John Smith's chart.",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    STRANDED_HINT_IS_LEFT_ALONE,
+    ids=[case[0][:44] for case in STRANDED_HINT_IS_LEFT_ALONE],
+)
+async def test_a_hint_stranded_by_a_dropped_bracket_costs_no_word_of_the_answer(
+    restorer: Restorer, text: str, expected: str
+) -> None:
+    result = await restorer.restore(SESSION, text, strategy=TOKENIZATION)
+
+    assert result.text == expected
+    assert TOKEN_RE.search(result.text) is None
+
+
+async def test_no_word_after_a_bracketless_token_is_ever_deleted(
+    restorer: Restorer,
+) -> None:
+    """The property behind the table, stated without a hand-written expectation.
+
+    The table's second column is written by hand, so a future row could encode a
+    deletion that nobody re-derived. This asks the question directly and over the
+    whole hint alphabet plus a sample of ordinary English that lives inside it:
+    after a token that lost both brackets, EVERY word the model wrote is still in
+    the answer. It is the assertion that goes red the moment a stranded-hint
+    mop-up is reintroduced, whatever guards it ships with.
+    """
+    for run in (
+        "cardiovascular",
+        "oral-antidiabetic",
+        "renal",
+        "insulin",
+        "and",
+        "per-protocol",
+        "active",
+        "a",
+        "9",
+        "a-1-b",
+        # Exactly the emitter's own bound -- the most hint-like run there is, and
+        # still not ours to delete once the brackets that made it ours are gone.
+        "x" * MAX_HINT_LEN,
+    ):
+        text = f"The chart mentions PHI_MEDICATION_2f4a1b3c|{run} today."
+
+        result = await restorer.restore(SESSION, text, strategy=TOKENIZATION)
+
+        assert result.text == f"The chart mentions Metformin|{run} today.", (run, result.text)
+        for word in text.split("|", 1)[1].split():
+            assert word in result.text, (run, word, result.text)
+
+
+# --------------------------------------------------------------------------
 # 10.6 -- spec-mandated case (exact test name)
 # --------------------------------------------------------------------------
 
@@ -712,10 +843,148 @@ async def test_both_kinds_of_miss_are_separated_in_one_response(
     by_classification = {str(event.detail["classification"]): event for event in rows}
     assert by_classification[MISS_LOST].token_id == NAME_ID
     assert by_classification[MISS_FABRICATED].token_id is None
-    # The type label is grammar-constrained (`[A-Z][A-Z0-9_]*`) and clamped, so it
-    # stays on both rows -- see
-    # `test_the_entity_type_label_copied_from_untrusted_text_is_bounded`.
-    assert by_classification[MISS_FABRICATED].entity_type == "PHI_NAME"
+    assert by_classification[MISS_LOST].entity_type == "PHI_NAME"
+    # CORRECTED EXPECTATION. This asserted `entity_type == "PHI_NAME"` on the
+    # FABRICATED row too, under the comment "the type label is grammar-constrained
+    # (`[A-Z][A-Z0-9_]*`) and clamped, so it stays on both rows". The grammar is
+    # real; the inference is false, and the row above only looks safe because
+    # `NAME` was chosen as the fixture's entity type. Group 2 is whatever the model
+    # put between the category and the hash, and an ALL-CAPS surname satisfies
+    # `[A-Z][A-Z0-9_]*` exactly:
+    #
+    #   restore("[PHI_MARISOL_VANTERPOOL_40281993] was seen.", issued={"1a2b3c4d"})
+    #     -> VAULT_MISS entity_type='PHI_MARISOL_VANTERPOOL'
+    #
+    # `_MAX_LABEL_LEN` bounded that leak's length, never its existence. So the
+    # expectation is narrowed to the half of the label that IS a closed set --
+    # group 1, one of the four `CATEGORIES` literals -- which is asserted below
+    # rather than dropped, so an auditor's "which namespace did the model imitate?"
+    # is still answerable and this test still fails if that answer disappears.
+    assert by_classification[MISS_FABRICATED].entity_type is None
+    assert by_classification[MISS_FABRICATED].detail["category"] == "PHI"
+    assert by_classification[MISS_LOST].detail["category"] == "PHI"
+
+
+async def test_a_fabricated_miss_row_cannot_carry_a_name_the_model_invented(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """The entity-type label is model-supplied text, and the grammar does not save it.
+
+    Four places asserted this was impossible, all resting on the same inference:
+    `entity_type` is `TOKEN_RE` groups 1 and 2, group 2 is `[A-Z][A-Z0-9_]*`, so it
+    "can never be an entity value". The grammar is real and the inference is false
+    -- an ALL-CAPS surname satisfies it exactly, and an ALL-CAPS name is what a
+    model writes when it invents a placeholder out of something it read. Before the
+    fix this exact call put `PHI_MARISOL_VANTERPOOL` in the hash-chained log and in
+    `GET /audit`, which build doc section 16 forbids unconditionally.
+
+    The assertion is quantified over every string the row persists rather than over
+    `entity_type` alone, because the first version of this fix suppressed
+    `token_id` and left the sibling field open -- a per-field check is what let
+    that happen.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION,
+        "[PHI_MARISOL_VANTERPOOL_40281993] was seen.",
+        strategy=TOKENIZATION,
+        issued=[NAME_ID],
+        run_id=RUN,
+    )
+
+    # The caller still learns everything: nothing is hidden, only un-persisted.
+    assert result.fabricated == ("40281993",)
+    assert result.text == f"{UNRESOLVED_ENTITY} was seen."
+
+    events = await audit.query(session_id=SESSION)
+    persisted = [
+        text
+        for event in events
+        for text in (
+            event.entity_type or "",
+            event.token_id or "",
+            *(str(key) for key in event.detail),
+            *(str(value) for value in event.detail.values()),
+        )
+    ]
+    for forbidden in ("marisol", "vanterpool", "40281993"):
+        assert not any(forbidden in text.lower() for text in persisted), (forbidden, persisted)
+
+    # What survives is the half that is a closed set -- one of the four
+    # `CATEGORIES` literals this package ships -- so "which namespace did the model
+    # imitate?" is still answerable from the row alone.
+    misses = [event for event in events if event.event_type == VAULT_MISS]
+    assert len(misses) == 1
+    assert misses[0].detail["classification"] == MISS_FABRICATED
+    assert misses[0].detail["category"] == "PHI"
+    assert await audit.verify_chain() is True
+
+
+async def test_the_number_of_miss_rows_a_response_can_write_is_capped(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """A hostile response chose how many hash-chained writes the restore performed.
+
+    The emit loop ran once per distinct un-issued ID with no bound. Measured on the
+    real `AuditLogger`: 400 fabricated placeholders cost 227 ms and 1 000 cost
+    561 ms, against the 500 ms the build doc's section 12 budgets for the whole
+    restore -- and 1 000 is well inside `llm_max_tokens` (16 000). Capped, the same
+    1 000 cost 22 ms.
+
+    What must NOT be lost is the auditor's arithmetic, so this pins the three
+    places the totals still live: the caller's `fabricated` tuple, the summary
+    row's per-class counts, and `DEOBFUSCATE`'s `unresolved_fabricated`.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+    count = _MAX_MISS_ROWS * 3
+    text = " ".join(f"[PII_NAME_{index:08x}]" for index in range(count))
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued=[NAME_ID], run_id=RUN
+    )
+
+    assert len(result.fabricated) == count
+
+    rows = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    individual = [row for row in rows if row.detail["reason"] == "token_not_in_vault"]
+    summary = [row for row in rows if row.detail["reason"] == "token_misses_suppressed"]
+    assert len(individual) == _MAX_MISS_ROWS
+    assert len(summary) == 1
+    assert summary[0].detail["suppressed"] == count - _MAX_MISS_ROWS
+    assert summary[0].detail["suppressed_fabricated"] == count - _MAX_MISS_ROWS
+    # Reconstructible: cap + suppressed == what the caller was told.
+    assert len(individual) + int(summary[0].detail["suppressed"]) == len(result.fabricated)
+
+    deobfuscate = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert deobfuscate[-1].detail["unresolved_fabricated"] == count
+    assert await audit.verify_chain() is True
+
+
+async def test_the_row_cap_never_suppresses_a_token_this_run_minted(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """LOST is an integrity incident, and its volume is bounded by OUR input.
+
+    The cap exists because a provider chooses how many IDs it fabricates. It does
+    not choose how many this run minted, so the LOST count is bounded by the
+    document we uploaded, and every one of those rows names a value a user was
+    entitled to see and cannot be given. Capping them would be trading the one
+    class of miss that has to be actioned individually for a budget the class
+    cannot blow.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+    count = _MAX_MISS_ROWS * 2
+    ids = [f"{index:08x}" for index in range(count)]
+    text = " ".join(f"[PII_NAME_{token_id}]" for token_id in ids)
+
+    result = await restorer.restore(SESSION, text, strategy=TOKENIZATION, issued=ids, run_id=RUN)
+
+    assert len(result.lost) == count
+    rows = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    assert [row.detail["reason"] for row in rows] == ["token_not_in_vault"] * count
+    assert sorted(str(row.token_id) for row in rows) == sorted(ids)
+    assert await audit.verify_chain() is True
 
 
 async def test_issued_matches_a_case_mangled_hash(settings: Settings, audit: AuditLogger) -> None:
@@ -2228,6 +2497,96 @@ async def test_a_shouted_pseudonym_is_reported_even_though_it_is_not_restored(
     summary = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
     assert summary[0].detail["surrogates_suspected_unrestored"] >= 1
     assert summary[0].detail["surrogates_issued"] == 2
+
+
+async def test_a_fake_the_model_quoted_only_the_first_line_of_is_reported(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """A surrogate can contain a newline, and then every counter can read clean.
+
+    The detector emits NAME spans that run past a hard wrap into the next field's
+    label -- measured on the fixture generator, `('NAME', 'Duane Ingram\\n    Date')`
+    and `('NAME', 'Robin Thomas\\n    Social Security')` -- so the fake minted for
+    one carries the wrap. `\\s+` flexing keeps the whole fake matching when the
+    model re-wraps it (the two control cases below), but the model usually quotes
+    only the NAME half, and then:
+
+    * the alternation has no alternative that matches, so nothing is restored;
+    * `_assert_no_surrogates` re-scans with that same pattern and cannot fire;
+    * the near-miss counter was built from that same pattern too, so it read 0.
+
+    `restored_count` 0, `surrogate_misses` 0, `surrogates_suspected_unrestored` 0,
+    outcome `ok` -- and the pseudonym is the answer. This is the restorer half of
+    the fix: the first line of a newline-bearing fake is counted as its own
+    alternative, so the degradation is at least visible in the result and in the
+    audit row. The other half is the detector not producing the span, which is not
+    this module's to make.
+    """
+    fake = "Duane Ingram\n    Date"
+    surrogates = {fake: "Robin Thomas\n    Date"}
+    restorer = Restorer(vault=FakeVault(), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION,
+        "The report names Duane Ingram as the filer.",
+        strategy=PSEUDONYMIZATION,
+        surrogates=surrogates,
+        run_id=RUN,
+    )
+
+    # The gap itself is unchanged and still honest about being a gap: the fake is
+    # what the user reads, and nothing pretends otherwise.
+    assert result.text == "The report names Duane Ingram as the filer."
+    assert result.restored_count == 0
+    assert result.surrogate_misses == 0
+    # The signal that was missing, in the result and in the persisted row.
+    assert result.surrogates_suspected_unrestored == 1
+    summary = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert summary[-1].detail["surrogates_suspected_unrestored"] == 1
+
+    # CONTROL. The two shapes that DO restore must not start reporting a near miss
+    # as well, or the counter is noise: a signal that fires on a correct run is a
+    # signal a reader learns to ignore.
+    for quoted in ("Duane Ingram\n    Date", "Duane Ingram Date"):
+        clean = await restorer.restore(
+            SESSION,
+            f"The report names {quoted} as the filer.",
+            strategy=PSEUDONYMIZATION,
+            surrogates=surrogates,
+        )
+        assert clean.restored_count == 1, quoted
+        assert clean.surrogates_suspected_unrestored == 0, quoted
+
+
+async def test_a_pluralised_fake_is_not_counted_and_the_docstring_no_longer_says_it_is(
+    settings: Settings,
+) -> None:
+    """PIN on a corrected claim: the counter is an upper bound in CASE only.
+
+    `_count_surrogate_near_misses` enumerated "an upper-cased heading, a
+    lower-cased mention **or a pluralised surname**" as the survivals it catches.
+    Measured, the plural counts zero -- the folded build is still
+    `_compile_surrogate_pattern`, which still writes `RIGHT_GUARD` per branch, so
+    the `es` fails the guard exactly as it does in the resolving build. README
+    section 7 gap 3 says the opposite of the old docstring and is the one that was
+    right.
+
+    Pinned rather than left as a comment because the false claim was one word
+    inside a true sentence, which is the shape that survives review.
+    """
+    restorer = Restorer(vault=FakeVault(), settings=settings)
+    surrogates = {"Lopez": "Torres"}
+
+    plural = await restorer.restore(
+        SESSION, "The Lopezes met.", strategy=PSEUDONYMIZATION, surrogates=surrogates
+    )
+    shouted = await restorer.restore(
+        SESSION, "THE LOPEZ FILE.", strategy=PSEUDONYMIZATION, surrogates=surrogates
+    )
+
+    assert plural.text == "The Lopezes met."
+    assert plural.surrogates_suspected_unrestored == 0
+    assert shouted.surrogates_suspected_unrestored == 1
 
 
 async def test_the_near_miss_count_is_an_upper_bound_and_says_so(

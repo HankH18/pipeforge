@@ -3,15 +3,31 @@
 Three schema-level guarantees live here, and all three are load-bearing for the
 zero-PII-in-logs requirement:
 
-1. ``AuditEvent`` has no field capable of holding an original value: ``detail``
-   rejects string values over 64 characters, and every remaining string column is
-   length-capped, so the claim is enforced by the schema rather than by convention.
+1. ``AuditEvent`` cannot hold *content*: ``detail`` rejects string values over 64
+   characters and every remaining string column is length-capped at
+   :data:`MAX_AUDIT_LABEL_LEN`, so a paragraph, a note or a document -- the
+   bulk-exfiltration shape -- is refused by the schema rather than by convention.
    The check quantifies over ``model_fields`` rather than over a list of column
    names, because a list only ever covers the columns its author remembered.
+
+   **It is not the stronger claim this docstring shipped for a while -- that the
+   schema is structurally incapable of holding an *original*.**
+   ``"John Smith"``, ``"MRN 4823910"``, an SSN and
+   an e-mail all fit inside 64 characters, and no length check can recognise a
+   name; ``audit/logger.py``, ``api/schemas.py`` and the README all retract the
+   stronger claim, and two copies of it survived here. What actually holds is
+   narrower and is *measured* rather than asserted: no call site in this package
+   writes an original -- every ``emit`` carries token IDs, entity *types*, counts,
+   latencies and digests -- and the 100-run leakage harness scans the raw SQLite
+   file as bytes against every vaulted original on every run. Keeping the overclaim
+   here was the worse half of the drift, because this is the module the ceilings
+   are declared in, so a reader checking the guarantee lands on the retracted
+   sentence first.
 2. **Every model in this module is classified for each exit it can be masked on,
    and the classification is quantified over ``model_fields`` for the same reason
-   point 1 is.** There are *three* exits. Two are masked here; the third is not,
-   and cannot be::
+   point 1 is.** There are *four* exits. Two are masked here; the third is not and
+   cannot be; the fourth is not a read of a constructed model at all, which is why
+   it went unnamed for so long::
 
        repr        ``repr()``/``str()``/``f"{result}"`` -- what an accidental
                    interpolation in a log line emits. Masks originals AND
@@ -34,6 +50,11 @@ zero-PII-in-logs requirement:
                    each value's *runtime* type and therefore to skip the declared
                    schema's field serializers entirely.
                    **Not masked. Not maskable at this layer.**
+       validation  ``pydantic.ValidationError`` -- what is raised *instead of* a
+                   model when construction is refused. It carries the whole input
+                   mapping: ``exc.errors()[0]["input"]`` is the dict as passed, and
+                   ``str(exc)`` renders a middle-elided excerpt of it.
+                   **Not masked. Not reachable by any mask on this page.**
 
    The third exit is not an oversight and is not closeable by adding another
    serializer. Pydantic keeps field values in the instance ``__dict__``, and a
@@ -50,11 +71,35 @@ zero-PII-in-logs requirement:
    session vault and fails closed. An accident reaches for ``f"{result}"``; it
    does not reach for ``pickle.dumps`` or ``serialize_as_any=True``.
 
+   The fourth exit hid behind the *shape* of the other three. Each of those is a
+   read of a model that exists; this one only happens when the model does **not**
+   exist, so no ``__repr__`` and no ``field_serializer`` declared on this page is
+   ever consulted -- pydantic assembles the error before any of them run.
+   Measured: ``Detection(entity_type="NAME", category=PII, start=5, end=0,
+   text="CANARY-John-Smith-123-45-6789", score=0.5)`` raises, and
+   ``exc.errors()[0]["input"]`` is the full input dict, ``text`` and all, while
+   ``str(exc)`` carries the elided tail ``...-45-6789``. A *missing* required field
+   produces the same shape, so the channel is not specific to the span-order check
+   that exposed it, and moving that one check to a field-level validator would
+   narrow the channel without closing it.
+
+   It stays open, deliberately. A ``ValidationError`` is raised, not returned: it
+   goes to whoever constructed the model, and inside this package that is always
+   the process's own code, never a caller. The two places one could reach an
+   outside reader are both already closed by other components rather than by a
+   mask here -- ``api/errors.py`` rewrites every ``RequestValidationError`` to
+   field *names* and counts, and ``errors.py``'s ``PipelineError`` hierarchy caps
+   structured detail at :data:`MAX_DETAIL_VALUE_LEN`. What must not happen is a
+   handler that logs ``exc.errors()`` or interpolates a ``ValidationError``, and
+   naming the exit is how that stays visible.
+
    The exact boundary is *measured* rather than asserted: for every field this
    module declares as a key or an original,
    ``tests/test_models.py::THIRD_EXIT_LEAKS`` records the precise set of exits the
    value survives, and the test fails if reality moves in **either** direction --
    a newly leaking exit, or a leak that quietly stopped and left this text stale.
+   The fourth exit is measured the same way, by
+   ``test_a_refused_construction_is_the_fourth_exit_and_carries_the_input_dict``.
 
    The masked-in-``repr`` set is declared per class as
    :attr:`_MaskedRepr.REPR_MASKED` and rendered by one shared ``__repr__`` that
@@ -329,14 +374,21 @@ class ObfuscationResult(BaseModel):
 class AuditEvent(BaseModel):
     """Hash-chained audit record.
 
-    This schema *cannot hold* an original value: ``detail`` accepts only counts,
-    latencies, hashes, and short machine codes, and every remaining string column
-    is length-capped at :data:`MAX_AUDIT_LABEL_LEN`. Without those caps the
-    "no field capable of holding an original value" claim was untrue --
-    ``entity_type`` and ``token_id`` accepted a 5 000-character string, and both
-    are written from values parsed out of untrusted LLM output.
+    This schema *cannot hold content*: ``detail`` bounds every string value at 64
+    characters and every remaining string column at :data:`MAX_AUDIT_LABEL_LEN`,
+    so a note or a document cannot fit in a row. Without those caps even that was
+    untrue -- ``entity_type`` and ``token_id`` accepted a 5 000-character string,
+    and both are written from values parsed out of untrusted LLM output.
 
-    That claim is quantified over *every* field, so the test that checks it
+    **The ceilings do not make the schema incapable of holding an *original*, and
+    this docstring used to say they did.** A name, an MRN, an SSN and an e-mail
+    all fit in 64 characters. The no-originals property is a property of the call
+    sites, not of this class, and it is measured by the leakage harness rather
+    than asserted here; see the module docstring and ``audit/logger.py``. Stating
+    it the strong way made a retracted claim load-bearing on the model that every
+    audit row is built from.
+
+    The ceiling claim is quantified over *every* field, so the test that checks it
     (``test_no_audit_event_field_can_hold_a_content_sized_string``) enumerates
     ``model_fields`` rather than a hand-written list of column names. The list it
     replaced named five columns and silently omitted ``prev_hash`` and

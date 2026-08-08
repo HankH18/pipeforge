@@ -29,9 +29,19 @@ message spaces are provably disjoint rather than merely different::
 
     token ID    HMAC(sk, entity_type || 0x00 || normalize(value))   always has a NUL
     date shift  HMAC(sk, b"date-shift")                             never has a NUL
-    Faker seed  HMAC(sk, b"faker:" || entity_type)                  never has a NUL
+    Faker seed  HMAC(sk, b"faker:" || label)                        never has a NUL
 
-:func:`_label_bytes` rejects an ``entity_type`` that is empty or contains NUL,
+The Faker row said ``|| entity_type`` and that understated the message space it has
+to be disjoint from. :func:`derive_faker_seed`'s second argument is a *domain
+label*, and no production caller passes a bare entity type: Deviation 45 routes the
+document's own text into it, so ``PseudonymizationStrategy`` emits
+``NAME:john smith``, ``EMAIL:...``, ``ADDRESS:...`` and ``NAME:last:smith``, plus a
+``:{attempt}`` suffix on a collision retry. The disjointness argument survives that
+widening unchanged -- which is the point of stating it accurately rather than
+narrowly -- because it rests on NUL and on the fixed prefix, and :func:`normalize`
+strips NUL from document text before it ever reaches the label.
+
+:func:`_label_bytes` rejects a ``label`` that is empty or contains NUL,
 which is what makes the right-hand column true: every token-ID message contains at
 least one NUL and neither of the others can contain any. The two NUL-free spaces
 are separated from each other by their fixed prefixes (``b"faker:"`` cannot begin
@@ -240,7 +250,25 @@ _PROVIDERS: dict[str, type[EnvKeyProvider] | type[MockKMSKeyProvider]] = {
 
 
 def build_key_provider(settings: Settings) -> KeyProvider:
-    """Select a provider by config string. Adding a real KMS = one class + one entry."""
+    """Select a provider by config string. Adding a real KMS = one class + one entry.
+
+    **This function is the validator, and that is recent.** ``Settings.key_provider``
+    was ``Literal["env", "mock_kms"]``, so the sentence above was false by two
+    edits: pydantic refused ``SCP_KEY_PROVIDER=aws_kms`` before this was reached, a
+    third provider could be written and registered but never selected, and the
+    ``unknown_key_provider`` branch below was unreachable from a validated
+    ``Settings`` -- dead code standing in for a check that lived somewhere else.
+    The field is a plain ``str`` now (see the comment at ``config.py``'s
+    ``key_provider``), which puts the decision in the one place that knows what is
+    registered.
+
+    Nothing is loosened by that. An unknown name still fails closed and still
+    before the first request: this raises :class:`ConfigError` and runs inside
+    ``EncryptedDocumentStore.__init__``, which the lifespan builds at startup.
+    ``test_every_registered_key_provider_is_reachable_from_a_validated_settings``
+    pins both directions -- every registered name resolves, and an unregistered one
+    raises here rather than passing.
+    """
     try:
         cls = _PROVIDERS[settings.key_provider]
     except KeyError as exc:
@@ -407,10 +435,25 @@ def derive_date_shift_days(session_key: bytes) -> int:
     return delta
 
 
-def derive_faker_seed(session_key: bytes, entity_type: str) -> int:
-    """Per-session, per-entity-type Faker seed, so fakes are stable within a session."""
+def derive_faker_seed(session_key: bytes, label: str) -> int:
+    """Per-session, per-*label* Faker seed, so fakes are stable within a session.
+
+    The parameter was named ``entity_type`` and both the name and this line were a
+    narrower description than the code: ``label`` is any caller-chosen domain
+    string, and since Deviation 45 no production caller passes a bare type.
+    ``PseudonymizationStrategy._seed`` builds ``NAME:john smith``,
+    ``EMAIL:<normalized>``, ``ADDRESS:<normalized>`` and ``NAME:last:smith``,
+    appending ``:{attempt}`` when a candidate fake collides -- so the same entity
+    type yields a different Faker instance per *value*, which is what makes two
+    different people carrying one type get two different fakes.
+
+    ``label`` still goes through :func:`_label_bytes`, so it must be non-empty and
+    NUL-free; that guard is what keeps this HMAC's message space disjoint from the
+    token-ID one (see the module docstring), and document text reaches it only
+    through :func:`normalize`, which strips NUL.
+    """
     _check_session_key(session_key)
-    label = _label_bytes(entity_type, reason="invalid_faker_label")
+    label_bytes = _label_bytes(label, reason="invalid_faker_label")
     return int.from_bytes(
-        hmac.new(session_key, b"faker:" + label, hashlib.sha256).digest()[:8], "big"
+        hmac.new(session_key, b"faker:" + label_bytes, hashlib.sha256).digest()[:8], "big"
     )

@@ -148,6 +148,61 @@ class _Replacement:
     value: str
 
 
+@dataclass(frozen=True, slots=True)
+class _Surface:
+    """One surface form the residual sweep looks for, and what it splices for it.
+
+    ``action`` exists because not every sweepable value is a *tokenized* one. A
+    confidence-band redaction gets no vault row and no surrogate, only a
+    ``[REDACTED_<TYPE>]`` marker and a gate needle
+    (:meth:`~secure_context_pipeline.vault.session_vault.SessionVault.note_unrestorable`),
+    so its residual occurrences have to be masked with the same marker and reported
+    as ``REDACTED`` rather than invented a surrogate they do not have. See
+    :meth:`ObfuscationEngine._sweep_residual`.
+    """
+
+    replacement: str
+    entity_type: str
+    category: EntityCategory
+    score: float
+    action: EntityAction = EntityAction.OBFUSCATED
+
+
+@dataclass(frozen=True, slots=True)
+class _SweepBase:
+    """Where the residual sweep started, so a second pass can rewind to it.
+
+    Only the sweep's own additions are undone; the detected, redacted and stripped
+    spans it was handed are not the sweep's to discard. ``covered`` is kept as a
+    copy rather than as a length like the other three, which is a few tuples of
+    memory in exchange for not depending on the lists growing in lockstep -- they do
+    today, and nothing enforces it.
+    """
+
+    replacements: int
+    spans: int
+    redactions: int
+    covered: list[tuple[int, int]]
+
+
+def _rewind_sweep(
+    base: _SweepBase,
+    replacements: list[_Replacement],
+    spans: list[SpanOut],
+    redactions: list[RedactionRecord],
+    covered: list[tuple[int, int]],
+) -> None:
+    """Undo the sweep's splices, spans and redaction records in place, back to ``base``.
+
+    In place, because the scan closure reads these lists by reference and rebinding
+    them would leave it appending to the discarded copies.
+    """
+    del replacements[base.replacements :]
+    del spans[base.spans :]
+    del redactions[base.redactions :]
+    covered[:] = base.covered
+
+
 class ObfuscationEngine:
     """Applies detections to text: dedupe, tokenize/pseudonymize, redact, strip.
 
@@ -240,6 +295,13 @@ class ObfuscationEngine:
                 # deliberately excluded: that span is prose, not a value, and its
                 # phrasing recurs in ordinary text. See
                 # ``SessionVault.note_unrestorable``.
+                #
+                # Planting that needle obliges the sweep to clear it: this marks ONE
+                # span, and the gate then scans the whole payload for the value. The
+                # residual sweep below therefore masks the rest of this value's
+                # occurrences with the same marker, or an ordinary document stating a
+                # number twice is refused by a needle this call planted -- measured,
+                # and argued at ``_sweep_residual``.
                 if item.reason == _REASON_LOW_CONFIDENCE:
                     self._vault.note_unrestorable(session_id, detection.text)
                 continue
@@ -247,8 +309,24 @@ class ObfuscationEngine:
             replacements.append(_Replacement(detection.start, detection.end, record.surrogate))
             spans.append(_span(detection, EntityAction.OBFUSCATED, record.surrogate))
 
+        # Audited BEFORE the sweep, and the order is load-bearing for the reason
+        # ``_sweep_residual`` sets out: the sweep's second read of the originals set
+        # must be the last look this call takes at it, because everything after it is
+        # window in which a concurrent run's vault write turns this run from a masked
+        # value into a refused request. One awaited ``audit.emit`` per entity is by far
+        # the largest thing that used to sit in that window -- measured end to end on
+        # ``fixtures/medical_note.txt``, 23.5 ms of the 26.5 ms total.
+        #
+        # Nothing here depends on the sweep: the events describe ``planned`` and
+        # ``records``, both final before this line, and the vault rows they name were
+        # written by ``_resolve_groups`` further up. The one behaviour this changes is
+        # a run whose sweep raises (``SessionExpiredError`` if the session dies
+        # mid-call) -- its OBFUSCATE events are now written rather than lost, which
+        # describes what actually happened to the vault rather than less.
+        await self._audit_result(session_id, run_id, planned, records, strategy)
+
         swept, swept_records = await self._sweep_residual(
-            session_id, text, planned, records, replacements, spans
+            session_id, text, planned, records, replacements, spans, redactions
         )
         obfuscated = _splice(text, replacements)
         # ``tokens`` declares every surrogate present in ``obfuscated_text`` -- which
@@ -262,8 +340,6 @@ class ObfuscationEngine:
         tokens = [records[key] for key in _ordered_keys(planned, records)]
         declared = {record.token_id for record in tokens}
         tokens.extend(record for record in swept_records if record.token_id not in declared)
-
-        await self._audit_result(session_id, run_id, planned, records, strategy)
 
         logger.info(
             "text obfuscated",
@@ -296,6 +372,7 @@ class ObfuscationEngine:
         records: Mapping[tuple[str, str], TokenRecord],
         replacements: list[_Replacement],
         spans: list[SpanOut],
+        redactions: list[RedactionRecord],
     ) -> tuple[int, list[TokenRecord]]:
         """Mask every remaining occurrence of an already-vaulted value.
 
@@ -334,9 +411,64 @@ class ObfuscationEngine:
         pseudonymized SSN is re-detected by pass 2 and blocks the request; and it
         builds the pseudonym restore map from the same set, so an undeclared fake is
         never restored and the caller reads the fake as though it were the answer.
+
+        **The originals set is read twice, and the second read is the point.** A
+        session is shared -- ``POST /ask`` is per ``doc_id``, not per session -- so a
+        concurrent run can vault a value between this pass's read and the EgressGate's
+        read of the same session-wide set at gate time. If that value occurs in this
+        document and this call's detector missed it, the sweep never held it as a
+        surface, it goes out in the clear, and the gate refuses the request with
+        ``EGRESS_BLOCKED(reason='vault_original')``. That refusal is *correct* -- the
+        payload does carry a value the system now knows is sensitive -- so the repair
+        is to make this pass see the value, never to make the gate blind to it. The
+        comment at the rewind below says why the whole sweep is redone on a late
+        arrival rather than appended to.
+
+        **This narrows the window; it does not close it, and it cannot.** A write can
+        always land after whichever read is last, so what remains exposed is the
+        splice, the caller's prompt obfuscation, the payload assembly, and the gate's
+        own dispatch -- and a value vaulted in *that* interval still reaches the gate
+        unswept and is still refused, correctly. What changed is only how much of the
+        run sits inside the window. Measured end to end through the real orchestrator
+        on ``fixtures/medical_note.txt`` (mock provider, n=15, median): the interval
+        between the engine's last read of the originals set and the gate's read was
+        **26.5 ms before this change and 2.0 ms after** -- 92% of it closed, most of
+        that by moving the per-entity audit write above the sweep rather than by the
+        second read itself. The failure mode of what remains is a refused request,
+        never a released value.
+
+        **A redact-band value is swept too, with its marker rather than a surrogate.**
+        A detection scoring in ``[threshold_redact, threshold_obfuscate)`` gets
+        ``[REDACTED_<TYPE>]`` and no vault row, and the engine hands the value to the
+        gate as an unrestorable needle (``SessionVault.note_unrestorable``). Masking
+        only the *labelled* mention then made an ordinary document unprocessable:
+        ``Member SSN 452189376 verified against payer records.`` followed by ``Ledger
+        reference 452189376 appears in the reconciliation table.`` is ``SSN@0.40`` at
+        the first mention and undetected at the second, so the second went out in the
+        clear, pass 1 found its own needle there, and the request came back
+        ``422 EGRESS_BLOCKED(reason='vault_original')`` -- measured through the real
+        ASGI app on three ordinary financial shapes, three of three blocked. Redacting
+        the residual is the same decision this call already made about the same value,
+        applied consistently; refusing the request is not a safer version of it, it is
+        the same policy with the document thrown away.
+
+        Two boundaries of that, both deliberate. It is scoped to
+        ``_REASON_LOW_CONFIDENCE``, never to ``action: redact`` policy spans, for the
+        reason ``note_unrestorable`` gives: a ``CASE_STRATEGY`` sentence is prose whose
+        phrasing recurs, and sweeping it would rewrite ordinary text. And it is scoped
+        to *this call*: a gate-only needle from an EARLIER call cannot be swept here,
+        because the vault stores it as a bare string with no entity type
+        (``_SessionCache.gate_only``) and there is no honest ``<TYPE>`` to print --
+        ``_add_prior_session_surfaces`` therefore still leaves an unresolvable original
+        alone, which is also what keeps the leakage harness's planted-needle proof
+        (``test_the_sweep_never_masks_an_original_it_cannot_resolve_to_a_record``)
+        working. What survives is the same word-boundary limit the whole sweep has:
+        ``ledgerref452189376x`` is not an occurrence by
+        :func:`~secure_context_pipeline.textrules.occurs_as_a_unit`, so the gate blocks
+        it -- and that block is the one ``note_unrestorable`` was written to produce.
         """
         covered: list[tuple[int, int]] = [(r.start, r.end) for r in replacements]
-        surfaces: dict[str, tuple[str, str, EntityCategory, float]] = {}
+        surfaces: dict[str, _Surface] = {}
         for item in planned:
             if item.action is not EntityAction.OBFUSCATED:
                 continue
@@ -346,9 +478,39 @@ class ObfuscationEngine:
                 continue
             surfaces.setdefault(
                 detection.text,
-                (record.surrogate, detection.entity_type, detection.category, detection.score),
+                _Surface(
+                    record.surrogate, detection.entity_type, detection.category, detection.score
+                ),
             )
-        prior = await self._add_prior_session_surfaces(session_id, text, surfaces)
+        # Carried across both reads so the second one costs O(originals that arrived
+        # since the first) rather than a second regex scan of every prior original.
+        examined: set[str] = set()
+        prior = await self._add_prior_session_surfaces(session_id, text, surfaces, examined)
+
+        # LAST, and ``setdefault``, so a redaction marker can only ever claim a surface
+        # nothing restorable already claimed. Both earlier sources outrank it and for
+        # the same reason: an irreversible mask on a value the vault can restore is a
+        # lost answer, not a safer one. This call's own tokenizations outrank it
+        # because banding is per (entity_type, value) group and a value can be typed
+        # twice -- ``MRN`` above the threshold, ``ACCOUNT_NUMBER`` below it -- and the
+        # mask should not depend on which detection came first in offset order. A
+        # prior call's vault row outranks it because the row already exists: the value
+        # was tokenized on an earlier document in this session, and re-detecting it
+        # here at 0.40 does not un-vault it.
+        for item in planned:
+            if item.action is not EntityAction.REDACTED or item.reason != _REASON_LOW_CONFIDENCE:
+                continue
+            detection = item.detection
+            surfaces.setdefault(
+                detection.text,
+                _Surface(
+                    format_redaction(detection.entity_type),
+                    detection.entity_type,
+                    detection.category,
+                    detection.score,
+                    EntityAction.REDACTED,
+                ),
+            )
 
         # Insertion-ordered, so the returned records follow sweep order and the
         # ``tokens`` list stays deterministic.
@@ -402,29 +564,69 @@ class ObfuscationEngine:
             for surface in sorted(surfaces, key=lambda value: (-len(value), value)):
                 if len(surface.strip()) < MIN_SWEEP_LEN:
                     continue
-                surrogate, entity_type, category, score = surfaces[surface]
+                plan = surfaces[surface]
+                redacting = plan.action is EntityAction.REDACTED
                 for match in re.finditer(_word_bounded(surface), text, re.IGNORECASE):
                     start, end = match.span()
                     if any(start < c_end and end > c_start for c_start, c_end in covered):
                         continue
-                    replacements.append(_Replacement(start, end, surrogate))
+                    replacements.append(_Replacement(start, end, plan.replacement))
                     covered.append((start, end))
                     spans.append(
                         SpanOut(
-                            entity_type=entity_type,
-                            category=category,
+                            entity_type=plan.entity_type,
+                            category=plan.category,
                             start=start,
                             end=end,
-                            score=score,
-                            action=EntityAction.OBFUSCATED,
-                            surrogate=surrogate,
+                            score=plan.score,
+                            action=plan.action,
+                            # A redaction marker is not a surrogate: nothing restores
+                            # it, and reporting one here would put a string in the
+                            # restore map that the payload's marker never matches.
+                            surrogate=None if redacting else plan.replacement,
                         )
                     )
+                    if redacting:
+                        redactions.append(
+                            RedactionRecord(
+                                entity_type=plan.entity_type,
+                                start=start,
+                                end=end,
+                                score=plan.score,
+                            )
+                        )
                     found += 1
                     used.setdefault(surface, None)
             return found
 
+        # Everything the sweep is about to add, so the second pass can be undone back
+        # to exactly the detected/redacted/stripped spans rather than layered on top.
+        detected = _SweepBase(len(replacements), len(spans), len(redactions), list(covered))
+
         swept = await asyncio.to_thread(scan)
+
+        # The second read, as late as this pass can make it. Empty on every
+        # single-run session and on every concurrent one where nothing new was
+        # vaulted in the interval, which is the overwhelmingly common case.
+        late = await self._add_prior_session_surfaces(session_id, text, surfaces, examined)
+        if late:
+            # Rewind and rescan the WHOLE surface set rather than appending the new
+            # surfaces to what the first pass produced. Longest-first is a total order
+            # over the whole set, and an append-only second pass breaks it: with
+            # "Smith" masked in pass one and "John Smith" arriving in pass two, the
+            # long surface's match overlaps a covered span, is skipped, and "John "
+            # is left standing beside a surrogate -- readable, and invisible to the
+            # gate, which finds neither original verbatim and releases. Redoing the
+            # sweep costs one extra scan of a document that just lost a race, and
+            # nothing at all on every run that did not.
+            prior.update(late)
+            _rewind_sweep(detected, replacements, spans, redactions, covered)
+            used.clear()
+            swept = await asyncio.to_thread(scan)
+            logger.info(
+                "originals set grew during obfuscation; sweep re-run",
+                extra={"session_id": session_id, "late_surfaces": len(late)},
+            )
 
         if swept:
             logger.info("residual occurrences swept", extra={"swept": swept})
@@ -434,7 +636,8 @@ class ObfuscationEngine:
         self,
         session_id: str,
         text: str,
-        surfaces: dict[str, tuple[str, str, EntityCategory, float]],
+        surfaces: dict[str, _Surface],
+        examined: set[str],
     ) -> dict[str, TokenRecord]:
         """Add values vaulted on an earlier call that occur in *this* document.
 
@@ -449,6 +652,16 @@ class ObfuscationEngine:
         resolved back to its record here and is left to the egress gate, which is
         the fail-closed outcome rather than a silent one.
 
+        Called **twice** per sweep against a set a concurrent run can grow in
+        between, so ``examined`` carries the originals already decided about from one
+        call to the next and the second call only pays for what arrived since. Only
+        *permanent* decisions are recorded there: below the length floor, and absent
+        from ``text``, are both properties of immutable inputs. "No vault record" is
+        not -- it is what a redact-band ``note_unrestorable`` needle looks like, and
+        also what a concurrent run's value looks like for the moment between its
+        cache write and its row -- so an unresolvable original is re-offered on the
+        next read rather than written off.
+
         Returns ``{surface: record}`` for every surface added, so the sweep can
         report which records reached the payload.
         """
@@ -457,16 +670,23 @@ class ObfuscationEngine:
         if not originals:
             return resolved
         for original in sorted(originals):
-            if original in surfaces or len(original.strip()) < MIN_SWEEP_LEN:
+            if original in examined or original in surfaces:
+                continue
+            if len(original.strip()) < MIN_SWEEP_LEN:
+                examined.add(original)
                 continue
             if not re.search(_word_bounded(original), text, re.IGNORECASE):
+                examined.add(original)
                 continue
             record = await self._record_for_original(session_id, original)
             if record is None:
                 continue
+            examined.add(original)
             # Score 1.0: this is not a detector guess to be graded, it is a value
             # the vault already holds. The UI shows it as certain because it is.
-            surfaces[original] = (record.surrogate, record.entity_type, record.category, 1.0)
+            surfaces[original] = _Surface(
+                record.surrogate, record.entity_type, record.category, 1.0
+            )
             resolved[original] = record
         return resolved
 

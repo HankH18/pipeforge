@@ -55,6 +55,9 @@ from secure_context_pipeline.obfuscation.strategies.base import (
 from secure_context_pipeline.obfuscation.strategies.pseudonymization import (
     MAX_FAKE_ATTEMPTS,
     PseudonymizationStrategy,
+    _Candidate,
+    _gate_fold,
+    _gate_needles,
     _structural_fake,
     parse_source_date,
 )
@@ -1678,6 +1681,398 @@ async def test_whole_string_collision_is_caught_even_when_no_invented_word_is(
     }
 
 
+#: The one original the vault holds in the seam test below, and the value the
+#: strategy is asked to fake beside it. Both spellings of an MRN original are used
+#: across the two tests, and both are real: ``MRN``'s pattern is ``\K\d{6,10}``, so
+#: a pattern hit vaults the bare digits (the second test), while a span that arrives
+#: with its label attached vaults the label too -- the shape ``_identifier_needles``
+#: cites as the reason its digit-run limb exists.
+NEEDLE_ACCOUNT = "Account No. 100200300400"
+NEEDLE_MRN = "MRN: 556728"
+
+#: A session key on which the structural mask draws ``Account No. 556728956575`` for
+#: :data:`NEEDLE_ACCOUNT` on attempt 0 -- twelve freely chosen digits whose first six
+#: are the digits of the vaulted ``MRN: 556728``. Found by searching 88 719 keys
+#: (seven landing sites at 1e-6 each, so about one key in 140 000), and pinned for
+#: the same reason :data:`SURNAME_ECHO_KEY` is: the fault was first seen as one
+#: blocked run in eleven executions of the 100-run leakage suite, and a regression
+#: test may not be a coincidence with a 9% hit rate.
+DIGIT_RUN_COLLISION_KEY = (88719).to_bytes(32, "big")
+
+
+async def test_a_fake_carrying_a_real_originals_digit_run_is_regenerated(env: Env) -> None:
+    """The collision guard and the egress gate must mean the same thing by "collision".
+
+    ``_invents_a_real_word`` tests whole-**word** membership. Pass 1 does not stop
+    there: ``_identifier_needles`` scans for any contiguous run of six or more digits
+    of a vaulted original, glued to anything at all. A Tier-1 fake draws its digits
+    freely, so it can land on a real MRN's digit run while sharing no word with
+    anything in the session -- the guard passed it, and the gate then blocked *our
+    own output* with ``reason='vault_original'`` on a run in which nothing had
+    leaked. Self-inflicted, and measured at one blocked run in eleven executions of
+    the 100-run leakage suite.
+
+    Every premise is asserted before the outcome, because a pass here would
+    otherwise be indistinguishable from a lucky draw: the unguarded generator really
+    does reproduce the run, the word-level guard really is blind to it, and the real
+    gate really does refuse the payload that guard would have released.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=DIGIT_RUN_COLLISION_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    await env.vault.put(
+        env.session_id,
+        TokenRecord(
+            session_id=env.session_id,
+            token_id="deadbeef",
+            entity_type="MRN",
+            category=EntityCategory.PHI,
+            surrogate="[PHI_MRN_deadbeef]",
+            created_at=time.time(),
+        ),
+        NEEDLE_MRN,
+    )
+    originals = env.vault.originals_for_session(env.session_id)
+    gate = egress_gate.EgressGate(
+        vault=env.vault, detector=SilentDetector(), settings=env.settings
+    )
+
+    unguarded = strategy._generate("ACCOUNT_NUMBER", NEEDLE_ACCOUNT, 0)
+    assert unguarded.text == "Account No. 556728956575", (
+        f"{unguarded.text!r} is not the draw this key was pinned for, so nothing below "
+        f"is testing the seam"
+    )
+    assert "556728" in unguarded.text, "the premise: the fake carries the real MRN's digits"
+    assert not strategy._invents_a_real_word(unguarded, env.vault, env.session_id), (
+        "the word-level guard must be blind to this -- that blindness IS the seam, and "
+        "a test where the old guard already objected proves nothing about the new one"
+    )
+    leak = f"Ledger reconciliation for {unguarded.text} completed."
+    assert gate._scan_originals(leak, originals, frozenset({unguarded.text})) == 1, (
+        "the gate must refuse the unguarded fake, or this test is about nothing"
+    )
+
+    surrogate = await strategy.make_surrogate(
+        Detection(
+            entity_type="ACCOUNT_NUMBER",
+            category=EntityCategory.FIN,
+            start=0,
+            end=len(NEEDLE_ACCOUNT),
+            text=NEEDLE_ACCOUNT,
+            score=0.9,
+        ),
+        "aaaaaaaa",
+        env.vault,
+        session_id=env.session_id,
+    )
+
+    assert not STRICT_TOKEN_RE.fullmatch(surrogate), (
+        "the guard must regenerate; degrading to a token here would dodge the gate by "
+        "switching the tier off"
+    )
+    assert re.fullmatch(r"Account No\. \d{12}", surrogate), (
+        f"format preservation must survive the retry: {surrogate!r}"
+    )
+    assert "556728" not in surrogate, surrogate
+    released = f"Ledger reconciliation for {surrogate} completed."
+    assert gate._scan_originals(released, originals, frozenset({surrogate})) == 0, (
+        "the payload the pipeline would now send is one the gate releases"
+    )
+
+
+#: The other half of the gate's unbounded vocabulary, and it needs its own key and
+#: its own pair of values. On this key the mask draws ``Account No. 9004-4392-9552``
+#: for ``Account No. 1002-0030-0400``; the vaulted MRN ``4439295`` appears **nowhere
+#: in that string** -- its digits straddle two hyphens -- and shows up only in the
+#: digit-only projection ``900443929552`` that ``_regrouped_identifier_needle`` is
+#: compared against. The values were constructed rather than searched for (any key
+#: yields such a slice; the MRN is read off the draw), which is the honest way to get
+#: a deterministic instance of a 1e-7 event.
+REGROUPED_COLLISION_KEY = (3).to_bytes(32, "big")
+REGROUPED_ACCOUNT = "Account No. 1002-0030-0400"
+REGROUPED_MRN = "4439295"
+
+
+async def test_a_fake_that_regroups_a_real_originals_digits_is_regenerated(env: Env) -> None:
+    """The second unbounded limb: the payload's digit stream, separators deleted.
+
+    ``_identifier_needles`` is compared against a haystack that kept its separators,
+    so it cannot see a real identifier our fake has *re-grouped* --
+    ``4439295`` inside ``9004-4392-9552``. ``_regrouped_identifier_needle`` is
+    compared against the digit-only projection of the whole payload and blocks
+    exactly that, so a guard carrying only the first limb still hands the gate a
+    payload it refuses.
+
+    The two limbs are therefore pinned separately, and this test asserts the first
+    one is blind here before asserting the guard is not.
+    """
+    strategy = build_strategy(
+        "pseudonymization",
+        StrategyContext(
+            registry=env.registry, session_key=REGROUPED_COLLISION_KEY, settings=env.settings
+        ),
+    )
+    assert isinstance(strategy, PseudonymizationStrategy)
+    await env.vault.put(
+        env.session_id,
+        TokenRecord(
+            session_id=env.session_id,
+            token_id="deadbeef",
+            entity_type="MRN",
+            category=EntityCategory.PHI,
+            surrogate="[PHI_MRN_deadbeef]",
+            created_at=time.time(),
+        ),
+        REGROUPED_MRN,
+    )
+    originals = env.vault.originals_for_session(env.session_id)
+    gate = egress_gate.EgressGate(
+        vault=env.vault, detector=SilentDetector(), settings=env.settings
+    )
+
+    unguarded = strategy._generate("ACCOUNT_NUMBER", REGROUPED_ACCOUNT, 0)
+    assert unguarded.text == "Account No. 9004-4392-9552", (
+        f"{unguarded.text!r} is not the draw these values were pinned for"
+    )
+    assert REGROUPED_MRN not in unguarded.text, (
+        "the premise: the run is NOT written contiguously, so the substring limb "
+        "cannot be what catches this"
+    )
+    needles = _gate_needles([REGROUPED_MRN])
+    assert not needles.occur_in(egress_gate._skeleton(unguarded.text), ""), (
+        "the substring half alone releases this candidate"
+    )
+    assert needles.occur_in("", egress_gate._digits_only(_gate_fold(unguarded.text))), (
+        "the digit-stream half is the one that must catch it"
+    )
+    leak = f"Ledger reconciliation for {unguarded.text} completed."
+    assert gate._scan_originals(leak, originals, frozenset({unguarded.text})) == 1, (
+        "the gate must refuse the unguarded fake, or this test is about nothing"
+    )
+
+    surrogate = await strategy.make_surrogate(
+        Detection(
+            entity_type="ACCOUNT_NUMBER",
+            category=EntityCategory.FIN,
+            start=0,
+            end=len(REGROUPED_ACCOUNT),
+            text=REGROUPED_ACCOUNT,
+            score=0.9,
+        ),
+        "aaaaaaaa",
+        env.vault,
+        session_id=env.session_id,
+    )
+
+    assert not STRICT_TOKEN_RE.fullmatch(surrogate), "the guard must regenerate, not give up"
+    assert re.fullmatch(r"Account No\. \d{4}-\d{4}-\d{4}", surrogate), surrogate
+    assert REGROUPED_MRN not in egress_gate._digits_only(surrogate), surrogate
+    released = f"Ledger reconciliation for {surrogate} completed."
+    assert gate._scan_originals(released, originals, frozenset({surrogate})) == 0
+
+
+async def test_the_needle_guard_also_covers_the_value_being_replaced(env: Env) -> None:
+    """The one original the vault cannot supply, in the needle vocabulary too.
+
+    A value reaches the vault only once its surrogate exists, so while
+    ``_fake_identifier`` runs the value being replaced is in ``originals_for_session``
+    only if a caller happened to seed ``reserved_originals``. ``_invents_a_real_word``
+    closes that gap for words with its ``also`` argument; this closes it for needles.
+
+    Asserted at the unit rather than end to end, and the reason is worth stating
+    rather than hiding: the structural mask preserves digit *count*, so a fake that
+    contains its own original's six-digit run has to reproduce that run exactly, and
+    every such candidate is already refused by the whole-string layer or by
+    ``own_words``. The generators that are **not** length-preserving -- the address
+    and e-mail paths -- are not bound by that argument, and neither is a future
+    Tier-1 generator, so the term is carried rather than argued away. What is pinned
+    here is that it is wired: with an empty vault, nothing else can reject this
+    candidate.
+    """
+    strategy = build_strategy("pseudonymization", env.context())
+    assert isinstance(strategy, PseudonymizationStrategy)
+    session_id, _expires = await env.sessions.create("test-user")
+    assert env.vault.originals_for_session(session_id) == frozenset(), (
+        "the vault must be empty, or the session term could be what rejects this"
+    )
+
+    # One candidate, two calls: the only difference is whether the value being
+    # replaced is allowed to contribute its needles.
+    carrier = _Candidate("Ref 556728-A", frozenset({"ref", "556728-a"}))
+    assert not strategy._carries_a_gate_needle(carrier, env.vault, session_id), (
+        "with no originals anywhere and no own-value term there is nothing to collide with"
+    )
+    assert strategy._carries_a_gate_needle(
+        carrier, env.vault, session_id, _gate_needles(["MRN: 556728"])
+    ), "the value being replaced must contribute needles like any other original"
+
+
+async def test_the_needle_index_is_incremental_without_being_stale(env: Env) -> None:
+    """The needle index tracks the session in both directions.
+
+    ``_original_needles`` is rebuilt incrementally because the originals snapshot
+    changes on every issued surrogate and a full rescan per change is quadratic in
+    the document (834 ms vs 986 ms on ``legal_brief_large.txt``). That optimisation
+    is only sound while the set grows, and ``reserved_originals`` is re-seeded per
+    call and can shrink -- so both directions are asserted here rather than argued:
+    a value added later must contribute its needles, and a value that goes away must
+    stop contributing them. A cache that only ever unions is red on the second half;
+    a cache keyed on identity alone is red on the first.
+    """
+    strategy = build_strategy("pseudonymization", env.context())
+    assert isinstance(strategy, PseudonymizationStrategy)
+    carrier = _Candidate("Ref 556728-A", frozenset({"ref", "556728-a"}))
+    later = _Candidate("Ref 4439295-B", frozenset({"ref", "4439295-b"}))
+
+    strategy.reserved_originals = frozenset({normalize("MRN: 556728")})
+    assert strategy._carries_a_gate_needle(carrier, env.vault, env.session_id)
+    assert not strategy._carries_a_gate_needle(later, env.vault, env.session_id)
+
+    # A second document in the same session: the set grows.
+    strategy.reserved_originals = frozenset(
+        {normalize("MRN: 556728"), normalize("Account 4439295")}
+    )
+    assert strategy._carries_a_gate_needle(carrier, env.vault, env.session_id)
+    assert strategy._carries_a_gate_needle(later, env.vault, env.session_id), (
+        "a needle added after the index was first built must still be seen"
+    )
+
+    # A third call carrying only the second value: the set shrinks.
+    strategy.reserved_originals = frozenset({normalize("Account 4439295")})
+    assert strategy._carries_a_gate_needle(later, env.vault, env.session_id)
+    assert not strategy._carries_a_gate_needle(carrier, env.vault, env.session_id), (
+        "a needle whose original is no longer in the session must be dropped, or the "
+        "guard degrades values on the strength of call history"
+    )
+
+
+#: Shapes the shipped registry vaults, as digit templates. Deliberately a mix of
+#: what does and does not carry a needle -- bare identifier cores, labelled ones,
+#: separator-grouped ones, a phone number, an amount, a short date, a docket number
+#: and an alphanumeric member ID -- so the differential below is not a corpus of
+#: guaranteed hits.
+NEEDLE_SHAPES = (
+    "DDDDDD",
+    "DDDDDDD",
+    "DDDDDDDDDD",
+    "MRN: DDDDDDD",
+    "DDD-DD-DDDD",
+    "DDDD-DDDD-DDDD",
+    "DDDDDDDDDDDD",
+    "(DDD) DDD-DDDD",
+    "$1,DDD.DD",
+    "DD/DD/19DD",
+    "Case No. 1:23-cv-DDDDD",
+    "BCBSDDDDDDDDD",
+    "DD-DDDDDDD",
+    "Account No. DDDDDDDDDDDD",
+)
+
+
+def _draw(rng: random.Random, shape: str) -> str:
+    return "".join(rng.choice("0123456789") if char == "D" else char for char in shape)
+
+
+def _splice_digits(rng: random.Random, host: str, digits: str) -> str:
+    """``host`` with ``digits`` written over its digit positions, shape preserved."""
+    host_digits = [char for char in host if char.isdigit()]
+    if len(host_digits) < len(digits):
+        return host
+    at = rng.randrange(0, len(host_digits) - len(digits) + 1)
+    replaced = host_digits[:at] + list(digits) + host_digits[at + len(digits) :]
+    stream = iter(replaced)
+    return "".join(next(stream) if char.isdigit() else char for char in host)
+
+
+class _EmptyVault:
+    """A vault with no originals. The differential passes them in per pair."""
+
+    def originals_for_session(self, session_id: str) -> frozenset[str]:
+        return frozenset()
+
+
+def test_the_collision_guard_reaches_exactly_as_far_as_pass_one_does(
+    settings: Settings, registry: EntityRegistry
+) -> None:
+    """Differential: the tightened guard is neither weaker nor stricter than the gate.
+
+    The guard exists to keep the gate from ever firing on our own output, so the
+    property that matters is an agreement between two components -- and the agreement
+    has two directions, both of which have cost this repo something:
+
+    * **weaker** is the defect this test was written for: a fake the guard releases
+      and pass 1 blocks is a self-inflicted ``EGRESS_BLOCKED``;
+    * **stricter** is the cost of over-correcting: a fake the guard rejects and pass 1
+      would have released spends the retry budget and eventually degrades a value to
+      a plain token for nothing. Testing the run needles against the digit stream --
+      the obvious single-haystack simplification -- is exactly that mistake, and this
+      direction is what refuses it.
+
+    Sharing the needle *functions* with the gate is deliberate (the producer conforms
+    to the consumer's rule), so this test cannot be a check on the functions; it is a
+    check on the **composition** -- both limbs wired, each to the projection the gate
+    compares it against, over the fold the gate applies. A guard missing the
+    regrouped limb, or folding the candidate differently, or testing a needle against
+    the wrong haystack, is red here.
+
+    The gate side is the real ``EgressGate._scan_originals``, so a pair counts as a
+    hit only if the shipped gate really would block. 4 000 pairs here (117 gate hits,
+    107 guard rejections, ~0.25 s), half of them with six digits of the original
+    spliced into the candidate so hits are common rather than astronomically rare;
+    the same generator run out to 40 000 pairs gives 1 040 gate hits and 0 in either
+    failing direction.
+    """
+    rng = random.Random(20250805)
+    gate = egress_gate.EgressGate(
+        vault=_EmptyVault(), detector=SilentDetector(), settings=settings
+    )
+    assert registry.entities, "the registry fixture is only here to pin the shapes as real"
+    gate_hits = 0
+    guard_rejects = 0
+    for _ in range(4000):
+        original = _draw(rng, rng.choice(NEEDLE_SHAPES))
+        candidate = _draw(rng, rng.choice(NEEDLE_SHAPES))
+        if rng.random() < 0.5:
+            digits = egress_gate._digits_only(original)
+            start = rng.randrange(0, max(len(digits) - 5, 1))
+            candidate = _splice_digits(rng, candidate, digits[start : start + 6])
+        rejected = _gate_needles([original]).occur_in(
+            egress_gate._skeleton(candidate),
+            egress_gate._digits_only(_gate_fold(candidate)),
+        )
+        blocked = gate._scan_originals(candidate, frozenset({original})) >= 1
+        gate_hits += blocked
+        guard_rejects += rejected
+        if rejected:
+            assert blocked, (
+                f"the guard is STRICTER than the gate: it would retry (and eventually "
+                f"emit a plain token) for {candidate!r} against {original!r}, which the "
+                f"gate releases"
+            )
+        if blocked and not rejected:
+            # The remaining gate limbs are the bounded ones, which the word-level and
+            # whole-string layers of the guard own. Anything else is the seam again.
+            shared = {word for word in normalize(candidate).split() if len(word) >= 3} & {
+                word for word in normalize(original).split() if len(word) >= 3
+            }
+            assert shared or normalize(candidate) == normalize(original), (
+                f"the guard is WEAKER than the gate: it would release {candidate!r} "
+                f"against {original!r}, and the gate blocks it"
+            )
+    assert gate_hits >= 100, (
+        f"only {gate_hits} of 4000 pairs reached the gate's limbs at all, so this "
+        f"differential is not exercising them"
+    )
+    assert guard_rejects >= 100, (
+        f"the guard rejected only {guard_rejects} of 4000 pairs, so the stricter-than "
+        f"direction above is close to vacuous"
+    )
+
+
 async def test_a_shifted_date_landing_on_another_real_date_degrades_to_a_token(
     env: Env,
 ) -> None:
@@ -2414,6 +2809,234 @@ async def test_the_sweep_never_masks_an_original_it_cannot_resolve_to_a_record(
     assert result.obfuscated_text == (
         f"Patient {result.tokens[0].surrogate}. Vendor control marker: {planted}"
     )
+
+
+async def test_a_value_vaulted_after_the_sweeps_first_read_is_still_masked(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cross-call sweep re-reads the originals set; one read is a TOCTOU window.
+
+    ``_add_prior_session_surfaces`` reads ``originals_for_session`` while the payload
+    is being BUILT and the EgressGate reads the same session-wide set again at gate
+    time. A session is shared -- ``POST /ask`` is per ``doc_id``, not per session --
+    so a concurrent run can vault a value in between. If that value occurs in this
+    run's document and this run's detector missed it, the sweep never had it as a
+    surface, the value goes out in the clear, and the gate correctly refuses the
+    request with ``EGRESS_BLOCKED(reason='vault_original')``.
+
+    The block is right and must stay right: the payload really does carry, in the
+    clear, a value the system now knows is sensitive. What is wrong is the engine
+    being the last component to learn it. So the sweep asks again, after the scan,
+    and masks whatever arrived in the meantime -- a refused request becomes an
+    obfuscated one, and nothing the gate looks for is made invisible to it.
+
+    **Modelled at the observable rather than by racing two coroutines.** What the
+    engine sees of a concurrent vault is exactly this: one read that predates the
+    write and a later read that does not. Hiding the value from the first read
+    reproduces that in one deterministic run; racing a real second ``obfuscate``
+    reproduces the same thing at whatever rate the interleave happens to land, and
+    the integration suite's sixteen-way probe
+    (``test_concurrent_runs_on_one_session_do_not_cross_wires``) does not reach it at
+    all -- its documents are identical but for the MRN, so every run detects every
+    shared value itself and never depends on another run's write. 62 runs of it,
+    green, before this test was written.
+
+    Tokenization only, because the model has to be exact: the pseudonymization
+    collision guard reads ``originals_for_session`` too, so "the first read" would no
+    longer be the sweep's read and the window under test would not be the one hidden.
+
+    Also asserts the record is DECLARED. A surrogate spliced by the sweep and left
+    out of ``ObfuscationResult.tokens`` is worse than the block it replaces: the
+    orchestrator hands ``tokens`` to the gate as "our own output" and builds the
+    restore map from it, so an undeclared one is re-detected by pass 2 and, under
+    pseudonymization, read back by the caller as though the fake were the answer.
+    """
+    value = "Northgate Clinic"
+
+    # The concurrent run's write. It lands, in the modelled timeline, after this
+    # run's sweep has already read the set -- see ``racing`` below.
+    other_document = f"Referred from {value} on Tuesday."
+    await env.engine.obfuscate(
+        env.session_id,
+        other_document,
+        [span(other_document, value, "NAME")],
+        strategy="tokenization",
+    )
+    record = await env.vault.get_by_original(env.session_id, "NAME", normalize(value))
+    assert record is not None, "premise: the concurrent run really did vault it"
+
+    reads: list[frozenset[str]] = []
+    real_originals = env.vault.originals_for_session
+    stale = True
+
+    def racing(session_id: str) -> frozenset[str]:
+        """The set as this run observes it: the first read predates the write."""
+        nonlocal stale
+        known = real_originals(session_id)
+        if stale and session_id == env.session_id:
+            stale = False
+            known -= {value}
+        reads.append(known)
+        return known
+
+    monkeypatch.setattr(env.vault, "originals_for_session", racing)
+
+    text = f"Patient John Smith was seen today.\nReferred by {value} for follow-up.\n"
+    result = await env.engine.obfuscate(
+        env.session_id, text, [span(text, "John Smith", "NAME")], strategy="tokenization"
+    )
+
+    # Premise: the window really was open. The first read is this run's own value
+    # and nothing else; the concurrent one is visible only afterwards.
+    assert reads[0] == frozenset({"John Smith"}), reads
+    assert value in real_originals(env.session_id)
+
+    assert value not in result.obfuscated_text, (
+        "the value the concurrent run vaulted went out in the clear -- the gate "
+        "would refuse this request rather than release it"
+    )
+    assert record.surrogate in result.obfuscated_text
+    assert record.token_id in {item.token_id for item in result.tokens}, (
+        "a surrogate reached the payload undeclared"
+    )
+    assert "John Smith" not in result.obfuscated_text, "this run's own detection, still masked"
+
+    # And the consequence, from the gate itself rather than restated here.
+    gate = egress_gate.EgressGate(vault=env.vault, detector=SilentDetector(), settings=env.settings)
+    originals = real_originals(env.session_id)
+    assert gate._scan_originals(result.obfuscated_text, originals) == 0, "released, not refused"
+    assert gate._scan_originals(text, originals) == 2, (
+        "control: unswept, the gate counts both originals and blocks"
+    )
+
+
+async def test_a_late_arrival_is_swept_in_one_order_with_the_surfaces_before_it(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read redoes the sweep; appending to it would leave a name half-masked.
+
+    Longest-surface-first is a **total** order over the whole surface set, and it is
+    load-bearing: where "Smith" and "John Smith" both match one residual, the surname
+    claiming it splices five characters and leaves "John " standing. A second pass
+    that only chased the surfaces that arrived late would break exactly that, because
+    the long surface's match overlaps a span the short one already covered and is
+    skipped -- and the result is the worst of both outcomes. The payload carries
+    "John " in the clear beside a surrogate, and the EgressGate releases it: neither
+    vaulted original occurs verbatim any more, so pass 1 counts zero and the refusal
+    that would at least have been safe never happens.
+
+    So the sweep is rewound to the detected spans and re-run over the union. The two
+    assertions that separate the two implementations are the exact payload -- one
+    surrogate covering the whole name, not a surname surrogate with a forename in
+    front of it -- and the manifest, which must declare the record that actually
+    reached the payload and not the one the discarded first pass used.
+    """
+    surname, full = "Smith", "John Smith"
+    for value in (surname, full):
+        seed = f"Case note for {value}, filed today."
+        await env.engine.obfuscate(
+            env.session_id, seed, [span(seed, value, "NAME")], strategy="tokenization"
+        )
+    short_record = await env.vault.get_by_original(env.session_id, "NAME", normalize(surname))
+    full_record = await env.vault.get_by_original(env.session_id, "NAME", normalize(full))
+    assert short_record is not None and full_record is not None
+    assert short_record.token_id != full_record.token_id, "premise: two rows, two surrogates"
+
+    stale = True
+    real_originals = env.vault.originals_for_session
+
+    def racing(session_id: str) -> frozenset[str]:
+        """``John Smith`` is vaulted by a concurrent run after the first read."""
+        nonlocal stale
+        known = real_originals(session_id)
+        if stale and session_id == env.session_id:
+            stale = False
+            known -= {full}
+        return known
+
+    monkeypatch.setattr(env.vault, "originals_for_session", racing)
+
+    # No detections at all: everything here is the cross-call sweep's work, so the
+    # ordering under test is not being decided by this call's detected spans.
+    text = "Contact John Smith about the discharge summary."
+    result = await env.engine.obfuscate(env.session_id, text, [], strategy="tokenization")
+
+    assert result.obfuscated_text == f"Contact {full_record.surrogate} about the discharge summary."
+    assert "John" not in result.obfuscated_text, (
+        "the forename was left in the clear -- the surname claimed the span first"
+    )
+    assert {item.token_id for item in result.tokens} == {full_record.token_id}, (
+        "the manifest must describe the surviving pass, not the rewound one"
+    )
+    assert len(result.spans) == 1
+    assert text[result.spans[0].start : result.spans[0].end] == full
+
+
+async def test_an_original_that_gains_a_row_between_the_two_reads_is_swept(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unresolvability is a fact about a moment, so it is not written off between reads.
+
+    The second read only pays for what it has not already decided about, and that
+    bookkeeping is where a re-read quietly becomes a single read again. Two of the
+    three skips are permanent -- below the length floor, and absent from a document
+    that cannot change -- but "no vault record" is not. A value reaches the originals
+    set with no row whenever the redact band noted it (``note_unrestorable``), and a
+    concurrent run scoring the SAME value above ``threshold_obfuscate`` then writes
+    the row: same digits, different sentence, different confidence. Between the two
+    reads it goes from unsweepable to sweepable, and an engine that remembered the
+    first answer would leave it in the clear for the gate to refuse.
+
+    Modelled exactly at that boundary: the value is in the set for both reads, and
+    the row exists only for the second. ``test_the_sweep_never_masks_an_original_it
+    _cannot_resolve_to_a_record`` above pins the other direction -- still no row at
+    the last read means still untouched -- so the two together say "retry, do not
+    assume", rather than "mask anything the set names".
+    """
+    value = "452-18-9376"
+    text = f"Member SSN {value} verified against payer records."
+
+    # In the set from the start, with no row: this is the redact band's needle.
+    env.vault.note_unrestorable(env.session_id, value)
+    seed = f"Claim for SSN {value} was reprocessed."
+
+    reads = 0
+    real_originals = env.vault.originals_for_session
+    real_get = env.vault.get_by_original
+
+    def counting(session_id: str) -> frozenset[str]:
+        nonlocal reads
+        reads += 1
+        return real_originals(session_id)
+
+    async def row_lands_between_the_reads(
+        session_id: str, entity_type: str, normalized: str
+    ) -> TokenRecord | None:
+        """The concurrent run's ``put`` completes after this run's first read."""
+        if reads < 2 and normalize(normalized) == normalize(value):
+            return None
+        return await real_get(session_id, entity_type, normalized)
+
+    # The row the concurrent run writes. Created up front and hidden by the stub
+    # above until the second read, because ``put`` cannot be driven from inside the
+    # synchronous read the engine makes.
+    await env.engine.obfuscate(
+        env.session_id, seed, [span(seed, value, "SSN")], strategy="tokenization"
+    )
+    landed = await real_get(env.session_id, "SSN", normalize(value))
+    assert landed is not None
+
+    monkeypatch.setattr(env.vault, "originals_for_session", counting)
+    monkeypatch.setattr(env.vault, "get_by_original", row_lands_between_the_reads)
+
+    result = await env.engine.obfuscate(env.session_id, text, [], strategy="tokenization")
+
+    assert reads >= 2, "premise: the sweep asked twice"
+    assert value not in result.obfuscated_text
+    assert result.obfuscated_text == (
+        f"Member SSN {landed.surrogate} verified against payer records."
+    )
+    assert {item.token_id for item in result.tokens} == {landed.token_id}
 
 
 MARKUP_WRAPPERS = [
@@ -3477,6 +4100,163 @@ async def test_mid_confidence_span_is_redacted_without_a_vault_entry(
 
     events = await env.audit.query(session_id=env.session_id, event_type=REDACT)
     assert events[0].detail["reason"] == "below_obfuscate_threshold"
+
+
+@pytest.mark.parametrize("strategy", BOTH_MODES)
+async def test_a_redact_band_residual_is_masked_rather_than_left_for_the_gate(
+    env: Env, strategy: str
+) -> None:
+    """The band's own needle must not be the thing that refuses the document.
+
+    A redact-band detection gets ``[REDACTED_<TYPE>]``, no vault row, and -- since
+    ``note_unrestorable`` -- a gate needle, so the EgressGate scans the outbound
+    payload for a value the engine masked in exactly one place. Real documents state
+    a number twice and the detector types it once: ``Member SSN 452189376 verified
+    against payer records.`` is ``SSN@0.40`` on the shipped detector, while ``Ledger
+    reference 452189376 appears in the reconciliation table.`` is nothing at all. The
+    second mention therefore went out verbatim, pass 1 found the needle this call had
+    just planted, and the request came back ``422
+    EGRESS_BLOCKED(reason='vault_original')`` -- three of three ordinary financial
+    shapes, measured through the real ASGI app.
+
+    Redacting the residual is the same decision the call already made about the same
+    value. The alternative on offer is not a safer masking, it is the identical
+    policy plus a discarded document.
+
+    The gate's own pass 1 supplies the verdict rather than this test restating it:
+    ``_scan_originals`` is the code that used to block, run here over the real
+    originals set, with the unswept text as the control so a zero cannot mean "the
+    needle was never planted".
+    """
+    assert env.settings.threshold_redact <= 0.4 < env.settings.threshold_obfuscate
+    value = "452189376"
+    text = (
+        f"Member SSN {value} verified against payer records.\n"
+        f"Ledger reference {value} appears in the reconciliation table.\n"
+    )
+    result = await env.engine.obfuscate(
+        env.session_id, text, [span(text, value, "SSN", score=0.4)], strategy=strategy
+    )
+
+    marker = format_redaction("SSN")
+    assert value not in result.obfuscated_text, "the untyped second mention stayed in the clear"
+    assert result.obfuscated_text == (
+        f"Member SSN {marker} verified against payer records.\n"
+        f"Ledger reference {marker} appears in the reconciliation table.\n"
+    )
+
+    # Still un-restorable and still a needle: the sweep must not have quietly turned
+    # a redaction into a tokenization to get the payload clean.
+    assert result.tokens == []
+    assert await env.vault.row_count(env.session_id) == 0
+    assert value in env.vault.originals_for_session(env.session_id)
+
+    # Both occurrences are reported as what they are, and neither invents a surrogate
+    # that nothing could restore.
+    assert [item.action for item in result.spans] == [EntityAction.REDACTED] * 2
+    assert [item.surrogate for item in result.spans] == [None, None]
+    assert [text[item.start : item.end] for item in result.spans] == [value, value]
+    assert len(result.redactions) == 2, "the stat strip must count the splice it made"
+    assert {item.entity_type for item in result.redactions} == {"SSN"}
+
+    gate = egress_gate.EgressGate(vault=env.vault, detector=SilentDetector(), settings=env.settings)
+    originals = env.vault.originals_for_session(env.session_id)
+    assert gate._scan_originals(result.obfuscated_text, originals) == 0, "released, not refused"
+    assert gate._scan_originals(text, originals) == 1, (
+        "control: unswept, the gate finds the needle this call planted and blocks"
+    )
+
+
+async def test_the_redact_band_sweep_leaves_policy_redactions_and_glued_runs_alone(
+    env: Env,
+) -> None:
+    """Both boundaries of the redact-band sweep, in the one place they can be compared.
+
+    **Policy redactions are out of scope**, for the reason ``note_unrestorable``
+    gives: an ``action: redact`` span like ``CASE_STRATEGY`` is a *sentence*, not a
+    value, and its phrasing legitimately recurs -- sweeping it would rewrite ordinary
+    prose, and it is not a gate needle either, so there is nothing to protect. Only
+    ``below_obfuscate_threshold`` redactions are swept.
+
+    **The word-boundary rule still binds.** ``ledgerref452189376x`` is not an
+    occurrence of ``452189376`` by :func:`textrules.occurs_as_a_unit`, so the sweep
+    cannot reach it -- and it must not, or ``Browning`` stops containing ``Brown``.
+    The gate scans digit-carrying values with no adjacency rule at all, so it blocks
+    that payload: the glued shape is precisely the leak ``note_unrestorable`` was
+    written to catch, and the two components disagreeing here is the safe direction.
+    """
+    sentence = "Our litigation strategy is to delay until discovery closes"
+    text = f"Background. {sentence}. As stated: {sentence}."
+    result = await env.engine.obfuscate(
+        env.session_id,
+        text,
+        [span(text, sentence, "CASE_STRATEGY", score=0.99)],
+        strategy="tokenization",
+        doc_category="legal",
+    )
+    assert result.obfuscated_text == (
+        f"Background. {format_redaction('CASE_STRATEGY')}. As stated: {sentence}."
+    ), "a policy redaction was swept across the document"
+    assert env.vault.originals_for_session(env.session_id) == frozenset(), "not a needle either"
+    assert len(result.redactions) == 1
+
+    value = "452189376"
+    glued = f"Member SSN {value} verified. Internal ledgerref{value}x follows.\n"
+    swept = await env.engine.obfuscate(
+        env.session_id, glued, [span(glued, value, "SSN", score=0.4)], strategy="tokenization"
+    )
+    assert swept.obfuscated_text == (
+        f"Member SSN {format_redaction('SSN')} verified. Internal ledgerref{value}x follows.\n"
+    ), "the sweep reached inside a longer alphanumeric run"
+
+    gate = egress_gate.EgressGate(vault=env.vault, detector=SilentDetector(), settings=env.settings)
+    originals = env.vault.originals_for_session(env.session_id)
+    assert gate._scan_originals(swept.obfuscated_text, originals) >= 1, (
+        "the glued run is the disclosure note_unrestorable exists to block"
+    )
+
+
+async def test_a_redaction_marker_never_claims_a_surface_the_vault_can_restore(
+    env: Env,
+) -> None:
+    """The redact-band sweep is a floor, not an override: the row wins.
+
+    A value can be vaulted on Monday's discharge summary at 0.90 and re-detected in
+    Tuesday's referral letter at 0.40, and the band is decided per call. If the
+    redact-band surface outranked the prior-call one, every residual of that value
+    would be spliced with ``[REDACTED_SSN]`` -- irreversibly, for a value the vault
+    holds a key for -- and the user would read a hole where the restorer could have
+    put the number back. An irreversible mask on a restorable value is a lost answer,
+    not a safer one, so the marker is added last and only by ``setdefault``.
+
+    The detected mention is still redacted: that is this call's banding decision and
+    it is not the sweep's to overrule. What the sweep decides is the *residual*, and
+    it decides it with the surrogate.
+    """
+    value = "452189376"
+    seed = f"Claim for SSN {value} was reprocessed."
+    await env.engine.obfuscate(
+        env.session_id, seed, [span(seed, value, "SSN", score=0.9)], strategy="tokenization"
+    )
+    record = await env.vault.get_by_original(env.session_id, "SSN", normalize(value))
+    assert record is not None, "premise: the earlier call vaulted it"
+
+    text = (
+        f"Member SSN {value} verified against payer records.\n"
+        f"Ledger reference {value} appears in the reconciliation table.\n"
+    )
+    result = await env.engine.obfuscate(
+        env.session_id, text, [span(text, value, "SSN", score=0.4)], strategy="tokenization"
+    )
+
+    assert result.obfuscated_text == (
+        f"Member SSN {format_redaction('SSN')} verified against payer records.\n"
+        f"Ledger reference {record.surrogate} appears in the reconciliation table.\n"
+    ), "the residual lost its restorable mask to the band's marker"
+    assert record.token_id in {item.token_id for item in result.tokens}, (
+        "a surrogate reached the payload undeclared, so nothing will restore it"
+    )
+    assert await env.vault.row_count(env.session_id) == 1, "one value, still one row"
 
 
 async def test_below_the_redact_floor_the_span_is_left_alone(env: Env) -> None:

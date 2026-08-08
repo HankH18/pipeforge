@@ -100,8 +100,34 @@ LANGUAGE = "en"
 # Context window used when deciding which registry entity claims a built-in hit.
 # Asymmetric on purpose: labels sit before their value ("DOB: 1985-03-12"), and a
 # trailing window only has to catch the occasional "1985-03-12 (date of birth)".
+#
+# These are the OUTER bound, not the window itself -- see ``_context_window_start``.
+# 60 characters of plain lookback reaches over an intervening field, and a chart
+# header puts three differently-labelled dates inside one:
+#
+#     Name: Chelsea Hammond   DOB: 03/12/1985   Admitted: 07/01/2024
+#
+# (Same header as ``_context_window_start``'s docstring, and the same name for the
+# reason given there: the one this example used to carry is a live NER recall miss.)
+#
+# Every one of those dates starts within 60 characters of the single ``DOB:``, so
+# all three were typed DOB/PII. Over-claiming that way leaks nothing -- every one of
+# them is still vaulted and masked -- but the entity type and category are wrong in
+# the outbound surrogate, in the audit row and in the UI panel, and build doc section
+# 9.2 splits DATE_TIME into DOB and DATE precisely so that distinction means
+# something. UNDER-claiming is the other thing entirely: outside a medical document
+# DOB is the only claimant of DATE_TIME, so a date that loses its context word is not
+# re-typed, it is dropped. ``_resolve_builtin`` is where that asymmetry is enforced.
 CONTEXT_WINDOW_BEFORE = 60
 CONTEXT_WINDOW_AFTER = 30
+
+# Characters a field LABEL is made of: letters, the blanks inside a multi-word
+# label, and the punctuation real labels carry ("D.O.B.", "Acct. No.", "MRN #").
+# Deliberately excludes digits, so the walk-back in ``_context_window_start`` stops
+# at the previous field's value rather than eating through it.
+_LABEL_RUN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .,/#&()-'"
+)
 
 # Presidio's DEBUG path has call sites that log document content. Build doc section
 # 16 forbids that unconditionally and carves out no exception for debug paths, so
@@ -573,10 +599,85 @@ def resolve_overlaps(
 #: different things: failing to trim a real label masks it as part of the name,
 #: which is cosmetic, while trimming a real name drops a value nobody then vaults.
 #: Only one of those is a disclosure.
-_FIELD_LABEL_TAIL_RE = re.compile(r"[A-Z][A-Z ]{0,20}\Z")
+#:
+#: The character class admits the punctuation labels carry, not only letters and
+#: spaces. ``[A-Z][A-Z ]{0,20}`` was the first spelling and it made the rule turn on
+#: how the *label* happened to be typed: ``DOB`` was trimmed and ``D.O.B.`` was not,
+#: so the exact ``'David Ochoa\n    D.O.B.'`` composite the trim exists to prevent
+#: came back verbatim on a spelling ``entities.yaml`` itself ships DOB context for
+#: (``d.o.b`` is in DOB's ``context:``, precisely because real charts write it that
+#: way). Digits stay out: a run carrying one is a value, not a label.
+_FIELD_LABEL_TAIL_RE = re.compile(r"[A-Z][A-Z .,/#&()-]{0,24}\Z")
+
+#: A ``Label: value`` line, anchored at the start of the line. Lazy, so it binds the
+#: FIRST colon: the label is the run that *introduces* the value, not everything up
+#: to the last colon on the line. Digits are outside the class on purpose -- it is
+#: what keeps ``"in Case No. 9:19-cv-19197 was entered by attorney Sara"`` from
+#: reading as a labelled field, which is a real line in the shipped legal corpus and
+#: the only near-miss the measurement below found.
+_FIELD_LINE_RE = re.compile(r"[ \t]*[A-Za-z][A-Za-z .,/#&'()-]{0,40}?:")
+
+#: The same shape matched at the start of the *next* field's label.
+_NEXT_LABEL_RE = re.compile(r"[A-Za-z][A-Za-z .,/#&'()-]{0,40}?:")
 
 
-def _is_field_label_tail(text: str, newline: int, end: int) -> bool:
+def _context_window_start(text: str, start: int) -> int:
+    """Where the backward context window for a span at ``start`` begins.
+
+    ``CONTEXT_WINDOW_BEFORE`` characters back, except that **the nearest preceding
+    field label owns the value that follows it**, so the window never reaches back
+    over one label to borrow the previous one. One label, one value.
+
+    That rule is what a fixed 60-character lookback cannot express. Measured on a
+    chart header the shipped medical fixture is written in::
+
+        PATIENT CHART
+        Name: Chelsea Hammond   DOB: 03/12/1985   Admitted: 07/01/2024
+        Discharged: 07/09/2024
+
+    all three dates start within 60 characters of the one ``DOB:``, so all three
+    were claimed by DOB even though ``Admitted:`` and ``Discharged:`` carry their
+    own, contrary labels. With the window clamped, ``03/12/1985`` still sees ``DOB``
+    and the other two see only their own labels, so they fall through to DATE.
+
+    **That name used to be ``Priyanka Raghunathan``, which was an own goal**: spaCy
+    emits no ``PERSON`` for that string in this field-shaped frame, so the worked
+    example for the clamp handed a reader a header whose patient name is never
+    detected and therefore never vaulted. The recall miss is real and is declared in
+    the README's section 1 boundary list, along with why no pass of the egress gate
+    can backstop it; the example here uses a name the detector does claim, because
+    illustrating one rule with a live instance of a different failure teaches the
+    wrong thing. Nothing about the clamp changed.
+
+    The clamp is the start of the run of label characters ending at the nearest
+    colon before ``start``. Digits are not label characters (:data:`_LABEL_RUN_CHARS`),
+    which is what stops the walk at the *previous* field's value: in the header above
+    the walk back from ``Admitted:`` halts on the ``5`` of ``1985``. Where a field's
+    value is itself alphabetic the walk runs on into it and the window is wider than
+    one label -- accepted, because that direction only ever *keeps* context, and
+    over-claiming still masks the value while losing it does not.
+
+    **This function narrows a window; it must never be the reason a span ends up
+    with no claimant.** Falling through to DATE is only available inside a medical
+    document, so outside one a clamp that hides the birth word does not re-type the
+    date, it deletes it. ``Detector._resolve_builtin`` is what keeps that from
+    happening: it re-scores under the unclamped window whenever the clamped pass
+    leaves nothing standing. Read the two together.
+
+    A span with no colon anywhere behind it -- ordinary prose, "Chelsea was born
+    03/12/1985" -- gets the full 60 characters unchanged.
+    """
+    floor = max(0, start - CONTEXT_WINDOW_BEFORE)
+    colon = text.rfind(":", floor, start)
+    if colon == -1:
+        return floor
+    label_start = colon
+    while label_start > floor and text[label_start - 1] in _LABEL_RUN_CHARS:
+        label_start -= 1
+    return label_start
+
+
+def _is_field_label_tail(text: str, start: int, newline: int, end: int) -> bool:
     """Whether ``text[newline:end]`` is a wrapped-on field LABEL rather than value.
 
     The distinction the newline alone cannot make. ``'David Ochoa\n    DOB'`` is a
@@ -586,18 +687,65 @@ def _is_field_label_tail(text: str, newline: int, end: int) -> bool:
     cutting it there throws the surname away and, because the discarded half is then
     never vaulted, sends it to the provider in the clear.
 
-    Two accepted shapes: a tail that is only whitespace (the span merely ran past the
-    end of its line), and a tail that looks like a label AND is followed by a colon.
-    Everything else is treated as part of the value.
+    Three accepted shapes, in the order they are tested.
+
+    1. The tail is only whitespace -- the span merely ran past the end of its line.
+    2. The tail *is* a label by its own shape (:data:`_FIELD_LABEL_TAIL_RE`: no
+       lowercase letter, no digit) and a colon follows it. ``DOB:``, ``D.O.B.:``,
+       ``MRN #:``.
+    3. **The tail is the first words of the NEXT field's label.** Shape alone cannot
+       reach this one: ``Date``, ``Social Security`` and ``Phone`` are Title Case,
+       which is exactly the shape of a surname, so rule 2 must keep refusing them.
+       Position can. The tail qualifies only when all three hold:
+
+       * the span's own line *begins* with a label (``_FIELD_LINE_RE``) whose colon
+         is before the span -- the span is a labelled field's VALUE;
+       * the tail begins its own line, with nothing but indentation before it;
+       * the tail continues, on that line, into a colon -- and the tail is a
+         **strict prefix** of that label, i.e. the span cut a multi-word label in
+         half. A surname followed by a colon is the *whole* tail, never a prefix of
+         a longer one, so ``'Margaret\n    Whitfield: she attests...'`` cannot
+         satisfy this however it is punctuated. That is the clause that makes rule 3
+         safe rather than merely narrow.
+
+    Measured before shipping rule 3, over every newline-crossing NER span the
+    detector produced on 160 documents -- 20 generator seeds x 4 kinds, each read
+    both at its native layout and re-wrapped at 62 columns, which is what a real PDF
+    or DOCX extraction produces and the shape that made the blanket trim leak.
+
+    1,047 such spans. 922 are a value wrapped mid-run; ground truth is the
+    generator's own ledger of planted person names, so "the tail carries a planted
+    name word" is a fact about the fixture rather than a judgement about the text.
+    Rules 1 and 2 trim 99 of the other 125 and **0** of the 922. Rule 3 trims 12
+    more -- every remaining NAME that ran into a multi-word label -- and still **0**
+    of the 922, so the disclosure direction is unchanged and measured, not argued.
+    The 14 left over are two shapes, both correctly declined: place and organisation
+    names wrapped mid-value that the person-name ledger does not list, and a
+    Title-Case label that is complete rather than cut in half, which is the case the
+    strict-prefix clause refuses on purpose because a surname looks exactly like it.
+
+    Independently, over the same corpus at its native layout, the number of
+    detections whose text contains a line break went from 8 to 2, and the number of
+    planted name words left uncovered by any detection did not move (110).
     """
     tail = text[newline:end].strip()
     if not tail:
         return True
-    if _FIELD_LABEL_TAIL_RE.fullmatch(tail) is None:
+    if _FIELD_LABEL_TAIL_RE.fullmatch(tail) is not None:
+        # The colon lives just past the span -- it is what makes the tail a label
+        # rather than a capitalised word that happens to follow a wrap.
+        if text[end : end + 2].lstrip().startswith(":"):
+            return True
+    line_start = text.rfind("\n", 0, start) + 1
+    head = _FIELD_LINE_RE.match(text, line_start)
+    if head is None or head.end() > start:
         return False
-    # The colon lives just past the span -- it is what makes the tail a label rather
-    # than a capitalised word that happens to follow a wrap.
-    return text[end : end + 2].lstrip().startswith(":")
+    if text[newline + 1 : end].lstrip() != tail:
+        return False
+    line_end = text.find("\n", end)
+    rest = text[end : line_end if line_end != -1 else len(text)]
+    label = _NEXT_LABEL_RE.match(tail + rest)
+    return label is not None and label.end() > len(tail) + 1
 
 
 class Detector:
@@ -774,13 +922,43 @@ class Detector:
         self._entity_cache[doc_category] = resolved
         return resolved
 
-    def _has_context(self, spec: EntitySpec, text: str, start: int, end: int) -> bool:
-        """True when one of ``spec.context`` occurs on a word boundary near the span."""
+    def _has_context(
+        self, spec: EntitySpec, text: str, end: int, window_start: int
+    ) -> bool:
+        """True when one of ``spec.context`` occurs on a word boundary near the span.
+
+        ``window_start`` is where the backward window begins; the caller chooses it,
+        because the same span is scored under two of them -- see ``_resolve_builtin``.
+        """
         pattern = self._context_patterns.get(spec.name)
         if pattern is None:
             return False
-        window = text[max(0, start - CONTEXT_WINDOW_BEFORE) : end + CONTEXT_WINDOW_AFTER]
+        window = text[window_start : end + CONTEXT_WINDOW_AFTER]
         return pattern.search(window) is not None
+
+    def _claimant_in_window(
+        self,
+        claimants: tuple[str, ...],
+        text: str,
+        end: int,
+        doc_category: str | None,
+        window_start: int,
+    ) -> str | None:
+        """Best claimant for a built-in hit, scored with one particular window."""
+        best: str | None = None
+        best_key: tuple[int, int] | None = None
+        for name in claimants:
+            spec = self._registry.spec(name)
+            if not spec.allowed_in(doc_category):
+                continue
+            has_context = self._has_context(spec, text, end, window_start)
+            if spec.requires_context and not has_context:
+                continue
+            score = (2 if has_context else 0) + (1 if spec.only_in_doc_categories else 0)
+            key = (-score, self._declaration_order[name])
+            if best_key is None or key < best_key:
+                best, best_key = name, key
+        return best
 
     def _resolve_builtin(
         self, builtin: str, text: str, start: int, end: int, doc_category: str | None
@@ -794,25 +972,37 @@ class Detector:
         category (a scoped entity is the more specific claim). Highest score wins,
         ties break on registry declaration order. No survivor means the hit is not
         something this registry cares about, and it is dropped.
+
+        **The label clamp may re-type a hit; it may never zero it.** Scoring runs
+        twice. First with the clamped window (:func:`_context_window_start`), which
+        is what stops a chart header's one ``DOB:`` from claiming the ``Admitted:``
+        date three fields along. If that leaves no survivor at all, it runs again
+        with the plain ``CONTEXT_WINDOW_BEFORE`` lookback and that answer stands.
+
+        Without the second pass the clamp is a disclosure, not a refinement. Outside
+        a medical document DOB is the ONLY claimant of ``DATE_TIME`` -- ``DATE``
+        carries ``only_in_doc_categories: [medical]`` -- and DOB is
+        ``requires_context: true``, so a clamp that cuts the birth word out of the
+        window drops the date entirely: never detected, never vaulted, and pass 2
+        re-runs this same blind detector, so the real date of birth reaches the
+        provider in the clear. ``"Date of birth\\nReported: 01/17/1977"`` is that
+        document. Falling back cannot lose a hit the unclamped window kept, because
+        the fallback window *is* the unclamped one and it is consulted exactly when
+        the clamped pass returned nothing.
         """
         claimants = self._aliases.get(builtin)
         if not claimants:
             return None
 
-        best: str | None = None
-        best_key: tuple[int, int] | None = None
-        for name in claimants:
-            spec = self._registry.spec(name)
-            if not spec.allowed_in(doc_category):
-                continue
-            has_context = self._has_context(spec, text, start, end)
-            if spec.requires_context and not has_context:
-                continue
-            score = (2 if has_context else 0) + (1 if spec.only_in_doc_categories else 0)
-            key = (-score, self._declaration_order[name])
-            if best_key is None or key < best_key:
-                best, best_key = name, key
-        return best
+        clamped = _context_window_start(text, start)
+        resolved = self._claimant_in_window(claimants, text, end, doc_category, clamped)
+        if resolved is not None:
+            return resolved
+
+        floor = max(0, start - CONTEXT_WINDOW_BEFORE)
+        if floor == clamped:
+            return None
+        return self._claimant_in_window(claimants, text, end, doc_category, floor)
 
     def _to_detection(
         self, result: Any, text: str, offset: int, doc_category: str | None
@@ -873,6 +1063,16 @@ class Detector:
         # `action: redact` back to the first line of its own strategy sentence and
         # shipped the rest, and five recall tests said so.
         #
+        # Those five tests no longer say so, and the comment claimed they did for
+        # longer than it was true. They caught the BLANKET trim; once the trim was
+        # narrowed to `_is_field_label_tail` a strategy sentence stopped satisfying
+        # the condition anyway, so deleting `spec.presidio` here left the whole suite
+        # green while `'attorney work\nPRODUCT:'` -- an `action: strip` privilege
+        # assertion whose tail is a shape rule 2 accepts -- was truncated to
+        # `'attorney work'` and `PRODUCT:` went out on the wire. The scope is now
+        # pinned directly, by
+        # `test_a_pattern_backed_span_is_never_trimmed_at_a_label_shaped_wrap`.
+        #
         # **And the newline alone is not the condition.** Trimming every NER span at
         # its first line break was the first attempt and it LEAKED, for the mirror
         # of the reason pattern spans must not be trimmed: the same wrapping that
@@ -886,14 +1086,14 @@ class Detector:
         # *unwrapped* (mean line 527 chars), which is exactly why the suite could not
         # see it.
         #
-        # So the trim fires only on the shape actually observed in the `David Ochoa`
-        # case: the tail after the line break is a FIELD LABEL -- a short run of
-        # letters and spaces immediately followed by a colon -- or is nothing but
-        # whitespace. A tail that continues the value (`Whitfield, who signed...`) is
-        # kept, and the whole wrapped span is vaulted and spliced as one.
+        # So the trim fires only where the tail after the line break is a FIELD
+        # LABEL rather than more of the value -- three shapes, all of them and the
+        # measurement behind them in `_is_field_label_tail`. A tail that continues
+        # the value (`Whitfield, who signed...`) is kept, and the whole wrapped span
+        # is vaulted and spliced as one.
         if spec.presidio:
             newline = text.find("\n", start, end)
-            if newline != -1 and _is_field_label_tail(text, newline, end):
+            if newline != -1 and _is_field_label_tail(text, start, newline, end):
                 end = newline
             end = start + len(text[start:end].rstrip())
             if start >= end:
@@ -1003,6 +1203,35 @@ class Detector:
         the redact floor lowers it -- the registry author asked for that entity to be
         obfuscated at a lower confidence, and dropping it here would silently ignore
         the override.
+
+        **What the floor costs, stated plainly, because the build doc reads two ways
+        on it.** Section 9.2 specifies the three bands this implements. Section 2
+        bullet 8 says something stronger -- "entities detected below the
+        obfuscation-confidence threshold are **redacted**, never passed through raw"
+        -- and taken literally that is a floor of zero, since ``threshold_obfuscate``
+        is 0.5 and everything under it would have to be redacted. The two cannot both
+        hold, and this code implements 9.2. The price is measurable:
+
+            'The ledger reference 412337891 was archived.'
+                Presidio US_SSN [21:30] score=0.05      floor(SSN) = 0.3
+                detect(general) -> []   detect(financial) -> []
+
+        so a value Presidio *did* type as an SSN reaches the provider verbatim. Two
+        spellings behave the same way (``41233-7891``, ``412-337891``); the properly
+        formatted ``412-33-7891`` scores 0.85 and is vaulted, and the bare digits
+        with a nearby "SSN" score inside the redact band and become
+        ``[REDACTED_SSN]``. So the gap is exactly "9-digit-shaped, no supporting
+        context", where Presidio's own confidence is 0.05 and the same string is far
+        more often an order number or a ledger reference than an SSN.
+
+        **Removing the discard here changes nothing on the wire**, which is worth
+        knowing before anyone tries it: ``ObfuscationEngine._classify`` drops the
+        same band again ("Below the redact floor the detector should already have
+        dropped it"). Measured end to end with this method forced to ``0.0`` -- the
+        detector returns ``SSN 412337891 0.05`` and the payload is byte-identical,
+        because the engine then discards it. Closing bullet 8 means changing the
+        engine's band policy, not this floor, and it means accepting redaction of
+        every 9-digit run in every document.
         """
         override = self._registry.threshold_for(entity_type, self._settings.threshold_obfuscate)
         return min(self._settings.threshold_redact, override)

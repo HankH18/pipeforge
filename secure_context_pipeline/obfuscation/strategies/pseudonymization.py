@@ -112,6 +112,36 @@ construction**. Every generator reports that itself, in :class:`_Candidate`:
   the source" would put the real surname on the wire inside our own surrogate.
   Measured at ~1.9% of person spans before the split existed.
 
+The gate's needle vocabulary, borrowed on purpose
+-------------------------------------------------
+Word granularity is not enough either, and the half it misses is a **seam**: the
+guard and the gate disagreed about what a collision is, and the pipeline blocked
+itself on the difference. ``_invents_a_real_word`` asks whole-word set membership;
+the gate's pass 1 additionally carries two *unbounded* comparisons -- any contiguous
+run of six or more digits (``_identifier_needles``) and, for a pure-digit original,
+the whole digit skeleton against the payload's digit stream
+(``_regrouped_identifier_needle``). A Tier-1 fake draws its digits freely, so it can
+land on a real original's six-digit run while sharing no word with anything: the
+guard passed it, the gate blocked it, and the run was refused with
+``reason='vault_original'`` although nothing had leaked. Observed live at one
+blocked run in eleven executions of the 100-run leakage suite -- a false positive
+of ours, not of the gate's, since those digits really are in the payload.
+
+So the guard asks the gate's own question, with the gate's own functions:
+:meth:`PseudonymizationStrategy._carries_a_gate_needle`. **Importing them here is
+the producer conforming to the consumer's published rule, which is the opposite of
+a checker borrowing its answer from the thing it checks** -- a verifier that shared
+this code would prove nothing, whereas a generator that does not share it emits
+payloads its own gate refuses. Left to drift, the drift does not show up as a red
+test; it shows up as a self-inflicted ``EGRESS_BLOCKED`` on a live request. Do not
+replace the import with a local copy of the two needle rules.
+
+Priced before it was trusted, on the four shipped fixtures with the session keys
+pinned so both runs see the same 100 sessions: the plain-token fallback rate is
+**0.4538% before and 0.4538% after** (27 of 5950 Tier-1 surrogates, all in
+``legal_brief_large.txt``), and this limb rejected nothing in those 5950 draws --
+the expected shape of a fault that fires once per ~1100 runs.
+
 Whole-string equality is not enough on the **surrogate** side either, and that
 half is about restoration rather than leakage. Two surrogates where one occurs as
 a unit inside the other are restored longest-first, so the short one never
@@ -162,6 +192,7 @@ from __future__ import annotations
 import logging
 import re
 import string
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -186,6 +217,18 @@ from secure_context_pipeline.obfuscation.strategies.base import (
     ObfuscationStrategy,
     StrategyContext,
     register_strategy,
+)
+
+# The consumer's rule, imported rather than restated. See "The gate's needle
+# vocabulary" in the module docstring for why this direction of import is the
+# correct one and must not be "fixed" into a local copy.
+from secure_context_pipeline.pipeline.egress_gate import (
+    _digits_only,
+    _fold_decimal_digits,
+    _identifier_needles,
+    _regrouped_identifier_needle,
+    _skeleton,
+    _strip_invisible,
 )
 from secure_context_pipeline.textrules import match_case as _match_case
 from secure_context_pipeline.textrules import occurs_as_a_unit as _occurs_as_a_unit
@@ -290,6 +333,88 @@ def _words_of(value: str) -> frozenset[str]:
 
 
 # ---------------------------------------------------------------------------
+# The egress gate's unbounded needles, asked here so the gate never has to
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _GateNeedles:
+    """Pass 1's unbounded needle vocabulary for a set of originals.
+
+    Two fields rather than one set, because the gate compares the two families
+    against **different projections** of the payload and copying that split is the
+    whole point of this class:
+
+    * ``substrings`` -- :func:`_identifier_needles`, tested by the gate against the
+      payload's skeleton views (:func:`_skeleton`), i.e. against text with its
+      separators intact. A six-digit run needle therefore hits only where the
+      payload writes those six digits contiguously.
+    * ``digit_streams`` -- :func:`_regrouped_identifier_needle`, tested by the gate
+      against the payload's *digit-only* projection, where every separator is gone.
+
+    Each family is handed the same projection here that the gate hands it, built by
+    the gate's own functions rather than by a lookalike: a candidate reaches
+    :meth:`occur_in` as ``_skeleton(text)`` and as
+    ``_digits_only(_gate_fold(text))``, which is what ``_scan_originals`` derives
+    from the payload for those two limbs.
+
+    Collapsing them into one set and testing both against one haystack would be
+    wrong in both directions. Against the text alone it would miss every regrouping
+    the gate's digit view exists to catch. Against the digit stream alone it would be
+    *stricter than the gate*: for a vaulted ``MRN: 556728`` the gate releases
+    ``Account No. 5567-2812-3344`` -- the run needle is compared against a haystack
+    that kept its separators, and an original carrying letters contributes no
+    regrouped needle at all -- so rejecting that candidate would spend the retry
+    budget, and eventually a plain token, on a payload nothing would have blocked.
+    Both variants measure the same 0.4538% fallback on the four shipped fixtures,
+    because neither limb fires there at all (see
+    :meth:`PseudonymizationStrategy._carries_a_gate_needle` for the rate); that is
+    precisely why the split is copied from the gate's code rather than tuned against
+    a fixture run.
+    """
+
+    substrings: frozenset[str]
+    digit_streams: frozenset[str]
+
+    def occur_in(self, skeleton: str, digits: str) -> bool:
+        """Whether any needle is present in a candidate's two projections."""
+        return any(needle in skeleton for needle in self.substrings) or any(
+            needle in digits for needle in self.digit_streams
+        )
+
+
+#: The needles of nothing. Named so the guard's ``also`` argument has a default that
+#: reads as "no extra vocabulary" rather than as an empty tuple of empty sets.
+_NO_NEEDLES = _GateNeedles(frozenset(), frozenset())
+
+
+def _gate_fold(value: str) -> str:
+    """``value`` as pass 1 sees it before deriving a needle or a digit stream.
+
+    ``_fold_decimal_digits(_strip_invisible(normalize(...)))`` is exactly what
+    ``EgressGate._scan_originals`` applies to each original before the needle
+    functions see it, and to the payload before ``_digit_views`` projects it.
+    Skipping it here would leave the guard blind to precisely the inputs the fold
+    exists for: an MRN a document writes in Arabic-Indic digits yields a needle at
+    the gate and would yield none here.
+    """
+    return _fold_decimal_digits(_strip_invisible(normalize(value)))
+
+
+def _gate_needles(values: Iterable[str]) -> _GateNeedles:
+    """Every unbounded needle pass 1 would derive from ``values``."""
+    substrings: set[str] = set()
+    digit_streams: set[str] = set()
+    for value in values:
+        folded = _gate_fold(value)
+        substrings.update(_identifier_needles(folded))
+        regrouped = _regrouped_identifier_needle(folded)
+        if regrouped is not None:
+            digit_streams.add(regrouped)
+    return _GateNeedles(frozenset(substrings), frozenset(digit_streams))
+
+
+# ---------------------------------------------------------------------------
 # Structural (format-preserving) mask
 # ---------------------------------------------------------------------------
 
@@ -369,6 +494,9 @@ class PseudonymizationStrategy(ObfuscationStrategy):
         self._union_key: tuple[int, int] | None = None
         self._words_source: frozenset[str] | None = None
         self._words_cache: frozenset[str] = frozenset()
+        self._needles_source: frozenset[str] | None = None
+        self._needles_values: frozenset[str] = frozenset()
+        self._needles_cache: _GateNeedles = _NO_NEEDLES
 
     @property
     def shift_days(self) -> int:
@@ -421,6 +549,9 @@ class PseudonymizationStrategy(ObfuscationStrategy):
             word for word in _words_of(detection.text) if len(word) >= _MIN_COLLIDING_WORD
         )
         forbidden = self._original_words(vault, session_id) | own_words
+        # Same argument, same value, the other vocabulary: the digit runs of the
+        # value being replaced are needles the vault cannot supply yet either.
+        own_needles = _gate_needles([detection.text])
         for attempt in range(MAX_FAKE_ATTEMPTS):
             candidate = self._generate(
                 detection.entity_type, detection.text, attempt, forbidden
@@ -437,6 +568,13 @@ class PseudonymizationStrategy(ObfuscationStrategy):
             # surname verbatim on the wire inside our own surrogate. Reject on any
             # INVENTED word that is a real word, in either direction.
             if self._invents_a_real_word(candidate, vault, session_id, own_words):
+                continue
+            # Whole *words* are not enough either, and this is the half the gate
+            # was left to catch. A fake identifier's digits are drawn freely, so
+            # they can carry a real original's six-digit run -- no word of ours
+            # equals a word of theirs, and pass 1 blocks the run all the same. See
+            # :meth:`_carries_a_gate_needle`.
+            if self._carries_a_gate_needle(candidate, vault, session_id, own_needles):
                 continue
             if await self._surrogate_taken(vault, session_id, candidate.text):
                 continue
@@ -665,6 +803,106 @@ class PseudonymizationStrategy(ObfuscationStrategy):
                 if len(word) >= _MIN_COLLIDING_WORD
             )
         return self._words_cache
+
+    def _original_needles(self, vault: SessionVault, session_id: str) -> _GateNeedles:
+        """Every unbounded pass-1 needle this session's originals contribute.
+
+        Cached on the identity of the memoised originals snapshot, exactly as
+        :meth:`_original_words` is, so an unchanged session costs one identity test.
+
+        **Rebuilt incrementally, and that is a measurement rather than a
+        preference.** The snapshot changes every time a surrogate is issued, because
+        issuing one vaults an original -- so a per-change full rescan is quadratic in
+        the document, and :meth:`_original_words` already pays that shape. Measured
+        on ``legal_brief_large.txt`` (668 Tier-1 spans, 196 distinct values, ~400
+        originals), mean of 15 obfuscations, repeated: **822 ms** without this check
+        at all, **986 ms** with a full rebuild per change, **834 ms** as written --
+        the incremental union gives back 92% of a 20% regression. The other three
+        fixtures move by 1-2 ms either way.
+
+        The union is exact because :func:`_gate_needles` is itself a per-value union,
+        so the needles of a superset are the needles of the subset plus the needles
+        of what was added. That holds only while the set *grows*, which is true
+        within one document but not across calls -- ``reserved_originals`` is
+        re-seeded per :meth:`~ObfuscationStrategy.obfuscate` and can shrink. The
+        subset test is therefore checked rather than assumed, and a shrink falls back
+        to a full rebuild; carrying stale needles instead would be safe but
+        needlessly strict, and would make the guard depend on call history.
+        """
+        source = self._normalized_originals(vault, session_id)
+        if source is not self._needles_source:
+            if self._needles_values <= source:
+                fresh = _gate_needles(source - self._needles_values)
+                self._needles_cache = _GateNeedles(
+                    self._needles_cache.substrings | fresh.substrings,
+                    self._needles_cache.digit_streams | fresh.digit_streams,
+                )
+            else:
+                self._needles_cache = _gate_needles(source)
+            self._needles_values = source
+            self._needles_source = source
+        return self._needles_cache
+
+    def _carries_a_gate_needle(
+        self,
+        candidate: _Candidate,
+        vault: SessionVault,
+        session_id: str,
+        also: _GateNeedles = _NO_NEEDLES,
+    ) -> bool:
+        """Whether this fake would trip the egress gate's unbounded identifier limbs.
+
+        **The seam this closes.** :meth:`_invents_a_real_word` tests whole-word set
+        membership, and pass 1 does not: it also carries
+        :func:`~secure_context_pipeline.pipeline.egress_gate._identifier_needles`
+        (any contiguous run of ``MIN_IDENTIFIER_RUN_DIGITS`` digits, plus a
+        separator-bearing whole value of seven digits) and
+        :func:`~secure_context_pipeline.pipeline.egress_gate._regrouped_identifier_needle`
+        over the payload's digit stream. A Tier-1 fake whose freely drawn digits
+        happen to contain a real original's six-digit run shares no *word* with
+        anything, so this guard passed it -- and then pass 1 blocked our own output
+        with ``reason='vault_original'`` on a run in which nothing had leaked.
+        Measured at one blocked run in eleven executions of the 100-run leakage
+        suite; reproduced deterministically in
+        ``test_a_fake_carrying_a_real_originals_digit_run_is_regenerated``.
+
+        Rejecting is cheap and the alternative is not: on exhaustion this degrades
+        one value to a plain token (a fluency loss in one span), while a gate block
+        fails the whole request. **The cost was measured before the check was
+        trusted**, on the four shipped fixtures over 25 sessions each with the
+        session keys pinned so the two runs are the same 100 sessions: 27 of 5950
+        Tier-1 surrogates degrade to a plain token *both* with and without this
+        limb -- 0.4538% either way, all 27 in ``legal_brief_large.txt``, and the
+        number of successful regenerations is 10 either way. This limb rejected
+        nothing in 5950 draws, which is the expected shape of a fault seen once per
+        ~1100 leakage runs, and it is why "does not degrade ordinary use" is a
+        measurement here rather than an argument.
+
+        **Importing the gate's helpers is the point, not a layering slip.** A
+        *verifier* that borrowed its answer from the code it checks would prove
+        nothing; this is the opposite direction -- the producer conforming to the
+        consumer's published rule so the consumer never has to fire. If these two
+        vocabularies are allowed to drift, the drift is not caught by a red test,
+        it is paid for as a self-inflicted ``EGRESS_BLOCKED`` on a live request. Do
+        not "fix" this into a local copy of the two needle functions.
+
+        ``also`` carries the needles of the value being replaced, which is not in
+        the vault while its own surrogate is being generated -- the same gap
+        :meth:`_invents_a_real_word`'s ``also`` fills for words. Its reach is
+        narrower than that one's and the difference is stated rather than implied:
+        the structural mask preserves digit *count*, so a mask output containing its
+        own original's six-digit run has to reproduce that run exactly, and the
+        whole-string and ``own_words`` layers already refuse every such candidate.
+        The term is carried because the non-length-preserving generators (address,
+        e-mail) and any Tier-1 generator added later are not covered by that
+        argument. Pinned by
+        ``test_the_needle_guard_also_covers_the_value_being_replaced``.
+        """
+        skeleton = _skeleton(candidate.text)
+        digits = _digits_only(_gate_fold(candidate.text))
+        return self._original_needles(vault, session_id).occur_in(
+            skeleton, digits
+        ) or also.occur_in(skeleton, digits)
 
     @staticmethod
     async def _surrogate_taken(vault: SessionVault, session_id: str, candidate: str) -> bool:

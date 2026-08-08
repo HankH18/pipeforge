@@ -536,10 +536,26 @@ class SessionVault:
         while buying nothing -- the value it protects is the *sentence*, and the
         sentence is what got replaced. See ``ObfuscationEngine._plan``.
 
-        Dies with the session: this lives in the cache ``destroy()`` drops, so a
-        destroyed session contributes nothing and cannot be resurrected by a late
-        call -- the ``_destroyed`` guard is the same one ``put`` uses for the
-        write that loses the race with logout.
+        Dies with the session: this lives in the cache ``destroy()`` drops, and the
+        ``_destroyed`` guard is what stops a late call from rebuilding it. That
+        guard is **weaker than ``put``'s and this is the load-bearing difference**:
+        ``put`` also awaits ``registry.key()`` *inside* ``self._lock``, so it
+        refuses a dead session whether or not a tombstone was ever recorded. This
+        method cannot -- it is synchronous because the EgressGate's read side is --
+        so the tombstone is the only thing it has, and the tombstone has to be
+        there.
+
+        It was not, in the order the API actually logs out in. ``destroy`` recorded
+        one only ``if key_still_live``, and ``DELETE /sessions/{id}`` pops the key
+        *before* calling the vault (``routes/sessions.py``; the TTL reaper and
+        ``demo.py`` do the same), so every shipped destruction path left
+        ``_destroyed`` empty and this guard inert. Measured on the real objects:
+        after a complete key-first logout, one late ``note_unrestorable`` put
+        ``frozenset({'Priya Raghunathan'})`` back into ``originals_for_session``
+        and re-created the cache entry -- plaintext resurrected past logout, held
+        for the life of the process, with nothing left to collect it. ``destroy``
+        now tombstones whenever the session had a key *or* a cache, which covers
+        both logout orders; see its docstring for what that costs.
 
         It *creates* the cache when there is none, and that is load-bearing rather
         than incidental: the cache is otherwise only ever created by ``put``, so a
@@ -613,26 +629,61 @@ class SessionVault:
         :class:`SessionExpiredError`, reads raise :class:`VaultMissError`, and a
         surviving row can never repopulate the cache on read-through.
 
-        The API logs out the other way round (``registry.destroy()`` first), so
-        in that path the key is already gone and no tombstone is recorded. That
-        is correct rather than a gap: with the key gone every accessor fails at
+        **The API logs out the other way round** (``registry.destroy()`` first),
+        and the condition is ``key_still_live or cache is not None`` for that
+        order rather than for this one. For every accessor that can await, a dead
+        key is enough on its own: each of them fails at
         ``registry.key()``, and :meth:`put` reads that key *inside* ``self._lock``
         -- so a write that acquires the lock after this ``destroy`` finds the key
         already gone, and one that acquired it before is cleaned up here. No
         appeal to how many event-loop steps separate two statements is needed.
-        Skipping the tombstone there also means a caller cannot grow the set by
-        destroying session IDs that never existed.
+
+        :meth:`note_unrestorable` is the exception, and it is why the ``cache``
+        half exists. It is synchronous (the EgressGate's read side cannot await),
+        so it can consult nothing but the tombstone -- and with ``key_still_live``
+        alone, the key-first order recorded none, leaving its guard inert in
+        *every* shipped destruction path. A late call then rebuilt the plaintext
+        cache of a fully logged-out session; measured, and pinned by
+        ``test_a_late_note_unrestorable_is_refused_after_the_apis_logout_order``
+        (the older ``..._cannot_resurrect_a_destroyed_session`` covers the
+        vault-first order, which is the one nothing in the product uses).
+
+        Tombstoning on the cache rather than unconditionally keeps the property
+        that motivated the original condition: ``DELETE /session/{id}`` takes an
+        arbitrary ID, and an ID that never had a key or a cache still records
+        nothing, so a caller cannot grow the set by destroying sessions that never
+        existed (``test_destroying_an_unknown_session_stores_no_state``). What it
+        does cost is one entry per *real* logged-out session that got as far as a
+        vault write, retained until :meth:`close`, where before it was one per
+        vault-first logout only. A 32-char session ID is 81 bytes
+        (``sys.getsizeof``) plus its slot, so a process that runs and logs out a
+        million pipelines holds on the order of a hundred megabytes of dead IDs --
+        the accepted price of the guard above being real, and cheap next to a
+        session key registry that is already one entry per live session. A bounded
+        or evicting set would be worse than either: the entry an attacker could
+        evict is exactly the one that matters.
+
+        The residue this does not cover, stated rather than left to be found: a
+        session destroyed key-first that never reached a ``put`` *or* a
+        ``note_unrestorable`` has no cache and no live key, so it is
+        indistinguishable here from an ID that never existed and is not
+        tombstoned. A ``note_unrestorable`` arriving after that -- an in-flight run
+        whose document scored entirely inside the redact band, logged out before
+        its first needle -- can still create a cache. Closing that needs the vault
+        to be told the session existed, which only the caller knows; the accessor
+        that would read the cache is the gate, within the same already-doomed run.
 
         **The liveness read is inside the lock for the same reason.** Taken
         outside it, ``key_still_live`` was a stale answer by the time it was
         acted on: a ``registry.destroy()`` landing in between recorded a
-        tombstone for a session whose key was already gone. The set is therefore
-        bounded by the sessions that were live at some ``destroy`` -- and in the
-        API's key-first order it stays empty, which
-        ``test_logout_in_api_order_is_final_for_in_flight_writes`` pins. Entries
-        are released wholesale by :meth:`close`; a process that logs out
-        vault-first retains one session ID per logout until then, which is
-        accepted at this tier and stated here rather than left to be discovered.
+        tombstone for a session that had neither a key nor a cache -- per-session
+        state kept for nothing. That is still the only thing the ordering buys now
+        that the cache is the other half of the condition, and it is still worth
+        buying, because ``destroy`` sits behind a caller-reachable route.
+        ``test_destroy_records_no_tombstone_for_a_key_that_died_while_it_queued``
+        pins it, deliberately with a session that holds no cache -- with one, both
+        the stale and the correct read tombstone and the test would prove nothing.
+        Entries are released wholesale by :meth:`close`.
         """
         deleted = 0
         async with self._lock:
@@ -644,7 +695,7 @@ class SessionVault:
                 key_still_live = True
             cache = self._caches.pop(session_id, None)
             cached_entries = len(cache.by_token) if cache is not None else 0
-            if key_still_live:
+            if key_still_live or cache is not None:
                 self._destroyed.add(session_id)
             conn = self._conn
             if conn is not None:

@@ -27,11 +27,20 @@
 # the five tokens preceding the match, and the test is `configured_word in word` --
 # a substring test, in that direction. So an inflected context word can never fire:
 # the lemma of "filed" is "file", and "filed" is not a substring of "file". The build
-# doc's registry ships five such words -- CASE_ID "filed", DIAGNOSIS "presents",
-# MEDICATION "prescribed"/"takes", ACCOUNT_NUMBER "routing" -- all silently inert.
-# Each is replaced here by the stem that does match. Keeping the doc's spelling
-# alongside was tried and rejected: a config value that provably cannot fire is dead
-# weight a reader has to re-derive.
+# doc's registry ships four such words -- CASE_ID "filed", DIAGNOSIS "presents",
+# MEDICATION "prescribed"/"takes" -- all silently inert. Three are replaced here by
+# the stem that does match; "takes" has no working spelling at all, for the second
+# reason given below. Keeping the doc's spelling alongside was tried and rejected:
+# a config value that provably cannot fire is dead weight a reader has to re-derive.
+#
+# A FIFTH doc word is replaced and is NOT of that kind. This note used to count
+# ACCOUNT_NUMBER's "routing" among the inert four, and that was false in the phrasing
+# that matters: spaCy lemmatises "routing" to "routing" in the noun-adjunct reading --
+# measured on "Please wire to the bank routing number 021000021", i.e. the actual ACH
+# context -- so the specification's own word does boost there, 0.70 -> 1.00. It is
+# inert only in the verb reading ("they were routing the calls", lemma "rout"). The
+# shipped "rout" is therefore a WIDENING rather than a repair, and what it costs is
+# recorded above the ACCOUNT_NUMBER entry and in README Deviation 34.
 #
 # There is a second filter behind the first, and the stem rule alone does not survive
 # it. The enhancer does not search the raw lemmas: `_extract_surrounding_words` keeps
@@ -144,6 +153,20 @@ entities:
   DATE:
     category: PHI
     presidio: DATE_TIME
+    # Build doc section 6.2, verbatim, and section 331 states the consequence: "in
+    # `medical` docs, remaining dates map to DATE (PHI -- HIPAA treats
+    # individual-related dates as identifiers); elsewhere bare dates pass through."
+    #
+    # THAT PASS-THROUGH IS A REAL DISCLOSURE AND THIS COMMENT USED TO BE THE ONLY
+    # PLACE IT WAS RECORDED, which is a place no reviewer reads. Measured at the
+    # provider boundary on the shipped fixtures, both strategies, it is 153 distinct
+    # dates in cleartext from legal_brief_large.txt, 11 from financial_disclosure.txt
+    # (the whole PART IV ledger plus the reporting period), 4 from legal_memo.txt and
+    # 0 from medical_note.txt. It is now declared in the README's section 1 boundary
+    # list -- "A sixth limit" -- and pinned by
+    # tests/test_declared_boundaries.py::test_ordinary_dates_pass_through_outside_medical_documents
+    # so widening this entry turns that table red instead of leaving it silently
+    # stale. Widening it is a product decision, not a bug fix.
     only_in_doc_categories: [medical]
     # Presidio's DATE_TIME also fires on relative prose ("daily", "overnight",
     # "the last twelve hours"). Those are not identifiers, and vaulting them poisons
@@ -222,9 +245,29 @@ entities:
     context: [medical, record, chart]
     tier: 1
 
+  # {2,6} on the letter prefix, against the build doc's {2,4}. The doc's bound knows
+  # BCBS and UHC and misses every payer whose member-ID scheme prints five or six
+  # letters -- AETNA, CIGNA, HUMANA, ANTHEM. That is the identifier-position rule's
+  # failure class stated verbatim above MRN: a member ID no pattern anchors on is
+  # never vaulted, so the egress gate's first pass has no needle for it and its
+  # second re-runs this same pattern. Measured before the change, on the literal
+  # sentence "Member ID AETNA1234567 and policy HUMANA12345678 and BCBS123456789 on
+  # file.": one detection, the four-letter prefix, and both longer member IDs went to
+  # the provider byte for byte. After: three.
+  #
+  # The precision cost was measured, not argued, because a prefix bound is exactly
+  # the kind of widening this file refuses elsewhere. Two more letters do not touch
+  # what makes the pattern specific -- the letters stay UPPER case and must abut the
+  # digit run with no space or separator, so "AETNA 4412093" and "Aetna4412093" are
+  # still not matches, and an all-caps token welded to seven-plus digits is an
+  # identifier in every register the corpora carry. Held-out INSURANCE_ID coverage
+  # 4/5 -> 5/5 ('AETNA4412093' was the one shortfall); false positives on both clean
+  # corpora unchanged at 0 of 35 documents; unannotated spans inside the recall
+  # corpus unchanged at 4 against a cap of 6. {2,7} buys no payer either corpus
+  # knows and was not taken.
   INSURANCE_ID:
     category: PHI
-    patterns: ['\b[A-Z]{2,4}\d{7,12}\b']
+    patterns: ['\b[A-Z]{2,6}\d{7,12}\b']
     context: [insurance, member, policy, payer]
     tier: 1
 
@@ -246,20 +289,94 @@ entities:
     # outright because neither it nor its stem can reach the enhancer (header note).
     context: [mg, dose, prescribe, medication]
 
-  # Three changes to the build doc's pattern, all measured on the recall corpus in
+  # Five changes to the build doc's pattern, all measured on the recall corpus in
   # tests/test_detection.py:
   #   (?i)  -- a chart writes "Creatinine" at the head of a table row and "a1c" in
   #            running prose. The analyte names carry the specificity; case does not.
-  #   {0,20}? lazy -- greedy, "your LDL is 162 and your A1C came back at 7.4" matched
+  #   lazy  -- greedy, "your LDL is 162 and your A1C came back at 7.4" matched
   #            the single span "LDL is 162 and your A1" (the "1" of "A1C" satisfying
   #            \d+) and swallowed the start of the second analyte, so the 7.4 escaped.
   #            Lazy stops at the first number after each analyte, giving two spans.
   #   NEWLINE_TAIL -- see the note above CASE_STRATEGY at the foot of this file; a
   #            value in the next column of a wrapped table row is one newline away
   #            from its analyte.
+  #   LABEL_GUARD -- the newline branch above, unguarded, ran off the end of the row
+  #            and into the NEXT FIELD'S LABEL. "Recent labs: LDL\nDOB: 1974-03-02"
+  #            matched the single span "LDL\nDOB: 1974", and that is all three of the
+  #            harms the NER line-break trim in detector.py enumerates, occurring on a
+  #            pattern that trim deliberately exempts: the splice collapses two lines
+  #            and destroys the DOB label; the vaulted original is a composite that is
+  #            not a value, so the bare date is never an original and the egress gate
+  #            has no needle for it; and a PII date is typed and audited as PHI.
+  #            The exemption's stated ground -- that a pattern-backed sentence tail is
+  #            *required* to span a hard wrap -- is true of CASE_STRATEGY and
+  #            SETTLEMENT_TERM, which need the wrap to reach the end of a sentence. It
+  #            is not true here: LAB_RESULT is a field-VALUE pattern and needs the
+  #            wrap only to reach the value in the next column of one wrapped row, so
+  #            it has no reason ever to cross a "<label>:" boundary. The guard refuses
+  #            exactly that shape -- a newline followed by a short letters-only run
+  #            and a colon -- and nothing else, so "HbA1c\n    7.4", the layout the
+  #            branch exists for, still matches. Measured: two composite spans on the
+  #            finding's own inputs before, zero after, with the bare DOB now detected
+  #            as DOB in both.
+  #   period branch -- '[^.\n]' cannot cross any '.', so two ordinary extracted-chart
+  #            layouts returned ZERO detections: a parenthetical abbreviation, "LDL
+  #            cholesterol (calc.) 162", and the dot leaders of a fixed-width table,
+  #            "WBC ..... 12.3". Undetected is un-vaulted, which is invisible to all
+  #            three egress passes. The branch is written as the two SHAPES those
+  #            layouts are made of, not as a blanket "a '.' is crossable unless a
+  #            letter follows". The blanket form was tried first and is what a
+  #            sentence boundary looks like from the inside: it made ". " crossable
+  #            whenever the next sentence opened on anything but a letter, so
+  #            "Her LDL was normal. 3 refills were sent" vaulted
+  #            "LDL was normal. 3", "eGFR unremarkable. 62-year-old male" vaulted
+  #            "eGFR unremarkable. 62", and three more like them -- text that is not
+  #            a lab value, vaulted as one, which makes the restored answer wrong in
+  #            a way the reader cannot see. The two shapes instead are:
+  #              '\.(?=[.)\]}])'          -- a '.' abutting a closer or another '.':
+  #                                          the "(calc.)" abbreviation, and every
+  #                                          dot of a leader run but the last.
+  #              '(?<=\.)\.(?![.)\]}])'   -- the LAST dot of a leader run, which is
+  #                                          identified by the dot BEFORE it.
+  #            A sentence-ending '.' has neither shape -- nothing abuts it on the
+  #            right and its left neighbour is a letter -- so it is uncrossable
+  #            whatever follows the space. The residual, stated rather than hidden:
+  #            a parenthetical that ends in a full stop ("(see below.) 42") has the
+  #            first shape and is crossable, because it is byte-identical to
+  #            "(calc.) 162". It is bounded by the {0,30} tail.
+  #            The two guards are mutually exclusive on the character after the dot,
+  #            so exactly one of them can consume any given '.'. That is a
+  #            performance property, not tidiness: the first draft used
+  #            '\.(?=[.)\]}])|(?<=\.)\.' -- no '(?!...)' on the second -- which lets
+  #            both branches consume the same dot. Measured on `regex` with
+  #            PATTERN_FLAGS, i.e. the engine the detector actually runs, a mere
+  #            "A1C " + "." * 250 went from 0.03 ms to 57 SECONDS of backtracking:
+  #            a denial of service reachable from one uploaded fixed-width table,
+  #            and one the shipped ReDoS harness could not see, because its
+  #            LAB_RESULT rows (`a1c-filler`, `a1c-newlines`) carry no dot run. The
+  #            guard is held by test_registry_edges.py's LAB_DOT_RUN_ATTACKS, which
+  #            is that missing row. With the guard, and with the four
+  #            branches disjoint on their first character so the alternation stays
+  #            deterministic, the same dot-run attacks the existing `a1c-*` ReDoS
+  #            rows do not carry ("A1C " + "." * n, ". " * n, ".\n" * n) measure
+  #            0.03 / 0.06 / 0.11 / 0.23 ms at 4k / 8k / 16k / 32k characters -- a
+  #            flat 2.0x per doubling, and equal to the pattern this replaces to
+  #            two decimal places.
+  #   {0,30} rather than the doc's {0,20} -- " cholesterol (calc.) " is 21 characters,
+  #            so the parenthetical layout needs 21 of the 20 the doc allows and the
+  #            period branch alone does not reach it. 30 is that measurement plus one
+  #            short word. It is not a licence to run: every branch consumes exactly
+  #            one character, so 30 is 30 characters and not 30 runs, the tail is
+  #            lazy and stops at the first digit after the analyte, and no branch can
+  #            cross a sentence boundary at any width. Measured span-for-span over
+  #            117 documents -- the four shipped fixtures plus RECALL_CORPUS,
+  #            CLEAN_CORPUS and HELD_OUT_CORPUS in tests/test_detection.py -- {0,30}
+  #            and the doc's {0,20} give byte-identical matches once the period
+  #            branch is written as the two shapes above: 0 documents differ. The
+  #            extra ten characters are spent only on "(calc.)".
   LAB_RESULT:
     category: PHI
-    patterns: ['(?i)\b(?:A1C|HbA1c|LDL|HDL|WBC|eGFR|creatinine)\b(?:[^.\n]|\n(?![ \t\r]*\n)){0,20}?\d+(?:\.\d+)?']
+    patterns: ['(?i)\b(?:A1C|HbA1c|LDL|HDL|WBC|eGFR|creatinine)\b(?:[^.\n]|\.(?=[.)\]}])|(?<=\.)\.(?![.)\]}])|\n(?![ \t\r]*\n)(?![ \t]*[A-Za-z][A-Za-z .]{0,20}:)){0,30}?\d+(?:\.\d+)?']
     context: [lab, result]
     tier: 4
 
@@ -275,8 +392,13 @@ entities:
     # where the quadratic split was measured (0.28/1.1/4.4 ms at 200/400/800 spaces
     # after "account", a clean 4x per doubling) when both runs were plain '*'.
     patterns: ['(?i)\b(?:acct|account|a/c)s?\.?[\s:#.\-]*+(?:(?:number|num|no|ident|id|ref|#)\.?[\s:#.\-]*+(?:(?:is|was)[\s:#.\-]*+)?)?\K\d{8,17}\b']
-    # "rout" is not a typo: it is what spaCy lemmatises the doc's "routing" to,
-    # and the enhancer matches against the lemma (header note).
+    # "rout" is not a typo, and it is not the doc's "routing" repaired either. The
+    # noun-adjunct lemma of "routing" is "routing", so the doc's own word already
+    # boosts in the ACH reading; "rout" is the lemma only of the verb. "rout" is a
+    # substring of both, so it covers both readings -- and the honest cost is that it
+    # is a substring of "routine", "route" and "router" too, which the doc's word is
+    # not. Kept because a missed ACH context is a missed obfuscation and a spurious
+    # context boost is not. Header note, and README Deviation 34.
     context: [account, bank, rout]
     tier: 1
 

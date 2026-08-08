@@ -6,20 +6,31 @@ This file proves the layer underneath it: that each registry field shape
 supposed to and no other, that every lookup helper answers correctly on a miss as
 well as a hit, and that the gazetteer parser keeps exactly the lines it should.
 
-Everything is asserted against a small synthetic registry written here, so the
+Sections 1-6 are asserted against a small synthetic registry written here, so the
 expected values are literals rather than something re-derived from the code under
-test. No assertion here reads ``entities.yaml``.
+test, and nothing in them reads ``entities.yaml``.
+
+Section 7 is the deliberate exception, and the reason is the point of it: three of
+the *shipped* patterns carry hand-written guards whose failure mode is a value
+reaching the provider, not a wrong lookup. A guard asserted against a synthetic copy
+of the pattern would be a guard nothing binds to ``entities.yaml`` -- the copy stays
+green while the shipped regex is edited underneath it. So section 7 loads the real
+registry and runs the real ``build_pattern_recognizer`` over it.
 """
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+import regex
 
 from secure_context_pipeline.detection import recognizers as recognizers_module
 from secure_context_pipeline.detection import registry as registry_module
 from secure_context_pipeline.detection.recognizers import (
+    PATTERN_FLAGS,
     build_gazetteer_recognizer,
     build_pattern_recognizer,
     build_recognizers,
@@ -511,3 +522,268 @@ def test_a_gazetteer_row_with_no_term_is_rejected(
     assert table["metformin"] == "oral-antidiabetic"
     assert table["insulin"] == "injectable"
     recognizers_module._GAZETTEER_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# 7. the shipped patterns' hand-written guards
+# ---------------------------------------------------------------------------
+# These run against the real `entities.yaml` (the session-scoped `registry` fixture)
+# through the real recognizer builder, so they see the same regex and the same
+# `PATTERN_FLAGS` the detector does. Everything above this line uses the synthetic
+# registry instead; see the module docstring for why these three do not.
+
+
+def _shipped_spans(registry: EntityRegistry, entity_type: str, text: str) -> list[str]:
+    """Substrings the shipped pattern for `entity_type` claims in `text`."""
+    recognizer = build_pattern_recognizer(registry.spec(entity_type))
+    hits = recognizer.analyze(text=text, entities=[entity_type])
+    return [text[hit.start : hit.end] for hit in sorted(hits, key=lambda hit: hit.start)]
+
+
+def test_the_shipped_insurance_id_pattern_reaches_five_and_six_letter_payers(
+    registry: EntityRegistry,
+) -> None:
+    """A member ID this pattern misses is never vaulted, and no egress pass sees it.
+
+    The build doc's prefix bound is `[A-Z]{2,4}`, which knows BCBS and UHC and misses
+    every payer whose scheme prints five or six letters. Measured on the sentence
+    below before the widening: ONE detection of three, `BCBS123456789`, with
+    `AETNA1234567` and `HUMANA12345678` travelling to the provider byte for byte.
+    That is the identifier-position failure class entities.yaml states above MRN --
+    the egress gate's first pass scans for *vaulted* originals and its second re-runs
+    this same pattern, so a value nothing anchors on is invisible to both. On the
+    held-out corpus the same widening took INSURANCE_ID coverage 4/5 -> 5/5.
+
+    The second half is what keeps the widening from being a licence: two more letters
+    must not loosen what makes the pattern specific. The letters stay UPPER case and
+    must abut the digit run with no separator, so a spaced or title-cased payer name
+    is still not a match -- which is why those two are asserted here rather than
+    left to the clean-corpus false-positive count in test_detection.py.
+    """
+    text = "Member ID AETNA1234567 and policy HUMANA12345678 and BCBS123456789 on file."
+    assert _shipped_spans(registry, "INSURANCE_ID", text) == [
+        "AETNA1234567",
+        "HUMANA12345678",
+        "BCBS123456789",
+    ]
+
+    assert _shipped_spans(registry, "INSURANCE_ID", "Member ID AETNA 4412093 on file.") == []
+    assert _shipped_spans(registry, "INSURANCE_ID", "Member ID Aetna4412093 on file.") == []
+
+
+def test_the_shipped_lab_result_pattern_stops_at_the_next_fields_label(
+    registry: EntityRegistry,
+) -> None:
+    """LAB_RESULT may cross a hard wrap into a VALUE, never into a LABEL.
+
+    The line-break trim in detector.py is scoped to `presidio:`-backed entities on the
+    stated ground that a pattern-backed sentence tail is *required* to span a hard
+    wrap. That holds for CASE_STRATEGY and SETTLEMENT_TERM, which need the wrap to
+    reach the end of a sentence. LAB_RESULT is a field-VALUE pattern and needs it only
+    to reach the next column of one wrapped row, so it was exempt from the trim
+    without ever needing the exemption, and it collected all three harms the trim's
+    own comment enumerates: `'Recent labs: LDL\\nDOB: 1974-03-02'` matched the single
+    span `'LDL\\nDOB: 1974'`, which collapses two lines and destroys the DOB label,
+    vaults a composite that is not a value (so the bare date is never an original and
+    the gate has no needle for it), and audits a PII date as PHI LAB_RESULT.
+
+    Not covered by `test_detection.py::test_no_detection_spans_a_line_break`: that one
+    filters to `ner_backed`, which is precisely the set LAB_RESULT is not in.
+
+    Both directions are asserted. Refusing the label is worth nothing if the guard
+    also refuses the wrapped table row the newline branch exists for -- that would
+    trade a composite span for an undetected lab value, which is the worse of the two.
+    """
+    for text in (
+        "Recent labs: LDL\nDOB: 1974-03-02\n",
+        "    Recent labs: HbA1c\n    DOB: 04/13/1956\n",
+    ):
+        spans = _shipped_spans(registry, "LAB_RESULT", text)
+        assert spans == [], f"a lab span ran into the next field's label: {spans}"
+
+    assert _shipped_spans(registry, "LAB_RESULT", "Row: HbA1c\n    7.4 percent\n") == [
+        "HbA1c\n    7.4"
+    ]
+
+
+def test_the_shipped_lab_result_pattern_crosses_a_non_sentence_period(
+    registry: EntityRegistry,
+) -> None:
+    """A period inside a lab line is punctuation, not the end of the tail.
+
+    The doc's tail class `[^.\\n]` cannot cross any `.`, so two ordinary
+    extracted-chart layouts returned ZERO detections and their values went to the
+    provider un-vaulted: a parenthetical abbreviation, `'LDL cholesterol (calc.) 162'`,
+    and the dot leaders of a fixed-width table, `'WBC ..... 12.3'`.
+
+    The widening is bounded by the two SHAPES those layouts are made of -- a `.`
+    abutting a closer or another `.`, and the last `.` of a leader run, identified by
+    the `.` before it -- and not by a blanket "crossable unless a letter follows".
+    That blanket form was what shipped first and it is what
+    `test_the_shipped_lab_result_pattern_stays_inside_one_sentence` below exists to
+    keep out. The last assertion here is the constraint at its mildest: an ordinary
+    sentence boundary must still stop the tail, or LAB_RESULT starts vaulting the
+    next sentence's numbers as a lab value.
+    """
+    assert _shipped_spans(registry, "LAB_RESULT", "Lab report: LDL cholesterol (calc.) 162.") == [
+        "LDL cholesterol (calc.) 162"
+    ]
+    assert _shipped_spans(registry, "LAB_RESULT", "Lab report: WBC ..... 12.3 today.") == [
+        "WBC ..... 12.3"
+    ]
+    assert _shipped_spans(registry, "LAB_RESULT", "Panel: eGFR ........ 58 mL/min today.") == [
+        "eGFR ........ 58"
+    ]
+
+    assert _shipped_spans(registry, "LAB_RESULT", "LDL was normal. Patient is 62 today.") == []
+
+
+# The sentence openings a period-crossing tail can reach that a LETTER test does
+# not stop. Each is an ordinary clinical or administrative sentence, and each was
+# measured swallowed by the blanket form of the period branch; the second element
+# is what LAB_RESULT vaulted -- text that is not a lab value, which the restorer
+# then splices back as though it were one.
+SENTENCE_AFTER_A_LAB_LINE = [
+    ("Her LDL was normal. 3 refills were sent to the pharmacy.", "LDL was normal. 3"),
+    ("The WBC came back fine. 2024 follow-up is already booked.", "WBC came back fine. 2024"),
+    ("His A1C is at goal. (See note 4 for the plan.)", "A1C is at goal. (See note 4"),
+    ("Creatinine stable. -- 12 month recheck.", "Creatinine stable. -- 12"),
+    ("eGFR unremarkable. 62-year-old male, no complaints.", "eGFR unremarkable. 62"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "over_captured"),
+    SENTENCE_AFTER_A_LAB_LINE,
+    ids=[case[0][:44] for case in SENTENCE_AFTER_A_LAB_LINE],
+)
+def test_the_shipped_lab_result_pattern_stays_inside_one_sentence(
+    registry: EntityRegistry, text: str, over_captured: str
+) -> None:
+    """A LAB_RESULT span may never reach past the full stop that ends its sentence.
+
+    Over-capture here is not a leak -- the span is vaulted, so nothing extra travels
+    to the provider. It is a CORRECTNESS defect, and a quiet one: the vaulted
+    original is a sentence fragment rather than a value, so the token the model is
+    given stands for "LDL was normal. 3" and the restorer splices that whole
+    fragment back wherever the model put the token. The answer the user reads is
+    then wrong in a way no audit row records, because every count is clean.
+
+    The rule that let it in was "a `.` is crossable unless a letter follows it",
+    which is a description of a sentence boundary seen from the wrong side: English
+    sentences open on digits, dashes and brackets too. `over_captured` is the exact
+    span measured under that rule, asserted as a value the pattern must NOT return,
+    so this cannot be satisfied by a pattern that merely stops somewhere else.
+
+    The `\\d` in each case is deliberate. The tail is lazy and stops at the first
+    digit after the analyte, so a next sentence with no number in it would pass
+    trivially -- these are the ones that actually reach.
+    """
+    spans = _shipped_spans(registry, "LAB_RESULT", text)
+
+    assert over_captured not in spans, f"a lab span ran into the next sentence: {spans}"
+    for span in spans:
+        assert not _crosses_a_full_stop(span), f"span crosses a sentence boundary: {span!r}"
+
+
+def _crosses_a_full_stop(span: str) -> bool:
+    """Does `span` contain a `.` that ends a sentence rather than punctuating a value?
+
+    A sentence-ending `.` is one with no `.` abutting it on either side, no closer
+    immediately after, and digits on neither side -- i.e. neither of the two shapes
+    the pattern's period branch is allowed to cross, and not the decimal point of
+    the value the span ends on. Written from that DEFINITION rather than by reusing
+    the registry's regex, so the checker and the checked share no expression and a
+    pattern edit cannot make the check agree with it.
+    """
+    for index, char in enumerate(span):
+        if char != ".":
+            continue
+        before = span[index - 1] if index else ""
+        after = span[index + 1 :][:1]
+        if before == "." or after in {".", ")", "]", "}"}:
+            continue
+        if before.isdigit() and after.isdigit():
+            continue
+        return True
+    return False
+
+
+# The dot-run attacks the shipped ReDoS harness does not carry.
+#
+# `test_detection.py::test_no_registry_pattern_backtracks_super_linearly` runs every
+# registry pattern against a table of attack payloads, and LAB_RESULT's rows there
+# are `a1c-filler` ("A1C " + "z" * n) and `a1c-newlines` -- neither of which is made
+# of DOTS. That matters because the period branch is the one part of the pattern
+# whose alternatives can both consume a '.', and an ambiguous pair of them is
+# catastrophic rather than merely slow: the first draft of the branch,
+# `\.(?=[.)\]}])|(?<=\.)\.` with no `(?!...)` on the second alternative, took
+# 57 SECONDS on `"A1C " + "." * 250` under `regex` with PATTERN_FLAGS -- against
+# 0.03 ms for the shipped form -- and every row of the shipped harness stayed green
+# through it, because none of them feeds the pattern a dot run.
+#
+# So the guard lives here, next to the branch it guards. A fixed-width table of dot
+# leaders is not an attack shape a reviewer has to imagine; it is the layout the
+# branch was ADDED for, which is what makes the omission worth closing.
+LAB_DOT_RUN_ATTACKS = [
+    ("solid-dots", lambda n: "A1C " + "." * n),
+    ("dot-space", lambda n: "A1C " + ". " * (n // 2)),
+    ("dot-newline", lambda n: "A1C " + ".\n" * (n // 2)),
+    # A dot run that never reaches a digit, so the match must FAIL after walking it
+    # -- failure is where a backtracking pattern spends its time.
+    ("dots-no-value", lambda n: "A1C " + "." * n + " end"),
+]
+
+DOT_RUN_SMALL_CHARS = 4_000
+DOT_RUN_LARGE_CHARS = 16_000
+# 4x the length, so linear is 4x. 12x leaves room for cache and constant-factor
+# effects while still failing anything quadratic (which is 16x) by a wide margin.
+DOT_RUN_GROWTH_CAP = 12.0
+DOT_RUN_FLOOR_MS = 0.5
+# The failure this exists for measured ~22 000 ms at 4 000 characters, so any bound
+# in this range catches it; 250 ms matches the shipped harness's own budget.
+DOT_RUN_BUDGET_MS = 250.0
+DOT_RUN_SAMPLES = 3
+
+
+def _best_search_ms(compiled: object, text: str) -> float:
+    """Fastest of `DOT_RUN_SAMPLES` runs, in milliseconds.
+
+    The minimum rather than the mean, for the reason the shipped harness gives:
+    preemption and GC can only ADD time, so the minimum is the closest estimate of
+    the pattern's own cost and the only one that does not make this a test of how
+    busy the machine is.
+    """
+    samples = []
+    for _ in range(DOT_RUN_SAMPLES):
+        started = time.perf_counter()
+        compiled.search(text)  # type: ignore[attr-defined]
+        samples.append((time.perf_counter() - started) * 1000.0)
+    return min(samples)
+
+
+@pytest.mark.parametrize(
+    ("label", "build"), LAB_DOT_RUN_ATTACKS, ids=[case[0] for case in LAB_DOT_RUN_ATTACKS]
+)
+def test_the_shipped_lab_result_pattern_is_linear_on_dot_runs(
+    registry: EntityRegistry, label: str, build: Callable[[int], str]
+) -> None:
+    """LAB_RESULT's period branch must stay linear on the runs it is allowed to cross.
+
+    Compiled the way the detector compiles it -- `regex` with `PATTERN_FLAGS` -- so
+    this measures the engine that actually runs in the pipeline and not `re`.
+    """
+    (pattern,) = registry.spec("LAB_RESULT").patterns
+    compiled = regex.compile(pattern, PATTERN_FLAGS)
+
+    small_ms = _best_search_ms(compiled, build(DOT_RUN_SMALL_CHARS))
+    large_ms = _best_search_ms(compiled, build(DOT_RUN_LARGE_CHARS))
+
+    assert large_ms < DOT_RUN_BUDGET_MS, (
+        f"LAB_RESULT on {label} took {large_ms:.0f} ms at {DOT_RUN_LARGE_CHARS} chars"
+    )
+    assert large_ms <= DOT_RUN_GROWTH_CAP * small_ms + DOT_RUN_FLOOR_MS, (
+        f"LAB_RESULT on {label}: {small_ms:.3f} ms at {DOT_RUN_SMALL_CHARS} chars -> "
+        f"{large_ms:.3f} ms at {DOT_RUN_LARGE_CHARS} "
+        f"({large_ms / max(small_ms, 1e-9):.1f}x for 4x the length; linear is 4x)"
+    )

@@ -20,6 +20,7 @@ from secure_context_pipeline.api.deps import (
     UserIdQuery,
     _clamp,
     _owns_session,
+    reap_expired_sessions,
 )
 from secure_context_pipeline.api.schemas import SessionCreateRequest, SessionCreateResponse
 from secure_context_pipeline.audit.logger import SESSION_CREATE, VAULT_DESTROY
@@ -44,7 +45,19 @@ async def create_session(
     logged, or persisted -- destroying it is what makes the vault
     irrecoverable. The ``user_id`` is recorded with it, and every later
     request presenting this session must claim the same one.
+
+    **This route reaps too, and it is the one route that must.** It is the only
+    way a session is created, so it is the only source of future expiries, and it
+    needs no credential -- which used to mean an anonymous caller could grow
+    ``SessionRegistry._unreaped`` indefinitely and never pay for any of it, while
+    some later ``POST /pipeline/run`` paid for all of it at once. Reaping here
+    puts a bounded slice of the cost
+    (:data:`~secure_context_pipeline.api.constants.MAX_REAP_PER_REQUEST` IDs, ~1.2 ms
+    each measured) on the caller creating the sessions, and it holds the
+    registry's own queue to whatever expired since the previous request rather
+    than to however long it has been since anyone ran a pipeline.
     """
+    await reap_expired_sessions(services)
     session_id, expires_at = await services.sessions.create(body.user_id)
     await services.audit.emit(
         AuditEvent(
@@ -95,7 +108,28 @@ async def delete_session(
     ciphertext is AES-GCM under a key derived from the session key, so once
     it is gone no later write can derive one. The vault's tombstone defends
     the same race one layer down; this closes it at the source.
+
+    **An expired session is reaped first, because otherwise this route is a
+    no-op on it.** ``_owns_session`` resolves through ``SessionRegistry.owner()``,
+    which raises for an expired session and so answers ``False`` -- and the
+    branch below is the only thing that calls ``vault.destroy``. So a logout one
+    second after the TTL lapsed returned 204 while three decrypted originals
+    stayed resident in ``SessionVault._caches`` and three AES-GCM rows stayed on
+    disk (measured, at ``session_ttl_seconds=3``: ``cached=True originals=3
+    rows=3`` before *and* after the ``DELETE``). That contradicts README gap 7's
+    "and not explicitly logged out" and Q4's "during an active session", both of
+    which describe the plaintext cache as bounded by the session's life plus an
+    explicit logout. The reaper is the destruction path for an expired session,
+    and until now no route reached it except ``POST /pipeline/run`` -- which
+    logout does not go through.
+
+    ``first=session_id`` hoists this session to the front of the bounded backlog,
+    so the caller asking for *this* vault to be gone does not get told 204 while
+    its rows wait behind somebody else's expiries. The 204 is unchanged either
+    way: the reaper raises nothing, and it cannot turn an unowned session into an
+    owned one.
     """
+    await reap_expired_sessions(services, first=session_id)
     existed = False
     if await _owns_session(services, session_id, user_id):
         existed = await services.sessions.destroy(session_id)

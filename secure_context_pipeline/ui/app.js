@@ -9,7 +9,7 @@
   // to a second name mid-demo and Destroy addressed a session that user does not own.
   const S = {
     sessionId: null, lastSessionId: null, userId: null,
-    docId: null, uploadKey: null, busy: false,
+    docId: null, uploadKey: null, busy: false, verifying: false,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -75,8 +75,130 @@
   //: The possessive the restorer re-attaches to a substituted piece. See `renderRestored`.
   const POSSESSIVE = /^['’]s?/;
 
-  const STAT_ORDER = ['detect_ms', 'obfuscate_ms', 'egress_ms', 'llm_ms', 'restore_ms',
-    'total_ms', 'entities_detected', 'tokens_issued'];
+  // ---------- the stats strip: what each counter counts, and which ones matter ----------
+  //
+  // The strip prints every key `PipelineResult.stats` carries -- 22 of them on a
+  // shipped fixture -- and it used to print them in ONE styling with no key at all,
+  // ordered timings-first. Measured on fixtures/medical_note.txt, that put
+  // `egress_rescan_warnings 3` in the same grey chip as `detect_ms 412.6 ms`, so the
+  // page never said which numbers are the security claim and which are stopwatch
+  // readings, and a reviewer had no way to know whether 3 warnings beside a green
+  // RUN_OK is fine (it is -- see that entry) or the thing to ask about.
+  //
+  // Three visual states, all built from classes `style.css` already defines: this
+  // page's CSP is `style-src 'self'` with no `unsafe-inline`, so a new rule would
+  // have to go in the stylesheet, and the same argument the audit heading makes
+  // applies -- the change does not own that file.
+  //
+  //   dim    `stat muted`                  a stage timing. Anything matching /_ms$/.
+  //   bright `stat`                        a count of what the run did to the data.
+  //   green  `stat badge ok`  / red        a counter whose CLEAN READING IS 0,
+  //          `stat badge err`              showing the value it actually reads.
+  //
+  // `zero: true` marks that third set, and it is deliberately three entries long: a
+  // page that paints eight things red has stopped ranking them. The three are the
+  // restoration failures -- every other safety counter has a legitimate non-zero
+  // value on an ordinary run. `why` is the plain-English meaning, rendered as the
+  // chip's `title`; the raw key stays visible because it is the API field name a
+  // reviewer greps for. Insertion order here IS print order: safety first, because
+  // the safety counters are the reason the strip exists.
+  //
+  // A key absent from this table still renders -- bright, untitled, appended after
+  // the known ones -- so a counter the API adds later is visible rather than
+  // silently dropped. That was already true of the flat list this replaces and is
+  // pinned by `test_render_stats_uses_the_pipeline_order_and_formats_durations`.
+  const STAT_META = {
+    // `entities_detected` and panel 1's header count two DIFFERENT sets, and the
+    // sets are not nested. See the `c1` assignment in `run` for the measurement.
+    entities_detected: { why: 'SAFETY. Spans the detector returned over the document ' +
+      'text, before any policy ran. The header of panel 1 counts a different set -- ' +
+      'the spans this run actually masked -- and neither is a subset of the other. ' +
+      'Hover that header for the arithmetic.' },
+    prompt_entities_detected: { why: 'SAFETY. Spans the detector returned over the ' +
+      'prompt you typed. The prompt is obfuscated on the same path the document is; ' +
+      'its spans are absent from panel 1 because their offsets are prompt-space.' },
+    tokens_issued: { why: 'SAFETY. Vault rows this run minted -- one per distinct ' +
+      '(entity type, value), document and prompt together. Lower than ' +
+      'entities_detected whenever a value occurs more than once.' },
+    prompt_tokens_issued: { why: 'SAFETY. How many of tokens_issued came from the ' +
+      'prompt rather than from the document.' },
+    pseudonyms_issued: { why: 'SAFETY. How many of tokens_issued the payload carries ' +
+      'as a realistic fake rather than as a bracketed token. Read off the emitted ' +
+      'shape, not off the strategy that was asked for.' },
+    redactions: { why: 'SAFETY. Spans replaced with [REDACTED_<TYPE>] instead of a ' +
+      'restorable token -- registry policy, or a score too low to be worth vaulting. ' +
+      'Irreversible by design: these do not come back in panel 4.' },
+    stripped: { why: 'SAFETY. Spans deleted from the payload outright. Also ' +
+      'irreversible, and also absent from panel 4.' },
+    egress_rescan_warnings: { why: 'SAFETY. Entity hits the gate\'s OWN detector ' +
+      'found in the outbound payload, outside the spans this run emitted -- ' +
+      'typically a pseudonym that reads like a real name. Logged, never blocked: a ' +
+      'HIGH-SEVERITY re-hit raises EGRESS_BLOCKED and the payload never reaches the ' +
+      'provider, so a non-zero count beside a green RUN_OK is the designed outcome ' +
+      'and not a leak.' },
+    restored_count: { why: 'SAFETY. Occurrences the restorer put an original value ' +
+      'back into. Panel 4 paints exactly these.' },
+    vault_misses: { why: 'SAFETY, and 0 is the clean reading. Occurrences replaced ' +
+      'with [UNRESOLVED_ENTITY] because the vault could not resolve the token. ' +
+      'Non-zero has a row in the audit tail below saying which token.', zero: true },
+    unresolved_fabricated: { why: 'SAFETY, and 0 is the clean reading. Distinct ' +
+      'token IDs in the response that this session never issued -- the model invented ' +
+      'them. Nothing leaked and nothing was lost, but the answer names an entity that ' +
+      'does not exist.', zero: true },
+    unresolved_lost: { why: 'SAFETY, and 0 is the clean reading. Distinct token IDs ' +
+      'this run DID issue that the vault no longer holds. The one counter here that ' +
+      'means a value the user was entitled to could not be given back.', zero: true },
+    fetch_ms: { why: 'TIMING. Reading and decrypting the stored document.' },
+    detect_ms: { why: 'TIMING. Detection over the document.' },
+    prompt_detect_ms: { why: 'TIMING. Detection over the prompt.' },
+    obfuscate_ms: { why: 'TIMING. Vaulting and splicing the document.' },
+    prompt_obfuscate_ms: { why: 'TIMING. Vaulting and splicing the prompt.' },
+    inject_ms: { why: 'TIMING. Assembling the outbound payload.' },
+    egress_ms: { why: 'TIMING. The egress gate\'s three passes over the payload.' },
+    llm_ms: { why: 'TIMING. The provider call.' },
+    restore_ms: { why: 'TIMING. Substituting originals back into the response.' },
+    total_ms: { why: 'TIMING. The whole run, end to end.' },
+  };
+
+  // ---------- panel 1's counter, and the number it is NOT ----------
+  //
+  // Panel 1's header said "52 spans" while the strip three lines above it said
+  // `entities_detected 54`, with nothing on the page reconciling them. Both numbers
+  // are correct and they count different sets:
+  //
+  //   entities_detected  = len(detections) in `pipeline/orchestrator.run` -- what the
+  //                        DETECTOR returned over the document text, before the
+  //                        engine applied any policy. (The prompt's spans are
+  //                        reported separately as `prompt_entities_detected`.)
+  //   panel 1's count    = len(result.detections), which the orchestrator fills from
+  //                        `obf.spans` -- one entry per span the ENGINE acted on, and
+  //                        every one of them is a splice into the outbound payload:
+  //                        a surrogate (OBFUSCATED), a [REDACTED_<TYPE>] marker
+  //                        (REDACTED) or a deletion (STRIPPED). "Masked" is the one
+  //                        word true of all three.
+  //
+  // The tempting label is "52 of 54", and it is false: the sets are not nested in
+  // either direction. `ObfuscationEngine._plan` DROPS detections (below the
+  // MIN_SWEEP_LEN=3 enforceability floor, scoped out of the document category, out of
+  // range, or classified away), and `_sweep_residual` ADDS spans the detector never
+  // returned -- occurrences of a value this SESSION vaulted on an earlier call that
+  // this call's detector missed.
+  //
+  // Measured on fixtures/medical_note.txt as `medical`, tokenization: detector 54 ->
+  // 3 dropped at the enforceability floor ("MD", "RN", "MD", all typed ADDRESS) -> 51
+  // planned -> +1 from the residual sweep ("Larkspur Valley Hospital") -> 52 masked.
+  // So 52 excludes 3 of the 54 and includes 1 that is not among them.
+  //
+  // Both numbers are therefore labelled for what they count and each points at the
+  // other, rather than being joined by an arithmetic that does not hold.
+  const C1_MASKED = ' spans masked';
+  const C1_TITLE = 'The spans this run masked in the outbound payload -- replaced with a ' +
+    'surrogate, with a [REDACTED_<TYPE>] marker, or deleted -- which is the set ' +
+    'highlighted below. The stats strip\'s entities_detected counts a DIFFERENT set: ' +
+    'the spans the detector returned over this document before any policy ran. Neither ' +
+    'is a subset of the other -- spans under 3 characters are dropped, and the vault\'s ' +
+    'cross-call sweep adds occurrences the detector missed here. Measured on ' +
+    'fixtures/medical_note.txt as medical: 54 detected, 3 dropped, 1 swept in, 52 masked.';
 
   //: restorer.py's sentinel, verbatim. See the gap handling in `renderRestored`.
   const UNRESOLVED = '[UNRESOLVED_ENTITY]';
@@ -128,15 +250,75 @@
   };
 
   // ---------- transport ----------
+  //
+  // How long this page waits for a reply before it gives up and hands the controls
+  // back. There was no deadline at all, and `setBusy(true)` disables Run, Destroy,
+  // Create session, the file picker and both <select>s for the whole of a request:
+  // a reply that never arrives -- the API killed mid-run, a proxy holding the socket
+  // open, a laptop suspended between the send and the answer -- therefore locked the
+  // page permanently. Reproduced in the node harness against a fetch that never
+  // settles: `btn-run`, `btn-destroy`, `btn-session`, `#file`, `#category` and
+  // `#strategy` all read disabled, `#spin` is visible, `#banner` is empty, and
+  // nothing short of a reload recovers it.
+  //
+  // Two budgets, because the calls are not the same size:
+  //
+  //   slow  the two POSTs that do server-side work. `/pipeline/run` may legitimately
+  //         spend `llm_timeout_s` (config.py: 60 s) on each of `MAX_ATTEMPTS`
+  //         (anthropic_provider.py: 3) provider attempts plus two backoff sleeps
+  //         capped at `MAX_BACKOFF_S` (10 s) -- 200 s of ceiling before detection,
+  //         obfuscation and the gate's three passes are counted -- and `/documents`
+  //         parses a PDF or expands a .docx inside the request. 240 s clears that
+  //         ceiling; anything under it would abort runs the server was going to
+  //         answer, which is a worse failure than the one being fixed.
+  //   fast  everything else: a session mint, a delete, an audit page, two badges.
+  //
+  // A plain object rather than two `const`s so the node harness can shorten them;
+  // nothing on the page writes it.
+  const TIMEOUT = { fast: 30000, slow: 240000 };
+
+  //: The error `api` throws when its budget runs out. Its own code rather than the
+  //: engine's AbortError, whose message differs per browser and reads as a bug.
+  function timedOut(budget) {
+    const late = new Error('timeout');
+    late.code = 'REQUEST_TIMEOUT';
+    late.detail = 'No reply from the API in ' + Math.round(budget / 1000) +
+      ' seconds, so this page stopped waiting and gave the controls back. The request ' +
+      'may still be running on the server -- reload the audit tail before assuming it ' +
+      'did not happen.';
+    return late;
+  }
+
   async function api(method, path, opts) {
     const o = opts || {};
     const init = { method, headers: {} };
     if (o.json) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(o.json); }
     if (o.form) { init.body = o.form; }
+    // AbortController, and the deadline covers reading the BODY as well as getting
+    // the headers: a proxy that sends a 200 and then stalls mid-stream hangs
+    // `res.json()` exactly as long as it would have hung `fetch`.
+    const budget = o.slow ? TIMEOUT.slow : TIMEOUT.fast;
+    const ctrl = new AbortController();
+    let expired = false;
+    const timer = setTimeout(() => { expired = true; ctrl.abort(); }, budget);
+    init.signal = ctrl.signal;
+    try {
+      return await send(path, init, budget, () => expired);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  //: The request itself. Split out only so the `clearTimeout` above can be a
+  //: `finally` over every exit -- the two throws below and the two returns.
+  async function send(path, init, budget, isExpired) {
     let res;
     try {
       res = await fetch(path, init);
     } catch (err) {
+      // An abort arrives here as the same rejection a dead connection does, so the
+      // deadline flag -- not the exception -- is what tells the two apart.
+      if (isExpired()) throw timedOut(budget);
       // `fetch` REJECTS -- connection refused, DNS, CORS, abort -- with a native
       // TypeError carrying neither `.code` nor `.detail`, and showError's
       // `JSON.stringify(e.detail || {})` turned that into the banner "ERROR {}", the
@@ -157,6 +339,7 @@
     try {
       body = ct.indexOf('json') >= 0 ? await res.json() : await res.text();
     } catch (err) {
+      if (isExpired()) throw timedOut(budget);
       // A body that declares JSON and does not parse -- a proxy's error page under
       // the wrong content-type, a truncated response -- threw a SyntaxError out of
       // here and landed in the same content-free banner.
@@ -186,6 +369,21 @@
   }
   const clearBanner = () => { $('banner').hidden = true; };
 
+  // The header badge is this page's standing answer to "is the API up", and it was
+  // written exactly once, by `health()` at load. After that it never moved: kill the
+  // server mid-demo and every action banners NETWORK_UNREACHABLE while the header
+  // still reads a green "ok · mock/claude-... · en_core_web_lg", describing a process
+  // that is gone. That is the same complaint `api`'s network branch was written to
+  // fix -- the two halves of the UI reporting one fact differently -- so the branch
+  // now moves the badge too. It is also the class fix: `health()`'s own catch set the
+  // text and left `class="badge muted"`, so the one badge that says the API is down
+  // was dim grey, indistinguishable from the "health: …" it starts as.
+  function markUnreachable() {
+    const el = $('health');
+    el.className = 'badge err';
+    el.textContent = 'health: unreachable';
+  }
+
   // The `detail` half of a banner. Two things it must not do. It must not print the
   // literal "{}" as the whole message: `JSON.stringify(undefined || {})` is exactly
   // what a native error produced, so "ERROR {}" was this UI's report for the API
@@ -208,38 +406,248 @@
     return e.detail ? '' : String(e.message || '');
   }
 
+  //: A byte count from an error detail as MB, one decimal. Used only on the two
+  //: ceilings whose detail always carries the number, and never called without
+  //: `typeof n === 'number'` first -- "undefined MB" in a banner would be a worse
+  //: message than the blob this table replaces.
+  const mb = (n) => Math.round((n / 1048576) * 10) / 10 + ' MB';
+
+  //: The parenthetical the two size refusals share: the ceiling that fired and the
+  //: size that hit it, whichever of the two the body actually carried. Empty when
+  //: it carried neither, so the sentence in front of it still ends in a full stop.
+  function sizePhrase(d) {
+    const parts = [];
+    if (typeof d.max_bytes === 'number') parts.push('the ceiling is ' + mb(d.max_bytes));
+    if (typeof d.bytes === 'number') parts.push('this one is ' + mb(d.bytes));
+    return parts.length ? ' (' + parts.join(', ') + ')' : '';
+  }
+
+  //: The ceiling behind each field a 422 can name, keyed by the dotted location
+  //: FastAPI reports in `detail.fields`. The API's VALIDATION_ERROR detail carries
+  //: the field names and an error count and NEVER the limit -- see
+  //: `api/errors.py::_validation_handler`, which reduces the body to
+  //: `{errors, fields}` precisely so no caller input is echoed -- so the number has
+  //: to live on this side. It is a mirror, and a mirror can drift: the numbers here
+  //: are `MAX_ID_LEN` (64), `MAX_PROMPT_CHARS` (8000) from `api/schemas.py` and
+  //: `MAX_AUDIT_PAGE` (1000) from `api/constants.py`, and
+  //: `tests/test_ui_behaviour.py` imports those three constants and asserts each
+  //: one appears in the banner this map produces -- the same arrangement
+  //: SCOPED_RULES has with entities.yaml, so a ceiling moved in Python fails there
+  //: rather than leaving this sentence quietly wrong.
+  const FIELD_LIMITS = {
+    'body.user_id': 'user_id must be 1 to 64 characters.',
+    'body.doc_id': 'doc_id must be 1 to 64 characters.',
+    'body.session_id': 'session_id must be at most 64 characters.',
+    'body.prompt': 'The prompt box must hold 1 to 8000 characters.',
+    'query.limit': 'The audit page size must be 1 to 1000 rows.',
+    'query.user_id': 'user_id must be 1 to 64 characters.',
+  };
+
+  //: `body.prompt` -> `prompt`. The dotted half is FastAPI's location, not a name
+  //: a reviewer can look for on the page.
+  const shortField = (f) => f.slice(f.lastIndexOf('.') + 1);
+
+  // ---------- the code-to-sentence table ----------
+  //
+  // Every code this API can emit, mapped to a sentence that names the control or
+  // the input and says what to do next. Before this table `showError` fell through
+  // to `detailText` for everything but the three below, so a rejected upload read
+  //
+  //   UNPROCESSABLE_DOCUMENT {"reason":"unsupported_document_type","suffix":".xyz",
+  //   "detected":"unknown"}
+  //
+  // -- accurate, machine-shaped, and silent about which of this page's controls to
+  // touch. Where the detail carries a number that IS the answer (a byte ceiling, a
+  // page count, a retry delay) the number is folded into the sentence and the map
+  // is then dropped: a sentence followed by the blob it paraphrases is still a blob.
+  //
+  // The keys were read off the API rather than invented -- the `ApiError` sites in
+  // `api/deps.py`, `api/routes/documents.py` and `api/routes/audit.py`, the two
+  // `_send_*` writers in `api/middleware.py`, the handlers in `api/errors.py`, and
+  // the `code` class attribute of every `PipelineError`/`LLMError` subclass.
+  // `INTERNAL_ERROR` is deliberately NOT here: nothing raises it. The 500 handler
+  // answers with the exception's own code, which for the base class is
+  // `PIPELINE_ERROR`, and a sentence for a code the API cannot emit is dead prose
+  // that reads like coverage.
+  //
+  // Each entry takes `(d, detail)`: `d` is the detail map, normalised to `{}` when
+  // the body carried a bare string, and `detail` is `detailText`'s rendering for
+  // the entries that still want it appended.
+  const SENTENCES = {
+    // Both of the gate's exits arrive under this one code, and they are not the
+    // same claim. A deliberate block (vault_original / detector_rescan /
+    // independent_pattern) is the control catching a leak -- the strongest thing
+    // this product says about itself. The fail-safe wrapper in EgressGate.check
+    // turns any internal exception into reason "gate_exception", hit_count 0: the
+    // control fell over and blocked by default, having caught nothing. The UI said
+    // the first sentence for both, with the distinguishing field visible only
+    // inside the JSON tail. The tail stays on this one code: `reason` and
+    // `hit_count` are the demo's evidence that the block happened.
+    EGRESS_BLOCKED: (d, detail) => (d.reason === 'gate_exception'
+      ? 'The egress gate FAILED INTERNALLY and blocked by default. Nothing was sent -- and ' +
+        'nothing was caught either: this is a gate error, not a caught leak. '
+      : 'FAIL-CLOSED: the egress gate refused to release the payload. ' +
+        'No provider call was made. ') + detail,
+
+    SESSION_EXPIRED: () =>
+      'Session key is gone — the vault cannot be read, so nothing can be obfuscated or restored. ' +
+      'Press "Create session" for a new one, then re-run.',
+
+    // Every route here is anonymous, so the meters are per source address:
+    // a shared address can spend a budget this browser never touched.
+    // The third meter is the one this page is most likely to trip: the chain walk
+    // behind Verify chain is priced in ROWS (audit.py: 5,000 rows per token, burst
+    // 24), and it is charged on success, so five clicks in a row on a large log
+    // spend the bucket. The sentence named the two meters that had not fired.
+    // The delay is the whole content of this detail, so it is stated rather than
+    // dumped: `{"retry_after_seconds":3}` and "wait 3 seconds" are the same fact.
+    RATE_LIMITED: (d) => 'Throttled — too many requests from this address. Durable writes, ' +
+      'failed audit-scope lookups, and the chain walk behind Verify chain (priced per row ' +
+      'of the log) are each metered per caller. ' +
+      (typeof d.retry_after_seconds === 'number'
+        ? 'Wait ' + d.retry_after_seconds + ' seconds and retry.'
+        : 'Wait and retry.'),
+
+    // ---- upload path: the file picker is the control in every one of these ----
+    UPLOAD_TOO_LARGE: (d) => 'That document is larger than this server accepts' + sizePhrase(d) +
+      '. Choose a smaller file with the file picker — fixtures/ has documents that fit.',
+
+    // Counted by the ASGI middleware before a handler runs, so it bounds the whole
+    // multipart body, not the file alone -- a file just under the upload ceiling
+    // can still trip it once the framing and the two form fields are added.
+    REQUEST_TOO_LARGE: (d) => 'The request was refused before it was read: it is larger than ' +
+      'this server accepts' + sizePhrase(d) + '. The ceiling counts the multipart framing ' +
+      'and the form fields as well as the file. Choose a smaller file with the file picker.',
+
+    EMPTY_UPLOAD: () => 'The file you chose has no bytes in it. Choose a document with text ' +
+      'in it with the file picker (fixtures/ has one of each supported type).',
+
+    UNPROCESSABLE_DOCUMENT: (d) => {
+      if (d.reason === 'unsupported_document_type') {
+        return 'This server cannot read that file type' +
+          (typeof d.suffix === 'string' && d.suffix ? ' (' + d.suffix + ')' : '') +
+          '. Choose a .txt, .md, .pdf or .docx with the file picker.';
+      }
+      // A scanned PDF with no text layer: every page parsed and every page was
+      // empty. The page count is the one number that tells a reviewer the file was
+      // read at all, so it is stated rather than left in the map.
+      if (d.reason === 'pdf_all_pages_failed') {
+        return 'The PDF was opened but all ' + (typeof d.pages === 'number' ? d.pages + ' ' : '') +
+          'pages came back empty — a scan with no text layer does this, and there is ' +
+          'nothing for the detector to run on. Choose a text-bearing document with the ' +
+          'file picker.';
+      }
+      // The zip-bomb guard in store/extraction.py. Both numbers are the answer to
+      // "by how much", so both are named.
+      if (d.reason === 'docx_expansion_limit') {
+        return 'That .docx declares more uncompressed content than this server will expand' +
+          (typeof d.uncompressed === 'number' && typeof d.limit === 'number'
+            ? ' (' + mb(d.uncompressed) + ' declared, limit ' + mb(d.limit) + ')' : '') +
+          '. Choose a smaller document with the file picker.';
+      }
+      return 'That document could not be parsed' +
+        (typeof d.reason === 'string' && d.reason ? ' (' + d.reason + ')' : '') +
+        ', so nothing was stored. Choose another file with the file picker.';
+    },
+
+    INVALID_DOC_CATEGORY: () => 'The doc_category sent with the upload is not one this build ' +
+      'knows. Choose medical, legal, financial or general in the Category dropdown and run ' +
+      'again — the category decides which rule sets run.',
+
+    // ---- request shape ----
+    VALIDATION_ERROR: (d) => {
+      const fields = String(d.fields || '').split(',').filter(Boolean);
+      const limits = [];
+      for (const f of fields) {
+        if (FIELD_LIMITS[f] && limits.indexOf(FIELD_LIMITS[f]) < 0) limits.push(FIELD_LIMITS[f]);
+      }
+      return 'The API rejected ' +
+        (fields.length ? fields.map(shortField).join(', ') : 'a field in this request') +
+        '. ' + (limits.length ? limits.join(' ') + ' ' : '') +
+        'Correct that input and try again.';
+    },
+
+    // Starlette's own HTTPException, re-rendered by `api/errors.py`. On this page
+    // the reachable source is python-multipart refusing a malformed or over-long
+    // multipart header, which is the upload again.
+    BAD_REQUEST: () => 'The server could not parse the request — a malformed or over-long ' +
+      'multipart upload is the reachable cause here. Re-choose the file with the file picker ' +
+      'and run again.',
+
+    // StoreAuthError and a genuinely absent document answer identically on purpose
+    // (build doc section 8), so the sentence has to cover both without guessing.
+    NOT_FOUND: () => 'No such document for this user. "Not yours" and "does not exist" answer ' +
+      'identically by design, so check the User ID field still matches the session owner, ' +
+      'then re-choose the file to upload it again.',
+
+    AUDIT_SCOPE_REQUIRED: () => 'The audit log can only be read for a session or a run, and ' +
+      'this page scopes it to the live session. Press "Create session" first.',
+
+    // ---- restore path ----
+    VAULT_MISS: () => 'A placeholder in the answer has no vault entry to restore it from, so ' +
+      'the response cannot be de-obfuscated. The session was destroyed or expired between the ' +
+      'send and the restore. Press "Create session" and run again.',
+
+    CRYPTO_AUTH_FAILED: () => 'A stored blob failed its AES-GCM authentication tag and was ' +
+      'refused rather than trusted — that is the tamper check firing, not a decode glitch. ' +
+      'Press "Create session" and upload the document again; if it repeats, the store was ' +
+      'written under a different master key.',
+
+    // ---- server-side ----
+    NOT_READY: () => 'The API is still starting up — the detector and its gazetteers load once ' +
+      'at boot. Wait a few seconds and press the button again.',
+
+    CONFIG_ERROR: (d) => 'The server is misconfigured' +
+      (typeof d.reason === 'string' && d.reason ? ' (' + d.reason + ')' : '') +
+      ' and no control on this page can fix it. Correct the API environment and restart it.',
+
+    DETECTION_ERROR: () => 'Detection failed on this document, so the run stopped before any ' +
+      'payload was built — nothing reached the provider. Try another document with the file ' +
+      'picker; if every document fails, the server log has the reason.',
+
+    DETECTION_INVARIANT: () => 'The detector broke one of its own invariants (overlapping or ' +
+      'out-of-range spans) and refused to continue rather than obfuscate from a span map it ' +
+      'does not trust. Nothing reached the provider. Try another document with the file picker.',
+
+    PIPELINE_ERROR: (d) => 'The pipeline stopped on an internal error' +
+      (typeof d.reason === 'string' && d.reason ? ' (' + d.reason + ')' : '') +
+      '. Run again; if it repeats, the server log carries the traceback.',
+
+    // ---- provider ----
+    LLM_ERROR: () => 'The model provider failed. Only the obfuscated payload was ever sent, so ' +
+      'nothing original is exposed by this failure. Run again.',
+
+    LLM_REFUSAL: (d) => 'The provider declined the obfuscated prompt' +
+      (typeof d.category === 'string' && d.category ? ' (policy category ' + d.category + ')' : '') +
+      '. Nothing original left this machine. Reword the prompt and run again.',
+
+    LLM_TRANSPORT_ERROR: (d) => 'The provider call failed' +
+      (typeof d.attempts === 'number' ? ' after ' + d.attempts + ' attempts' : '') +
+      (typeof d.reason === 'string' && d.reason ? ' (' + d.reason + ')' : '') +
+      '. The pipeline is healthy and the upstream is not: check the API key and network, ' +
+      'or set the provider to mock, then run again.',
+
+    LLM_RESPONSE_ERROR: (d) => 'The provider answered but the body carried no usable text' +
+      (typeof d.reason === 'string' && d.reason ? ' (' + d.reason + ')' : '') +
+      '. Run again; if it repeats, set the provider to mock to keep the demo moving.',
+  };
+
   function showError(e) {
     const detail = detailText(e);
-    let msg = detail;
-    if (e.code === 'EGRESS_BLOCKED') {
-      // Both of the gate's exits arrive under this one code, and they are not the
-      // same claim. A deliberate block (vault_original / detector_rescan /
-      // independent_pattern) is the control catching a leak -- the strongest thing
-      // this product says about itself. The fail-safe wrapper in EgressGate.check
-      // turns any internal exception into reason "gate_exception", hit_count 0: the
-      // control fell over and blocked by default, having caught nothing. The UI said
-      // the first sentence for both, with the distinguishing field visible only
-      // inside the JSON tail.
-      msg = ((e.detail && e.detail.reason) === 'gate_exception'
-        ? 'The egress gate FAILED INTERNALLY and blocked by default. Nothing was sent -- and ' +
-          'nothing was caught either: this is a gate error, not a caught leak. '
-        : 'FAIL-CLOSED: the egress gate refused to release the payload. ' +
-          'No provider call was made. ') + detail;
-    } else if (e.code === 'SESSION_EXPIRED') {
-      msg = 'Session key is gone — the vault cannot be read, so nothing can be obfuscated or restored. ' +
-        'Create a new session to continue. ' + detail;
-    } else if (e.code === 'RATE_LIMITED') {
-      // Every route here is anonymous, so the meters are per source address:
-      // a shared address can spend a budget this browser never touched.
-      // The third meter is the one this page is most likely to trip: the chain walk
-      // behind Verify chain is priced in ROWS (audit.py: 5,000 rows per token, burst
-      // 24), and it is charged on success, so five clicks in a row on a large log
-      // spend the bucket. The sentence named the two meters that had not fired.
-      msg = 'Throttled — too many requests from this address. Durable writes, failed ' +
-        'audit-scope lookups, and the chain walk behind Verify chain (priced per row of ' +
-        'the log) are each metered per caller. Wait and retry. ' + detail;
-    }
-    banner('err', e.code || 'ERROR', msg.trim());
+    // A string detail is the shape THIS file throws (NO_FILE, NETWORK_UNREACHABLE);
+    // the API's is always a map. Normalising means every entry above can read a
+    // field without guarding the container, and a string one still renders through
+    // `detail`.
+    const d = (e.detail && typeof e.detail === 'object') ? e.detail : {};
+    const explain = SENTENCES[e.code];
+    // Unknown code -> exactly the rendering that was here before, `detailText` and
+    // nothing else. A code this table has never heard of must still reach the
+    // screen carrying everything the body had: swallowing it -- or answering with a
+    // generic "something went wrong" -- would make the newest failure in the API
+    // the quietest one on the page.
+    const msg = explain ? explain(d, detail) : detail;
+    banner('err', e.code || 'ERROR', String(msg).trim());
+    if (e.code === 'NETWORK_UNREACHABLE') markUnreachable();
   }
 
   // Panel 1: splice detections into the raw text, highest offset first, so the
@@ -263,6 +671,29 @@
     return esc(text.slice(0, cursor)) + html;
   }
 
+  // ---------- what a mark in panel 2 or 3 says when you hover it ----------
+  //
+  // Nothing, before these. Panel 1's marks have carried entity type, action, score
+  // and the surrogate since the first build, and the two panels that show the
+  // SUBSTITUTE carried no `title` at all -- so the only thing telling the three kinds
+  // of highlight apart was a colour, and the legend beside it names a CATEGORY, not a
+  // kind. Under pseudonymization that is the dangerous direction and panel 3 is where
+  // it bites: measured on fixtures/medical_note.txt, "Jamie Cain, MD" is painted PHI
+  // green in the provider's-eye view with nothing on the page saying it is a fake
+  // this run minted rather than a clinician named in the document. A reviewer's only
+  // recourse was diffing panel 3 against panel 1 by eye, which is the manual check
+  // the highlighting exists to replace.
+  //
+  // None of the three names an original value: the whole point is that panels 2 and 3
+  // do not hold one. The pseudonym tip names the entity TYPE, which the payload's
+  // own bracketed tokens print in clear anyway.
+  const TOK_TIP = 'A surrogate token. The original it stands for is in the vault for this ' +
+    'session and is not anywhere in this payload; panel 4 puts it back.';
+  const RED_TIP = 'A redaction marker. The value was removed rather than tokenised -- ' +
+    'irreversible by design, so it does not come back in panel 4.';
+  const psTip = (t) => 'A PSEUDONYM this run minted for a ' + (t || 'detected value') +
+    '. It reads like a real value and is not one: the original never left the vault.';
+
   // Panels 2 and 3: highlight surrogates (coloured per category) and [REDACTED_*]
   // markers. `from` is where the scan starts; everything before it is plain text.
   //
@@ -280,8 +711,8 @@
   // `detections`, and it is where the second false mark came from.
   function renderMarks(text, dets, from) {
     const start = from > 0 ? from : 0;
-    const cat = new Map();
-    (dets || []).forEach((d) => { if (d.surrogate) cat.set(d.surrogate, d.category); });
+    const meta = new Map();
+    (dets || []).forEach((d) => { if (d.surrogate) meta.set(d.surrogate, d); });
     const alt = surAlt(dets);
     const re = new RegExp(MARKS_SRC + (alt ? '|' + alt : ''), 'g');
     let out = esc(text.slice(0, start));
@@ -289,9 +720,17 @@
     let m;
     re.lastIndex = start;
     while ((m = re.exec(text)) !== null) {
-      const c = m[1] || (m[0].slice(0, 10) === '[REDACTED_' ? 'RED' : (cat.get(m[0]) || 'PII'));
+      const hit = meta.get(m[0]);
+      const guess = (hit && hit.category) || 'PII';
+      const c = m[1] || (m[0].slice(0, 10) === '[REDACTED_' ? 'RED' : guess);
+      // `m[1]` is MARKS_SRC's category capture, so it is set only when the bracketed
+      // surrogate-token limb matched -- which is exactly the three-way split the
+      // tooltip needs, and it is read off the emitted SHAPE rather than off the
+      // strategy that was asked for.
+      const tipText = m[1] ? TOK_TIP : (c === 'RED' ? RED_TIP : psTip(hit && hit.entity_type));
       out += esc(text.slice(last, m.index));
-      out += '<mark class="tok c-' + esc(c) + '">' + esc(m[0]) + '</mark>';
+      out += '<mark class="tok c-' + esc(c) + '" title="' + esc(tipText) +
+        '">' + esc(m[0]) + '</mark>';
       last = m.index + m[0].length;
     }
     return out + esc(text.slice(last));
@@ -358,13 +797,37 @@
     return out + esc(restored.slice(pos));
   }
 
+  // Grouping is decided by the key's own suffix rather than by `STAT_META`, so a
+  // timing the API adds later reads as a timing even before anyone writes it a
+  // meaning. It is the same test the formatter already made.
+  const isTiming = (k) => /_ms$/.test(k);
+
   function renderStats(stats) {
-    const keys = STAT_ORDER.filter((k) => k in stats)
-      .concat(Object.keys(stats).filter((k) => STAT_ORDER.indexOf(k) < 0));
+    const keys = Object.keys(STAT_META).filter((k) => k in stats)
+      .concat(Object.keys(stats).filter((k) => !(k in STAT_META)));
     $('stats').innerHTML = keys.map((k) => {
+      const meta = STAT_META[k];
       const v = Number(stats[k]);
-      const shown = /_ms$/.test(k) ? v.toFixed(1) + ' ms' : String(Math.round(v));
-      return '<span class="stat"><i>' + esc(k) + '</i>' + esc(shown) + '</span>';
+      const shown = isTiming(k) ? v.toFixed(1) + ' ms' : String(Math.round(v));
+      // Timings recede, safety counts stay at full brightness, and the three whose
+      // clean reading is 0 carry the verdict colour of the number they are showing.
+      // `stat badge ok`/`err` reuse the badge rules `style.css` already ships. The
+      // cascade was checked rather than hoped for: `.stat` is declared AFTER `.badge`
+      // and both set `border-radius` and `padding` at the same specificity, so the
+      // chip keeps its own 4px shape; what the badge contributes is `border-color` and
+      // `color` from `.badge.ok`/`.badge.err`, which are (0,2,0) and win, plus a
+      // harmless `white-space: nowrap`. See the block above `STAT_META`.
+      let cls = 'stat';
+      if (isTiming(k)) cls = 'stat muted';
+      else if (meta && meta.zero) cls = Math.round(v) === 0 ? 'stat badge ok' : 'stat badge err';
+      // Named `tip` and not `title`: `renderOriginal` already has a `title` holding
+      // `d.entity_type` and `d.action`, and the escaping audit in
+      // tests/test_api_ui_escaping.py resolves an identifier's safety across the whole
+      // file rather than per scope -- so reusing the name would import that one's raw
+      // terms into this expression and the audit would (correctly) refuse it.
+      const tip = meta ? ' title="' + esc(meta.why) + '"' : '';
+      return '<span class="' + cls + '"' + tip + '><i>' + esc(k) + '</i>' + esc(shown) +
+        '</span>';
     }).join('');
   }
 
@@ -434,7 +897,10 @@
     $('p2').innerHTML = esc(IDLE);
     $('p3').innerHTML = esc(IDLE);
     $('p4').innerHTML = esc(IDLE);
-    ['c1', 'c2', 'c3', 'c4'].forEach((id) => { $(id).textContent = ''; });
+    // The title goes with the count. `c1` carries the reconciliation between the two
+    // span numbers on the page (`C1_TITLE`), and a tooltip explaining "54 detected,
+    // 52 masked" hanging off an empty counter is the previous run still talking.
+    ['c1', 'c2', 'c3', 'c4'].forEach((id) => { $(id).textContent = ''; $(id).title = ''; });
     $('stats').innerHTML = '';
     $('audit-run').textContent = '';
     // The scope note describes ONE run's category. Left up, it would sit under the
@@ -470,9 +936,30 @@
       // SESSION_CREATE and checks it on every audit read and on destroy. Re-reading
       // the field later reads whatever the field says now -- see `destroySession`.
       const owner = userId();
+      // The session this click replaces, captured with ITS owner and not the field's
+      // current contents -- same rule as `destroySession`, and for the same reason.
+      const outgoing = S.sessionId;
+      const outgoingOwner = sessionOwner();
       const r = await api('POST', '/sessions', { json: { user_id: owner } });
       S.sessionId = r.session_id;
       S.userId = owner;
+      // Pressing Create session with one already live used to abandon it in silence:
+      // no DELETE was issued, so the previous session key and its vault rows -- the
+      // rows that map a token back to an original value -- stayed in the server's
+      // process memory until the TTL reaped them, and the page had just thrown the id
+      // away (`lastSessionId` is nulled below), so no control on it could ever erase
+      // them. Verified in the harness: the second click issued POST /sessions and one
+      // audit GET, and nothing else. On a page whose largest red button demonstrates
+      // irreversible erasure, the small blue one above it quietly did the opposite.
+      //
+      // Ordered mint-then-destroy so a failed mint leaves the reviewer the session
+      // they already had. The outcome is PROVED, not assumed: DELETE /sessions
+      // answers 204 for a session it did not touch, so this makes the same
+      // VAULT_DESTROY existed=1 read `destroySession` makes, and the banner below
+      // says which of the two answers it got.
+      const replaced = outgoing
+        ? await replaceSession(outgoing, outgoingOwner)
+        : { warn: false, text: '' };
       // The previous session's run is not this session's. Without the reset a fresh
       // session badge sat above the dead session's four panels, stats row, audit rows
       // and `run_id` label, and a reviewer reading the audit table under that badge
@@ -488,7 +975,8 @@
       const when = new Date(r.expires_at * 1000).toLocaleTimeString();
       $('session-badge').className = 'badge ok';
       $('session-badge').textContent = 'session ' + r.session_id.slice(0, 12) + '… · expires ' + when;
-      banner('ok', 'SESSION_CREATED', 'Session key lives in process memory only.');
+      banner(replaced.warn ? 'warn' : 'ok', 'SESSION_CREATED',
+        'Session key lives in process memory only.' + replaced.text);
       // Shows the new session's own SESSION_CREATE row, which is both the honest
       // replacement for the rows just cleared and the first evidence of this session.
       await loadAudit();
@@ -522,6 +1010,38 @@
       return null;
     }
     return (r.events || []).some((e) => e.detail && Number(e.detail.existed) === 1);
+  }
+
+  // Erase the session a new one is replacing, and say -- in the words the banner
+  // will print -- which of the three things happened. `{ warn }` picks the banner's
+  // colour, because two of the three are the reviewer's problem and one is not.
+  //
+  // Best-effort by construction: the new session already exists by the time this
+  // runs, so a failure here must not throw the whole click away. It reports instead.
+  async function replaceSession(sessionId, owner) {
+    const shown = sessionId.slice(0, 12) + '…';
+    let code = null;
+    try {
+      await api('DELETE', '/sessions/' + encodeURIComponent(sessionId) +
+        '?user_id=' + encodeURIComponent(owner));
+    } catch (e) {
+      code = e.code || 'ERROR';
+    }
+    if (code) {
+      return { warn: true, text: ' The session it replaces (' + shown + ') could not be ' +
+        'deleted (' + code + '), so its key and its vault rows are STILL LIVE in the ' +
+        'server until the TTL reaps them.' };
+    }
+    const confirmed = await destroyConfirmed(sessionId, owner);
+    if (confirmed === true) {
+      return { warn: false, text: ' The session it replaces (' + shown + ') was destroyed ' +
+        'first — the audit log records that erasure as existed=1, so its key and vault ' +
+        'rows did not outlive it.' };
+    }
+    return { warn: true, text: ' The session it replaces (' + shown + ') was sent a delete, ' +
+      'but the audit read that would prove the erasure ' +
+      (confirmed === false ? 'says existed=0' : 'could not be completed') +
+      ', and a 204 proves nothing here. Treat that session as STILL LIVE.' };
   }
 
   async function destroySession() {
@@ -629,7 +1149,9 @@
     form.append('file', f, f.name);
     form.append('user_id', uid);
     form.append('doc_category', cat);
-    const r = await api('POST', '/documents', { form });
+    // `slow`: the PDF parse and the .docx expansion happen inside this request, so it
+    // is not a transport-latency call and must not be held to the short budget.
+    const r = await api('POST', '/documents', { form, slow: true });
     S.docId = r.doc_id;
     S.uploadKey = key;
     return r.doc_id;
@@ -676,6 +1198,8 @@
       $('c1').textContent = doc.chars + ' chars · not yet scanned';
 
       const result = await api('POST', '/pipeline/run', {
+        // `slow`: the provider call alone is allowed 3 x 60 s plus backoff.
+        slow: true,
         json: {
           session_id: sid,
           user_id: uid,
@@ -690,7 +1214,11 @@
       // green RUN_OK banner and beside a confident summary of a document that
       // contained nothing.
       $('p1').innerHTML = doc.chars ? renderOriginal(doc.text, result.detections) : esc(NO_TEXT);
-      $('c1').textContent = doc.chars + ' chars · ' + (result.detections || []).length + ' spans';
+      // "spans" alone did not say WHICH spans, and it is the number a reviewer
+      // compares against `entities_detected` in the strip above. See `C1_TITLE`.
+      $('c1').textContent = doc.chars + ' chars · ' + (result.detections || []).length +
+        C1_MASKED;
+      $('c1').title = C1_TITLE;
       const fence = result.obfuscated_payload.indexOf(DOC_OPEN);
       $('p2').innerHTML = renderMarks(result.obfuscated_payload, result.detections, fence);
       $('c2').textContent = result.obfuscated_payload.length + ' chars';
@@ -712,16 +1240,29 @@
       await loadAudit(result.run_id);
     } catch (e) {
       showError(e);
-      if (e.code === 'EGRESS_BLOCKED' || e.code === 'SESSION_EXPIRED') {
-        // The 422 body names the run that was refused. Without it the tail was
-        // reloaded session-wide, which on a session that had already run put the
-        // EGRESS_BLOCK row at position 79 of 84 inside a 260px scrolling box -- and
-        // `audit-run` still read the PREVIOUS run's id, because only the success path
-        // ever wrote it.
-        const refused = (e.detail && e.detail.run_id) || null;
-        if (refused) $('audit-run').textContent = 'run_id ' + refused + ' · refused';
-        await loadAudit(refused);
-      }
+      // The 422 body names the run that was refused. Without it the tail was
+      // reloaded session-wide, which on a session that had already run put the
+      // EGRESS_BLOCK row at position 79 of 84 inside a 260px scrolling box -- and
+      // `audit-run` still read the PREVIOUS run's id, because only the success path
+      // ever wrote it.
+      const refused = (e.detail && e.detail.run_id) || null;
+      if (refused) $('audit-run').textContent = 'run_id ' + refused + ' · refused';
+      // For every refusal that reached the server, and it used to be only for
+      // EGRESS_BLOCKED and SESSION_EXPIRED. `resetRun` above blanks the four panels,
+      // the stats row and the #audit-run LABEL, and it deliberately does not touch
+      // the table -- so every other server-side refusal (NOT_FOUND, RATE_LIMITED,
+      // LLM_TRANSPORT_ERROR, CRYPTO_AUTH_FAILED, NETWORK_UNREACHABLE, a timeout) left
+      // the PREVIOUS run's audit rows sitting under an emptied label, beside panel 1's
+      // new document: exactly the cross-run mixture the rest of the reset exists to
+      // prevent, on the rows a reviewer reads as the evidence. A reload that itself
+      // fails is honest too -- `loadAudit`'s catch says the lookup failed rather than
+      // rendering an empty log.
+      //
+      // Not for the two `ensureDoc` raises before it sends anything. NO_FILE and
+      // NO_CATEGORY are refusals of the CLICK, not of a run: nothing was uploaded, no
+      // run id exists, and the tail cannot have changed -- so an audit read here would
+      // be the only request issued by a path whose whole point is that it issues none.
+      if (e.code !== 'NO_FILE' && e.code !== 'NO_CATEGORY') await loadAudit(refused);
     } finally { setBusy(false); }
   }
 
@@ -772,6 +1313,16 @@
   }
 
   async function verifyChain() {
+    // Its own in-flight flag rather than `setBusy`: the chain walk is a read, it is
+    // legitimately usable while nothing else is happening, and it is the one button
+    // `setBusy` deliberately leaves alive. What it must not be is startable twice.
+    // The walk is priced in ROWS (audit.py: 5,000 per token, burst 24) and charged on
+    // success, so on a log of any size an impatient double-click spends the bucket
+    // and the second answer is the 429 the RATE_LIMITED sentence describes -- a
+    // throttle the page inflicted on itself, reported as if the server had.
+    if (S.verifying) return;
+    S.verifying = true;
+    $('btn-verify').disabled = true;
     try {
       const r = await api('GET', '/audit/verify');
       const el = $('verify-badge');
@@ -791,6 +1342,9 @@
       el.className = 'badge muted';
       el.textContent = e.code === 'RATE_LIMITED' ? 'chain: throttled' : 'chain: not verified';
       showError(e);
+    } finally {
+      S.verifying = false;
+      $('btn-verify').disabled = false;
     }
   }
 
@@ -800,7 +1354,7 @@
       const el = $('health');
       el.className = 'badge ' + (h.status === 'ok' ? 'ok' : 'err');
       el.textContent = h.status + ' · ' + h.llm_provider + '/' + h.llm_model + ' · ' + h.spacy_model;
-    } catch (e) { $('health').textContent = 'health: unreachable'; }
+    } catch (e) { markUnreachable(); }
   }
 
   // ---------- the fixture preset ----------

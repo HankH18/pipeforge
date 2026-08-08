@@ -465,6 +465,34 @@ def test_build_key_provider_selects_by_config() -> None:
     assert keys.build_key_provider(_settings(key_provider="mock_kms")).name == "mock_kms"
 
 
+def test_every_registered_key_provider_is_reachable_from_a_validated_settings() -> None:
+    """Both halves of "adding a real KMS = one class + one entry", from the outside.
+
+    That sentence is ``build_key_provider``'s docstring and it was false while
+    ``Settings.key_provider`` was ``Literal["env", "mock_kms"]``: a third provider
+    could be written, registered in :data:`keys._PROVIDERS`, and still be
+    unselectable, because pydantic refused the name before this function saw it.
+    The field is a ``str`` now, so the registry is the list that decides -- and
+    "the two lists agree" stopped being enforced by the type and has to be
+    enforced here.
+
+    Both directions are asserted because each fails a different way. A registered
+    name that no longer resolves is a provider that exists and cannot be turned
+    on. An *un*registered name that no longer raises is the serious one: widening
+    the field moved the fail-closed check into this function, and
+    ``grep -rn unknown_key_provider tests/`` matched nothing before this test, so
+    the branch every unknown provider name now depends on was itself untested.
+    """
+    for name in keys._PROVIDERS:
+        provider = keys.build_key_provider(_settings(key_provider=name))
+        assert provider.name == name, f"{name} is registered but resolves to {provider.name}"
+
+    with pytest.raises(ConfigError) as excinfo:
+        keys.build_key_provider(_settings(key_provider="aws_kms"))
+    assert excinfo.value.detail["reason"] == "unknown_key_provider"
+    assert excinfo.value.detail["value"] == "aws_kms"
+
+
 def test_key_material_never_appears_in_repr() -> None:
     settings = _settings()
     for obj in (settings, keys.EnvKeyProvider(settings), keys.MockKMSKeyProvider(settings)):
@@ -649,16 +677,29 @@ def test_session_key_hmac_domains_are_disjoint() -> None:
 
     Separation rests on one framing byte. Every token-ID message contains a NUL
     (the ``type || 0x00 || value`` separator); neither of the other two messages
-    can contain one, because ``entity_type`` is validated NUL-free -- see
+    can contain one, because the label is validated NUL-free -- see
     ``test_derivations_reject_an_unframeable_entity_type``, which is what makes
     the right-hand column below true. The two NUL-free spaces are then kept apart
     by their fixed prefixes.
+
+    **The Faker formula is pinned twice, and the second one is the load-bearing
+    case.** ``b"faker:" + b"NAME"`` was the only message asserted here, and no
+    production caller emits it: since Deviation 45,
+    ``PseudonymizationStrategy._seed`` passes a composite label built from the
+    *document's own text* -- ``f"{entity_type}:{normalize(text)}"``, plus
+    ``f":{attempt}"`` on a collision retry -- so the message space the disjointness
+    argument has to cover is far wider than the one it was tested over. The
+    composite case is added rather than swapped in: the bare type is still a legal
+    label and the build doc writes the formula that way, so both are pinned.
     """
     sk = keys.new_session_key()
 
     # Messages recomputed independently from section 8, not read from the module.
     date_message = b"date-shift"
     faker_message = b"faker:" + b"NAME"
+    # What `PseudonymizationStrategy._seed` actually passes: type, colon, the
+    # normalized document value. Document text, straight into an HMAC message.
+    production_faker_message = b"faker:" + b"NAME:john smith"
     token_message = b"NAME" + b"\x00" + b"john smith"
 
     # 1. Each derivation really uses the message the build doc specifies.
@@ -670,17 +711,26 @@ def test_session_key_hmac_domains_are_disjoint() -> None:
     assert keys.derive_faker_seed(sk, "NAME") == int.from_bytes(
         hmac.new(sk, faker_message, hashlib.sha256).digest()[:8], "big"
     )
+    assert keys.derive_faker_seed(sk, "NAME:john smith") == int.from_bytes(
+        hmac.new(sk, production_faker_message, hashlib.sha256).digest()[:8], "big"
+    )
     assert (
         keys.derive_token_id(sk, "NAME", "John Smith")
         == hmac.new(sk, token_message, hashlib.sha256).hexdigest()[:8]
     )
 
-    # 2. The invariant that makes those three spaces disjoint.
+    # 2. The invariant that makes those three spaces disjoint. The composite label
+    #    is included because that is the one carrying attacker-influenced bytes:
+    #    `normalize` strips NUL (and every other C0 control) from document text, so
+    #    a planted NUL cannot buy a message that looks like a token-ID message.
     assert b"\x00" in token_message
     assert b"\x00" not in date_message
     assert b"\x00" not in faker_message
-    assert not faker_message.startswith(date_message)
-    assert not date_message.startswith(faker_message)
+    assert b"\x00" not in production_faker_message
+    assert b"faker:" + keys.normalize("Jo\x00hn Smith").encode() == b"faker:john smith"
+    for message in (faker_message, production_faker_message):
+        assert not message.startswith(date_message)
+        assert not date_message.startswith(message)
 
 
 @pytest.mark.parametrize("entity_type", ["date-shift", "faker", "FAKER", "NAME"])

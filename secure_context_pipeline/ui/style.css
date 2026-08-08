@@ -82,8 +82,16 @@ mark.tok { font-weight: bold; }
    so it fell back to bare `mark` (no background) and read as ordinary bold text. A
    failure has to look like one -- error colour and a wavy underline, deliberately
    unlike both .rest (teal, success) and .c-RED (solid, a policy redaction that WORKED). */
-.unres, i.unres { color: var(--err); background: #3a1418;
+.unres { color: var(--err); background: #3a1418;
   text-decoration: underline wavy var(--err); }
+/* The legend swatch is an empty 10x10 <i>: no text, so no underline, so the wavy
+   line the rule above calls the distinguisher cannot render there. That left the
+   "not restored (vault miss)" key painted #3a1418 next to the "[REDACTED_*]" key's
+   #4a1512 -- 1.09:1 against each other, i.e. two dark red squares a reader cannot
+   tell apart, and the two mean opposite things: one is a policy redaction that
+   WORKED, the other is the single value the run failed to give back. The hatch is
+   the wavy line's job done with the only channel an empty box has. */
+i.unres { background: repeating-linear-gradient(135deg, #3a1418 0 3px, var(--err) 3px 4px); }
 
 .audit { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
 .audit h2 { display: flex; align-items: center; gap: 10px; }

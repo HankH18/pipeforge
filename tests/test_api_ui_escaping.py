@@ -115,6 +115,68 @@ def _split(blank: str, seps: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _matching_paren(blank: str, open_idx: int) -> int:
+    """Index of the ``)`` closing the ``(`` at ``open_idx``, or end of source.
+
+    Must run on the blanked text: a ``")"`` inside a string literal would otherwise
+    close the argument list early and truncate the argument being checked.
+    """
+    depth = 0
+    for idx in range(open_idx, len(blank)):
+        if blank[idx] in "([{":
+            depth += 1
+        elif blank[idx] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return len(blank)
+
+
+def _interpolations(term: str) -> list[str] | None:
+    """The ``${...}`` expressions inside a backtick literal, or ``None`` if not one.
+
+    A template literal is a *concatenation written without a ``+``*, and the checker
+    used to be blind to exactly that: ``_LITERAL`` matched any backtick string whole,
+    so ``` `<pre>${result.raw_llm_response}</pre>` ``` assigned to ``.innerHTML``
+    read as a plain string literal and the audit returned no problems. Measured
+    against the real ``app.js`` before this existed -- substituting that expression
+    for the ``$('p3').innerHTML`` line left ``audit_escaping`` reporting ``[]``,
+    while the same injection written as ``'<pre>' + result.raw_llm_response`` was
+    caught. The escape hatch was the syntax, not the sink.
+
+    ``app.js`` uses no interpolated template literal today (152 backticks, zero
+    ``${``), so this is a *latent* hole rather than a live one -- which is the reason
+    it is worth closing here rather than in the file: the checker is what a future
+    edit has to get past, and this is the shape that would have walked through.
+
+    Brace-matched rather than regex-matched, because ``${obj.fn({a: 1})}`` nests and
+    a non-greedy ``\\$\\{(.*?)\\}`` would stop at the inner brace and hand back a
+    fragment that parses as safe. Returns ``[]`` for a backtick literal with no
+    interpolation, which is genuinely a constant and stays safe.
+    """
+    if len(term) < 2 or not term.startswith("`") or not term.endswith("`"):
+        return None
+    found: list[str] = []
+    i, n = 1, len(term) - 1
+    while i < n:
+        if term[i] == "\\":
+            i += 2
+            continue
+        if term.startswith("${", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if term[j] in "{([":
+                    depth += 1
+                elif term[j] in "})]":
+                    depth -= 1
+                j += 1
+            found.append(term[i + 2 : j - 1])
+            i = j
+            continue
+        i += 1
+    return found
+
+
 def _terms(expr: str, blank: str) -> list[str]:
     """The pieces of ``expr`` that are concatenated into the result.
 
@@ -178,17 +240,30 @@ def audit_escaping(source: str) -> tuple[list[str], list[str]]:
     Three families of expression become markup in this UI, and all three are
     checked:
 
-    1. every assignment to ``.innerHTML`` -- the only DOM sink the file uses;
+    1. every write to a DOM markup sink: assignment to ``.innerHTML`` or
+       ``.outerHTML``, the second argument of ``.insertAdjacentHTML(...)``, and
+       every argument of ``document.write``/``writeln``;
     2. every ``+`` chain that concatenates an HTML *tag* literal, wherever it
        appears (this is what covers the insides of the ``render*`` helpers);
     3. every ``return`` out of a function that builds markup, which catches a
        raw value returned in a chain that happens to carry no tag of its own.
 
-    A term is accepted only if it is a string literal, an ``esc(...)`` call, a
-    call to one of this file's own markup builders, a ``map``/``join`` chain, or
-    an identifier every assignment to which is itself accepted -- computed as a
-    fix-point, which is what admits the ``out``/``html``/``cls`` accumulators
-    without admitting ``doc.text``.
+    Rule 1 used to read "every assignment to ``.innerHTML`` -- **the only DOM sink
+    the file uses**", and that parenthesis was doing load-bearing work while nothing
+    checked it. ``innerHTML`` is indeed the only sink ``app.js`` uses today, but the
+    checker exists to constrain what the file may become, and the three sinks now
+    listed alongside it were each one keystroke away and each audited clean:
+    ``$('p3').outerHTML = result.raw_llm_response`` returned no problems. The claim
+    is now *also* asserted rather than only stated --
+    :func:`test_innerHTML_is_the_only_dom_sink_the_shipped_file_uses` fails if
+    ``app.js`` grows one of the others, so the two statements cannot drift apart.
+
+    A term is accepted only if it is a string literal, a template literal whose every
+    ``${...}`` interpolation is itself accepted (:func:`_interpolations`), an
+    ``esc(...)`` call, a call to one of this file's own markup builders, a
+    ``map``/``join`` chain, or an identifier every assignment to which is itself
+    accepted -- computed as a fix-point, which is what admits the ``out``/``html``/
+    ``cls`` accumulators without admitting ``doc.text``.
     """
     blank = _blank(source)
     # An HTML *tag* literal. The lone `'<'` key in the escape table is not one,
@@ -215,6 +290,16 @@ def audit_escaping(source: str) -> tuple[list[str], list[str]]:
             markup_funcs.add(arrow.group(1))
 
     def is_safe(term: str, idents: frozenset[str]) -> bool:
+        # Template literals FIRST: `_LITERAL` matches a backtick string whole, so
+        # asking it before this would call `<pre>${raw}</pre>` a constant. A template
+        # literal is safe exactly when every one of its interpolations is.
+        interpolated = _interpolations(term)
+        if interpolated is not None:
+            return all(
+                is_safe(t, idents)
+                for expr in interpolated
+                for t in _terms(expr, _blank(expr))
+            )
         if not term or _LITERAL.match(term) or term in idents:
             return True
         call = _CALL.match(term)
@@ -263,8 +348,30 @@ def audit_escaping(source: str) -> tuple[list[str], list[str]]:
             if not is_safe(term, idents):
                 problems.append(f"{kind}:{line} raw term `{' '.join(term.split())[:60]}`")
 
-    for m in re.finditer(r"\.innerHTML\s*=(?!=)", blank):
-        check(m.end(), _stmt_end(blank, m.end()), "innerHTML")
+    # Assignment sinks. `outerHTML` parses its right-hand side as markup exactly as
+    # `innerHTML` does -- it replaces the element instead of its children, which is a
+    # difference in what is destroyed, not in what is executed. Modelling only
+    # `innerHTML` meant one keystroke moved a raw value out of the checker's sight:
+    # `$('p3').outerHTML = result.raw_llm_response` audited clean.
+    for m in re.finditer(r"\.(innerHTML|outerHTML)\s*=(?!=)", blank):
+        check(m.end(), _stmt_end(blank, m.end()), m.group(1))
+
+    # Call sinks, where the markup is an ARGUMENT rather than a right-hand side, so
+    # the assignment scan above cannot see them at all.
+    #   el.insertAdjacentHTML(position, markup)  -- the SECOND argument is parsed
+    #   document.write(...) / document.writeln(...) -- every argument is
+    for m in re.finditer(r"\.insertAdjacentHTML\s*\(", blank):
+        lo = m.end()
+        hi = _matching_paren(blank, m.end() - 1)
+        args = _split(blank[lo:hi], ",")
+        if len(args) >= 2:
+            check(lo + args[1][0], lo + args[1][1], "insertAdjacentHTML")
+
+    for m in re.finditer(r"\bdocument\s*\.\s*write(?:ln)?\s*\(", blank):
+        lo = m.end()
+        hi = _matching_paren(blank, m.end() - 1)
+        for a, b in _split(blank[lo:hi], ","):
+            check(lo + a, lo + b, "document.write")
 
     for pos in markup_at:
         lo = pos
@@ -414,9 +521,20 @@ def test_the_escaping_checker_catches_every_way_the_control_can_be_removed() -> 
             "if (!lits.length) return esc(restored);",
             "if (!lits.length) return restored;",
         ),
+        # The chip's class is no longer the fixed literal `stat`: the strip now styles a
+        # timing, a count and a must-be-zero safety counter apart, so the class is chosen
+        # per key and the opening tag is `'<span class="' + cls + '"' + tip + '><i>'`.
+        # Only the anchor moved -- the mutation is the same deletion of `esc` from the
+        # two values, and the two values are the same two.
         "renderStats emits a raw stat key": (
-            "'<span class=\"stat\"><i>' + esc(k) + '</i>' + esc(shown) + '</span>'",
-            "'<span class=\"stat\"><i>' + k + '</i>' + shown + '</span>'",
+            "'><i>' + esc(k) + '</i>' + esc(shown) +",
+            "'><i>' + k + '</i>' + shown +",
+        ),
+        # The second sink `renderStats` grew: every counter the strip knows now carries
+        # its plain-English meaning as a `title`, which is an attribute context.
+        "renderStats puts a raw counter meaning in a title attribute": (
+            "' title=\"' + esc(meta.why) + '\"'",
+            "' title=\"' + meta.why + '\"'",
         ),
         "renderAudit emits a raw entity type": (
             "'</td><td>' + esc(e.entity_type || '')",
@@ -426,11 +544,94 @@ def test_the_escaping_checker_catches_every_way_the_control_can_be_removed() -> 
             "esc(JSON.stringify(e.detail || {}))",
             "JSON.stringify(e.detail || {})",
         ),
+        # The four below are not "delete esc from an existing sink" -- they are the
+        # ways a value reaches the DOM *around* the shape the checker modelled. Every
+        # one of them audited clean before `_interpolations` and the extra sinks
+        # existed, on a file whose docstring claimed all three families were covered.
+        # They stay in the battery because each is one keystroke from the real line.
+        "panel 3 interpolates the LLM response into a template literal": (
+            "$('p3').innerHTML = renderMarks(result.raw_llm_response, result.detections, 0);",
+            "$('p3').innerHTML = `<pre>${result.raw_llm_response}</pre>`;",
+        ),
+        "panel 3 writes the LLM response through outerHTML": (
+            "$('p3').innerHTML = renderMarks(result.raw_llm_response, result.detections, 0);",
+            "$('p3').outerHTML = result.raw_llm_response;",
+        ),
+        "panel 3 writes the LLM response through insertAdjacentHTML": (
+            "$('p3').innerHTML = renderMarks(result.raw_llm_response, result.detections, 0);",
+            "$('p3').insertAdjacentHTML('beforeend', result.raw_llm_response);",
+        ),
+        "the LLM response is written straight to the document": (
+            "$('p3').innerHTML = renderMarks(result.raw_llm_response, result.detections, 0);",
+            "document.write(result.raw_llm_response);",
+        ),
     }
     for name, (before, after) in mutations.items():
         assert source.count(before) == 1, (name, source.count(before))
         problems, _ = audit_escaping(source.replace(before, after))
         assert problems, f"the checker does not notice: {name}"
+
+
+def test_the_checker_does_not_cry_wolf_on_the_escaped_form_of_each_new_sink() -> None:
+    """Each sink added above must accept the *correct* spelling, or it is not a control.
+
+    A checker that reports a problem no matter what is written is as useless as one
+    that never does -- it just fails in the safe direction, and the first person to
+    hit it deletes the rule. So every mutation row in the battery has a mirror here
+    where the same sink is written with ``esc(...)``, and the audit must come back
+    empty. The template-literal pair is the one that matters most: interpolation is
+    ordinary modern JS and a rule that banned it outright would be worked around
+    rather than satisfied.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    anchor = "$('p3').innerHTML = renderMarks(result.raw_llm_response, result.detections, 0);"
+    assert source.count(anchor) == 1
+    safe_forms = {
+        "template literal, interpolation escaped": (
+            "$('p3').innerHTML = `<pre>${esc(result.raw_llm_response)}</pre>`;"
+        ),
+        "template literal, no interpolation at all": "$('p3').innerHTML = `<pre>idle</pre>`;",
+        "outerHTML, escaped": "$('p3').outerHTML = esc(result.raw_llm_response);",
+        "insertAdjacentHTML, escaped": (
+            "$('p3').insertAdjacentHTML('beforeend', esc(result.raw_llm_response));"
+        ),
+        "document.write, escaped": "document.write(esc(result.raw_llm_response));",
+    }
+    for name, replacement in safe_forms.items():
+        problems, _ = audit_escaping(source.replace(anchor, replacement))
+        assert not problems, f"false positive on the safe spelling of {name}: {problems}"
+
+
+def test_innerHTML_is_the_only_dom_sink_the_shipped_file_uses() -> None:
+    """``audit_escaping``'s rule 1 says so; this is that claim checked rather than assumed.
+
+    The checker now models four DOM markup sinks, but the file is supposed to use
+    exactly one. Both facts are worth holding: the checker is wide so a future edit
+    cannot slip out of it, and ``app.js`` is narrow so the reviewer has one shape to
+    read. The narrow claim is the one that was written down and never verified.
+
+    ``srcdoc`` and ``document.domain`` are in the pattern because they are markup and
+    origin sinks respectively that no amount of escaping makes safe here; if one ever
+    appears, the right response is to remove it, not to teach the checker about it.
+    """
+    source = _blank(APP_JS.read_text(encoding="utf-8"))
+    forbidden = re.compile(
+        r"\.outerHTML\s*=(?!=)"
+        r"|\.insertAdjacentHTML\s*\("
+        r"|\bdocument\s*\.\s*write(?:ln)?\s*\("
+        r"|\.srcdoc\s*=(?!=)"
+        r"|\bdocument\s*\.\s*domain\s*=(?!=)"
+    )
+    hits = [
+        f"line {source.count(chr(10), 0, m.start()) + 1}: {m.group(0).strip()}"
+        for m in forbidden.finditer(source)
+    ]
+    assert not hits, (
+        "app.js has grown a DOM sink other than innerHTML. audit_escaping does cover "
+        f"these, but rule 1's premise -- and the reviewer's one-shape reading -- is "
+        f"that innerHTML is the only one: {hits}"
+    )
+    assert ".innerHTML" in source, "premise: innerHTML is still the sink the UI uses"
 
 
 def test_no_regex_source_in_the_ui_carries_an_unbounded_quantifier() -> None:

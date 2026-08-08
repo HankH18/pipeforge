@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from secure_context_pipeline import textrules
 from secure_context_pipeline.audit.logger import (
     DETECT,
     EGRESS_BLOCK,
@@ -76,6 +77,7 @@ from secure_context_pipeline.pipeline.egress_gate import (
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
 from secure_context_pipeline.surrogates import (
+    CATEGORIES,
     REDACTION_RE,
     STRICT_TOKEN_RE,
     format_redaction,
@@ -722,7 +724,9 @@ async def test_pass_one_reads_the_whole_payload_rather_than_a_prefix(tmp_path: P
     await audit.close()
 
 
-async def test_pass_one_stays_off_the_critical_path_at_session_scale(tmp_path: Path) -> None:
+async def test_pass_one_stays_off_the_critical_path_at_session_scale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The exact-substring pre-filter, pinned as a budget rather than as an anecdote.
 
     ``_occurs_as_a_unit`` builds a regex per original, and the regex engine is two
@@ -737,6 +741,23 @@ async def test_pass_one_stays_off_the_critical_path_at_session_scale(tmp_path: P
     The budget is deliberately loose -- roughly ten times the measured cost with the
     pre-filter and a fifth of the cost without it -- so this fails on a lost
     pre-filter and not on a loaded machine.
+
+    **The wall clock is no longer the only witness**, because a wall clock is a
+    statement about the machine as much as about the code, and this one is asserted in
+    the default (unmarked) ``pytest`` run where the machine is whatever CI gave us.
+    The pre-filter is a *countable* thing: ``occurs_as_a_unit`` returns on ``needle not
+    in haystack`` before it asks :func:`textrules.boundary_guards` for anything, so the
+    number of ``boundary_guards`` calls is exactly the number of originals that got
+    past it and into a regex. Measured on the fixed seed below: **3 calls out of 60,000
+    comparisons** (20,000 originals against three haystack forms). Delete the
+    pre-filter and every one of the 60,000 builds and runs a pattern. The ceiling
+    asserted is 1,000 -- 300x the measured value and 60x below the unfiltered one --
+    so it is insensitive to a change in how many derived forms pass 1 compares, and
+    still cannot be satisfied by a scan that lost the pre-filter.
+
+    ``textrules.boundary_guards`` is patched rather than ``egress_gate``'s copy on
+    purpose: ``egress_gate`` imported the name, so its binding is a different object
+    and patching it would count nothing that ``occurs_as_a_unit`` does.
     """
     rng = random.Random(20250804)
     alphabet = string.ascii_lowercase
@@ -745,12 +766,26 @@ async def test_pass_one_stays_off_the_critical_path_at_session_scale(tmp_path: P
     }
     payload = " ".join("".join(rng.choice(alphabet) for _ in range(6)) for _ in range(9_000))
 
+    guarded = 0
+    real_guards = textrules.boundary_guards
+
+    def counting(value: str) -> tuple[str, str]:
+        nonlocal guarded
+        guarded += 1
+        return real_guards(value)
+
+    monkeypatch.setattr(textrules, "boundary_guards", counting)
+
     gate, audit = await _gate(tmp_path, vault=FakeVault(originals))
     started = time.perf_counter()
     report = await gate.check(payload, SESSION)
     elapsed = time.perf_counter() - started
 
     assert report.originals_scanned == len(originals)
+    assert guarded < 1_000, (
+        f"{guarded} of {len(originals)} originals reached the regex -- the "
+        f"exact-substring pre-filter is gone, and this says so without a stopwatch"
+    )
     assert elapsed < 5.0, (
         f"pass 1 took {elapsed:.1f}s for {len(originals)} originals against "
         f"{len(payload)} chars -- the exact-substring pre-filter is gone"
@@ -1490,6 +1525,99 @@ async def test_a_surrogate_the_strict_grammar_rejects_is_still_protected(
     gate, audit = await _gate(tmp_path, detector=detector)
     report = await gate.check(payload, SESSION, surrogates=frozenset({token}))
     assert report.rescan_warnings == 0
+    await audit.close()
+
+
+async def test_a_high_severity_hit_straddling_a_surrogate_edge_is_not_excused(
+    tmp_path: Path,
+) -> None:
+    """The overlap leniency belongs to the bracketed spans, and only to them.
+
+    Pass 2 skips a detection that merely *overlaps* a protected span, and the stated
+    justification is that a protected span "is ``[`` plus one unbroken word run, so a
+    value straddling its edge would have to be one the detector reads through our
+    bracket or our category literal". That is true of a token core and of a redaction
+    marker. It is false of the third source: a surrogate span is bare string equality
+    against a fake spliced into the document's own prose, with no bracket, no category
+    literal and no minimum length, so both of its edges are the *document's*
+    characters and a longer value can run straight off one.
+
+    Measured on the shipped detector before the fix: with ``5551234`` emitted, ``Vendor
+    account 5551234567 remains open.`` is ``ACCOUNT_NUMBER@1.00`` over ``[15:25]``
+    against a protected ``[15:22]`` -- overlapping, not contained -- and the gate
+    released a payload its own detector had just typed as a high-severity identifier.
+
+    Three probes, because the fix has to be a narrowing and not a switch: the straddle
+    blocks, a hit genuinely *inside* the surrogate is still excused, and the bracketed
+    leniency the docstring's argument does cover is untouched.
+    """
+    surrogate = "5551234"
+    straddle = f"Vendor account {surrogate}567 remains open."
+    gate, audit = await _gate(
+        tmp_path, detector=FakeDetector([("ACCOUNT_NUMBER", f"{surrogate}567", 1.0)])
+    )
+    with pytest.raises(EgressBlockedError) as exc:
+        await gate.check(straddle, SESSION, surrogates=frozenset({surrogate}))
+    assert exc.value.detail["reason"] == "detector_rescan"
+    assert exc.value.detail["entity_types"] == "ACCOUNT_NUMBER"
+    await audit.close()
+
+    # Contained is still contained: the fake itself, typed by the detector exactly as
+    # the pseudonymizer designed it to be, must not block or every run producing one
+    # would refuse itself.
+    gate, audit = await _gate(
+        tmp_path, detector=FakeDetector([("ACCOUNT_NUMBER", surrogate, 1.0)])
+    )
+    report = await gate.check(
+        f"Vendor account {surrogate} remains open.", SESSION, surrogates=frozenset({surrogate})
+    )
+    assert report.rescan_warnings == 0
+    await audit.close()
+
+    # And the leniency that IS argued for: the detector claiming the whole token
+    # including the closing bracket, while the protected core stops at the hash.
+    token = format_surrogate("PII", "NAME", "1a2b3c4d")
+    gate, audit = await _gate(tmp_path, detector=FakeDetector([("MRN", token, 0.99)]))
+    report = await gate.check(f"Patient {token} was seen.", SESSION)
+    assert report.rescan_warnings == 0, "the bracketed half lost its overlap leniency"
+    await audit.close()
+
+
+async def test_the_pass_row_records_what_the_rescan_warned_about(tmp_path: Path) -> None:
+    """A warning count with no drill-down is a number nobody can act on.
+
+    ``egress_rescan_warnings 3`` is displayed on a panel whose claim is "nothing
+    original got out", where a non-zero count reads as three near leaks. It is
+    normally the opposite -- the shipped medical fixture's three are the detector
+    re-typing "MD" and "RN" out of pseudonymized clinician lines as ``ADDRESS`` -- but
+    ``_rescan`` incremented a counter and discarded ``det.entity_type``, so there was
+    nowhere to establish that. The EGRESS_PASS row now carries the types, sorted,
+    deduplicated and comma-joined, mirroring ``entity_types`` on the block path.
+
+    Types only, never values: an audit row quoting the warned text would put payload
+    content into the log this gate exists to keep values out of. The assertion below
+    is written as an equality on the whole detail value for that reason -- a
+    substring check would pass on a row that also carried the text.
+    """
+    detector = FakeDetector(
+        [("ADDRESS", "Fairview Terrace", 0.9), ("NAME", "Rachel Medina", 0.9)]
+    )
+    gate, audit = await _gate(tmp_path, detector=detector)
+    report = await gate.check("Dr Rachel Medina of Fairview Terrace called.", SESSION)
+
+    assert report.rescan_warnings == 2
+    events = await audit.query(session_id=SESSION, event_type=EGRESS_PASS)
+    assert len(events) == 1
+    assert events[0].detail["rescan_warnings"] == 2
+    assert events[0].detail["rescan_warning_types"] == "ADDRESS,NAME"
+
+    # Nothing warned about -> the field is present and empty, so a reader can tell
+    # "no warnings" from "this build does not record them".
+    clean, clean_audit = await _gate(tmp_path / "clean")
+    await clean.check("Nothing sensitive here.", SESSION)
+    clean_events = await clean_audit.query(session_id=SESSION, event_type=EGRESS_PASS)
+    assert clean_events[0].detail["rescan_warning_types"] == ""
+    await clean_audit.close()
     await audit.close()
 
 
@@ -3134,13 +3262,20 @@ async def test_a_high_severity_hit_outside_our_own_output_always_blocks(
 
     The probes cover the boundary cases the span arithmetic is most likely to get
     wrong: identifiers adjacent to a token, straddling the end of one, sitting in the
-    hint tail, and inside a pseudonym's neighbourhood.
+    hint tail, inside a pseudonym's neighbourhood, and -- the last probe --
+    **straddling the end of a pseudonym**, which is the case the oracle and the gate
+    used to disagree about. ``5551234`` is a surrogate this run emitted and
+    ``5551234567`` is a 1.00-confidence ``ACCOUNT_NUMBER`` starting at the same offset;
+    it is not contained in anything we wrote, so the oracle demands a block, while the
+    gate's any-overlap rule excused it and released. The gate now requires containment
+    against a surrogate span, so the two agree -- see ``EgressGate._rescan``.
     """
     emitted = frozenset(
         {
             format_surrogate("PHI", "NAME", "1a2b3c4d"),
             format_surrogate("PHI", "MEDICATION", "2f4a1b3c", "oral-antidiabetic"),
             "Rachel Medina",
+            "5551234",
         }
     )
     probes = [
@@ -3155,6 +3290,7 @@ async def test_a_high_severity_hit_outside_our_own_output_always_blocks(
         "Dr Rachel Medina reviewed [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic].",
         "Nothing sensitive at all in this sentence.",
         f"{format_surrogate('PHI', 'NAME', '1a2b3c4d')} EIN 12-3456789 attached.",
+        "Vendor account 5551234567 remains open.",
     ]
 
     for payload in probes:
@@ -5229,3 +5365,398 @@ def test_every_skeleton_haystack_reaches_every_limb_that_scans_one() -> None:
         )
         == 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Pass 1 and OUR OWN emitted token ids
+# ---------------------------------------------------------------------------
+#
+# The defect these close: the unbounded limbs have no adjacency requirement -- that
+# is what lets them catch a regrouped or glued identifier -- so they read our own
+# surrogates as if they were payload text, and an 8-hex token id sometimes spells the
+# vaulted digits. A legitimate run was refused with `reason="vault_original"`, which
+# is a PII-leak block that is nothing of the kind. See `_mask_own_tokens`.
+
+#: The two payloads that reproduce it, exactly as measured. Each token here is one
+#: `format_surrogate` could have emitted, and the collision is in the ID: `8390244f`
+#: carries `8390244`, `a552140f` carries `552140`.
+_ID_COLLISIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "8390244",
+        "[FIN_ACCOUNT_NUMBER_8390244f]",
+        "<DOCUMENT>\nAccount [FIN_ACCOUNT_NUMBER_8390244f] closed.\n</DOCUMENT>",
+    ),
+    (
+        "552140",
+        "[PHI_MRN_a552140f]",
+        "<DOCUMENT>\nChart: [PHI_MRN_a552140f] reviewed.\n</DOCUMENT>",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("original", "token", "payload"),
+    [pytest.param(*row, id=row[0]) for row in _ID_COLLISIONS],
+)
+async def test_our_own_token_id_no_longer_reads_as_a_vaulted_identifier(
+    tmp_path: Path, original: str, token: str, payload: str
+) -> None:
+    """A run whose token id happens to spell a vaulted value is not a leak.
+
+    Measured collision rate on the shipped corpus before this closed: 1.3e-02 spurious
+    blocks per 100-run suite, observed twice in 27 executions, and the cause of a
+    long-standing intermittent failure in the leakage harness. The arithmetic is at
+    `MIN_IDENTIFIER_RUN_DIGITS`; what that paragraph did not say is that the shape it
+    was pricing is a *false block*, not a residual risk to accept in silence.
+
+    Both halves are asserted: the limb, because that is where the fix lives, and
+    `check()`, because a fix the orchestrator's `surrogates` argument never reaches is
+    not a fix. The first assertion below is the non-vacuity one -- with an empty
+    surrogate set, which is exactly the pre-exemption scanner, the same payload still
+    reports a hit, so a green here is the exemption working and not the collision
+    having evaporated.
+    """
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+
+    assert gate._scan_originals(payload, frozenset({original})) == 1, (
+        "the collision this test exists for is gone -- re-derive the payload"
+    )
+    assert gate._scan_originals(payload, frozenset({original}), frozenset({token})) == 0, (
+        "pass 1 read a vaulted digit run out of our own HMAC-derived token id"
+    )
+
+    report = await gate.check(payload, "sess-own-token-id", surrogates=frozenset({token}))
+    assert report.originals_scanned == 1, "pass 1 must have had something to scan"
+
+    # ...and the same call without the surrogate set is refused, which is what the
+    # caller was living with.
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-own-token-id")
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+@pytest.mark.parametrize(
+    ("label", "template"),
+    [
+        pytest.param("before", "Account {value} and {token} closed."),
+        pytest.param("after", "Account {token} and {value} closed."),
+        pytest.param("glued-left", "Account {value}{token} closed."),
+        pytest.param("glued-right", "Account {token}{value} closed."),
+        pytest.param("split-across", "Account 8{token}390244 closed."),
+        pytest.param("inside-our-own-hint", "Account [FIN_ACCOUNT_NUMBER_deadbeef|{value}] x."),
+    ],
+)
+async def test_a_vaulted_value_glued_to_our_own_token_still_blocks(
+    tmp_path: Path, label: str, template: str
+) -> None:
+    """The exemption is eight characters wide, and every neighbour of them is scanned.
+
+    A span exemption is only as good as its edges. The mask is per-character and
+    length-preserving, it covers group 3 of the emitted string and nothing else, and
+    every other character -- our `[`, our `_`, the category and type literals, the
+    `|hint` tail, our `]` -- is left exactly as it was, so no boundary anywhere in the
+    payload moves or changes class. These six placements are what that sentence means
+    operationally: the value immediately before the token, immediately after it, glued
+    to either bracket with no separator at all, split across the whole token, and
+    written into the hint we emitted ourselves.
+
+    The hint case is the one worth reading twice. `_protected_spans` narrowing 2
+    refuses to protect a hint in pass 2 because the hint alphabet `[a-z0-9-]` spells
+    an SSN; the same refusal is stronger in pass 1, because a hint is looked up **by
+    the original's own text**, so it is the one field of a token that is a projection
+    of the secret. `_own_token_mask` stops at the hash for that reason.
+    """
+    value = "8390244"
+    token = "[FIN_ACCOUNT_NUMBER_deadbeef]"
+    payload = template.format(value=value, token=token)
+    surrogates = frozenset({token, "[FIN_ACCOUNT_NUMBER_deadbeef|8390244]"})
+
+    gate = EgressGate(
+        vault=FakeVault({value}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    assert gate._scan_originals(payload, frozenset({value}), surrogates) == 1, label
+
+    with pytest.raises(EgressBlockedError) as raised:
+        await gate.check(payload, "sess-beside", surrogates=surrogates)
+    assert raised.value.detail["reason"] == "vault_original"
+
+
+async def test_only_a_surrogate_this_run_emitted_is_exempt_from_pass_one(
+    tmp_path: Path,
+) -> None:
+    """The exemption is a conjunction, and dropping either half is a hole.
+
+    **The grammar alone would be a hole**, because the payload is assembled from an
+    *uploaded document*: token-shaped text in that document is text the uploader
+    wrote. The first case here is byte-identical to a token we emit and is simply not
+    in the set this run issued, so pass 1 reads it -- which is the difference between
+    "our output" and "output-shaped".
+
+    **The set alone would be a hole**, and this one has already been paid for once:
+    the surrogate set carries *pseudonyms* as well as tokens, a fake drawn as `Rachel
+    Medina` while `Medina` is a real original puts that surname verbatim on the wire,
+    and an earlier version of this gate masked its own surrogates wholesale and hid
+    exactly that. The 100-run harness caught it. `STRICT_TOKEN_RE.fullmatch` is what
+    keeps the fake half scanned.
+    """
+    gate = EgressGate(
+        vault=FakeVault({"8390244", "Medina"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+
+    # 1. Token-shaped, and NOT ours: some other run's token, or an upload.
+    foreign = "[FIN_ACCOUNT_NUMBER_8390244f]"
+    payload = f"Account {foreign} closed."
+    assert STRICT_TOKEN_RE.fullmatch(foreign) is not None, "premise: it is token-shaped"
+    assert (
+        gate._scan_originals(
+            payload, frozenset({"8390244"}), frozenset({"[PHI_MRN_deadbeef]"})
+        )
+        == 1
+    ), "a token this run did not emit was exempted -- the grammar is not the rule"
+
+    # 2. Ours, and NOT a token: the pseudonym half of the same set.
+    fake = "Rachel Medina"
+    payload = f"Attending: {fake} reviewed the chart."
+    assert (
+        gate._scan_originals(payload, frozenset({"Medina"}), frozenset({fake})) == 1
+    ), "a pseudonym carrying a real original was exempted -- the Rachel Medina leak"
+
+
+async def test_pass_one_still_reads_inside_a_redaction_marker(tmp_path: Path) -> None:
+    """Markers are protected in pass 2 and deliberately not in pass 1.
+
+    They are the other half of `_protected_spans`, and there they are matched by
+    `REDACTION_RE` **alone** -- markers are not in the surrogate set, so there is no
+    string-equality leg to stand on. A grammar-only exemption in pass 1 is precisely
+    the hole the conjunction exists to refuse, and this grammar is *guessable* in a
+    way an HMAC id is not: `REDACTION_RE`'s type body is `[A-Z][A-Z0-9_]*`, digits
+    included, so an uploaded document containing `[REDACTED_MRN5567281]` would blank a
+    vaulted MRN if markers were exempted here.
+
+    The premises below are what make this a statement about the *pass-1 rule* rather
+    than about the marker grammar: the string really is a marker to the matcher that
+    protects markers in pass 2, and pass 1 blocks on it anyway.
+    """
+    marker = "[REDACTED_MRN5567281]"
+    payload = f"<DOCUMENT>\nChart {marker} filed.\n</DOCUMENT>"
+
+    assert REDACTION_RE.fullmatch(marker) is not None, (
+        "premise: pass 2 would treat this as our own output"
+    )
+    assert EgressGate._bracketed_spans(payload), "premise: it is a protected span there"
+
+    gate = EgressGate(
+        vault=FakeVault({"5567281"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    assert (
+        gate._scan_originals(
+            payload, frozenset({"5567281"}), frozenset({"[PHI_MRN_deadbeef]"})
+        )
+        == 1
+    ), "a vaulted MRN hid inside an uploader-written redaction marker"
+
+
+async def test_the_id_only_exemption_leaves_the_registry_literals_scanned(
+    tmp_path: Path,
+) -> None:
+    """What the exemption does NOT cover, asserted rather than left as prose.
+
+    The mask is group 3 -- the HMAC id -- and not the token core pass 2 protects. A
+    vaulted value spelled like a category or an entity type is word-bounded inside
+    every token of that type (`_` is a boundary, `textrules.ALNUM`), so pass 1 still
+    blocks on it. That is the pre-existing behaviour, kept deliberately: the literals
+    are ours by *configuration*, which is a weaker claim than "an HMAC no uploader can
+    steer" and not one worth spending an exemption on.
+
+    The cost of keeping it is measured rather than assumed, over every token core and
+    every redaction marker the shipped registry can produce and every value the
+    generator plants across 26 seeds x 4 kinds: zero collisions. A registry change
+    that introduces one turns this red, which is the point -- it is then a decision
+    someone makes rather than an intermittent block someone chases.
+    """
+    token = "[FIN_ACCOUNT_NUMBER_deadbeef]"
+    payload = f"Ledger {token} reviewed."
+    gate = EgressGate(
+        vault=FakeVault({"ACCOUNT_NUMBER"}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    assert (
+        gate._scan_originals(payload, frozenset({"ACCOUNT_NUMBER"}), frozenset({token})) == 1
+    ), "the exemption widened past the id and swallowed the type literal"
+
+    # The residual, measured on the corpus. Imported here rather than at module scope
+    # for the reason the floor measurement gives: the generator pulls in Faker.
+    from fixtures.generator import KINDS, expected_entities
+
+    registry = load_registry(REGISTRY_PATH)
+    surfaces = [
+        format_surrogate(category=category, entity_type=entity_type, token_id="00000000")
+        for category in CATEGORIES
+        for entity_type in sorted(registry.entities)
+    ]
+    surfaces += [format_redaction(entity_type=t) for t in sorted(registry.entities)]
+    # The id blanked the way the gate blanks it, so only the literals can answer.
+    haystack = " ".join(s.replace("00000000", "qqqqqqqq") for s in surfaces)
+    planted = {
+        value
+        for seed in range(26)
+        for kind in KINDS
+        for values in expected_entities(seed, kind).values()
+        for value in values
+    }
+    assert len(planted) == 8534, "the corpus moved -- re-measure the residual below"
+    collisions = sorted(
+        value
+        for value in planted
+        if _occurs_as_a_unit(value, haystack)
+        or _occurs_as_a_unit(normalize(value), normalize(haystack))
+    )
+    assert collisions == [], (
+        "a planted value is word-bounded inside a token core or a redaction marker, so "
+        "the literals this exemption deliberately leaves scanned now cost real blocks: "
+        + ", ".join(collisions[:10])
+    )
+
+
+async def test_the_regrouped_limb_reads_the_payload_with_our_tokens_excised_too(
+    tmp_path: Path,
+) -> None:
+    """The digit stream that our own leftover digits used to break.
+
+    `_digit_views` is a union of two projections and this payload is why. The vaulted
+    twelve digits are all present, split by one of our tokens -- so the payload
+    discloses the value, and the only thing standing between the two halves is text we
+    wrote. The masked view alone cannot see it: the id is blanked (that is the
+    exemption) but the `3` of the hint `lab-panel-3` is left in the stream, lands
+    between the halves and breaks the needle.
+
+    The control is the part that makes this a strengthening rather than a restoration.
+    The pre-exemption scanner blocked the same payload **only when the id happened to
+    supply the missing digit**: with `989aa4fe` it read the `9` out of our own token
+    and blocked; with `c3f7003f` it released. Both are blocked now, and the second one
+    is a payload that used to walk out.
+    """
+    original = "987714668699"
+    gate = EgressGate(
+        vault=FakeVault({original}),
+        detector=FakeDetector(),
+        settings=_settings(tmp_path),
+        audit=None,
+    )
+    for token_id, before in (("989aa4fe", 1), ("c3f7003f", 0)):
+        token = f"[PII_ADDRESS_{token_id}|lab-panel-3]"
+        payload = f"ledger filed 98771466869{token}9 patient\n"
+        assert gate._scan_originals(payload, frozenset({original})) == before, (
+            f"premise about the PRE-exemption scanner on id {token_id}"
+        )
+        assert gate._scan_originals(payload, frozenset({original}), frozenset({token})) == 1, (
+            "a vaulted identifier split across one of our own tokens was released"
+        )
+
+    # Non-vacuity: the limb is not saying yes to everything. The same shape with a
+    # different value in the vault reports nothing.
+    token = "[PII_ADDRESS_989aa4fe|lab-panel-3]"
+    payload = f"ledger filed 98771466869{token}9 patient\n"
+    assert (
+        gate._scan_originals(payload, frozenset({"123456789012"}), frozenset({token})) == 0
+    )
+
+
+def _fuzz_token(rng: random.Random, token_id: str | None = None) -> str:
+    """One token this pipeline could have emitted, drawn the way the emitter draws."""
+    return format_surrogate(
+        category=rng.choice(CATEGORIES),
+        entity_type=rng.choice(["NAME", "SSN", "MRN", "ACCOUNT_NUMBER", "TAX_ID", "DATE"]),
+        token_id=token_id or "".join(rng.choice("0123456789abcdef") for _ in range(8)),
+        hint=rng.choice([None, "chronic", "lab-panel-3", "oral-antidiabetic"]),
+    )
+
+
+async def test_every_hit_the_own_token_exemption_removes_is_a_coincidence_with_the_id(
+    tmp_path: Path,
+) -> None:
+    """Differential fuzz over pass 1, with and without the exemption.
+
+    Examples pin the shapes someone thought of; this pins the *property*, which is the
+    one the exemption's safety argument is actually made of: **a hit the exemption
+    removes must be a hit that depended on the particular id we drew.** The id is an
+    HMAC under the session key, so re-drawing it from the same distribution changes
+    nothing an uploader controls -- and if the pre-exemption scanner still finds the
+    value after eight fresh draws, the hit was not a coincidence with our token and the
+    exemption has taken something real.
+
+    The pre-exemption scanner is the same function with an empty surrogate set, which
+    is exact rather than a re-implementation: the mask is the identity on an empty set.
+    A wider campaign ran the same comparison against the module as it stood *before*
+    the change -- 100,000 cases over five seeds, zero drift on the empty-set path,
+    zero unexplained losses -- and this is its resident, fast form.
+
+    Cases are drawn to sit on the exemption's edges rather than uniformly: the value
+    inside an id, beside a token, glued to one, split across one, written into a hint,
+    spelled like a type literal, and carried by token-shaped text this run never
+    emitted.
+    """
+    rng = random.Random(20260808)
+    gate = object.__new__(EgressGate)
+    checked = 0
+    for _ in range(3000):
+        digits = "".join(rng.choice("0123456789") for _ in range(rng.randint(6, 12)))
+        value = rng.choice([digits, f"{digits[:3]}-{digits[3:5]}-{digits[5:]}", "Medina",
+                            f"ACCT{digits}", "ACCOUNT_NUMBER"])
+        colliding = _fuzz_token(rng, (digits + "abcdef")[:8])
+        tokens = [_fuzz_token(rng) for _ in range(rng.randint(1, 3))] + [colliding]
+        rng.shuffle(tokens)
+        body = " ".join(f"note {tok} filed" for tok in tokens)
+        placement = rng.randint(0, 5)
+        if placement == 0:
+            body += f"\nledger {value} closed"
+        elif placement == 1:
+            body += f"\nledger {value}{tokens[0]} closed"
+        elif placement == 2:
+            body += f"\nledger {tokens[0]}{value} closed"
+        elif placement == 3 and len(value) > 2:
+            body += f"\nledger {value[:2]}{tokens[0]}{value[2:]} closed"
+        elif placement == 4:
+            body += f"\nledger {_fuzz_token(rng, (digits + 'abcdef')[:8])} closed"
+        originals = frozenset({value})
+        surrogates = frozenset(tokens)
+
+        strict = gate._scan_originals(body, originals)
+        exempt = gate._scan_originals(body, originals, surrogates)
+        assert exempt >= strict or strict - exempt == 1, "pass 1 lost more than it can"
+        if exempt >= strict:
+            continue
+        checked += 1
+        for _draw in range(8):
+            redrawn, fresh = body, set()
+            for surrogate in sorted(surrogates, key=len, reverse=True):
+                match = STRICT_TOKEN_RE.fullmatch(surrogate)
+                assert match is not None
+                new_id = "".join(rng.choice("0123456789abcdef") for _ in range(8))
+                replacement = surrogate[: match.start(3)] + new_id + surrogate[match.end(3) :]
+                redrawn = redrawn.replace(surrogate, replacement)
+                fresh.add(replacement)
+            assert gate._scan_originals(redrawn, originals) == exempt, (
+                "the exemption removed a hit that survives re-drawing the token id, so "
+                "it was not a coincidence with our own output: "
+                f"{originals} in {body!r}"
+            )
+    # Non-vacuity: the campaign really did exercise the exemption rather than drawing
+    # 3,000 payloads it never fired on.
+    assert checked > 100, f"only {checked} cases exercised the exemption -- re-tune the draw"

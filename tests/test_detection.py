@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import pytest
@@ -33,6 +34,7 @@ from secure_context_pipeline.detection.detector import (
     DetectionInvariantError,
     Detector,
     _collapse_degenerate_runs,
+    _is_field_label_tail,
     _restore_offset,
     _verify_offsets,
     chunk_text,
@@ -58,6 +60,7 @@ from secure_context_pipeline.detection.registry import (
 from secure_context_pipeline.errors import ConfigError, DetectionError
 from secure_context_pipeline.models import Detection
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
+from secure_context_pipeline.obfuscation.strategies.base import available_strategies
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
 
@@ -92,9 +95,19 @@ def spans_of(detections: list[Detection], entity_type: str) -> list[tuple[int, i
 
 
 # ---------------------------------------------------------------------------
-# 1. Per-entity coverage: every pattern- and gazetteer-backed registry entity
+# 1. Per-entity coverage: EVERY registry entity
 # ---------------------------------------------------------------------------
 # (entity_type, doc_category, positive fixture, near-miss negative)
+#
+# Build doc section 10.2 bullet 1 asks for "per-entity-type fixture strings for
+# **every registry entry** (positive + near-miss negative)". The table covered 13 of
+# 20 -- the pattern- and gazetteer-backed ones -- and the guard test below derived
+# its own expectation from `pattern_backed() | gazetteer_backed()`, so the seven
+# `presidio:`-only entities were not merely missing, they were missing in a way the
+# guard was written to agree with. A checker whose expectation is derived from the
+# same narrowing as the thing it checks cannot report the narrowing; that is the
+# shape `registry.py::_compilable` names, and it is why the guard now starts from
+# the whole registry and subtracts an explicitly NAMED exemption set.
 ENTITY_FIXTURES: list[tuple[str, str | None, str, str]] = [
     (
         # EMAIL is the one entity backed by both a built-in and a pattern. The
@@ -179,14 +192,85 @@ ENTITY_FIXTURES: list[tuple[str, str | None, str, str]] = [
         "Our litigation strategy is to delay the deposition.",
         "The litigation calendar is full this quarter.",
     ),
+    # --- `presidio:`-only entities ------------------------------------------
+    # Nothing about a built-in-backed entity makes it exempt from the spec: the
+    # registry decides which built-in claims a hit, what category and tier it
+    # carries and which documents it is allowed in, and none of that is Presidio's.
+    # DOB and DATE below are the sharpest case -- one built-in, two registry
+    # entities, split by `requires_context` -- and each near-miss is the OTHER
+    # entity's positive, so a rule that collapsed the two would fail both rows.
+    (
+        "NAME",
+        None,
+        "Jane Doe signed the intake form this morning.",
+        "The committee signed the intake form this morning.",
+    ),
+    (
+        "CLIENT_IDENTITY",
+        "legal",
+        "Jane Doe signed the retainer agreement today.",
+        "The retainer agreement was signed today.",
+    ),
+    (
+        "SSN",
+        None,
+        "Her SSN is 412-33-7891 on the signed form.",
+        "Her badge is 41233 on the signed form.",
+    ),
+    (
+        "PHONE",
+        None,
+        "Call the office at 415-555-0177 before noon.",
+        "Call the office at extension 4177 before noon.",
+    ),
+    (
+        "ADDRESS",
+        None,
+        "The residence is at 1400 Harbor Street, Springfield.",
+        "The residence is a short walk from here.",
+    ),
+    (
+        # The near-miss is a date with no birth word: DOB is `requires_context`, so
+        # it must fall through -- and in a medical document DATE picks it up, which
+        # is the row below.
+        "DOB",
+        "medical",
+        "Patient DOB: 1985-03-12 confirmed at intake.",
+        "Patient visit: 2024-05-06 confirmed at intake.",
+    ),
+    (
+        "DATE",
+        "medical",
+        "The follow-up visit is on 2024-05-06.",
+        "The follow-up visit is scheduled soon.",
+    ),
 ]
 
+#: Registry entities deliberately absent from :data:`ENTITY_FIXTURES`, each with the
+#: place its positive/near-miss pair actually lives. Empty, and that is the point:
+#: an exemption has to be written down here with its evidence, so the coverage test
+#: below can never again be satisfied by re-deriving a narrower expectation. Same
+#: shape as ``CONTEXT_WITHOUT_A_CONSUMER``.
+FIXTURES_COVERED_ELSEWHERE: dict[str, str] = {}
 
-def test_fixture_table_covers_every_recognizer_backed_entity(registry: EntityRegistry) -> None:
-    """A new pattern/gazetteer entity in entities.yaml must arrive with fixtures."""
+
+def test_fixture_table_covers_every_registry_entity(registry: EntityRegistry) -> None:
+    """Build doc 10.2 bullet 1: positive + near-miss for EVERY registry entry.
+
+    The expectation is the whole registry minus a named exemption set, not
+    ``pattern_backed() | gazetteer_backed()``. That derivation was the previous
+    spelling and it encoded the very gap it was supposed to detect: the seven
+    ``presidio:``-only entities (ADDRESS, CLIENT_IDENTITY, DATE, DOB, NAME, PHONE,
+    SSN) were uncovered, and because the expected set was built from the same
+    predicate the table happened to satisfy, the test was green at 13 of 20 and
+    could not have gone red at any number.
+    """
     covered = {entity_type for entity_type, _, _, _ in ENTITY_FIXTURES}
-    expected = set(registry.pattern_backed()) | set(registry.gazetteer_backed())
+    expected = set(registry.entities) - set(FIXTURES_COVERED_ELSEWHERE)
     assert covered == expected
+    assert not set(FIXTURES_COVERED_ELSEWHERE) - set(registry.entities), (
+        "an exemption names an entity the registry no longer has"
+    )
 
 
 @pytest.mark.parametrize(
@@ -3424,7 +3508,20 @@ def test_per_entity_threshold_override_moves_the_detector_floor(
 
 
 async def test_below_floor_span_is_dropped(detector: Detector) -> None:
-    """The same digits with no supporting context fall under the redact floor."""
+    """The same digits with no supporting context fall under the redact floor.
+
+    **What this is NOT evidence of.** It is easy to read a test in the threshold
+    section as evidence for build doc section 2 bullet 8, "entities detected below
+    the obfuscation-confidence threshold are redacted, never passed through raw" --
+    and the README's requirement-traceability table did exactly that, citing this
+    test for that NFR. It asserts the opposite: the span is DROPPED, so
+    ``412337891`` reaches the provider verbatim. Measured end to end, payload
+    unchanged. Section 9.2's three bands and section 2 bullet 8 disagree, this
+    implementation follows 9.2, and the cost is written out at
+    ``Detector._floor_for``. The row above -- ``mid_confidence_span_is_returned``
+    -- is the one that carries the graceful-degradation claim, and only for the
+    band between the two thresholds.
+    """
     hits = await detector.detect("The ledger reference 412337891 was archived.")
     assert "SSN" not in types_of(hits)
 
@@ -3916,6 +4013,51 @@ async def test_case_strategy_fires_only_in_legal_documents(detector: Detector) -
     assert "CASE_STRATEGY" not in types_of(await detector.detect(text, "medical"))
 
 
+def test_the_recognizer_request_is_what_scopes_an_entity_out(detector: Detector) -> None:
+    """Layer 2 of ``only_in_doc_categories``, asserted at its own seam.
+
+    ``_entities_for`` documents itself as the mechanism -- "``AMOUNT``'s recognizer
+    is never even run outside a financial document" -- and the two end-to-end tests
+    above cannot tell that apart from any of the three later filters doing the work.
+    Measured: the field is enforced in three places (``registry.types_for_doc``, the
+    request built here, and ``_to_detection``'s ``allowed_in`` guard), and each one
+    on its own can be deleted with the other two hiding it. This is the assertion
+    that says WHICH layer ran, and it is the layer the performance claim rests on:
+    if the recognizer is requested anyway, the regex runs on every financial
+    document's worth of text in every medical one.
+    """
+    assert "AMOUNT" in detector._entities_for("financial")
+    assert "AMOUNT" not in detector._entities_for("medical")
+    assert "AMOUNT" not in detector._entities_for("general")
+    assert "AMOUNT" not in detector._entities_for(None)
+
+
+def test_the_detection_scope_guard_refuses_an_out_of_category_span(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """Layer 3: ``_to_detection`` re-checks ``allowed_in`` and that check is live.
+
+    Belt and braces over layer 2, and worth keeping rather than deleting, because
+    ``_to_detection`` is reached with whatever the analyzer returned: a recognizer
+    that Presidio holds from an earlier call, or an entity type requested for one
+    chunk and not another, arrives here with no memory of which document category
+    asked for it. Deleting the two lines left the whole suite green except for one
+    unrelated failure, so nothing said the guard was still connected.
+
+    Driven straight at the seam with a stub analyzer result, because layer 2 makes
+    the case unreachable from ``detect`` -- which is the point of having layer 3 and
+    also the reason it could rot unnoticed.
+    """
+    assert registry.spec("AMOUNT").only_in_doc_categories == ("financial",), (
+        "premise: AMOUNT is the scoped entity this test is about"
+    )
+    text = "The payment of $4,250.00 cleared."
+    result = SimpleNamespace(entity_type="AMOUNT", start=15, end=24, score=0.9)
+    assert detector._to_detection(result, text, 0, "financial") is not None
+    assert detector._to_detection(result, text, 0, "medical") is None
+    assert detector._to_detection(result, text, 0, None) is None
+
+
 # ---------------------------------------------------------------------------
 # 5. DOB vs DATE (build doc section 9.2)
 # ---------------------------------------------------------------------------
@@ -3982,6 +4124,122 @@ async def test_bare_date_in_a_general_document_is_dropped(detector: Detector) ->
     hits = await detector.detect("The follow-up visit is on 2024-05-06.", "general")
     assert "DATE" not in types_of(hits)
     assert "DOB" not in types_of(hits)
+
+
+async def test_a_neighbouring_label_stops_dob_claiming_the_date_beside_it(
+    detector: Detector,
+) -> None:
+    """One label owns one value: ``DOB:`` does not reach past ``Admitted:``.
+
+    ``test_bare_date_in_a_medical_document_is_date`` asserts the DATE side with a
+    sentence that has no birth word anywhere in it, so it is green whatever the
+    window does. The case that decides the rule is a chart header, where three
+    differently-labelled dates sit within one 60-character lookback of each other --
+    and with a flat ``CONTEXT_WINDOW_BEFORE`` all three came back DOB/PII:
+
+        DOB  PII  [48:58]  '03/12/1985'
+        DOB  PII  [71:81]  '07/01/2024'   <-- Admitted:
+        DOB  PII  [94:104] '07/09/2024'   <-- Discharged:
+
+    Not a leak -- DOB and DATE are both tier 2 and both are masked -- but the type
+    and the category are wrong in the outbound surrogate, in the audit row and in
+    the SpanOut panel, and build doc section 9.2 splits DATE_TIME into the two
+    precisely so that distinction carries information. Asserted on the exact
+    ``(type, category)`` of each of the three dates rather than on the type set,
+    because a set assertion passes as soon as *some* date is DATE.
+    """
+    text = (
+        "PATIENT CHART\n"
+        "Name: Priyanka Raghunathan   DOB: 03/12/1985   Admitted: 07/01/2024\n"
+        "Discharged: 07/09/2024\n"
+    )
+    hits = await detector.detect(text, "medical")
+    typed = {d.text: (d.entity_type, str(d.category)) for d in hits}
+    assert typed.get("03/12/1985") == ("DOB", "PII"), typed
+    assert typed.get("07/01/2024") == ("DATE", "PHI"), typed
+    assert typed.get("07/09/2024") == ("DATE", "PHI"), typed
+
+
+# The label clamp above may RE-TYPE a date. It may never leave one with no claimant
+# at all, and the two tests below are what hold that line -- both parametrized over
+# the document category, because ``medical`` is the one arm where the rule is free.
+#
+# DOB is ``requires_context: true`` and DATE carries ``only_in_doc_categories:
+# [medical]``, so outside a medical document DOB is the SOLE claimant of a Presidio
+# DATE_TIME hit. Inside one, a date the clamp cuts off from its birth word falls
+# through to DATE and is still vaulted; outside one there is nothing to fall through
+# to, so the same clamp does not relabel the date, it deletes it -- not detected, not
+# vaulted, no needle for pass 1, and pass 2 re-runs this same blind detector, so the
+# real date of birth reaches the provider in cleartext. A medical-only assertion is
+# green through all of that, which is exactly how the loss stayed invisible.
+DOB_DOC_CATEGORIES = ["medical", "financial", "legal", None]
+
+
+@pytest.mark.parametrize("doc_category", DOB_DOC_CATEGORIES)
+async def test_a_split_label_dob_is_detected_in_every_document_category(
+    detector: Detector, doc_category: str | None
+) -> None:
+    """A birth word on the line above, a different label on the value's own line.
+
+    The clamp stops the backward window at ``Reported:``, so no candidate sees
+    ``birth`` and the clamped scoring pass has no survivor. ``_resolve_builtin``
+    then re-scores under the plain 60-character lookback, where DOB claims it.
+
+    Asserted on coverage rather than on the entity type: the detector's contract is
+    that no detected original leaves in the clear, and whether this date is filed as
+    DOB or as DATE is a labelling question, not a disclosure one.
+    """
+    text = "Date of birth\nReported: 01/17/1977\n"
+    hits = await detector.detect(text, doc_category)
+    assert uncovered(text, hits, "01/17/1977") == "", (
+        f"the date of birth is undetected in doc_category={doc_category!r} "
+        "-- nothing vaults it, so it reaches the provider in cleartext"
+    )
+
+
+@pytest.mark.parametrize("doc_category", DOB_DOC_CATEGORIES)
+async def test_every_chart_header_date_is_covered_in_every_document_category(
+    detector: Detector, doc_category: str | None
+) -> None:
+    """The same header as the clamp test above, read as each kind of document.
+
+    Outside a medical document ``Admitted:`` and ``Discharged:`` have no DATE to
+    fall through to, so the clamp that correctly re-types them there must fall back
+    here instead of dropping them. Inside one, the re-typing still has to hold --
+    the fallback must not fire when the clamped pass found a claimant -- so the
+    medical arm asserts the exact types and the others assert coverage.
+    """
+    text = (
+        "PATIENT CHART\n"
+        "Name: Priyanka Raghunathan   DOB: 03/12/1985   Admitted: 07/01/2024\n"
+        "Discharged: 07/09/2024\n"
+    )
+    hits = await detector.detect(text, doc_category)
+    for date in ("03/12/1985", "07/01/2024", "07/09/2024"):
+        assert uncovered(text, hits, date) == "", (
+            f"{date} is undetected in doc_category={doc_category!r} -- it leaves in the clear"
+        )
+    if doc_category == "medical":
+        typed = {d.text: d.entity_type for d in hits}
+        assert typed.get("03/12/1985") == "DOB", typed
+        assert typed.get("07/01/2024") == "DATE", typed
+        assert typed.get("07/09/2024") == "DATE", typed
+
+
+async def test_a_date_with_no_birth_word_anywhere_is_still_dropped_outside_medical(
+    detector: Detector,
+) -> None:
+    """The fallback widens the window; it does not remove ``requires_context``.
+
+    Without this, "re-score under the unclamped window when nothing survived" could
+    be satisfied by dropping the ``requires_context`` filter on the second pass,
+    which would make every bare date in a legal or financial document a DOB and
+    vault dates that identify no one. The fallback window is the *pre-clamp* window
+    and nothing else: a document with no birth word within 60 characters still has
+    no DOB.
+    """
+    hits = await detector.detect("Reported: 01/17/1977 in the quarterly filing.", "financial")
+    assert types_of(hits) & {"DOB", "DATE"} == set()
 
 
 # ---------------------------------------------------------------------------
@@ -4524,6 +4782,17 @@ def test_duplicate_entity_name_is_rejected_at_load(tmp_path: Path) -> None:
             "categories: [PII]\nentities:\n"
             "  X: {category: PII, patterns: ['a'], only_in_doc_categories: [medial]}\n",
         ),
+        # `strategy:` is the one per-entity override nothing validated. The global
+        # spelling of the same setting (`SCP_STRATEGY`) has always been checked by
+        # `Settings`, so a typo there fails at import; a typo here loaded clean and
+        # `build_strategy` then raised `unknown_strategy` inside the first request
+        # that touched the entity -- and `ConfigError` subclasses `PipelineError`,
+        # so that is an HTTP 500 on every such run rather than a startup failure.
+        (
+            "registry_unknown_strategy",
+            "categories: [PII]\nentities:\n"
+            "  X: {category: PII, patterns: ['a'], strategy: tokenisation}\n",
+        ),
         ("registry_no_entities", "categories: [PII]\nentities: {}\n"),
         ("registry_not_a_mapping", "- a\n- b\n"),
         ("registry_yaml_invalid", "categories: [PII\nentities:\n"),
@@ -4536,6 +4805,33 @@ def test_malformed_registry_fails_loudly_at_load(tmp_path: Path, reason: str, bo
     with pytest.raises(ConfigError) as raised:
         load_registry(path)
     assert raised.value.detail["reason"] == reason
+
+
+def test_every_selectable_strategy_name_is_accepted_by_the_loader(tmp_path: Path) -> None:
+    """The load-time strategy check reads the same mapping ``build_strategy`` does.
+
+    The negative row above proves a typo is refused; on its own it is also
+    satisfied by a hardcoded list of names, which is exactly the failure mode
+    ``_compilable`` was written against -- a checker that does not share the
+    semantics of the thing it checks. Rejecting `tokenisation` while also
+    rejecting `pseudonymization` would be a worse bug than the one being fixed,
+    because it makes a documented extensibility knob unusable at startup.
+
+    Driven off ``available_strategies()``, so a strategy registered by a plugin
+    (``register_strategy``) is covered with no edit here, and a loader that
+    stopped consulting the registry fails on the next name added to it.
+    """
+    names = available_strategies()
+    assert "tokenization" in names and "pseudonymization" in names, names
+    for name in names:
+        path = tmp_path / f"entities-{name}.yaml"
+        path.write_text(
+            "categories: [PII]\n"
+            "entities:\n"
+            f"  X: {{category: PII, patterns: ['a'], strategy: {name}}}\n",
+            encoding="utf-8",
+        )
+        assert load_registry(path).spec("X").strategy == name
 
 
 # A registry regex runs against attacker-supplied document text, so a pattern that
@@ -5477,6 +5773,172 @@ async def test_an_all_caps_field_label_is_still_trimmed(
     text = "Patient name: David Ochoa\n    DOB: 1974-03-02\n"
     names = [d.text for d in await detector.detect(text, "medical") if d.entity_type == "NAME"]
     assert names == ["David Ochoa"], names
+
+
+#: ``(document, expected)`` for the label/value decision, written as whole documents
+#: so the LINE structure rule 3 reads is visible rather than reconstructed. The span
+#: under test is always the name on the first line; ``@`` marks where it starts and
+#: ``|`` where it ends, and both markers are stripped before the call.
+LABEL_TAIL_CASES: list[tuple[str, bool, str]] = [
+    (
+        "Patient name: @David Ochoa\n    DOB|: 1974-03-02\n",
+        True,
+        "the shipped spelling: rule 2, an all-caps tail followed by a colon",
+    ),
+    (
+        "Patient name: @David Ochoa\n    D.O.B.|: 04/13/1956\n",
+        True,
+        "rule 2 with punctuation -- the spelling entities.yaml ships DOB context for",
+    ),
+    (
+        "Patient name: @David Ochoa\n    MRN #|: 4471902\n",
+        True,
+        "rule 2: a label carrying a separator and a hash",
+    ),
+    (
+        "Name of the disclosing taxpayer: @Duane Ingram\n    Date| of birth: 04/02/1982\n",
+        True,
+        "rule 3: the span cut a Title-Case multi-word label in half",
+    ),
+    (
+        "Name of the co-filing spouse: @Robin Thomas\n    Social Security| Number: 916-42-1401\n",
+        True,
+        "rule 3, two words into the next label",
+    ),
+    (
+        "Bank account: @Marcus Webb\n    Acct| No.: 100200300400\n",
+        True,
+        "rule 3: mixed-case labels are reached by position, not by shape",
+    ),
+    (
+        "The declaration was executed by the client @Margaret\nWhitfield|: she attests.\n",
+        False,
+        "the leak the no-lowercase rule exists for: a surname followed by a colon",
+    ),
+    (
+        "Attending physician: Dr. @Margaret\n    Whitfield|: signature on file.\n",
+        False,
+        "rule 3's strict-prefix clause: inside a labelled field, a surname plus a "
+        "colon is the WHOLE tail, never a prefix of a longer label",
+    ),
+    (
+        "Attending physician: Dr. @Margaret\n    Whitfield|, who signed the consent.\n",
+        False,
+        "a tail that plainly continues the value",
+    ),
+    (
+        "Patient name: @David Ochoa\n   | \n",
+        True,
+        "the span merely ran past the end of its line",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("document", "expected", "why"),
+    LABEL_TAIL_CASES,
+    ids=[row[2].split(":")[0].split(" -- ")[0][:40] for row in LABEL_TAIL_CASES],
+)
+def test_the_field_label_rule_reads_position_as_well_as_shape(
+    document: str, expected: bool, why: str
+) -> None:
+    """``_is_field_label_tail`` decides, in isolation, on whole documents.
+
+    Asserted at the predicate rather than end to end because spaCy decides where a
+    PERSON span stops and it does not produce a composite for every label spelling:
+    measured on ``"Patient name: David Ochoa\\n    <LABEL>: <value>"``, the
+    untrimmed span is ``'David Ochoa\\n    DOB'`` for ``DOB``, ``'David Ochoa\\n
+    D.O.B.'`` for ``D.O.B.`` and ``'David Ochoa\\n    Acct'`` for ``Acct. No.``, but
+    a bare ``'David Ochoa'`` for ``SSN``, ``MRN #`` and ``Date of birth`` -- so an
+    end-to-end table over label spellings would be green on half its rows whatever
+    the rule did. The two spellings that DO produce a composite are asserted end to
+    end below; this table is what pins the rule itself.
+    """
+    start = document.index("@")
+    document = document.replace("@", "", 1)
+    end = document.index("|")
+    document = document.replace("|", "", 1)
+    newline = document.index("\n", start)
+    assert newline < end, "premise: the span under test must cross a line break"
+    assert _is_field_label_tail(document, start, newline, end) is expected, why
+
+
+async def test_a_punctuated_field_label_is_still_trimmed(
+    registry: EntityRegistry, settings: Settings
+) -> None:
+    """`D.O.B.` end to end -- the spelling that reopened the composite the trim closed.
+
+    With the tail class restricted to letters and spaces, this document produced
+    ``NAME 'David Ochoa\\n    D.O.B.'``: the splice then collapsed two lines and
+    destroyed the label, the vaulted original was the composite so the bare name was
+    never an original the egress gate could look for, and the SAME person appeared
+    as two different spans -- the composite here and ``'David Ochoa'`` in the
+    sentence below -- so one patient pseudonymized as two people.
+
+    The third line is load-bearing: it is what makes "the bare name is never an
+    original" observable, because it is a place the bare name occurs.
+    """
+    detector = Detector(registry, settings)
+    text = (
+        "    Patient name: David Ochoa\n"
+        "    D.O.B.: 04/13/1956\n"
+        "    Follow-up with David Ochoa next week.\n"
+    )
+    names = [d.text for d in await detector.detect(text, "medical") if d.entity_type == "NAME"]
+    assert names == ["David Ochoa", "David Ochoa"], names
+
+
+async def test_a_name_that_runs_into_a_multi_word_label_is_trimmed(
+    registry: EntityRegistry, settings: Settings
+) -> None:
+    """Rule 3 end to end, on the layout the fixture generator actually emits.
+
+    ``fixtures/generator.py`` writes financial disclosures as a field block, and
+    spaCy runs the taxpayer's name into the first word of the next field's label:
+    measured over 20 seeds, ``'Duane Ingram\\n    Date'`` and ``'Robin Thomas\\n
+    Social Security'`` occur 12 times. Rules 1 and 2 cannot reach them -- ``Date``
+    and ``Social Security`` are Title Case, which is the shape of a surname, and the
+    no-lowercase rule must keep refusing that shape. The vaulted original was the
+    composite, so the bare name was not an original and the pseudonym glued an
+    invented surname onto the next field's label.
+    """
+    detector = Detector(registry, settings)
+    text = (
+        "PART I -- DISCLOSING PARTY\n\n"
+        "    Name of the disclosing taxpayer: Duane Ingram\n"
+        "    Date of birth: 04/02/1982\n"
+        "    Social Security Number: 916-42-1401\n"
+    )
+    hits = await detector.detect(text, "financial")
+    names = [d.text for d in hits if d.entity_type in {"NAME", "CLIENT_IDENTITY"}]
+    assert names == ["Duane Ingram"], names
+    # The label survived the splice, which is the visible half of the same bug.
+    assert uncovered(text, hits, "Date of birth") == "Date of birth"
+
+
+async def test_a_pattern_backed_span_is_never_trimmed_at_a_label_shaped_wrap(
+    registry: EntityRegistry, settings: Settings
+) -> None:
+    """The ``spec.presidio`` scope on the trim, pinned directly.
+
+    The scope was described in ``_to_detection`` as load-bearing and backed by "five
+    recall tests", and that had stopped being true: those tests caught the BLANKET
+    trim, and once the trim was narrowed to ``_is_field_label_tail`` a strategy
+    sentence no longer satisfied the condition either way. Deleting ``spec.presidio``
+    then left the entire suite green -- 2,241 passed -- while this document lost half
+    its privilege assertion.
+
+    ``PRIVILEGED_MARKER`` is ``action: strip``, so what the trim would ship is not a
+    cosmetic label: the span is cut back to ``'attorney work'`` and ``PRODUCT:``
+    travels to the provider as ordinary prose. The tail is all-caps and followed by a
+    colon, which is exactly the shape rule 2 accepts, so nothing about the tail rule
+    protects this -- only the scope does.
+    """
+    detector = Detector(registry, settings)
+    text = "This memorandum is attorney work\nPRODUCT: the analysis below is privileged."
+    spans = [d.text for d in await detector.detect(text, "legal")
+             if d.entity_type == "PRIVILEGED_MARKER"]
+    assert spans == ["attorney work\nPRODUCT"], spans
 
 
 @pytest.mark.parametrize(

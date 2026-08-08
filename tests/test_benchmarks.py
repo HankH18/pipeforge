@@ -1,21 +1,43 @@
-"""Performance benchmarks (build doc section 12). Marker: ``bench`` -- opt-in.
+"""Performance benchmarks (build doc section 12). Marker: ``bench``.
 
-Four budgets, all with generous margins against the spec, all measured against
-the real components rather than a microbenchmark of a hot loop:
+Budgets, all with generous margins against the spec, all measured against the real
+components rather than a microbenchmark of a hot loop:
 
-===================================  ==========================  =========
-Measurement                          What it bounds              Budget
-===================================  ==========================  =========
-Obfuscation of 2,000 words           detect + obfuscate, no LLM  < 2 s
-Vault lookup p99 (1,000 lookups)     the egress/restore hot path < 5 ms
-De-obfuscation of a 500-token reply  the answer-assembly stage   < 500 ms
-Full pipeline, 12k-word brief        every stage we control      < 15 s
-===================================  ==========================  =========
+=====================================  ==========================  =========
+Measurement                            What it bounds              Budget
+=====================================  ==========================  =========
+Obfuscation of 2,000 words             detect + obfuscate, no LLM  < 2 s
+Vault lookup p99 (1,000 lookups)       the egress/restore hot path < 5 ms
+De-obfuscation of a 500-token reply    the answer-assembly stage   < 500 ms
+  -- warm vault (the request path)     cache hits, no SQLite       < 500 ms
+  -- cold vault (worst case)           500 SQLite + AES-GCM reads  < 500 ms
+  -- pseudonymization surrogate pass   regex compile + rewrite     < 500 ms
+Full pipeline, 12k-word brief          every stage we control      < 15 s
+=====================================  ==========================  =========
 
-Run with ``pytest -m bench``. The measured numbers are printed as a table at the
-end of the module so they can be quoted directly in the README -- an assertion
-that something is "under budget" is worth much less to a reviewer than the number
-it actually came in at.
+``pytest -m bench`` selects *only* these; it is not an opt-in gate, and the
+docstring used to call the marker "opt-in", which was wrong in the direction that
+matters. There is no ``addopts`` in ``pyproject.toml`` and no
+``collection_modifyitems`` hook, so a bare ``pytest`` collects and runs every one
+of them -- which is also what README section 4 counts ("2280 collected: 134
+leakage + 5 bench + rest unit + integration").
+
+**They stay in the default run, deliberately.** These measurements are the only
+evidence behind the section 12 table in the README, and a number nobody re-measures
+is a number that quietly stops being true; deselecting them by default would leave
+the README's headline latencies unbacked on every run that matters. The known cost
+is that a wall-clock assertion measures the machine as well as the code, and on a
+loaded box it can go red for reasons unrelated to the pipeline. The answer to that
+is :data:`BENCH_REPEATS` -- best-of-N on the budgets with the least headroom, which
+keeps the achievability claim intact -- and **not** a skip marker, a retry, or a
+widened budget. A skip would delete the evidence; the other two would weaken the
+claim. If one of these is red, the first move is to read the printed table: it
+gives the measured number and the headroom, which is usually enough to tell
+contention from a regression, and a genuine regression slows every repetition.
+
+The measured numbers are printed as a table at the end of the module so they can be
+quoted directly in the README -- an assertion that something is "under budget" is
+worth much less to a reviewer than the number it actually came in at.
 
 **What is deliberately excluded.** Loading ``en_core_web_lg`` costs seconds and
 happens exactly once per process (``detection.detector.get_analyzer``, wired into
@@ -95,8 +117,30 @@ RESPONSE_TOKENS = 500
 #: minimum moves with it and the test still fails; that is verified by sabotage
 #: rather than argued.
 #:
-#: The other two budgets (4,800x and 105x headroom) are single-shot: no realistic
-#: contention reaches them, and repeating them would only cost time.
+#: Applied to every budget whose headroom is in single digits. Best-of-3 as scored,
+#: across three consecutive quiet runs on this machine::
+#:
+#:     full pipeline, 12k-word brief          6.93 - 7.05 s / 15 s     2.1x   repeated
+#:     restore 500 surrogates (pseudonym.)     120 - 123 ms / 500 ms   4.2x   repeated
+#:     obfuscate 2,000 words (pseudonym.)    0.401 - 0.419 s / 2 s     4.9x   repeated
+#:     obfuscate 2,000 words (tokenization)  0.382 - 0.399 s / 2 s     5.1x   repeated
+#:     restore 500 tokens, cold vault           60 - 73 ms / 500 ms    7.4x   repeated
+#:     restore 500 tokens, warm vault         5.12 - 5.40 ms / 500 ms   96x   single
+#:     vault lookup p99                          ~0.001 ms / 5 ms     ~4500x  single
+#:
+#: The repetition earns its place on the two newest rows rather than being copied onto
+#: them out of symmetry: single-shot, the surrogate restore came in at 283.5 ms (1.8x,
+#: the tightest budget in the module) and the cold-vault restore at 107.3 ms (4.7x).
+#: Best-of-3 more than halves both. The first iteration is paying for a cold SQLite
+#: page cache and first-call overhead in the regex engine, which is a property of the
+#: measurement rather than of the pipeline -- precisely the case best-of-N is for.
+#:
+#: The surrogate restore is worth calling out because it had no budget test at all
+#: until recently: the section 12 restore row was asserted for the token pass only,
+#: and on the warm path the token pass is the cheap half by a factor of 23.
+#:
+#: The last two are single-shot: no realistic contention reaches two to four orders of
+#: headroom, and repeating them would only cost time.
 BENCH_REPEATS = 3
 
 
@@ -365,8 +409,23 @@ async def test_deobfuscation_of_a_500_token_response_is_under_500ms(
     """Restore a response carrying 500 distinct tokens (build doc sections 10.7 and 12).
 
     Every token is distinct, so the restorer's per-call resolution cache cannot
-    absorb the work -- this is 500 real vault reads plus the string rebuild, which
-    is the worst case a long analytical answer produces.
+    absorb the work: 500 separate resolutions plus the string rebuild.
+
+    **What this measures is the warm path, and that is now said rather than implied.**
+    This docstring used to claim "500 real vault reads", which was false and measurably
+    so -- counting ``SessionVault._fetch_one`` across this benchmark's own inputs gives
+    **zero** SQLite reads and therefore zero AES-GCM decryptions. ``_populate`` vaults
+    the values through ``vault.put``, which fills the vault's own ``_SessionCache``, so
+    every resolution here is a dict hit on already-decrypted plaintext. The cache doing
+    the absorbing was never the restorer's per-call one; it was the vault's.
+
+    That is not a worthless measurement -- it is exactly the production request path,
+    where obfuscation has just populated the cache in the same process moments earlier
+    -- but it is the *best* case, not the worst one the old wording claimed. The worst
+    case is measured immediately below by
+    :func:`test_deobfuscation_of_a_500_token_response_is_under_500ms_with_a_cold_vault`,
+    which drops the cache first and does pay for 500 SQLite reads and 500 AES-GCM
+    decryptions. Both are held to the same budget, so the claim survives either way.
     """
     sessions, vault, audit = vault_stack
     restorer = Restorer(vault=vault, settings=bench_settings, audit=audit)
@@ -389,14 +448,183 @@ async def test_deobfuscation_of_a_500_token_response_is_under_500ms(
     assert restored.vault_misses == 0
 
     report.record(
-        f"restore a {RESPONSE_TOKENS}-token response",
+        f"restore a {RESPONSE_TOKENS}-token response (warm vault)",
         elapsed_ms,
         BUDGET_RESTORE_MS,
         "ms",
-        note=f"{len(response):,} chars, {restored.restored_count} values restored",
+        note=f"{len(response):,} chars, {restored.restored_count} values restored, 0 SQLite reads",
     )
     assert elapsed_ms < BUDGET_RESTORE_MS, (
         f"restoring {RESPONSE_TOKENS} tokens took {elapsed_ms:.1f} ms, "
+        f"budget {BUDGET_RESTORE_MS} ms"
+    )
+
+
+async def test_deobfuscation_of_a_500_token_response_is_under_500ms_with_a_cold_vault(
+    bench_settings: Settings,
+    vault_stack: tuple[SessionRegistry, SessionVault, AuditLogger],
+    report: Report,
+) -> None:
+    """The same 500-token restore, but paying for real SQLite reads and real AES-GCM.
+
+    The warm benchmark above is the request path; this is the worst case its docstring
+    used to claim to be. Dropping ``_caches[session_id]`` after ``_populate`` forces
+    every resolution through ``SessionVault._fetch_one`` and the decrypt that follows
+    it. Measured with a counting wrapper on ``_fetch_one``: **0** calls warm, **500**
+    calls cold, which is what makes the two rows different measurements rather than
+    the same one run twice.
+
+    The cold path is reachable in production, which is why it gets a budget rather
+    than a comment: a restore whose session was vaulted by a *different* worker
+    process, or before a restart, or after the cache was evicted, starts cold. Held to
+    the same ``BUDGET_RESTORE_MS`` as the warm path -- if the cold path ever needs a
+    looser budget than the warm one, that is a finding about the vault, not a reason
+    to move the line.
+
+    ``vault._caches`` is private and is reached into on purpose. The alternative is
+    reopening a second ``SessionVault`` on the same database file, which measures
+    connection setup as well and makes the number harder to attribute; the assertion
+    below on the ``_fetch_one`` count is what keeps this honest either way.
+    """
+    sessions, vault, audit = vault_stack
+    restorer = Restorer(vault=vault, settings=bench_settings, audit=audit)
+    session_id, _expires_at = await sessions.create("test-user")
+    token_ids = await _populate(sessions, vault, session_id, RESPONSE_TOKENS)
+
+    response = "\n".join(
+        f"Paragraph {index}: the record identifies "
+        f"{format_surrogate('PII', 'NAME', token_id)} as a party to the matter."
+        for index, token_id in enumerate(token_ids)
+    )
+
+    # Count the reads, so "cold" is verified rather than assumed. A future cache that
+    # survives this pop would silently turn this back into a copy of the warm test.
+    reads = 0
+    original_fetch_one = SessionVault._fetch_one
+
+    async def counting_fetch_one(
+        self: SessionVault, sql: str, params: tuple[object, ...]
+    ) -> object:
+        nonlocal reads
+        reads += 1
+        return await original_fetch_one(self, sql, params)
+
+    # Best-of-N: see BENCH_REPEATS. At 4.7x this sits in the same band as the
+    # obfuscation budgets, which are repeated for the same reason. The cache is
+    # dropped again before every repetition, so each one is genuinely cold -- and
+    # `reads` is therefore counted per repetition, not cumulatively.
+    elapsed_ms = float("inf")
+    restored = None
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(SessionVault, "_fetch_one", counting_fetch_one)
+        for _ in range(BENCH_REPEATS):
+            vault._caches.pop(session_id, None)
+            reads = 0
+            started = time.perf_counter()
+            run_restored = await restorer.restore(session_id, response, strategy="tokenization")
+            elapsed_ms = min(elapsed_ms, (time.perf_counter() - started) * 1000.0)
+            restored = run_restored
+
+    assert restored is not None
+    assert restored.restored_count == RESPONSE_TOKENS
+    assert restored.vault_misses == 0
+    assert reads == RESPONSE_TOKENS, (
+        f"premise: a cold vault must do one SQLite read per distinct token -- got "
+        f"{reads} for {RESPONSE_TOKENS} tokens; if this is 0 the cache was not dropped "
+        "and this benchmark is a duplicate of the warm one"
+    )
+
+    report.record(
+        f"restore a {RESPONSE_TOKENS}-token response (cold vault)",
+        elapsed_ms,
+        BUDGET_RESTORE_MS,
+        "ms",
+        note=f"{reads} SQLite reads + {reads} AES-GCM decryptions",
+    )
+    assert elapsed_ms < BUDGET_RESTORE_MS, (
+        f"restoring {RESPONSE_TOKENS} tokens from a cold vault took {elapsed_ms:.1f} ms "
+        f"({reads} SQLite reads), budget {BUDGET_RESTORE_MS} ms"
+    )
+
+
+async def test_deobfuscation_of_a_500_surrogate_response_is_under_500ms(
+    bench_settings: Settings,
+    vault_stack: tuple[SessionRegistry, SessionVault, AuditLogger],
+    report: Report,
+) -> None:
+    """The pseudonymization half of the restore budget, which had none (build doc 12).
+
+    The section 12 restore row was asserted for the **token** pass only: the shipped
+    benchmark calls ``restore(..., strategy="tokenization")`` with no ``surrogates``
+    and no ``issued``, so ``_compile_surrogate_pattern`` and ``_restore_surrogates``
+    never ran and the README's unqualified "restore a 500-token response" number
+    covered one of the two strategies. The obfuscate row is already split into a
+    tokenization and a pseudonymization measurement; this is the restore side of the
+    same split.
+
+    It is the more expensive half, and for a different reason than the token pass:
+    tokens are found by a fixed regex and resolved one by one, while surrogates are
+    matched by a single alternation compiled *from the surrogate map itself*, so the
+    cost scales with the number of distinct fakes rather than with the number of
+    occurrences. 500 distinct surrogates is therefore a 500-branch pattern, which is
+    the shape worth bounding.
+
+    Mixed full-name and surname fakes on purpose: the restorer's longest-first
+    ordering is what stops ``Vandenberg`` rewriting the tail of ``Marguerite
+    Vandenberg``, and a map of only full names would never exercise it.
+    """
+    sessions, vault, audit = vault_stack
+    restorer = Restorer(vault=vault, settings=bench_settings, audit=audit)
+    session_id, _expires_at = await sessions.create("test-user")
+
+    surrogates: dict[str, str] = {}
+    lines: list[str] = []
+    for index in range(RESPONSE_TOKENS):
+        surname = f"Vandenberg{index:04d}"
+        full_name = f"Marguerite {surname}"
+        surrogates[full_name] = f"Real Person Number {index:04d}"
+        surrogates[surname] = f"Person{index:04d}"
+        # Both spellings occur, so the longest-first ordering is actually exercised.
+        lines.append(
+            f"Paragraph {index}: the record identifies {full_name} as a party; "
+            f"{surname} is named again in the schedule."
+        )
+    response = "\n".join(lines)
+
+    # Best-of-N: see BENCH_REPEATS. At 1.8x this is now the tightest budget in the
+    # module -- tighter than the full pipeline -- so it gets the same treatment the
+    # other tight budgets get, for the same reason and by the same policy. The pass is
+    # read-only with respect to the vault, so repeating it measures the same work.
+    elapsed_ms = float("inf")
+    restored = None
+    for _ in range(BENCH_REPEATS):
+        started = time.perf_counter()
+        run_restored = await restorer.restore(
+            session_id, response, strategy="pseudonymization", surrogates=surrogates, issued=()
+        )
+        elapsed_ms = min(elapsed_ms, (time.perf_counter() - started) * 1000.0)
+        restored = run_restored
+    assert restored is not None
+
+    # The pass must actually have done the work, or the timing bounds nothing.
+    assert restored.surrogates_seen > 0, (
+        "premise: the surrogate pass must have run -- if this is 0 the benchmark is "
+        "timing an empty pattern and the budget is vacuous"
+    )
+    assert restored.surrogate_misses == 0, "every surrogate in the map must resolve"
+    for fake, original in list(surrogates.items())[:5]:
+        assert fake not in restored.text, f"surrogate {fake} survived the pass"
+        assert original in restored.text
+
+    report.record(
+        f"restore a {RESPONSE_TOKENS}-surrogate response (pseudonymization)",
+        elapsed_ms,
+        BUDGET_RESTORE_MS,
+        "ms",
+        note=f"{len(response):,} chars, {len(surrogates)} distinct surrogates in the pattern",
+    )
+    assert elapsed_ms < BUDGET_RESTORE_MS, (
+        f"restoring {len(surrogates)} surrogates took {elapsed_ms:.1f} ms, "
         f"budget {BUDGET_RESTORE_MS} ms"
     )
 

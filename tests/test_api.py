@@ -34,6 +34,7 @@ import importlib.metadata
 import json
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,13 @@ from secure_context_pipeline.api.app import (
     _read_capped,
     create_app,
 )
+from secure_context_pipeline.api.constants import MAX_REAP_PER_REQUEST
+from secure_context_pipeline.api.deps import (
+    MAX_REAP_ATTEMPTS,
+    _enqueue_for_reaping,
+    reap_expired_sessions,
+)
+from secure_context_pipeline.api.errors import EXTRA_FIELD_MARKER
 from secure_context_pipeline.api.routes.audit import MAX_AUDIT_OFFSET
 from secure_context_pipeline.api.schemas import MAX_ID_LEN
 from secure_context_pipeline.audit.logger import (
@@ -1191,6 +1199,13 @@ async def test_security_headers_are_sent_on_every_response(client: AsyncClient) 
         assert "unsafe-inline" not in headers["content-security-policy"], path
         assert headers["x-content-type-options"] == "nosniff", path
         assert headers["referrer-policy"] == "no-referrer", path
+        # `no-store` is stamped on every response for the reason the path list in
+        # this loop exists: the one route that returns decrypted plaintext
+        # (`/documents/{doc_id}/text`) shipped with no `Cache-Control` at all, and
+        # a per-route header is a list that goes stale the moment a route is added.
+        # Pinned here by value so a narrowing to "the plaintext route only" is a
+        # failure rather than a silent policy change.
+        assert headers["cache-control"] == "no-store", path
 
     # Error responses are covered too -- they are the ones an attacker can reach
     # without knowing anything.
@@ -3233,3 +3248,643 @@ async def test_a_health_poll_does_not_disarm_the_ttl_reaper(
     assert expires == 1, f"expiry re-reaped: {expires} SESSION_EXPIRE events for one session"
     assert await services.sessions.sweep() == [], "the unreaped drain was not consumed"
     assert await services.audit.verify_chain() is True
+
+
+# ---------------------------------------------------------------------------
+# The reaper's *bound*. The tests above prove it runs; these prove what it costs.
+# ---------------------------------------------------------------------------
+async def _drain_reap_backlog(services: Services) -> None:
+    """Empty the shared backlog so a following test's arithmetic is exact.
+
+    The app is module-scoped, so :attr:`Services.reap_backlog` is shared state and
+    a test that left entries in it would silently change what the next one
+    measures. Bounded by construction: each call clears at least one entry.
+    """
+    while services.reap_backlog:
+        await reap_expired_sessions(services)
+
+
+async def test_one_request_is_never_charged_with_every_other_callers_expiries(
+    client: AsyncClient, services: Services
+) -> None:
+    """The reaper runs on the request path, so its cost has to be a constant.
+
+    `SessionRegistry.sweep()` returns every ID awaiting destruction -- not the ones
+    this caller caused -- and each one costs a `vault.destroy` plus two hash-chained
+    audit rows. The first version of `reap_expired_sessions` did all of them inside
+    whichever request happened to arrive next. Measured on a real app at
+    `session_ttl_seconds=1`: 258 anonymous sessions, then one reap, **311 ms in one
+    request**. `POST /sessions` needs no session and no credential, so the queue is
+    anonymously fillable and the caller who pays is not the caller who filled it --
+    a work-amplification primitive with a 204 on the front of it.
+
+    Two properties, and both are needed. **Bounded**: one request reaps at most
+    `MAX_REAP_PER_REQUEST`, whatever the backlog. **Lossless**: the residual is not
+    dropped on the floor to buy that bound -- it stays queued and later requests
+    finish it, so `test_ttl_expiry_runs_the_whole_destruction_path`'s guarantee
+    still holds for every session, just not all in one request.
+
+    Counted in IDs rather than milliseconds on purpose. A wall-clock assertion here
+    would be measuring the machine, and this suite already has one budget test that
+    goes red on a loaded runner; the number of vault destroys a request performs is
+    the thing the bound actually controls.
+    """
+    await _drain_reap_backlog(services)
+    minted = [
+        (await services.sessions.create(f"reap-filler-{i}", ttl_seconds=0))[0]
+        for i in range(MAX_REAP_PER_REQUEST * 3 + 5)
+    ]
+    # `create` sweeps *before* inserting, so the most recent mint is expired but not
+    # yet observed. One read forces the final sweep, which makes the count below the
+    # whole batch rather than the whole batch minus one.
+    await services.sessions.active_ids()
+
+    # One anonymous request. It has no session and asks for nothing; under the
+    # unbounded reaper it inherited all 53 destructions anyway.
+    assert (await client.post("/sessions", json={"user_id": "bystander"})).status_code == 200
+
+    assert len(services.reap_backlog) == len(minted) - MAX_REAP_PER_REQUEST, (
+        f"one request drained {len(minted) - len(services.reap_backlog)} expired sessions; "
+        f"the ceiling is {MAX_REAP_PER_REQUEST}. An arbitrary caller is being charged for "
+        "expiries it did not cause."
+    )
+    reaped_first = [
+        sid for sid in minted if await services.audit.length(session_id=sid) > 0
+    ]
+    assert len(reaped_first) == MAX_REAP_PER_REQUEST
+
+    # Lossless: keep issuing requests and every one of them gets finished. The
+    # iteration ceiling is generous but finite -- a reaper that stopped making
+    # progress would hang the suite otherwise, which is not a failure report.
+    for _ in range(len(minted)):
+        if not services.reap_backlog:
+            break
+        await reap_expired_sessions(services)
+    assert services.reap_backlog == {}, "the residual never drained"
+
+    for session_id in minted:
+        events = await services.audit.query(session_id=session_id)
+        kinds = {event.event_type for event in events}
+        assert kinds == {"SESSION_EXPIRE", "VAULT_DESTROY"}, (
+            f"{session_id} was bounded out of its own destruction path: {sorted(kinds)}"
+        )
+    assert await services.audit.verify_chain() is True
+
+
+async def test_a_flooded_reap_backlog_never_drops_a_session_holding_plaintext(
+    client: AsyncClient, services: Services
+) -> None:
+    """The queue was bounded by evicting the oldest, and that evicted the *plaintext*.
+
+    The ceiling was `MAX_REAP_BACKLOG` (4 096) and its justification was written
+    down twice: the key is popped by `_sweep_locked` before an ID can reach this
+    queue, so a dropped ID leaves only undecryptable rows behind. True of the
+    SQLite rows. False of `SessionVault._caches`, which holds originals that are
+    **already decrypted** and need no key -- and `SessionVault.destroy` is the only
+    thing that pops it, while `SessionRegistry.sweep` drains its unreaped set, so a
+    dropped ID is never offered again by anything.
+
+    Measured against the real registry and the real vault before the ceiling came
+    out, one expired session queued ahead of a 4 096-ID flood:
+
+        flooded 4096, evicted 1, victim still queued: False
+        PLAINTEXT CACHE STILL RESIDENT: True   originals: ['943-41-9520']
+        vault rows still on disk: 1   tombstoned: False
+        audit events for the victim: []
+
+    `POST /sessions` needs no credential, so the flood is anonymous and the victim
+    is somebody else. What the ceiling actually capped was a 32-character ID; what
+    it abandoned was that ID's decrypted originals, for the life of the process.
+
+    So the assertion is that nothing carrying outstanding destruction work is ever
+    discarded, however long the queue gets -- and then that the victim really is
+    destroyed, from the vault's side and the auditor's, rather than merely still
+    being on a list. Per-request work stays bounded by `MAX_REAP_PER_REQUEST`,
+    which `test_one_request_is_never_charged_with_every_other_callers_expiries`
+    pins; the two tests are the two halves of the same requirement.
+
+    The ghosts are removed by hand rather than drained: draining them would cost a
+    vault DELETE and two hash-chained audit rows each (~1.2 ms), which measures
+    SQLite rather than the queue and would dominate this file's runtime.
+    """
+    await _drain_reap_backlog(services)
+    doc_id = await _upload(client)
+    session_id, _expires = await services.sessions.create(OWNER, ttl_seconds=1)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+    assert services.vault.originals_for_session(session_id), (
+        "premise: the vault holds this session's decrypted originals"
+    )
+    assert await services.vault.row_count(session_id) > 0, "premise: the vault holds rows"
+
+    await asyncio.sleep(1.2)
+    # The reaper's own first line, called directly so the queue can be observed
+    # between the enqueue and the drain -- which is exactly the window the
+    # eviction ran in.
+    _enqueue_for_reaping(services, await services.sessions.sweep())
+    assert session_id in services.reap_backlog, "premise: the victim is queued, and oldest"
+    queued = len(services.reap_backlog)
+
+    ghosts = [f"ghost-{i:06d}" for i in range(8_192)]
+    _enqueue_for_reaping(services, ghosts)
+    assert session_id in services.reap_backlog, (
+        "an ID with outstanding destruction work was dropped from the queue: nothing "
+        "will ever call vault.destroy for it, so its decrypted originals stay in "
+        "SessionVault._caches until the process exits"
+    )
+    assert len(services.reap_backlog) == queued + len(ghosts), (
+        "the queue discarded entries under load; every entry is the last handle on "
+        "a session's plaintext"
+    )
+
+    # And the queue having no ceiling must not put the per-request cost back: one
+    # call, 8 192 IDs waiting, still finishes the hoisted session plus a constant.
+    reaped = await reap_expired_sessions(services, first=session_id)
+    assert session_id in reaped, "the hoist did not finish the session it was given"
+    # The hoisted session is spent *from* the budget, not added to it, so the
+    # total is the ceiling exactly -- a caller cannot buy a seventeenth
+    # destruction by naming one.
+    assert len(reaped) == MAX_REAP_PER_REQUEST, (
+        f"one request reaped {len(reaped)} sessions with {len(ghosts)} queued; the "
+        f"ceiling is {MAX_REAP_PER_REQUEST}. Removing the backlog ceiling must not "
+        "remove the per-request bound with it."
+    )
+    for ghost in ghosts:
+        services.reap_backlog.pop(ghost, None)
+
+    await _drain_reap_backlog(services)
+    assert session_id not in services.vault.cached_session_ids()
+    assert services.vault.originals_for_session(session_id) == frozenset(), (
+        "decrypted originals survived the reap"
+    )
+    assert await services.vault.row_count(session_id) == 0
+    kinds = {event.event_type for event in await services.audit.query(session_id=session_id)}
+    assert {"SESSION_EXPIRE", "VAULT_DESTROY"} <= kinds, (
+        f"the expiry went unaudited: {sorted(kinds)}"
+    )
+    assert await services.audit.verify_chain() is True
+
+
+async def test_a_destruction_that_fails_is_requeued_instead_of_stranding_the_session(
+    client: AsyncClient, services: Services
+) -> None:
+    """A transient failure used to be as permanent as the eviction that preceded it.
+
+    The ID is popped off `reap_backlog` *before* `vault.destroy` is attempted, and
+    the `except Exception` at the bottom of the loop only logged. So one failed
+    attempt -- a locked SQLite file, a `commit()` that raised outside the
+    `sqlite3.Error` the vault catches for itself -- put the ID in the same place
+    the 4 096-entry ceiling used to put it: nowhere. `SessionRegistry.sweep`
+    drains its unreaped set once, so nothing offers the ID again; the decrypted
+    originals stay in `SessionVault._caches` until the process exits, the rows
+    stay on disk with no path left that can delete them (every other route gates
+    on an ownership check that raises for an expired session), and neither
+    `SESSION_EXPIRE` nor `VAULT_DESTROY` is ever written.
+
+    Measured on this app before the fix, one forced failure on a session holding
+    real plaintext:
+
+        after failed reap:  queued again: False  originals: frozenset({'04/13/1956',
+                            '9224297', 'David Ochoa', '(704) 555-0151'})  rows: 4
+        after draining to
+        exhaustion:         queued again: False  originals: (the same four)  rows: 4
+
+    -- identical, because there was nothing left in the backlog to drain.
+
+    So the failure path re-queues, and the proof is in two halves: the ID survives
+    the failed attempt, and a *later* call actually finishes it. Asserting only the
+    first would pass against a re-queue that put the ID back in a structure the
+    drain never looks at.
+    """
+    await _drain_reap_backlog(services)
+    doc_id = await _upload(client)
+    session_id, _expires = await services.sessions.create(OWNER, ttl_seconds=1)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+    assert services.vault.originals_for_session(session_id), (
+        "premise: the vault holds this session's decrypted originals"
+    )
+    assert await services.vault.row_count(session_id) > 0, "premise: the vault holds rows"
+
+    await asyncio.sleep(1.2)
+    _enqueue_for_reaping(services, await services.sessions.sweep())
+    assert session_id in services.reap_backlog, "premise: the victim is queued"
+
+    real_destroy = services.vault.destroy
+    calls: list[str] = []
+
+    async def _locked_once(target: str) -> None:
+        calls.append(target)
+        if target == session_id and len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        await real_destroy(target)
+
+    with mock.patch.object(services.vault, "destroy", _locked_once):
+        reaped = await reap_expired_sessions(services)
+        assert session_id not in reaped, (
+            "the reaper reported a session it did not destroy; the return value is "
+            "what a caller would use to decide the work is done"
+        )
+        # The failure really did strand something -- otherwise the re-queue below
+        # would be proving nothing.
+        assert services.vault.originals_for_session(session_id), (
+            "premise: the failed destroy left the decrypted originals resident"
+        )
+        assert session_id in services.reap_backlog, (
+            "a session whose destruction failed was dropped from the queue: nothing "
+            "will ever call vault.destroy for it again, so its decrypted originals "
+            "stay in SessionVault._caches until the process exits and its rows stay "
+            "on disk untombstoned and unaudited"
+        )
+
+    # A later request finishes it, which is the half that makes the re-queue real.
+    await _drain_reap_backlog(services)
+    assert session_id not in services.vault.cached_session_ids()
+    assert services.vault.originals_for_session(session_id) == frozenset(), (
+        "decrypted originals survived the retry"
+    )
+    assert await services.vault.row_count(session_id) == 0, "vault rows survived the retry"
+    kinds = {event.event_type for event in await services.audit.query(session_id=session_id)}
+    assert {"SESSION_EXPIRE", "VAULT_DESTROY"} <= kinds, (
+        f"the retried expiry went unaudited: {sorted(kinds)}"
+    )
+    assert await services.audit.verify_chain() is True
+
+
+async def test_a_cancelled_request_does_not_take_the_slice_it_was_draining_with_it(
+    client: AsyncClient, services: Services
+) -> None:
+    """`except Exception` cannot see the failure a disconnect actually produces.
+
+    `asyncio.CancelledError` is a `BaseException` in 3.8 and later, so a client
+    that goes away mid-drain -- the concrete "cancelled request" case -- did not
+    reach the handler at the bottom of the loop at all. It unwound
+    `reap_expired_sessions` from the middle of a slice that had already been popped
+    off `reap_backlog`, so the session being destroyed **and every session behind it
+    in the slice** were stranded at once, with not even the warning line the caught
+    case produced. The queue is the only record that the work is outstanding, and
+    for the length of that loop the queue no longer holds it.
+
+    Charged nothing: a cancellation is evidence about the client, not about whether
+    the session can be destroyed, so the retry budget -- which exists to bound
+    *failures* -- comes back untouched. That is asserted on the number, not just on
+    membership, because a re-queue that silently spent an attempt would look
+    identical here and would let sixteen disconnects retire a session that was
+    never actually tried.
+    """
+    await _drain_reap_backlog(services)
+    doc_id = await _upload(client)
+    session_id, _expires = await services.sessions.create(OWNER, ttl_seconds=1)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+    assert services.vault.originals_for_session(session_id), (
+        "premise: the vault holds this session's decrypted originals"
+    )
+
+    await asyncio.sleep(1.2)
+    first_ghost = f"cancel-ghost-{uuid.uuid4().hex}"
+    behind = [f"cancel-behind-{uuid.uuid4().hex}" for _ in range(2)]
+    _enqueue_for_reaping(services, [first_ghost])
+    _enqueue_for_reaping(services, await services.sessions.sweep())
+    _enqueue_for_reaping(services, behind)
+    assert list(services.reap_backlog) == [first_ghost, session_id, *behind], (
+        "premise: the drain order is ghost, victim, then two that never get a turn"
+    )
+
+    real_destroy = services.vault.destroy
+
+    async def _disconnect_at_the_victim(target: str) -> None:
+        if target == session_id:
+            raise asyncio.CancelledError
+        await real_destroy(target)
+
+    with (
+        mock.patch.object(services.vault, "destroy", _disconnect_at_the_victim),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await reap_expired_sessions(services)
+
+    assert await services.audit.length(session_id=first_ghost) > 0, (
+        "premise: the drain really had started, so the slice was really in flight"
+    )
+    assert services.vault.originals_for_session(session_id), (
+        "premise: the cancelled destroy left the decrypted originals resident"
+    )
+    for stranded in (session_id, *behind):
+        assert stranded in services.reap_backlog, (
+            f"{stranded} was lost when the request was cancelled: it had already been "
+            "popped off the queue, and nothing offers a swept ID a second time"
+        )
+        assert services.reap_backlog[stranded] == MAX_REAP_ATTEMPTS, (
+            "a cancelled request spent one of the session's destruction attempts; "
+            "the budget bounds failures, and a disconnect is not one"
+        )
+
+    await _drain_reap_backlog(services)
+    assert services.vault.originals_for_session(session_id) == frozenset()
+    assert await services.vault.row_count(session_id) == 0
+    assert await services.audit.verify_chain() is True
+
+
+async def test_a_destruction_that_always_fails_is_retried_a_bounded_number_of_times(
+    client: AsyncClient, services: Services
+) -> None:
+    """The other half of the re-queue: it must not become an unbounded retry loop.
+
+    Re-queueing a failed ID is only safe if the retries are finite. Put back with
+    no counter, an ID whose destroy can never succeed -- a corrupt row, a disk that
+    is gone -- takes one of the sixteen slots in *every* request for the life of
+    the process, and sixteen of them take all of them, so healthy expiries queue
+    behind failures that will never clear. That is the same starvation the
+    per-request bound exists to prevent, arriving through the failure path.
+
+    So an ID gets `MAX_REAP_ATTEMPTS` attempts **in total**, not per request: the
+    re-queue goes to the tail, and the slice this call works on was popped before
+    the first destroy ran, so a failure can never be retried inside the call that
+    produced it. What is asserted here is that total -- the destroy is called
+    exactly eight times however many reaping calls follow -- because a bound that
+    is really "eight per request" would pass an assertion on the queue alone.
+
+    Exhausting the budget must not *drop* the ID, which would be the 4 096-entry
+    eviction all over again with a counter in front of it: the session whose
+    destruction keeps failing is by definition the one still holding decrypted
+    originals. It moves to `reap_failed`, where it is out of the budget's way but
+    still enumerable and still reachable -- and the last assertions here are that
+    a named logout gets it back out and finishes it, because a dead-letter map
+    nothing can drain is only a leak with better manners.
+    """
+    await _drain_reap_backlog(services)
+    doc_id = await _upload(client)
+    session_id, _expires = await services.sessions.create(OWNER, ttl_seconds=1)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+    assert services.vault.originals_for_session(session_id), (
+        "premise: the vault holds this session's decrypted originals"
+    )
+
+    await asyncio.sleep(1.2)
+    real_destroy = services.vault.destroy
+    calls: list[str] = []
+
+    async def _always_locked(target: str) -> None:
+        calls.append(target)
+        if target == session_id:
+            raise sqlite3.OperationalError("database is locked")
+        await real_destroy(target)
+
+    extra_calls = 5
+    with mock.patch.object(services.vault, "destroy", _always_locked):
+        for _ in range(MAX_REAP_ATTEMPTS + extra_calls):
+            await reap_expired_sessions(services)
+
+        assert calls.count(session_id) == MAX_REAP_ATTEMPTS, (
+            f"{MAX_REAP_ATTEMPTS + extra_calls} reaping calls produced "
+            f"{calls.count(session_id)} destroy attempts for one permanently-failing "
+            f"session; the budget is {MAX_REAP_ATTEMPTS} attempts for the life of the "
+            "process, so this ID is still taking a slot out of every request"
+        )
+        assert session_id not in services.reap_backlog, (
+            "an ID that can never be destroyed is still in the queue healthy expiries "
+            "are drained from"
+        )
+        assert session_id in services.reap_failed, (
+            "the exhausted ID was discarded rather than held: nothing can enumerate "
+            "it, nothing can retry it, and its decrypted originals are still resident"
+        )
+        assert services.vault.originals_for_session(session_id), (
+            "premise: the failures really did leave the originals resident"
+        )
+
+        # A named logout is the one thing that takes an ID back out of the
+        # dead-letter map. Under the patch it fails again, and is re-queued with a
+        # fresh budget rather than going straight back to `reap_failed`.
+        assert await reap_expired_sessions(services, first=session_id) == []
+        assert calls.count(session_id) == MAX_REAP_ATTEMPTS + 1
+        assert session_id in services.reap_backlog, (
+            "the hoist did not rescue the dead letter: DELETE /sessions/{id} is the "
+            "only retry an operator has"
+        )
+        assert session_id not in services.reap_failed
+
+    # And with the fault cleared, the rescued ID really is finished.
+    await _drain_reap_backlog(services)
+    assert session_id not in services.vault.cached_session_ids()
+    assert services.vault.originals_for_session(session_id) == frozenset()
+    assert await services.vault.row_count(session_id) == 0
+    kinds = {event.event_type for event in await services.audit.query(session_id=session_id)}
+    assert {"SESSION_EXPIRE", "VAULT_DESTROY"} <= kinds, (
+        f"the rescued expiry went unaudited: {sorted(kinds)}"
+    )
+    assert await services.audit.verify_chain() is True
+
+
+async def test_the_bounded_drain_delays_an_untouched_expiry_by_one_call_per_sixteen(
+    client: AsyncClient, services: Services
+) -> None:
+    """The price of the per-request bound, measured instead of assumed.
+
+    Before the bound, one reaping call finished every expiry it found, so an
+    expired session's decrypted originals left `SessionVault._caches` on the first
+    request after the expiry was observed. Bounding the drain at
+    `MAX_REAP_PER_REQUEST` moved that to `ceil(p / 16)` calls for a session at
+    1-based position `p` in the backlog -- `ceil(E / 16)` for the last of a burst
+    of `E` sessions that expire together and reach one `sweep()`.
+
+    That window is a real cost of a deliberate trade (the alternative is the
+    311 ms an anonymous caller could charge to an arbitrary victim's request), and
+    the reaper's docstring now states it. This is what stops the statement from
+    being prose: it drives the real vault to the boundary and asserts both sides of
+    it -- resident on call `ceil(E/16) - 1`, gone on call `ceil(E/16)`. An
+    assertion on the second alone would also pass for a reaper that finished
+    everything on the first call, which is the behaviour the bound removed.
+
+    The escape hatch is not re-proved here:
+    `test_a_flooded_reap_backlog_never_drops_a_session_holding_plaintext` already
+    shows `first=` finishing a named session on the spot with 8 192 IDs queued
+    ahead of it, which is why the window applies only to sessions nobody touches.
+    """
+    await _drain_reap_backlog(services)
+    doc_id = await _upload(client)
+    session_id, _expires = await services.sessions.create(OWNER, ttl_seconds=1)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+    assert services.vault.originals_for_session(session_id), (
+        "premise: the vault holds this session's decrypted originals"
+    )
+
+    await asyncio.sleep(1.2)
+    # Ghosts first, then the real expiry, so the victim is deterministically last
+    # in the FIFO -- `SessionRegistry.sweep` returns its IDs sorted, which would
+    # otherwise put the victim at an arbitrary depth.
+    ghosts = [f"window-ghost-{i:04d}" for i in range(MAX_REAP_PER_REQUEST * 3)]
+    _enqueue_for_reaping(services, ghosts)
+    _enqueue_for_reaping(services, await services.sessions.sweep())
+    queued = len(services.reap_backlog)
+    assert queued == len(ghosts) + 1, "premise: the victim is queued exactly once, at the back"
+
+    expected_calls = -(-queued // MAX_REAP_PER_REQUEST)
+    assert expected_calls > 1, "premise: the burst is deeper than one call's budget"
+
+    for call in range(1, expected_calls):
+        await reap_expired_sessions(services)
+        assert services.vault.originals_for_session(session_id), (
+            f"the victim was destroyed on call {call} of an expected {expected_calls}; "
+            f"either the drain is no longer bounded at {MAX_REAP_PER_REQUEST} or the "
+            "queue is no longer FIFO, and the window the reaper documents is wrong"
+        )
+
+    await reap_expired_sessions(services)
+    assert services.vault.originals_for_session(session_id) == frozenset(), (
+        f"{queued} sessions expired together and the last of them still held decrypted "
+        f"originals after {expected_calls} reaping calls; the documented window is "
+        f"ceil({queued} / {MAX_REAP_PER_REQUEST}) = {expected_calls}"
+    )
+    assert session_id not in services.vault.cached_session_ids()
+    assert await services.vault.row_count(session_id) == 0
+    assert not services.reap_backlog, "the burst did not drain in the calls it should have"
+    assert await services.audit.verify_chain() is True
+
+
+async def test_logging_out_after_the_ttl_lapsed_still_destroys_the_vault(
+    client: AsyncClient, services: Services
+) -> None:
+    """`DELETE /sessions/{id}` was a no-op on exactly the session that needed it.
+
+    Everything the route does is behind `_owns_session`, which resolves through
+    `SessionRegistry.owner()` -- and that raises for an expired session, so the
+    helper answers False and `vault.destroy` is skipped. The route still answered
+    204. Measured at `session_ttl_seconds=3`, one run, sleep 3.5 s, then DELETE:
+    `cached=True originals=3 rows=3` before, and the identical line after.
+
+    That is the difference between README gap 7's "no eviction ... and not
+    explicitly logged out" and what shipped: logging out explicitly did not evict
+    either, once the TTL had passed. The reaper is the destruction path for an
+    expired session and no route reached it except `POST /pipeline/run`, which a
+    logout does not go through.
+
+    The `MAX_REAP_PER_REQUEST * 2` ghosts are the second half of the test. With the
+    drain bounded, a plain FIFO reap would spend its whole budget on them and leave
+    this user's rows queued behind strangers' expiries while answering 204, so
+    `delete_session` hoists the session it was asked about to the front. Without
+    the ghosts a FIFO drain and a hoisting drain are indistinguishable here.
+    """
+    await _drain_reap_backlog(services)
+    doc_id = await _upload(client)
+    session_id, _expires = await services.sessions.create(OWNER, ttl_seconds=1)
+    assert (await _run(client, session_id, doc_id)).status_code == 200
+    assert await services.vault.row_count(session_id) > 0, "premise: the vault holds rows"
+    assert session_id in services.vault.cached_session_ids(), "premise: plaintext is cached"
+
+    await asyncio.sleep(1.2)
+    _enqueue_for_reaping(
+        services, [f"ghost-{uuid.uuid4().hex}" for _ in range(MAX_REAP_PER_REQUEST * 2)]
+    )
+
+    # The logout is the FIRST request to touch this session after it expired: no
+    # pipeline run in between, so nothing else can have run the reaper for it.
+    logout = await client.delete(f"/sessions/{session_id}", params={"user_id": OWNER})
+    assert logout.status_code == 204, logout.text
+
+    assert await services.vault.row_count(session_id) == 0, (
+        "logout after the TTL lapsed left the AES-GCM rows on disk -- and nothing "
+        "else can remove them, because every other path gates on the same "
+        "ownership check that just failed"
+    )
+    assert session_id not in services.vault.cached_session_ids(), (
+        "decrypted originals stayed resident in SessionVault._caches after an explicit logout"
+    )
+    events = await services.audit.query(session_id=session_id)
+    assert "SESSION_EXPIRE" in {event.event_type for event in events}
+    assert await services.audit.verify_chain() is True
+    await _drain_reap_backlog(services)
+
+
+# ---------------------------------------------------------------------------
+# Two small surface defects: a missing header and a missing method
+# ---------------------------------------------------------------------------
+async def test_the_endpoint_that_returns_plaintext_forbids_caching(
+    client: AsyncClient,
+) -> None:
+    """`GET /documents/{doc_id}/text` is one of exactly two routes allowed to emit
+    original plaintext, and it was the one the header set forgot.
+
+    Measured before the fix: a 200 carrying decrypted PHI came back with
+    `content-security-policy`, `x-content-type-options` and `referrer-policy` and
+    **no `cache-control` at all** -- and `grep -rni "no-store"` matched nothing in
+    the tree. Without it the body is storable by any intermediary and by the
+    browser's own back/forward and disk caches, so the plaintext outlives the
+    request, the session TTL and the cryptographic erasure that is supposed to end
+    it, on a machine this process does not control. The design was already
+    reasoning about this exact class of leakage one paragraph earlier, for a
+    `doc_id` in an outbound `Referer`.
+
+    Asserted on the plaintext route specifically as well as on the general sweep
+    above, because this is the response where the header is load-bearing rather
+    than hygienic: a stale `/health` in a cache is a stale liveness answer, a
+    stale `/documents/.../text` is the document.
+    """
+    doc_id = await _upload(client)
+    response = await client.get(f"/documents/{doc_id}/text", params={"user_id": OWNER})
+    assert response.status_code == 200, response.text
+    assert "David Ochoa" in response.json()["text"], "premise: this body carries plaintext"
+    assert response.headers["cache-control"] == "no-store"
+
+
+async def test_head_is_answered_by_the_route_and_not_by_the_static_mount(
+    client: AsyncClient,
+) -> None:
+    """`curl -I /health` returned 404 on a perfectly healthy process.
+
+    FastAPI's `@router.get` registers GET only, so a HEAD request matched the path
+    but not the method; Starlette kept looking and fell through to the catch-all
+    `Mount("/")` that `_mount_ui` installs last, which answered its own static-file
+    miss. `middleware.py`'s premise -- "mounted last, so every API route is matched
+    first" -- holds only for methods a route actually declares, and HEAD appeared
+    nowhere in the README or in `tests/`.
+
+    It matters for the least exotic reader there is: a load balancer's default
+    probe and the first thing an ops reviewer types. The status and the headers
+    must be the GET's, which is what distinguishes a real answer from the mount's.
+    """
+    head = await client.head("/health")
+    get = await client.get("/health")
+    assert head.status_code == get.status_code == 200
+    assert head.headers["content-type"] == "application/json"
+    for header in ("content-security-policy", "x-content-type-options", "cache-control"):
+        assert head.headers[header] == get.headers[header], header
+    assert head.content == b"", "HEAD must carry no body"
+
+
+async def test_an_unknown_body_field_name_is_not_echoed_into_the_422(
+    client: AsyncClient,
+) -> None:
+    """"No error path can echo a caller's input back" had one unstated exception.
+
+    `SessionCreateRequest` and `PipelineRunRequest` both declare `extra="forbid"`,
+    and pydantic's `extra_forbidden` error puts the caller's own key in `loc` --
+    which `_validation_handler` joined straight into `fields`. Measured before the
+    fix: a body carrying `{"evil_field_<script>": 1}` answered
+    `{"errors":1,"fields":"body.evil_field_<script>"}`, i.e. up to 64 characters of
+    attacker-chosen text reflected out of the endpoint whose whole documented
+    purpose is not reflecting the caller's input.
+
+    Not a live XSS -- the response is `application/json` under `nosniff` and a
+    `default-src 'none'` CSP -- which is the reason to fix it rather than to argue
+    about it: the guarantee is what other components are entitled to rely on, and
+    an exception nobody wrote down is the one that gets relied on wrongly.
+
+    The canary is a real-shaped original, not a marker string: it is exactly the
+    kind of value a client would put in a field name by accident, and the point is
+    that no part of it survives.
+    """
+    canary = "CANARY-David-Ochoa-123-45-6789"
+    response = await client.post("/sessions", json={"user_id": OWNER, canary: 1})
+    assert response.status_code == 422, response.text
+    body = response.text
+    assert canary not in body, f"the 422 echoed the caller's own field name: {body}"
+    assert "David" not in body and "Ochoa" not in body
+    detail = response.json()["detail"]
+    assert detail["fields"] == f"body.{EXTRA_FIELD_MARKER}"
+    assert detail["errors"] == 1
+
+    # The rewrite must not have flattened *declared* field names too -- naming the
+    # schema's own fields is what makes a 422 actionable, and only the caller's
+    # half is secret.
+    missing = await client.post("/sessions", json={})
+    assert missing.status_code == 422
+    assert missing.json()["detail"]["fields"] == "body.user_id"

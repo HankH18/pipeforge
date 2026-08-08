@@ -224,10 +224,30 @@ _HINT_TAIL_RE = re.compile(r"[^\s\]\}\)]{0,48}")
 #: to build the matcher and to key the issued map back from a flexed match.
 _WS_RUN_RE = re.compile(r"\s+")
 
-#: Longest label copied out of untrusted text into an audit row. The type label
-#: is grammar-constrained to ``[A-Z][A-Z0-9_]*`` and so can never be an entity
-#: value; the cap is belt-and-braces against a pathological response.
+#: Longest label copied out of untrusted text into an audit row.
+#:
+#: This constant's own comment used to argue that the cap was "belt-and-braces"
+#: because the type label "is grammar-constrained to ``[A-Z][A-Z0-9_]*`` and so
+#: can never be an entity value". The grammar is real; the conclusion is false.
+#: ``[PHI_MARISOL_VANTERPOOL_40281993]`` satisfies it exactly, and an ALL-CAPS
+#: surname is what a model writes when it invents a placeholder from a name it
+#: read. The cap is therefore a *bound* on a leak, not a proof there is none --
+#: see the label-suppression rule in :meth:`Restorer._restore_tokens`, which is
+#: what actually closes it.
 _MAX_LABEL_LEN = 48
+
+#: How many individual ``VAULT_MISS`` rows one restore may write for misses whose
+#: token IDs this run did **not** mint.
+#:
+#: The response is provider-controlled and the emit loop ran once per distinct
+#: unresolved ID with no bound, so the number of hash-chained audit writes was a
+#: number the provider chose. Measured on the real ``AuditLogger``: 400 fabricated
+#: ``[PII_NAME_xxxxxxxx]`` placeholders -- well inside the ``llm_max_tokens``
+#: ceiling of 16 000 -- cost **227 ms** of restore, and 1 000 of them cost
+#: **561 ms** against the 500 ms budget section 12 sets for the whole stage. With
+#: the cap the same 1 000 placeholders cost **22 ms** and write 33 rows, and the
+#: per-class totals stay reconstructible from the summary row.
+_MAX_MISS_ROWS = 32
 
 
 class SupportsVaultLookup(Protocol):
@@ -564,6 +584,16 @@ class Restorer:
             verbatim, because that is what an uploaded document's own reference
             code looks like and destroying it is worse than showing it. See
             :func:`_is_bracketed` for why parentheses are not our handwriting.
+
+        Miss *reporting* is capped; miss *counting* is not. Every unresolved ID
+        still reaches the caller in :class:`RestoreResult` and every one is still
+        counted into the ``DEOBFUSCATE`` row, but only the first
+        :data:`_MAX_MISS_ROWS` provider-attributable misses get an individual
+        hash-chained ``VAULT_MISS`` row; the rest collapse into one summary row
+        carrying per-class counts. A hash-chained write costs ~0.55 ms and the
+        number of them was a number the *provider* chose -- 400 fabricated
+        placeholders cost 227 ms and 1 000 cost 561 ms, against the 500 ms budget
+        for the whole stage; capped, the same 1 000 cost 22 ms.
         """
         matches = list(TOKEN_RE.finditer(text))
         if not matches:
@@ -596,18 +626,25 @@ class Restorer:
         # design: one that outlived the call would outlive its session scope.
         order: list[str] = []
         labels: dict[str, str] = {}
+        # Group 1 alone, kept apart from the full label: it is one of the four
+        # literals in `CATEGORIES`, a closed set this module ships, so it is the
+        # half of the label that provably cannot carry a value.
+        categories: dict[str, str] = {}
         for match, claimed in zip(matches, claimable, strict=True):
             if not claimed:
                 continue
             token_id = match.group(3).lower()
             if token_id not in labels:
                 labels[token_id] = f"{match.group(1)}_{match.group(2)}"[:_MAX_LABEL_LEN]
+                categories[token_id] = match.group(1)
                 order.append(token_id)
 
         resolved: dict[str, str] = {}
         unresolved: list[str] = []
         fabricated: list[str] = []
         lost: list[str] = []
+        emitted_misses = 0
+        suppressed: dict[str, int] = {}
         for token_id in order:
             try:
                 if minted is not None and token_id not in minted:
@@ -627,72 +664,123 @@ class Restorer:
                 else:
                     classification = MISS_FABRICATED
                     fabricated.append(token_id)
-                # `token_id` is recorded only when the ID is one we MINTED.
+                # NEITHER `token_id` NOR `entity_type` is recorded unless the ID is
+                # one we MINTED. Both halves of the row are copied out of the
+                # model's bytes, and the first version of this fix suppressed only
+                # `token_id` on the argument that `entity_type` -- `TOKEN_RE`'s
+                # groups 1 and 2 -- is "grammar-constrained to a category literal
+                # and `[A-Z][A-Z0-9_]*`, a type label, not a value". The grammar is
+                # real and the inference from it is wrong. Measured against the real
+                # `AuditLogger`:
                 #
-                # The two fields are not the same risk, and treating them as one was
-                # the first version of this fix. `entity_type` is `TOKEN_RE`'s groups
-                # 1 and 2, which the grammar constrains to a category literal and
-                # `[A-Z][A-Z0-9_]*` -- a type label, not a value -- and it is clamped
-                # to `_MAX_LABEL_LEN` by the deliberate defence
-                # `test_the_entity_type_label_copied_from_untrusted_text_is_bounded`
-                # exists to check. `token_id` is group 3, eight characters of
-                # unconstrained hex taken straight from the model's bytes, and it is
-                # the one that carries a value.
+                #     restore(sid, "[PHI_MARISOL_VANTERPOOL_40281993] was seen.",
+                #             issued={"1a2b3c4d"})
+                #     -> VAULT_MISS entity_type='PHI_MARISOL_VANTERPOOL' token_id=None
                 #
-                # The trigger is not adversarial. An ordinary document reference the
-                # model echoes back in the placeholder shape the system prompt taught
-                # it, `[PHI-MRN-40281993]`, is a `TOKEN_RE` match whose group 3 is
-                # eight digits of a real MRN -- and it landed in the `token_id`
-                # column, in the hash chain, and in `GET /audit`. (The parenthesised
-                # `(PHI-MRN-40281993)` used to reach this branch too, which was a
-                # second and worse defect -- `_is_bracketed` read a paren as our own
-                # handwriting and deleted the reference. Fixed there; the square
-                # form still arrives here and still carries the MRN.) That is
-                # the outcome build doc section 16 forbids unconditionally. For a
-                # FABRICATED miss the ID is by definition not ours -- `minted` was
+                # An ALL-CAPS surname satisfies `[A-Z][A-Z0-9_]*` exactly, and an
+                # ALL-CAPS name is precisely what a model writes when it invents a
+                # placeholder out of something it read. So a name reached the
+                # hash-chained log and `GET /audit`, and `_MAX_LABEL_LEN` bounded
+                # its length rather than its existence.
+                #
+                # The trigger is not adversarial either way. An ordinary document
+                # reference the model echoes back in the placeholder shape the
+                # system prompt taught it, `[PHI-MRN-40281993]`, is a `TOKEN_RE`
+                # match whose group 3 is eight digits of a real MRN -- and it landed
+                # in the `token_id` column, in the hash chain, and in `GET /audit`.
+                # (The parenthesised `(PHI-MRN-40281993)` used to reach this branch
+                # too, which was a second and worse defect -- `_is_bracketed` read a
+                # paren as our own handwriting and deleted the reference. Fixed
+                # there; the square form still arrives here.) That is the outcome
+                # build doc section 16 forbids unconditionally.
+                #
+                # What the row keeps costs an auditor nothing they could act on. For
+                # a FABRICATED miss the ID is by definition not ours -- `minted` was
                 # supplied and this ID is not in it -- so the classification is the
-                # diagnosis and the ID adds nothing a reader can act on.
+                # diagnosis; `category` (group 1, one of the four `CATEGORIES`
+                # literals this module ships) still says which namespace the model
+                # imitated, and being a closed set it cannot be a value.
                 #
-                # INDETERMINATE deliberately keeps it, and the line is drawn there
+                # INDETERMINATE deliberately keeps both, and the line is drawn there
                 # rather than at "anything we cannot prove is ours" because of where
                 # each case can occur. The orchestrator always supplies `issued`
                 # (see `orchestrator.py`), so the shipped pipeline can only ever
                 # produce LOST or FABRICATED, and the demonstrated leak is
                 # FABRICATED. INDETERMINATE means a library caller opted out of
-                # classification entirely, and on that path the ID is the only
-                # signal the row has at all.
+                # classification entirely, and on that path the ID and the label are
+                # the only signal the row has at all.
                 ours = classification != MISS_FABRICATED
-                await self._emit(
-                    session_id,
-                    run_id=run_id,
-                    event_type=VAULT_MISS,
-                    entity_type=labels[token_id],
-                    token_id=token_id if ours else None,
-                    detail={
-                        "stage": "deobfuscate",
-                        # Kept stable: it names the *observation*. `classification`
-                        # names the diagnosis, which is the part that needs a
-                        # human.
-                        "reason": "token_not_in_vault",
-                        "classification": classification,
-                    },
-                )
-                # A lost token is a value the user was entitled to and cannot be
-                # given; a fabricated one costs nothing. Same placeholder to the
-                # user, different severity to whoever reads the logs.
-                logger.log(
-                    logging.ERROR if classification == MISS_LOST else logging.WARNING,
-                    "vault miss during restore",
-                    extra={
-                        "session_id": session_id,
-                        "run_id": run_id,
-                        # Same rule as the audit row above: the process log is a
-                        # channel too, and section 16 carves out no exception for it.
-                        "token_id": token_id if ours else None,
-                        "entity_type": labels[token_id],
-                        "classification": classification,
-                    },
-                )
+                # A LOST row is never suppressed. `_MAX_MISS_ROWS` exists because a
+                # provider chooses how many IDs it fabricates; it does not choose
+                # how many this run minted, so the LOST count is bounded by our own
+                # document and every one of them names a value a user was entitled
+                # to see. The cap governs the classes the provider controls.
+                emitted_misses += 1
+                if classification == MISS_LOST or emitted_misses <= _MAX_MISS_ROWS:
+                    await self._emit(
+                        session_id,
+                        run_id=run_id,
+                        event_type=VAULT_MISS,
+                        entity_type=labels[token_id] if ours else None,
+                        token_id=token_id if ours else None,
+                        detail={
+                            "stage": "deobfuscate",
+                            # Kept stable: it names the *observation*.
+                            # `classification` names the diagnosis, which is the
+                            # part that needs a human.
+                            "reason": "token_not_in_vault",
+                            "classification": classification,
+                            "category": categories[token_id],
+                        },
+                    )
+                    # A lost token is a value the user was entitled to and cannot be
+                    # given; a fabricated one costs nothing. Same placeholder to the
+                    # user, different severity to whoever reads the logs.
+                    logger.log(
+                        logging.ERROR if classification == MISS_LOST else logging.WARNING,
+                        "vault miss during restore",
+                        extra={
+                            "session_id": session_id,
+                            "run_id": run_id,
+                            # Same rule as the audit row above: the process log is a
+                            # channel too, and section 16 carves out no exception
+                            # for it.
+                            "token_id": token_id if ours else None,
+                            "entity_type": labels[token_id] if ours else None,
+                            "classification": classification,
+                        },
+                    )
+                else:
+                    suppressed[classification] = suppressed.get(classification, 0) + 1
+
+        if suppressed:
+            # One row, counts only, so the per-class totals survive the cap. With
+            # `DEOBFUSCATE`'s `unresolved_fabricated`/`unresolved_lost` on the same
+            # run an auditor can still reconstruct the whole breakdown; what they
+            # lose is the individual identity of misses that, by classification,
+            # carry no ID of ours to identify.
+            await self._emit(
+                session_id,
+                run_id=run_id,
+                event_type=VAULT_MISS,
+                detail={
+                    "stage": "deobfuscate",
+                    "reason": "token_misses_suppressed",
+                    "suppressed": sum(suppressed.values()),
+                    "suppressed_fabricated": suppressed.get(MISS_FABRICATED, 0),
+                    "suppressed_indeterminate": suppressed.get(MISS_INDETERMINATE, 0),
+                    "row_cap": _MAX_MISS_ROWS,
+                },
+            )
+            logger.warning(
+                "vault-miss audit rows suppressed by the per-response cap",
+                extra={
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "suppressed": sum(suppressed.values()),
+                    "row_cap": _MAX_MISS_ROWS,
+                },
+            )
 
         parts: list[str] = []
         cursor = 0
@@ -1155,6 +1243,46 @@ def _consume_unclosed_tail(text: str, match: re.Match[str]) -> int:
     is cosmetic, whereas deleting a clause the model wrote silently changes the
     answer the user reads. All five bounds are pinned by the
     ``PROSE_AFTER_A_MANGLED_HINT`` table in ``tests/test_deobfuscation.py``.
+
+    **A token that lost BOTH brackets keeps its hint, on purpose.** Every bound
+    above leans on the closer that *balances* the opener, so ``bracket_dropped``
+    applied to both halves -- ``PHI_DIAGNOSIS_c5a3c75f|cardiovascular.`` -- has
+    nothing to terminate on and this returns immediately. The cost is real and is
+    accepted rather than hidden: with a vault of ``{'c5a3c75f': 'chest pain'}``
+    the user reads ``chest pain|cardiovascular.``, and the bracketed spelling of
+    the same token reads ``chest pain.``. That asymmetry is visible in panel 4 of
+    the demo.
+
+    A mop-up for the stranded form was written and then **reverted**, and the
+    reason is kept here so it is not written a second time. Without a bracket
+    there is no delimiter, so the only thing left to bound the deletion by is the
+    hint *alphabet* -- ``[a-z0-9-]{1,24}`` -- and that alphabet is also ordinary
+    English. Measured on the reverted implementation, with all of its table-cell
+    and length guards in place, it still deleted the model's own words (same
+    vault as above)::
+
+        PHI_DIAGNOSIS_c5a3c75f|and the rest follows.  ->  chest pain the rest follows.
+        PHI_DIAGNOSIS_c5a3c75f|per-protocol review.   ->  chest pain review.
+        col|head(NL)PHI_DIAGNOSIS_c5a3c75f|active     ->  col|head(NL)chest pain
+
+    The third is a compact markdown table -- no outer pipes, which is how a model
+    writes a two-column summary -- and it loses a cell exactly as the spaced-out
+    rows of ``PROSE_AFTER_A_MANGLED_HINT`` do.
+
+    The only honest bound is the *finite* hint vocabulary, since hints come from
+    the gazetteer class column and nowhere else. That is not reachable from here:
+    this module is handed a vault and settings, never a registry, and the run's
+    surrogate map carries pseudonyms only (see ``orchestrator._surrogate_map``),
+    so the hint this run emitted for a given token ID is not knowable at restore
+    time. Sourcing it from the gazetteers would make the restorer depend on the
+    detection stack and make its *deletion extent* a function of a data file --
+    and it would still not close the hole, because ``cardiovascular``, ``renal``,
+    ``insulin`` and ``autoimmune`` are all real class hints and all real English.
+
+    So the ordering of harms three paragraphs up decides it here too, and it
+    decides it the same way: a visible ``|cardiovascular`` is cosmetic and the
+    reader can see it; a word deleted from a clinical answer is not, and cannot.
+    Pinned by the ``STRANDED_HINT_IS_LEFT_ALONE`` table.
     """
     end = match.end()
     matched = match.group(0)
@@ -1298,11 +1426,11 @@ def _count_surrogate_near_misses(
 
     :func:`_compile_surrogate_pattern` is case-sensitive on purpose and that
     decision is right (folding case splices a real original next to a sentence
-    about the common word ``long``). The cost is that an upper-cased heading, a
-    lower-cased mention or a pluralised surname reaches the user **as the fake**,
-    with ``restored_count`` 0, ``vault_misses`` 0, ``surrogates_seen`` 0 and
-    outcome ``ok``. Nothing in the answer or the audit row distinguished that from
-    a document that simply had no pseudonyms in it.
+    about the common word ``long``). The cost is that an upper-cased heading or a
+    lower-cased mention reaches the user **as the fake**, with ``restored_count``
+    0, ``vault_misses`` 0, ``surrogates_seen`` 0 and outcome ``ok``. Nothing in
+    the answer or the audit row distinguished that from a document that simply had
+    no pseudonyms in it.
 
     This scans once more, case-insensitively and NFKC-folded, and *counts*. It
     never resolves and never rewrites, so the reason for case-sensitivity is
@@ -1310,6 +1438,28 @@ def _count_surrogate_near_misses(
     pass wrote are excluded for the same reason
     :meth:`Restorer._assert_no_surrogates` excludes them: a restored original
     legitimately contains other entities' fakes.
+
+    The enumeration above used to include "or a pluralised surname" and that was
+    false. The folded build is still :func:`_compile_surrogate_pattern`, which
+    still writes ``RIGHT_GUARD`` per branch, so the ``es`` of ``Lopezes`` fails the
+    guard exactly as it does in the resolving build. Measured against the real
+    restorer with ``Lopez`` issued: ``The Lopezes met.`` counts **0** while ``THE
+    LOPEZ FILE.`` counts 1. The counter is an upper bound in the *case* dimension
+    and inherits every boundary rule of the matcher it backstops -- README section
+    7 gap 3 records that, and records why a genuinely independent counter is a
+    design change rather than a patch.
+
+    **First lines are counted separately.** A surrogate may contain a newline: the
+    detector emits NAME spans that run past a hard wrap into the next field's
+    label (``Duane Ingram\\n    Date``), and the fake minted for one carries the
+    wrap. ``\\s+`` flexing keeps the whole fake matching when the model re-wraps
+    it, but not when the model quotes only the *name* half -- and then the fake
+    reaches the user with all three counters at zero, which is the exact blindness
+    this function exists to remove. Each such surrogate's first line is added to
+    the folded alternation as its own alternative. Longest-first ordering means a
+    surviving full fake is still counted once, not twice, and a surrogate with no
+    newline in it adds nothing, so the numbers README section 7 gap 3 quotes are
+    unchanged.
 
     Deliberately an upper bound. ``Long`` counts its lowercase common-word twin,
     and that over-count is preferable to a signal that goes quiet exactly when the
@@ -1322,7 +1472,13 @@ def _count_surrogate_near_misses(
     folded = unicodedata.normalize("NFKC", text)
     if len(folded) != len(text):
         folded = text
-    pattern = _compile_surrogate_pattern(surrogates, fold=True)
+    issued = list(surrogates)
+    heads = [
+        head
+        for head in (fake.split("\n", 1)[0].strip() for fake in issued if "\n" in fake)
+        if head
+    ]
+    pattern = _compile_surrogate_pattern([*issued, *heads], fold=True)
     if pattern is None:
         return 0
     return sum(

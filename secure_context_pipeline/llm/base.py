@@ -30,7 +30,18 @@ outside the new module.  A provider registered from outside the package -- a
 plugin, or a test -- needs no edit here at all, since it imports itself and
 :func:`register_provider` does the rest; that is what
 ``test_new_provider_name_is_selectable_with_zero_other_changes`` demonstrates.
-Either way nothing anywhere branches on a provider name.
+
+Nothing in the *call path* branches on a provider name: dispatch is a registry
+lookup, and no module downstream of it asks which provider it holds. There is one
+branch in the whole package and it is in configuration, not here --
+``Settings._validate`` refuses ``llm_provider == "anthropic"`` with no
+``anthropic_api_key`` set, so that provider's one required credential is checked
+at startup rather than surfacing as a 500 on the first request. This paragraph
+used to end "nothing anywhere branches on a provider name", which read as if the
+seam were completely name-blind; it is not, and a provider with its own mandatory
+credential would add a second such line. Moving the requirement onto
+``AnthropicProvider.__init__`` would make the stronger sentence true and is the
+better end state; until then the exception is named rather than papered over.
 """
 
 from __future__ import annotations

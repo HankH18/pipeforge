@@ -20,6 +20,19 @@ changes**::
 ``tests/test_obfuscation.py::test_dummy_strategy_plugs_in_with_zero_engine_changes``
 asserts exactly that.
 
+**Drop-in for the engine, and only for the engine.** Two components outside this
+package still enumerate the two shipped names by hand, so a third strategy is
+engine-usable without being reachable from a request:
+``Settings.strategy`` is ``Literal["tokenization", "pseudonymization"]``
+(``config.py:106``), which rejects a third name at config load and at the
+``/pipeline/run`` request field; and ``deobfuscation.restorer._KNOWN_STRATEGIES``
+(``restorer.py:171``) is a frozenset of the same two, checked at ``restorer.py:426``,
+so a run that reached the restorer under a third name would raise
+``PipelineError(reason='unknown_strategy')``. Neither is an engine change, which is
+why the claim above is true as written and still not the whole cost -- both would
+have to be widened for a new strategy to run end to end through
+``PipelineOrchestrator``.
+
 Deviation from the build doc's ABC signature (documented as required)
 ---------------------------------------------------------------------
 The doc writes ``make_surrogate(self, detection, token_id, vault)``. This adds a

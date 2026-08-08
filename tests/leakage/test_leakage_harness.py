@@ -27,10 +27,17 @@ Four assertions per run (build doc section 10.5):
    comparisons ``EgressGate._scan_originals`` makes, over the same two views of the
    payload it makes them against (as sent, and transport-decoded), so the harness
    cannot pass on a form the gate would catch -- and with no minimum length, so a short
-   value the gate skips still fails here. No span is exempt, including the
-   pipeline's own output: a pseudonym that reproduces a real value verbatim puts
-   that value on the wire wherever it sits. The run additionally asserts that no
-   surrogate equals the value it replaces.
+   value the gate skips still fails here. **Exactly one span is exempt**, and its
+   width is eight characters: the hexadecimal id of a token *this run issued*, matched
+   by exact string occurrence and blanked before any limb reads the payload
+   (:func:`_harness_mask_own_ids`). That id is an HMAC under the session key truncated
+   to eight hex characters, so a needle found inside one is a coincidence with a random
+   string rather than a disclosure -- and the unbounded limbs, which have no adjacency
+   requirement by design, were reporting those coincidences as *"original present in
+   the outbound payload"*. Nothing else the pipeline wrote is excused. A pseudonym in
+   particular is not: a fake that reproduces a real value verbatim puts that value on
+   the wire wherever it sits, and this harness has caught exactly that once. The run
+   additionally asserts that no surrogate equals the value it replaces.
 2. **Audit DB and captured log output hold zero originals.** The audit side is
    queried through :meth:`AuditLogger.query` and, as defence in depth, the raw
    SQLite files are scanned as bytes -- a value that never survives the query API
@@ -149,6 +156,21 @@ headline claim for as long as it lasted.
 implementations over the same inputs and fails on any payload the gate blocks and this
 file calls clean, so the next limb the gate grows is a red here rather than a silence.
 
+**The one time the asymmetry ran the other way, and what it cost.** Every entry above
+is the gate gaining reach and this file lagging. The own-token-id exclusion is the
+mirror image: the gate *narrowed*, dropping a false ``EGRESS_BLOCKED`` refusal on runs
+where a vaulted digit run happened to appear inside one of our own HMAC ids, and this
+file did not follow -- so the identical non-event stopped failing at the gate and
+started failing on **assertion 1**, which reads as "an original reached the provider".
+That is a worse red for the same nothing, and it is the one direction where being
+stricter than the gate is not free: a ~1-per-suite false positive on the headline claim
+is a claim nobody can quote. Closed here by :func:`_harness_mask_own_ids`, and
+deliberately **not** by importing the gate's ``_mask_own_tokens``: the exemption is
+derived from the vault's own issued-surrogate map, and
+:func:`test_the_own_id_exclusion_does_not_ask_the_gate_for_its_answer` stubs the gate's
+whole exemption dead and requires this module to exclude anyway -- the same sabotage
+:func:`_harness_separator_hit` and :func:`_reference_skeleton` each already earned.
+
 Then one adversarial run that removes detection from the argument entirely: a
 value of a shape **no recogniser in the registry matches** is planted in the
 document and injected into the vault's originals set, so the detector is provably
@@ -156,12 +178,16 @@ blind to it and the value rides through to the payload untouched. The gate must
 still block, the block must be audited, and the provider must never be called.
 That is the fail-closed property, proven independent of detection recall.
 
-Run it with ``pytest -m leakage``. Roughly 57 s on this machine, measured rather than
-remembered -- the spaCy analyzer and the whole component graph are built once for the
-module and every run gets a fresh session. The number in this sentence had drifted to
-"40 s" while the suite actually took 53 s, which is harmless here and is the same habit
-that makes a stale claim about a *limit* dangerous, so it is measured when it is
-quoted.
+Run it with ``pytest -m leakage``. **94-96 s** on this machine, measured rather than
+remembered -- three consecutive invocations of ``pytest tests/leakage/ -q -s`` took
+94.83 s, 95.49 s and 95.87 s, of which the 100 runs themselves were 89.6 s, 90.1 s and
+90.5 s. A range rather than a point because three earlier invocations of the same file
+took 93.10/93.49/93.81 s: the spread is other work on the machine, and quoting the
+fastest one as *the* number is how the last two figures went stale. The spaCy analyzer
+and the whole component graph are built once for the module and every run gets a fresh
+session. The number in this sentence had drifted to "40 s" while the suite actually took
+53 s, and then to "57 s" while it took 95; that is harmless here and is the same habit
+that makes a stale claim about a *limit* dangerous, so it is re-measured when quoted.
 """
 
 from __future__ import annotations
@@ -169,16 +195,20 @@ from __future__ import annotations
 import ast
 import base64
 import json
+import linecache
 import logging
 import re
 import secrets
+import time
 import unicodedata
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from html import unescape
 from pathlib import Path
-from typing import Any, NamedTuple
+from types import SimpleNamespace
+from typing import Any, NamedTuple, cast
 from urllib.parse import unquote
 
 import pytest
@@ -463,6 +493,112 @@ class Harness:
         return blob
 
 
+def _run_label(index: int) -> str:
+    """``run 086 (financial/tokenization, seed 90086, id 086-financial-...)``.
+
+    Spelled out rather than left as the parametrize id, because the four facts are
+    what a reader acts on and the id is what they paste into ``-k``. Both, once.
+    """
+    seed, kind, strategy = plan_run(index)
+    return f"run {index:03d} ({kind}/{strategy}, seed {seed}, id {run_id_for(index)})"
+
+
+def _failure_site(exc: BaseException) -> str:
+    """Where a run died, as ``line N: <source>``, carrying **no exception message**.
+
+    The message is deliberately left out. Everything this module raises itself is
+    already ``mask``-ed, but an exception out of the *package* is arbitrary text
+    that has been near the document -- and this string is printed by the summary,
+    which is the one line a reviewer copies out of the run. A file, a line number
+    and the source text of the statement are enough to name the assertion, cost
+    nothing to produce, and cannot carry an original by construction. The full
+    message is not lost either way: pytest still prints the failing run's own
+    traceback directly above the summary.
+
+    The quoted statement is *source*, which is the only reason quoting it is safe:
+    it can carry a value only if that value is hardcoded in this file, and every
+    original here is drawn from the generator at runtime. Pinned from the other
+    side by ``test_a_run_that_dies_before_record_is_named_with_its_reason``, which
+    raises through a local so a literal cannot supply the string it looks for.
+
+    Two frames matter and they are usually different. The deepest frame *in this
+    file* is the harness statement that failed -- for a pipeline exception that is
+    the ``orchestrator.run`` call, which is exactly the fact worth recording. The
+    deepest frame overall says which module actually raised, which is what tells a
+    gate timeout apart from a failed assertion two lines later.
+    """
+    here = ""
+    deepest = ""
+    tb = exc.__traceback__
+    while tb is not None:
+        filename = tb.tb_frame.f_code.co_filename
+        deepest = f"{Path(filename).name}:{tb.tb_lineno}"
+        if Path(filename).name == Path(__file__).name:
+            source = linecache.getline(filename, tb.tb_lineno).strip()
+            here = f"harness line {tb.tb_lineno}: {source[:80]}"
+        tb = tb.tb_next
+    if not here:
+        return f"raised in {deepest or '<no traceback>'}"
+    if deepest.startswith(Path(__file__).name):
+        return here
+    return f"{here} -- raised in {deepest}"
+
+
+@dataclass(frozen=True, slots=True)
+class RunFailure:
+    """One run that did not reach :meth:`Ledger.record`, and what it was doing.
+
+    This exists because the harness failed exactly once, on run 086 under heavy
+    concurrent load (two uvicorn servers and browser automation on the same
+    machine), and the *failure* was diagnosable only from a traceback nobody had
+    kept: what survived was ``99 == 100`` from the summary and
+    ``Ledger(runs=99, leaks=0, ...)``, which says a run vanished and says nothing
+    at all about which one or why. ``leaks=0`` even rules out the interesting
+    answer, so the surviving evidence could not distinguish a gate timeout from a
+    fixture error from an assertion three lines from the end.
+
+    Four facts make the next occurrence answerable without a rerun: the run's
+    identity (``run_id_for`` carries index, kind, strategy and seed), the
+    exception *type*, the statement it came out of, and how long the run had been
+    going. The last one is not padding -- the one observed failure was on a loaded
+    machine, so "was this run 30x slower than its neighbours" is the first
+    question to ask, and only the harness can answer it after the fact.
+
+    Two failure modes in the pipeline are triggered by *load specifically*, both
+    raise straight out of ``orchestrator.run``, and both leave exactly the residue
+    that was observed -- no leak, no tally, no explanation:
+
+    * ``DetectionError(reason="detect_deadline")`` -- ``Detector.detect`` refuses
+      to *start* a chunk more than ``detect_timeout_s`` (30 s) in;
+    * ``EgressBlockedError(reason="gate_exception")`` -- ``EgressGate.check`` wraps
+      itself in ``asyncio.timeout(DEFAULT_TIMEOUT_S)``, also 30 s, and a gate that
+      times out blocks rather than releasing.
+
+    Neither is a hypothesis this file can confirm after the fact for run 086, and
+    neither is being asserted here. They are named because the failure line now
+    distinguishes them on sight: the exception type, the module that raised it
+    (``raised in detector.py:NNN`` versus ``egress_gate.py:NNN``) and an
+    ``elapsed_s`` past 30 s against the ~2.5 s a healthy run takes. Any of the
+    ordinary assertions in the run body prints its own ``harness line NNNN:
+    assert ...`` instead. Verified by forcing the second of the two: with the
+    gate's budget temporarily set to 0.5 ms, the summary printed ``run 000
+    (medical/tokenization, seed 90000, ...) raised EgressBlockedError after 1.08s
+    at harness line NNNN: result = await harness.orchestrator.run(... -- raised in
+    egress_gate.py:552``.
+    """
+
+    index: int
+    exc_type: str
+    where: str
+    elapsed_s: float
+
+    def __str__(self) -> str:
+        return (
+            f"{_run_label(self.index)} raised {self.exc_type} after "
+            f"{self.elapsed_s:.2f}s at {self.where}"
+        )
+
+
 @dataclass(slots=True)
 class Ledger:
     """Accumulates the run tally so the module can print one summary line."""
@@ -472,9 +608,51 @@ class Ledger:
     originals_vaulted: int = 0
     round_trip_checked: int = 0
     notes: list[str] = field(default_factory=list)
+    #: Indices that entered the run body, and those that finished it. The
+    #: difference is the set the old ``99 != 100`` could only count.
+    entered: set[int] = field(default_factory=set)
+    completed: set[int] = field(default_factory=set)
+    failures: list[RunFailure] = field(default_factory=list)
+    #: ``(seconds, index)`` for the slowest run, and the wall time of all of them.
+    slowest: tuple[float, int] | None = None
+    elapsed_total: float = 0.0
 
-    def record(self, *, originals: int, restored: int) -> None:
+    @contextmanager
+    def watching(self, index: int) -> Iterator[None]:
+        """Wrap one run so that dying inside it is a recorded fact rather than a gap.
+
+        Three bookkeeping lines and a ``try`` around a run that takes ~1.3 s, so the
+        cost of doing this 100 times is not measurable against the 135 s the module
+        takes. The ``except`` clause is ``BaseException`` on purpose: a timeout, a
+        cancellation and a ``KeyboardInterrupt`` are exactly the outcomes that leave
+        a run unrecorded, and catching only ``Exception`` would miss all three. It
+        re-raises unconditionally -- **nothing here converts a red run into a green
+        one**, and a run whose exception is swallowed would still be missing from
+        :attr:`completed`, so the summary would still fail.
+        """
+        self.entered.add(index)
+        started = time.perf_counter()
+        try:
+            yield
+        except BaseException as exc:
+            self.failures.append(
+                RunFailure(
+                    index=index,
+                    exc_type=type(exc).__name__,
+                    where=_failure_site(exc),
+                    elapsed_s=time.perf_counter() - started,
+                )
+            )
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            self.elapsed_total += elapsed
+            if self.slowest is None or elapsed > self.slowest[0]:
+                self.slowest = (elapsed, index)
+
+    def record(self, *, index: int, originals: int, restored: int) -> None:
         self.runs += 1
+        self.completed.add(index)
         self.originals_vaulted += originals
         self.round_trip_checked += restored
 
@@ -484,6 +662,48 @@ class Ledger:
             f"({self.originals_vaulted} originals vaulted and scanned, "
             f"{self.round_trip_checked} surrogates round-tripped)"
         )
+
+    def timing(self) -> str:
+        """The load line. Printed every time, because it is only useful *before* the fault.
+
+        A run that fails under contention is diagnosed by comparing it against the
+        runs that did not, and that comparison needs the healthy numbers to have
+        been printed on the healthy days too.
+        """
+        if self.slowest is None:
+            return "[leakage] no run was timed"
+        seconds, index = self.slowest
+        entered = len(self.entered)
+        mean = self.elapsed_total / entered if entered else 0.0
+        return (
+            f"[leakage] {self.elapsed_total:.1f}s in {entered} run(s), "
+            f"mean {mean:.2f}s, slowest {run_id_for(index)} at {seconds:.2f}s"
+        )
+
+    def diagnosis(self, expected: frozenset[int] = frozenset()) -> list[str]:
+        """One line per run that was expected and never recorded. Empty when all did.
+
+        ``expected`` is the selected set, so a run that never even entered the body
+        -- a fixture error, a collection-time crash -- is reported as that, rather
+        than being invisible the way it was when the only evidence was a count.
+        """
+        by_index = {failure.index: failure for failure in self.failures}
+        lines = []
+        for index in sorted((set(expected) | self.entered) - self.completed):
+            failure = by_index.get(index)
+            if failure is not None:
+                lines.append(str(failure))
+            elif index in self.entered:
+                lines.append(
+                    f"{_run_label(index)} entered the body, raised nothing and recorded "
+                    "nothing -- an early return, or a deleted record() call"
+                )
+            else:
+                lines.append(
+                    f"{_run_label(index)} never entered the body -- it was selected but its "
+                    "setup did not complete (fixture error, or the process died first)"
+                )
+        return lines
 
 
 @pytest.fixture(scope="module")
@@ -503,8 +723,22 @@ def leak_settings(tmp_path_factory: pytest.TempPathFactory) -> Settings:
 
 @pytest.fixture(scope="module")
 def detector(registry: EntityRegistry, leak_settings: Settings) -> Detector:
-    """Built ONCE for the module. Constructing it loads spaCy; 100 of those would
-    dominate the runtime and measure nothing."""
+    """Built ONCE for the module -- and per-run scope would not undo that.
+
+    The original reason given here was that "constructing it loads spaCy", which
+    is only true the first time in a process: the ``AnalyzerEngine`` behind it is
+    memoised in ``detection.detector._ANALYZERS``, a module-level dict keyed by
+    spaCy model name, so the second ``Detector(...)`` in a process shares the
+    first one's engine. Measured in one process: the first construction takes
+    360 ms and its first ``detect`` a further 3.4 s; the second construction takes
+    **1 ms**.
+
+    That matters for the isolation question rather than for the timing one. The
+    engine is the most-shared mutable object in this module -- up to
+    ``detect_concurrency`` (4) worker threads call ``analyze`` on it at once -- and
+    changing this fixture to per-run scope would not give a run its own copy of
+    it. See :func:`harness` for what per-run scope would and would not buy.
+    """
     return Detector(registry, leak_settings)
 
 
@@ -519,6 +753,56 @@ async def harness(
 
     Everything is closed in the teardown: an unclosed aiosqlite connection keeps a
     non-daemon thread alive and hangs interpreter exit.
+
+    **Module scope is not isolation, so the question of whether one run can perturb
+    another was examined rather than assumed.** It came up because the harness
+    failed once, on run 086, only under heavy concurrent load, and "the runs share
+    everything" is the first thing anyone looks at. What the reading found:
+
+    * **Every value in every assertion is keyed by the run's own session id.** Each
+      run calls ``sessions.create``, and the needles come from
+      ``vault.originals_for_session(session_id)``, which reads
+      ``SessionVault._caches[session_id]``. ``get_by_original`` is scoped the same
+      way, and pseudonymization's collision guard unions *that* set with the
+      current document's own originals and nothing else. So no run can see, reuse
+      or shift another run's values, and a session is never reused: the ids are
+      fresh and the TTL (3600 s) is two orders of magnitude past the module's
+      runtime, so nothing is swept mid-module either.
+    * **Nothing outlives a run.** No ``create_task`` or ``ensure_future`` exists
+      anywhere in the package -- every audit write, vault write and
+      ``asyncio.to_thread`` offload is awaited before ``orchestrator.run`` returns
+      -- so the shared event loop carries no work from one run into the next. The
+      single exception is documented in ``Detector.detect``: after a
+      ``detect_deadline`` its worker threads cannot be cancelled and keep burning
+      CPU. That can only make the *next* run slower, and only after a run has
+      already gone red, so it amplifies a visible failure rather than creating a
+      silent one.
+    * **One real coupling: the audit DB is one file for all 100 runs.** Assertion
+      2a's byte limb scans ``audit_bytes()``, so run *n* scans every earlier run's
+      rows as well as its own. The direction is strictly more haystack, never
+      less, which makes it a strengthening rather than a hole -- with two
+      consequences worth naming. Cost: the blob reaches **5.5 MB** after 100 runs
+      (0.9 MB of database plus a WAL that saturates near 4.1 MB at SQLite's
+      1000-page auto-checkpoint), and ``find_in_bytes`` over it measures **150 ms**
+      against **1.6 ms** over the first run's 50 KB -- about 27 ms/MB, linear. End
+      to end that shows up as **2.51 s mean for the first ten runs and 3.07 s for
+      the last ten** on one 100-run invocation: real, bounded, and nowhere near a
+      30 s budget. Attribution: a value that leaks in run *n* is reported again by
+      every later run whose fixture plants the same string, so the first red is the
+      guilty run and the rest are echoes.
+    * **The shared object that per-run fixtures would not un-share** is the spaCy
+      ``AnalyzerEngine``, memoised process-wide in ``detector._ANALYZERS``. See
+      :func:`detector`.
+
+    **What per-run fixtures would cost, measured, since that is the usual argument
+    for keeping these.** Rebuilding the registry, the ``Detector`` and the three
+    SQLite databases takes 60 ms (13 ms + 1 ms + 47 ms) once the process is warm,
+    so 100 of them is ~6 s on a module that takes 135 s -- about 4%, which is not
+    the reason to keep module scope. The reason is that it would buy no isolation
+    the session id does not already provide, would leave the one genuinely shared
+    mutable object shared anyway, and would change the artifact the README quotes.
+    If a future finding shows a real cross-run mechanism, the cost of switching is
+    4% and this paragraph is the evidence that it is affordable.
     """
     root = tmp_path_factory.mktemp("leakage-db")
     audit_db = root / "audit.db"
@@ -566,16 +850,24 @@ async def harness(
 
 @pytest.fixture(scope="module")
 def ledger(request: pytest.FixtureRequest) -> Iterator[Ledger]:
-    """Tally across the module, printed once at teardown for the README."""
+    """Tally across the module, printed once at teardown for the README.
+
+    Three lines now, not one. The README quotes :meth:`Ledger.summary` and
+    ``test_readme_claims.py`` parses it, so that line is unchanged; the timing line
+    and any diagnosis lines are printed beside it. They go through the same
+    capture-disabled path, because the only run that ever needed them was one
+    whose per-test output a reviewer no longer had.
+    """
     book = Ledger()
     yield book
-    line = book.summary()
+    lines = [book.summary(), book.timing(), *book.diagnosis()]
+    text = "\n" + "\n".join(lines)
     capture = request.config.pluginmanager.getplugin("capturemanager")
     if capture is not None:
         with capture.global_and_fixture_disabled():
-            print("\n" + line)
+            print(text)
     else:  # pragma: no cover -- capture plugin is always present under pytest
-        print("\n" + line)
+        print(text)
 
 
 # ---------------------------------------------------------------------------
@@ -955,7 +1247,193 @@ def _haystack_forms(haystack: str) -> _HaystackForms:
     )
 
 
-def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
+#: Length of a token id, as :func:`issued_token_id` parses one. Spelled here rather
+#: than imported from ``surrogates`` for the same reason that function is hand-written:
+#: the whole value of this exclusion is that it is decided without the production
+#: grammar, and a length is part of the decision.
+_HARNESS_ID_LEN = 8
+
+#: What each character of one of **our own** emitted token ids is rewritten to before
+#: any scan in this module reads the haystack. See :func:`_harness_mask_own_ids`.
+#:
+#: Three properties make this character inert, and they are the reason it is not a
+#: decorative choice:
+#:
+#: * **alphanumeric**, so it cannot move a word boundary in either direction: a
+#:   neighbour that was glued to a token id is still glued to it, and a neighbour that
+#:   was separated from it by our ``_`` or ``]`` still is. Every bounded form in this
+#:   module decides with :func:`occurs_as_a_unit`, which keys on
+#:   :data:`~secure_context_pipeline.textrules.ALNUM_RE`, so a mask of a *different*
+#:   class would be a fold that deletes a boundary -- the exact mistake
+#:   :func:`_haystack_forms` records having made once already;
+#: * **not a digit**, which is the entire point: the limbs this exclusion exists for
+#:   read digit runs, and a token id's digits are what they were colliding with;
+#: * **not hexadecimal**, so a mask can never be read back as a token id, and
+#:   **ASCII, NFKC-stable, casefold-stable, not a mark and not invisible**, so every
+#:   derived form (:func:`normalize`, :func:`_reference_strip_invisible`,
+#:   :func:`_reference_skeleton`, :func:`_digits_only`,
+#:   :func:`_decode_transport_encodings`) leaves it exactly as it is.
+#:
+#: It is the same character the gate masks with, and that agreement is deliberate in
+#: the way :func:`_haystack_forms` calls its fold ordering deliberate: the two scans
+#: are compared against each other, so the harness must not be the one that manufactures
+#: a hole the gate does not have. A vaulted original of eight ``q``\\ s would be
+#: reported by both -- a false red here and a false block there, which is the strict
+#: direction on both sides. The *decision* -- which strings, which span -- is derived
+#: below without reading a line of the gate, and that is the half that has to be
+#: independent.
+_HARNESS_ID_MASK_CHAR = "q"
+
+
+def _harness_own_id_mask(surrogate: str) -> str | None:
+    """``surrogate`` with its own 8-hex id blanked, or ``None`` if it is not one of ours.
+
+    **Written here rather than imported, and that is the whole point of it.** The gate
+    gained the identical exemption (``_own_token_mask`` / ``_mask_own_tokens``) and its
+    docstring names this module as the sibling instance it does not close. Importing
+    those would close it by making this module agree with the code it checks by
+    construction -- which is the mistake ``_harness_separator_hit`` and
+    :func:`_reference_skeleton` both exist because of, each after a released payload
+    proved it. :func:`test_the_own_id_exclusion_does_not_ask_the_gate_for_its_answer`
+    is the sabotage that says so out loud.
+
+    Ownership is decided by :func:`issued_token_id`, this module's own hand-written
+    parse of a surrogate -- no :data:`~secure_context_pipeline.surrogates.STRICT_TOKEN_RE`,
+    no ``ENTITY_TYPE_RE``, no category alternation. It returns ``None`` for a
+    **pseudonym**, which is the narrowing that keeps the dangerous half of the set
+    scanned: a fake drawn as ``Rachel Medina`` while ``Medina`` is a real original puts
+    that surname verbatim on the wire, and exempting it would hide a real leak. This
+    harness has caught exactly that once.
+
+    **The span is the id and nothing else.** Not the token, not the core, not the
+    ``|hint`` tail -- the hint alphabet ``[a-z0-9-]`` spells an SSN and a hint is looked
+    up *by the original's own text*, so it is the one field of a token that is derived
+    from the value. The id is not: it is an HMAC under the session key truncated to
+    eight hex characters, so a needle found inside one is a coincidence with a random
+    string rather than a disclosure. Every other character -- our ``[``, our ``_``, the
+    category and type literals, the hint, our ``]`` -- keeps being read.
+
+    The span is recomputed from the parse rather than taken on trust: ``core`` is what
+    :func:`issued_token_id` split, its last :data:`_HARNESS_ID_LEN` characters are the
+    id, and the slice is asserted equal to the id that function returned. A surrogate
+    whose spelling ever stops satisfying that is left unmasked, which is the strict
+    direction.
+    """
+    token_id = issued_token_id(surrogate)
+    if token_id is None:
+        return None
+    core = surrogate[1:-1].split("|", 1)[0]
+    end = 1 + len(core)
+    start = end - _HARNESS_ID_LEN
+    if start < 1 or surrogate[start:end].lower() != token_id:
+        return None
+    return surrogate[:start] + _HARNESS_ID_MASK_CHAR * _HARNESS_ID_LEN + surrogate[end:]
+
+
+def _harness_mask_own_ids(haystack: str, issued: frozenset[str]) -> str:
+    """``haystack`` with the ids of the tokens **this run issued** blanked.
+
+    **The false positive this removes**, measured on the real functions rather than
+    reasoned about. The unbounded limbs -- :func:`_identifier_needles` and the
+    digit-skeleton limb -- have no adjacency requirement at all, which is exactly what
+    lets them catch a glued or regrouped identifier. So they read our own tokens as if
+    they were payload text, and a token id is eight hex characters whose digits
+    sometimes *are* a vaulted value's digits::
+
+        find_in_text({'8390244'}, 'Account [FIN_ACCOUNT_NUMBER_8390244f] closed.')
+            -> ['8390244']
+        find_in_digit_heavy_text({'8390244'}, ...the same string...)
+            -> ['8390244']
+
+    Nothing leaked in either case: the ``8390244`` on the wire is a slice of a digest
+    the pipeline wrote itself. The gate used to turn the same coincidence into an
+    ``EgressBlockedError`` and stopped doing so; the reading on the harness side is
+    *worse*, because the assertion it fails says "original present in the outbound
+    payload" -- the headline claim of this repository -- about a run in which nothing
+    left. The gate measured its own rate at 1.3e-02 spurious blocks per 100-run suite,
+    seen twice in 27 executions.
+
+    **Two narrowings, and each one is a hole if it is dropped.**
+
+    1. **Exact string occurrence, never a grammar.** What is blanked is
+       ``str.replace`` of the surrogates the run actually issued, read out of the vault
+       (``SessionVault.surrogates_for_session``). A grammar over token-shaped text
+       would let an *uploaded document* carry ``[PHI_MRN_5567281a]`` and have this
+       module skip a vaulted MRN inside it -- the payload is assembled from a document
+       the uploader wrote, so a rule keyed on shape is a rule an attacker can satisfy.
+    2. **The id, not the token** (:func:`_harness_own_id_mask`). The replacement is
+       per-character, length-preserving and alphanumeric, so no boundary anywhere moves
+       or changes class. A vaulted value beside a token, glued to a token, or split
+       across one is still read by every limb -- which is the complement, and it is
+       pinned by :func:`test_a_vaulted_value_glued_to_our_own_token_is_still_found` and
+       :func:`test_a_vaulted_value_spanning_a_token_boundary_is_still_found`.
+
+    Longest surrogate first, so a token that is a substring of another is not blanked
+    out from under the longer one. A surrogate this fails to blank is the old
+    behaviour, which is the strict direction.
+
+    ``issued`` defaults to empty at every call site that does not have a run to draw
+    it from, and with it empty this is the identity function -- so the differential
+    fuzz against the gate still compares two *unexempted* scans, and this module stays
+    exactly as wide as the gate there.
+    """
+    if not issued:
+        return haystack
+    masked = haystack
+    for surrogate in sorted(issued, key=len, reverse=True):
+        replacement = _harness_own_id_mask(surrogate)
+        if replacement is None:
+            continue
+        masked = masked.replace(surrogate, replacement)
+    return masked
+
+
+def _harness_strip_own_tokens(haystack: str, issued: frozenset[str]) -> str:
+    """``haystack`` with our own tokens **removed**, hint and all. For digits only.
+
+    Deletion, not masking, and for exactly one consumer: the digit stream the
+    regrouped-identifier limb (:func:`_digit_skeleton_hit`) reads. Deleting text is
+    unsafe in general -- it glues the neighbours together and takes a word boundary
+    with them, which is the mistake :func:`_haystack_forms` records -- but a
+    digits-only projection has no boundaries left to lose, so removing a token and
+    removing only its digits are the same operation there.
+
+    **This exists because masking alone LOST a real leak, measured on this module's own
+    functions rather than reasoned about.** The regrouped limb catches a vaulted
+    all-digit value that the payload writes with different grouping, by comparing two
+    digits-only streams. Our own token ids are digits in that stream too, so masking
+    them is the point -- but a token can also sit *inside* a disclosure and split it::
+
+        vault  {'987714668699'}
+        wire   'ledger filed 98771466869[PII_ADDRESS_989aa4fe|lab-panel-3]9 today'
+
+        find_in_text(...)                       -> ['987714668699']   # before
+        find_in_text(..., issued={that token})   -> []                # masking only
+
+    All twelve digits are on the wire. The pre-exclusion scan reported it -- but only
+    by luck, because it was reading the ``989`` out of the id: re-draw the id as
+    ``c3f7003f`` and the same payload reported clean either way. So the second stream
+    is not a concession to the old behaviour, it is the answer the old behaviour was
+    reaching by accident, and the ``3`` of ``lab-panel-3`` is why deleting the whole
+    token rather than only its id is what the stream needs.
+
+    Same ownership test as :func:`_harness_mask_own_ids`, through the same
+    :func:`_harness_own_id_mask`: a pseudonym's digits stay in the stream, because
+    nothing about a fake makes its characters ours.
+    """
+    if not issued:
+        return haystack
+    stripped = haystack
+    for surrogate in sorted(issued, key=len, reverse=True):
+        if _harness_own_id_mask(surrogate) is None:
+            continue
+        stripped = stripped.replace(surrogate, "")
+    return stripped
+
+
+def find_in_text(
+    originals: frozenset[str], haystack: str, issued: frozenset[str] = frozenset()
+) -> list[str]:
     """Every original occurring in ``haystack``, in **every** comparison the gate makes.
 
     Four bounded forms and then one unbounded limb -- the same five comparisons, in
@@ -1031,11 +1509,38 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
     :func:`find_in_digit_heavy_text`, whose channels are a different false-positive
     surface (see :data:`_HARNESS_RUN_FLOOR` for what that surface has already cost this
     module) that this view has not been measured against.
+
+    **``issued`` is the one exclusion this scan makes, and it is not an exemption for
+    anything the pipeline wrote** -- it is the eight-hex ids of the tokens *this run*
+    put on the wire, blanked by exact string occurrence
+    (:func:`_harness_mask_own_ids`, which carries the measurement and the two
+    narrowings it rests on). Everything else the pipeline wrote is still read,
+    pseudonyms first among them. It defaults to empty, so every call that has no run
+    behind it -- the differential corpus, the fuzz, the sabotage tests -- gets the
+    unexempted scan, and this module stays exactly as wide as the gate where
+    :func:`test_the_harness_is_never_weaker_than_the_gate_on_generated_input` compares
+    them. That default is why this is a parameter rather than the boolean flag
+    :func:`find_in_digit_heavy_text` argues against: a boolean says *scan less*, and
+    the mistaken default silently narrows the payload scan; a set of strings says
+    *these exact spans are ours*, and the mistaken default is the strict scan.
     """
-    views = [_haystack_forms(haystack)]
-    decoded = _decode_transport_encodings(haystack)
-    if decoded != haystack:
+    masked = _harness_mask_own_ids(haystack, issued)
+    views = [_haystack_forms(masked)]
+    decoded = _decode_transport_encodings(masked)
+    if decoded != masked:
         views.append(_haystack_forms(decoded))
+    # Every digit stream the regrouped limb reads: a UNION, never a swap. Each view
+    # sees a payload the others cannot and OR-ing projections of one haystack can only
+    # add hits. The extra one is the haystack with our tokens DELETED rather than
+    # masked, and :func:`_harness_strip_own_tokens` carries the leak that measured it
+    # -- a vaulted value split by one of our own tokens, which masking alone reported
+    # clean. Built at most once, skipped when the run issued nothing and when deletion
+    # changed nothing, and de-duplicated when two streams agree.
+    digit_streams = [view.digits for view in views]
+    excised = _harness_strip_own_tokens(haystack, issued)
+    if excised != haystack:
+        digit_streams.append(_digits_only(_reference_skeleton(excised)))
+    digit_views = tuple(dict.fromkeys(digit_streams))
 
     def bounded(value: str) -> bool:
         """Forms 1-4, for a whole original or for one composite constituent.
@@ -1085,6 +1590,8 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
             or _harness_separator_hit(folded, view.folded)
             or _harness_separator_hit(folded, view.skeleton)
             or _harness_separator_hit(folded, view.boundary_skeleton)
+            for view in views
+        ) or any(
             # The digit-skeleton limb. Mirrors the gate's comparison for a
             # letter-free identifier: any regrouping of the same digits collapses
             # to the same string on both sides, which is what catches a vaulted
@@ -1092,8 +1599,12 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
             # this harness is weaker than the gate, and
             # `test_the_harness_is_never_weaker_than_the_gate_on_generated_input`
             # is what said so -- it went red the moment the gate gained the limb.
-            or _digit_skeleton_hit(folded, view.digits)
-            for view in views
+            #
+            # Lifted out of the per-view loop because it reads `digit_views`, which
+            # is the per-view streams PLUS the token-excised one -- the extra stream
+            # is a property of the whole haystack, not of one view of it.
+            _digit_skeleton_hit(folded, digits)
+            for digits in digit_views
         )
 
     found: list[str] = []
@@ -1137,6 +1648,35 @@ def find_in_text(originals: frozenset[str], haystack: str) -> list[str]:
 #: ``MIN_IDENTIFIER_RUN_DIGITS`` is for -- so the uncovered case is specifically the
 #: two channels the gate never sees. Pinned by
 #: :func:`test_the_scan_sees_an_identifier_glued_into_a_longer_run`.
+#:
+#: **The channel that measurement belongs to was the wrong one, and re-measuring it is
+#: what explains an intermittent red nobody could reproduce.** The 3.6 MB figure above
+#: is the surface of the database *files*, which this function never reads --
+#: :func:`find_in_bytes` reads those, and it declines these needles outright. What
+#: :func:`find_in_digit_heavy_text` is actually handed is one much smaller haystack and
+#: one much larger one. Re-measured over a full 100-run replay by counting the distinct
+#: 7-digit windows each run's haystacks actually contain:
+#:
+#:     audit query view (one session's rows)         99 windows -> 2.1e-03 per suite
+#:     DEBUG log haystack (log_haystack(caplog))  7,574 windows -> 1.7e-01 per suite
+#:
+#: over the 203 pure-digit identifier needles the 100 runs produce. The audit figure is
+#: on the side of the line this floor was drawn for. The log figure is 170x the wrong
+#: side of it, and it had never been measured, because the arithmetic was only ever run
+#: against the database.
+#:
+#: Both are live rather than theoretical. Run 099 (medical/pseudonymization, seed 90099)
+#: failed assertion 2a on a seven-digit MRN with ``identifier`` as the only limb that
+#: fired, once in 24 executions of the identical 100 runs and never again -- which is
+#: what a coincidence against per-process random hex looks like from the outside, and
+#: is not something a seed can reproduce.
+#:
+#: Narrowing either limb -- a higher floor, a boundary on the needle, dropping a
+#: haystack -- is a real loss of reach on the two channels where this module is the
+#: only opinion there is, so the trade is recorded here rather than taken unilaterally.
+#: What is taken here is the free half: :func:`describe_hits` now names the *kind of
+#: run* an ``identifier``-only hit landed in, so the next occurrence is one line to
+#: classify instead of an afternoon to reproduce.
 _HARNESS_RUN_FLOOR = 7
 
 
@@ -1157,35 +1697,154 @@ def _harness_identifier_needles(value: str) -> tuple[str, ...]:
     )
 
 
-def find_in_digit_heavy_text(originals: frozenset[str], haystack: str) -> list[str]:
+def find_in_digit_heavy_text(
+    originals: frozenset[str], haystack: str, issued: frozenset[str] = frozenset()
+) -> list[str]:
     """:func:`find_in_text` for the audit database and the process log.
 
-    Identical in its four bounded forms; the only difference is that the unbounded
-    identifier limb uses :func:`_harness_identifier_needles` instead of the gate's
-    own, i.e. it stops at :data:`_HARNESS_RUN_FLOOR` digits rather than at the gate's
-    run floor. :data:`_HARNESS_RUN_FLOOR` carries the measurement and the cost.
+    Identical in its four bounded forms **and in its composite limb**; the only
+    difference is that the unbounded identifier limb uses
+    :func:`_harness_identifier_needles` instead of the gate's own, i.e. it stops at
+    :data:`_HARNESS_RUN_FLOOR` digits rather than at the gate's run floor.
+    :data:`_HARNESS_RUN_FLOOR` carries the measurement and the cost.
+
+    That sentence used to say "the only difference is the identifier limb" while the
+    composite limb was in fact absent here, which made the docstring the thing that
+    hid the gap. Measured before the fix, on the audit-detail shape this scan exists
+    for::
+
+        c    = "03/11/2024, 09/17/2024"          # one spaCy DATE span, one original
+        hay  = '{"detail":{"note":"re-scheduled from 03/11/2024"}}'
+        find_in_text          -> ['03/11/2024, 09/17/2024']
+        find_in_digit_heavy   -> []
+
+    The constituent is in the audit database, the payload scan reports it, and this
+    scan -- the **only** opinion on that channel -- reported clean. The four bounded
+    forms all look for the composite, which nobody wrote as a unit, and the
+    identifier limb contributes nothing because the longest contiguous digit run in
+    it is four. So every limb went quiet at once, which is exactly the failure
+    :func:`find_in_text`'s form 6 was added for.
+
+    The limb is deliberately cheap here rather than re-derived: it reuses the gate's
+    :func:`_composite_needles`, which only yields needles when the value splits into
+    two or more constituents that *each* carry at least ``MIN_IDENTIFIER_DIGITS``
+    digits, and every needle is compared word-bounded. That is what keeps it off this
+    channel's false-positive surface -- it cannot fire on an ordinary English word,
+    which is the risk :data:`_HARNESS_RUN_FLOOR` exists to manage for the *unbounded*
+    limb. Measured: adding it changed no run's verdict across the 100-run suite.
 
     Kept as a separate function rather than a flag on :func:`find_in_text`, because
     the payload scan **must** stay exactly as wide as the gate -- that is the property
     :func:`test_the_harness_is_never_weaker_than_the_gate_on_generated_input` fuzzes,
     and a boolean parameter is one mistaken default away from silently narrowing it.
+
+    **``issued`` is the same own-id exclusion :func:`find_in_text` takes, and this
+    channel needs it for a measured reason rather than for symmetry.** Every token the
+    run emits reaches ``log_haystack(caplog)`` verbatim: ``aiosqlite`` logs each
+    statement it executes at DEBUG *with its bound parameters*, and the vault binds the
+    surrogate. Counted over six runs of the real harness -- 31, 4, 37, 14, 36 and 14
+    token-shaped surrogates issued, and **every one of them present in the log
+    haystack**, against **zero** in the audit query view and zero in the audit DB bytes.
+    So the coincidence the gate stopped blocking lands here too, and at this
+    function's own floor: :data:`_HARNESS_RUN_FLOOR` is seven digits and an 8-hex id
+    holds two seven-character windows.
+
+    That is why the run passes ``issued`` on the log limb and **not** on the two audit
+    limbs. Where the channel measurably carries none of our tokens the exclusion is the
+    identity function, and an identity function is still a claim somebody has to
+    defend; the audit scans stay unexempted, which is the strict direction on the
+    channel where this module is the only opinion there is.
     """
+    haystack = _harness_mask_own_ids(haystack, issued)
     norm_hay = normalize(haystack)
     folded_hay = _reference_strip_invisible(norm_hay)
     skeleton_hay = _reference_skeleton(haystack)
-    found: list[str] = []
-    for original in originals:
-        normalised = normalize(original)
+
+    def bounded(value: str) -> bool:
+        """The four bounded forms, for a whole original or one composite constituent.
+
+        Factored for the same reason :func:`find_in_text` factors its own: two copies
+        of the four forms are two places to edit the day a fifth is added, and this
+        function having every limb the payload scan has is the property that was
+        already lost once by writing them out twice.
+        """
+        normalised = normalize(value)
         folded = _reference_strip_invisible(normalised)
-        if (
-            occurs_as_a_unit(original, haystack)
+        return (
+            occurs_as_a_unit(value, haystack)
             or occurs_as_a_unit(normalised, norm_hay)
             or occurs_as_a_unit(folded, folded_hay)
             or occurs_as_a_unit(folded, skeleton_hay)
+        )
+
+    found: list[str] = []
+    for original in originals:
+        folded = _reference_strip_invisible(normalize(original))
+        if (
+            bounded(original)
             or any(needle in skeleton_hay for needle in _harness_identifier_needles(folded))
+            or any(bounded(part) for part in _composite_needles(original))
         ):
             found.append(original)
     return sorted(found)
+
+
+#: The characters a lowercase hexadecimal run is made of. Spelled here rather than
+#: reusing ``_HEX`` below, which accepts both cases: every haystack this is applied to
+#: has been through ``normalize``, so an upper-case digest has already been casefolded,
+#: and accepting ``A-F`` here would let ``ALPHA`` read as hexadecimal.
+_LOWER_HEX = frozenset("0123456789abcdef")
+
+
+def _identifier_site(folded: str, skeleton_hay: str) -> str:
+    """What kind of run an ``identifier``-limb hit landed in. A **shape**, never content.
+
+    The one fact missing from an ``identifier``-only red, and the reason such a red
+    used to cost an afternoon. That limb is a bare substring test with no adjacency
+    requirement (see :data:`_HARNESS_RUN_FLOOR`), so it has two completely different
+    causes and the failure line could not tell them apart:
+
+    * the pipeline wrote a vaulted identifier into the channel and glued a letter to it
+      -- ``batch47-1234567Alpha``, the case the limb exists for. A **real leak**;
+    * the seven digits fell inside a run of process-random hexadecimal -- a chain hash,
+      a session, run or document ID -- or inside a longer decimal run such as an epoch
+      timestamp. A **coincidence**, re-tossed on every process, reproducible by no seed.
+
+    The enclosing maximal alphanumeric run separates them on sight: 64 or 32 characters
+    of nothing but hex digits is a digest or an ID, and no document value is one.
+
+    Rendered as a length and a character class and nothing else, so this is safe on the
+    one channel it is printed to. ``mask`` withholds the needle for build doc section
+    16's reason; quoting the *haystack* around a hit would hand back the whole value the
+    masking just withheld, plus whatever else sits beside it. A length and the word
+    ``hexadecimal`` cannot carry either.
+
+    Uses ``str.find`` rather than a membership test, because the answer needed here is
+    *where*, and because a bare ``in`` deciding anything about a value in this file is
+    the mistake :func:`test_no_leak_comparison_in_this_module_bypasses_the_shared_rule`
+    exists to stop. Nothing here decides whether a value leaked -- that decision was
+    already made by :func:`find_in_digit_heavy_text`; this only describes it.
+    """
+    for needle in _identifier_needles(folded):
+        at = skeleton_hay.find(needle)
+        if at < 0:
+            continue
+        start, end = at, at + len(needle)
+        while start > 0 and skeleton_hay[start - 1].isalnum():
+            start -= 1
+        while end < len(skeleton_hay) and skeleton_hay[end].isalnum():
+            end += 1
+        run = skeleton_hay[start:end]
+        if run == needle:
+            return "standing alone"
+        if all(character in _LOWER_HEX for character in run):
+            kind = "hexadecimal"
+        elif run.isdigit():
+            kind = "decimal"
+        else:
+            kind = "mixed"
+        return f"inside a {len(run)}-char {kind} run"
+    return "site not located"
 
 
 def describe_hits(originals: list[str], haystack: str) -> list[str]:
@@ -1206,8 +1865,16 @@ def describe_hits(originals: list[str], haystack: str) -> list[str]:
     reader should check the arithmetic on before believing, and a red naming ``['raw']``
     is one they should not.
 
+    "Check the arithmetic" was the whole instruction until an ``identifier``-only red
+    actually happened, and it turned out not to be an instruction anybody could follow:
+    the arithmetic says a coincidence is possible, and says nothing at all about whether
+    *this* hit was one. So an ``identifier``-only hit now also carries
+    :func:`_identifier_site` -- the shape of the run the seven digits landed in, which
+    is the fact that decides it.
+
     Never renders the value: :func:`mask` gives a length and two characters, which is
-    build doc section 16's rule and applies to test output like everything else.
+    build doc section 16's rule and applies to test output like everything else. The
+    site is a length and a character class for the same reason.
     """
     norm_hay = normalize(haystack)
     folded_hay = _reference_strip_invisible(norm_hay)
@@ -1230,7 +1897,10 @@ def describe_hits(originals: list[str], haystack: str) -> list[str]:
             )
             if fired
         ]
-        described.append(f"{mask(original)} via {limbs or ['byte-limb-only']}")
+        # Only when ``identifier`` fired ALONE: every other limb is boundary-anchored,
+        # so it cannot fire on a coincidence and the site would be noise beside it.
+        site = f" {_identifier_site(folded, skeleton_hay)}" if limbs == ["identifier"] else ""
+        described.append(f"{mask(original)} via {limbs or ['byte-limb-only']}{site}")
     return described
 
 
@@ -1423,7 +2093,9 @@ def _reference_gate() -> EgressGate:
     )
 
 
-def _gate_scan_hits(originals: frozenset[str], payload: str) -> int:
+def _gate_scan_hits(
+    originals: frozenset[str], payload: str, issued: frozenset[str] = frozenset()
+) -> int:
     """How many originals the **real gate** reports in ``payload``. Pass 1, entire.
 
     Every "and the gate agrees" claim in this module goes through here, and that is a
@@ -1433,8 +2105,14 @@ def _gate_scan_hits(originals: frozenset[str], payload: str) -> int:
     name promised the gate could not see a combining mark went on passing, because the
     limb it interrogated was not the limb that had changed. A checker that asks the
     thing it checks a narrower question than the one it reports on has not checked it.
+
+    ``issued`` is the gate's own emitted-surrogate set, and it defaults to empty for
+    the same reason ``find_in_text``'s does: the differential corpus and the fuzz
+    compare two *unexempted* scans, which is the comparison "never weaker than the
+    gate" is written about. It is supplied only where a test's subject is the
+    exemption itself.
     """
-    return _reference_gate()._scan_originals(payload, originals)
+    return _reference_gate()._scan_originals(payload, originals, issued)
 
 
 async def surrogate_map(
@@ -1611,6 +2289,12 @@ def test_the_failure_message_names_the_limb_and_never_the_value() -> None:
       splice bug or the identifier limb catching seven digits inside a hex run ID is
       making that call off this string;
     * no original is ever rendered into it, however alarming the failure.
+
+    The identifier case additionally pins :func:`_identifier_site`, because "check the
+    arithmetic before believing this red" is not an instruction anybody can act on --
+    see :func:`test_an_identifier_only_hit_says_which_kind_of_run_the_digits_landed_in`
+    for the red that proved it. The shape of the enclosing run is the fact that decides
+    it, and a message that dropped it would be back to unactionable.
     """
     name = "Marguerite Vandenberg"
     tax_id = "47-1234567"
@@ -1619,9 +2303,14 @@ def test_the_failure_message_names_the_limb_and_never_the_value() -> None:
         f"{mask(name)} via ['raw', 'normalised', 'folded', 'skeleton']"
     ]
 
-    # The one limb whose reds a reader should check before believing.
+    # The one limb whose reds a reader should check before believing -- and the run
+    # shape that tells them which way to decide. ``mixed``, not ``hexadecimal``: the
+    # digits are glued to ``batch``/``Alpha``, so this is the real leak the limb exists
+    # for rather than a collision inside a digest.
     identifier_only = describe_hits([tax_id], "routing tag batch47-1234567Alpha here")
-    assert identifier_only == [f"{mask(tax_id)} via ['identifier']"], identifier_only
+    assert identifier_only == [
+        f"{mask(tax_id)} via ['identifier'] inside a 20-char mixed run"
+    ], identifier_only
 
     # A value the byte limb found and the query view does not carry is labelled, not
     # silently rendered as an empty list.
@@ -1816,6 +2505,79 @@ def test_the_byte_limb_declines_the_identifier_needles_and_says_what_that_costs(
     assert not find_in_bytes(frozenset({mrn}), run_id)
 
 
+def test_an_identifier_only_hit_says_which_kind_of_run_the_digits_landed_in() -> None:
+    """The fact that separates a real glued identifier from a hex coincidence.
+
+    The limb the test above declines on the byte channel is still applied to the audit
+    query view and to the process log, where the same arithmetic gives 2.1e-3 and
+    1.7e-1 expected spurious reds per suite respectively
+    (:data:`_HARNESS_RUN_FLOOR`). Both numbers are small enough to be invisible in
+    development and large enough to fire on the headline assertion eventually, and one
+    of them did: run 099 went red on a seven-digit MRN with ``identifier`` as the only
+    limb, once in 24 executions of the identical 100 runs.
+
+    What made that expensive was not the frequency, it was that the failure line said
+    ``via ['identifier']`` and stopped. A reader then has the same two candidates the
+    limb has -- a real leak or a coincidence -- and no way to choose between them
+    without re-running a process whose random material is already gone.
+
+    So both shapes are asserted here: the coincidence must be named as a run of
+    hexadecimal, and the real leak the limb exists for must NOT be. And the message
+    must still refuse to render the value or the text around it -- a site that quoted
+    its context would hand back exactly what ``mask`` withheld.
+    """
+    mrn = "8390244"
+
+    # The coincidence: seven digits inside a 64-character sha256 chain hash. Not a
+    # disclosure -- no document value is a hex digest -- and the message must say so.
+    digest = "a8390244" + "f" * 56
+    assert len(digest) == 64, "premise: this is digest-shaped, which is the whole point"
+    hashed = json.dumps([{"entry_hash": digest}], ensure_ascii=False)
+    assert find_in_digit_heavy_text(frozenset({mrn}), hashed) == [mrn], (
+        "premise: the identifier limb really does fire on a digest collision -- if it "
+        "no longer does, this module's audit false-positive rate has changed and "
+        "_HARNESS_RUN_FLOOR's arithmetic needs re-measuring"
+    )
+    described = describe_hits([mrn], hashed)
+    assert described == [f"{mask(mrn)} via ['identifier'] inside a 64-char hexadecimal run"], (
+        f"an identifier-only hit no longer names the run it landed in: {described}"
+    )
+
+    # The real leak: the same seven digits glued to a letter in an audit label. The
+    # enclosing run is not hexadecimal, and the message must not let a reader dismiss
+    # it as one.
+    glued = json.dumps([{"entity_type": "batch8390244Alpha"}], ensure_ascii=False)
+    assert find_in_digit_heavy_text(frozenset({mrn}), glued) == [mrn]
+    (reported,) = describe_hits([mrn], glued)
+    assert reported.endswith("inside a 17-char mixed run"), (
+        f"a genuine glued identifier is being described as something else: {reported}"
+    )
+    assert "hexadecimal" not in reported, (
+        "a real leak that reads as a hex coincidence is worse than no site at all"
+    )
+
+    # A bare identifier core, where the vaulted value carries a label the channel does
+    # not. Every bounded form misses -- they look for the whole original -- and the
+    # identifier limb is again the only one, so the site is what says the digits are
+    # sitting on their own rather than buried in a digest.
+    labelled = "MRN: 8390244"
+    alone = json.dumps([{"detail": {"note": mrn}}], ensure_ascii=False)
+    (standalone,) = describe_hits([labelled], alone)
+    assert standalone.endswith("via ['identifier'] standing alone"), standalone
+
+    # ...and where the bounded forms DO fire there is no site, because a
+    # boundary-anchored limb cannot fire on a coincidence and the shape would be noise.
+    (anchored,) = describe_hits([mrn], alone)
+    assert anchored == f"{mask(mrn)} via ['raw', 'normalised', 'folded', 'skeleton', 'identifier']"
+
+    # Nothing rendered but a shape: not the value, not its neighbours.
+    for line in (*described, reported, standalone, anchored):
+        assert mrn not in line, "the site leaked the value the mask withheld"
+        assert "batch" not in line and digest[:8] not in line, (
+            f"the site quoted its haystack: {line}"
+        )
+
+
 def test_the_scan_sees_an_invisible_character_bypass() -> None:
     """One U+200B must not make an original invisible to this module.
 
@@ -1881,6 +2643,57 @@ def test_the_audit_scan_sees_json_escaped_non_ascii() -> None:
 
     # Unescaping must not manufacture matches out of ordinary text.
     assert not find_in_bytes(frozenset({accented}), b'{"detail":{"v":"nothing here"}}')
+
+
+def test_the_audit_and_log_scan_sees_one_constituent_of_a_composite_original() -> None:
+    """The composite limb must be on :func:`find_in_digit_heavy_text`, not only on the payload scan.
+
+    A vault original is whatever the detector called one span, and spaCy returns
+    ``03/11/2024, 09/17/2024`` as a single ``DATE``. So the vaulted value is a string
+    nobody wrote as a unit, and a channel carrying just *one* of the two dates defeats
+    every other limb at once: the four bounded forms look for the composite, and the
+    unbounded identifier limb contributes nothing because the longest contiguous digit
+    run in it is four, one short of any run floor. That is the hole
+    :func:`_composite_needles` was added to :func:`find_in_text` to close.
+
+    It was closed on the payload only. The audit database and the process log are the
+    two channels where **this module is the only opinion there is** -- the gate never
+    sees them -- so the limb was missing from precisely the scan that has no backstop,
+    while ``find_in_digit_heavy_text``'s own docstring said the identifier floor was
+    the only difference between the two.
+
+    The negative half is not decoration. ``_composite_needles`` is a *widening*, and a
+    widening on these channels is where this module has already paid for a false
+    positive once (see :data:`_HARNESS_RUN_FLOOR`); the constituent needles are
+    word-bounded and digit-floored, so an unrelated date and a substring occurrence
+    must both stay quiet.
+    """
+    composite = "03/11/2024, 09/17/2024"
+    haystack = '{"detail":{"note":"re-scheduled from 03/11/2024"}}'
+
+    # Premise: the vaulted value itself is genuinely absent, so no bounded form can
+    # fire and this test is really about the composite limb.
+    assert composite not in haystack
+    assert not any(
+        needle in _reference_skeleton(haystack)
+        for needle in _harness_identifier_needles(composite)
+    ), "premise: the identifier limb contributes nothing -- longest digit run is four"
+
+    assert find_in_text(frozenset({composite}), haystack) == [composite]
+    assert find_in_digit_heavy_text(frozenset({composite}), haystack) == [composite], (
+        "the audit/log scan must see a constituent of a composite original: it is the "
+        "only opinion on these two channels, and every other limb goes quiet here"
+    )
+
+    # A date that is not one of the constituents must not fire.
+    assert not find_in_digit_heavy_text(
+        frozenset({composite}), '{"detail":{"note":"re-scheduled from 07/04/2021"}}'
+    )
+    # Nor may a constituent match without a word boundary, which is what keeps this
+    # limb off the false-positive surface the unbounded limb has to be careful about.
+    assert not find_in_digit_heavy_text(
+        frozenset({composite}), '{"detail":{"note":"batch103/11/20240"}}'
+    )
 
 
 def test_the_log_scan_sees_structured_extra_fields(
@@ -2181,6 +2994,18 @@ def test_the_scan_sees_an_identifier_glued_into_a_longer_run() -> None:
         "the audit database where a 32-hex run_id gives a six-digit needle 27 "
         "landing sites -- the false positive this module has already paid for once"
     )
+    # And pinned from ABOVE, which the assertion before it cannot do. A floor is a
+    # window, and only its lower edge was held: `not _harness_identifier_needles(...)`
+    # gets *more* true as the floor rises, so raising _HARNESS_RUN_FLOOR from 7 to 99 --
+    # which disables the identifier limb on the audit database and the process log
+    # entirely, the two channels where this module is the only opinion -- left all 137
+    # tests in this file green, 100/100 runs clean. Seven digits must still BE a needle,
+    # so the limb's own reason to exist is what goes red if the number drifts upward.
+    assert _harness_identifier_needles("3828921") == ("3828921",), (
+        f"a {_HARNESS_RUN_FLOOR}-digit run must still be a needle: if it is not, the "
+        "unbounded identifier limb is switched off on the audit database and the "
+        "process log, and this module reports clean because it stopped looking"
+    )
 
 
 #: Ordinary spellings of a single space, in the transports a document actually travels
@@ -2288,6 +3113,377 @@ def test_the_separator_limb_does_not_ask_the_gate_for_its_answer() -> None:
                 "this module reports a leak only because the gate does -- which is the "
                 "defect: 128 leakage tests stayed green through a whole vaulted name "
                 "on the wire, because the checker was asking the thing it checks"
+            )
+
+
+# ---------------------------------------------------------------------------
+# The own-token-id exclusion: the coincidence it removes, and everything it must
+# go on reporting. See _harness_mask_own_ids.
+# ---------------------------------------------------------------------------
+
+#: ``(vaulted value, the token WE issued, the payload)`` for the two coincidences the
+#: gate reproduced when it took the same exemption. Copied from its docstring on
+#: purpose: they are the exact strings that named this module as the sibling instance
+#: the gate fix did not close, so the ledger and the fix quote the same evidence.
+#:
+#: In both, every digit of the vaulted value sits inside an eight-hex id the pipeline
+#: drew itself -- an HMAC under the session key, truncated -- and nowhere else in the
+#: payload. :func:`test_the_own_id_coincidence_is_the_only_landing_site` asserts that
+#: "nowhere else" rather than trusting it, because the whole exclusion is only as
+#: defensible as the claim that the exempted characters carry no secret.
+_OWN_ID_COINCIDENCES: tuple[tuple[str, str, str], ...] = (
+    (
+        "8390244",
+        "[FIN_ACCOUNT_NUMBER_8390244f]",
+        "<DOCUMENT>\nAccount {} closed.\n</DOCUMENT>",
+    ),
+    ("552140", "[PHI_MRN_a552140f]", "Chart: {} reviewed."),
+)
+
+
+@pytest.mark.parametrize("value,token,frame", _OWN_ID_COINCIDENCES)
+def test_the_own_id_coincidence_is_the_only_landing_site(
+    value: str, token: str, frame: str
+) -> None:
+    """Premise for everything below: the digits are in our id and in nothing else.
+
+    Without this, every "the exclusion removes it" assertion in this section could be
+    satisfied by an exclusion that blanks far more than an eight-hex id -- the whole
+    token, the whole payload -- and the tests would read exactly the same. Asked
+    against :func:`_reference_contains`, which is written to the compliance question
+    (*is the value in the text?*) rather than to this module's occurrence rule, so a
+    bug in the occurrence rule cannot make this premise pass.
+    """
+    payload = frame.format(token)
+    assert _reference_contains(value, payload), (
+        f"premise: {mask(value)} is in this payload at all -- inside our own id"
+    )
+    assert not _reference_contains(value, payload.replace(token, "")), (
+        f"premise: {mask(value)} occurs ONLY inside the token this run issued. It occurs "
+        "somewhere else too, so this payload is a real disclosure and is the wrong "
+        "evidence for an exclusion"
+    )
+
+
+@pytest.mark.parametrize("value,token,frame", _OWN_ID_COINCIDENCES)
+def test_the_own_id_exclusion_removes_the_coincidence_the_gate_relocated(
+    value: str, token: str, frame: str
+) -> None:
+    """The reported defect, closed -- with the pre-fix behaviour asserted beside it.
+
+    The gate's own exemption removed these as ``EgressBlockedError`` refusals and its
+    docstring names this module as the half it did not close: *"verified, not inferred
+    -- on the two payloads at the top of this docstring it returns ``['8390244']`` and
+    ``['552140']``"*. Reproduced here before it was fixed, on the real functions::
+
+        find_in_text({'8390244'}, 'Account [FIN_ACCOUNT_NUMBER_8390244f] closed.')
+            -> ['8390244']
+
+    So the flake was **relocated**, not removed: the same non-event that used to stop
+    the run at the gate landed on assertion 1 instead, where it reads as *"original
+    present in the outbound payload"* -- the headline claim of this repository -- about
+    a run in which nothing left.
+
+    The un-excluded call is asserted in the same test rather than left implicit. An
+    exclusion whose "before" is not pinned is an exclusion that could be doing nothing,
+    and the assertion below it would still be green.
+    """
+    payload = frame.format(token)
+    originals = frozenset({value})
+
+    assert find_in_text(originals, payload) == [value], (
+        "premise: with no exclusion this module still reports the coincidence. If it "
+        "does not, the limb this fix is about has gone missing and the assertion below "
+        "is measuring nothing"
+    )
+    assert find_in_text(originals, payload, issued=frozenset({token})) == [], (
+        f"the own-id exclusion did not remove {mask(value)}: assertion 1 still reports "
+        "the pipeline's own HMAC digest as an original on the wire"
+    )
+
+
+def test_the_own_id_exclusion_reaches_the_log_channel_too() -> None:
+    """The same coincidence on the channel where this module is the only opinion.
+
+    ``aiosqlite`` logs every statement it executes at DEBUG *with its bound
+    parameters*, and the vault binds the surrogate -- so every token a run emits is in
+    ``log_haystack(caplog)`` verbatim. Counted over six real runs: 31/31, 4/4, 37/37,
+    14/14, 36/36 and 14/14 token-shaped surrogates present, against 0 in the audit
+    query view and 0 in the audit DB bytes. Assertion 2b therefore carries the identical
+    false positive, at this function's own floor -- :data:`_HARNESS_RUN_FLOOR` is seven
+    digits and an eight-hex id holds two seven-character windows.
+
+    Only the seven-digit coincidence is exercised: the six-digit one is below this
+    channel's floor and reports clean either way, which would make it a test of the
+    floor rather than of the exclusion.
+    """
+    value, token, frame = _OWN_ID_COINCIDENCES[0]
+    payload = frame.format(token)
+    originals = frozenset({value})
+
+    assert find_in_digit_heavy_text(originals, payload) == [value], (
+        "premise: the log/audit scan reports the coincidence with no exclusion"
+    )
+    assert find_in_digit_heavy_text(originals, payload, issued=frozenset({token})) == [], (
+        "the own-id exclusion did not reach the log channel, so the relocated flake is "
+        "still live on assertion 2b"
+    )
+
+
+@pytest.mark.parametrize("value,token,frame", _OWN_ID_COINCIDENCES)
+def test_the_own_id_exclusion_does_not_ask_the_gate_for_its_answer(
+    monkeypatch: pytest.MonkeyPatch, value: str, token: str, frame: str
+) -> None:
+    """Sabotage the gate's exemption machinery; this module must exclude anyway.
+
+    The prescription for this fix was explicit that it must **not** be
+    ``from egress_gate import _mask_own_tokens``, and the reason is a bill this file
+    has already paid twice. :func:`_harness_separator_hit` exists because deleting the
+    gate's ``_separator_needles`` "left the full suite green, including all 128 leakage
+    tests"; :func:`_reference_skeleton` exists because two successive gate fold changes
+    each moved this module in lockstep and it printed ``100/100 runs clean, 0 leaks``
+    through both. A checker that inherits its exemption from the code it checks has
+    stopped being a second opinion, and the way that failure looks from the outside is
+    *nothing at all*.
+
+    So every function the gate's exemption is built from is stubbed dead at once --
+    ``_own_token_mask`` returning ``None`` for everything, ``_mask_own_tokens`` and
+    ``_strip_own_tokens`` returning their input -- and this module must go on excluding.
+    All three rather than only the one under discussion: a checker that survives
+    because it happened to call a *different* borrowed helper is not independent
+    either. ``raising=False`` on none of them, deliberately: if one is renamed this test
+    must go red rather than silently sabotage nothing.
+
+    The two premises make the sabotage mean something. With the gate intact and its
+    surrogate set supplied, the gate exempts the coincidence (0 hits); with the gate
+    stubbed, it blocks again (1 hit). If the second premise ever fails, the stub missed
+    the mechanism and nothing below is evidence.
+    """
+    payload = frame.format(token)
+    originals = frozenset({value})
+    issued = frozenset({token})
+
+    assert _gate_scan_hits(originals, payload, issued) == 0, (
+        "premise: the live gate exempts this coincidence. If it does not, the defect "
+        "this test is about was never relocated and the ledger is wrong"
+    )
+
+    monkeypatch.setattr(egress_gate, "_own_token_mask", lambda surrogate: None)
+    monkeypatch.setattr(egress_gate, "_mask_own_tokens", lambda payload, surrogates: payload)
+    monkeypatch.setattr(egress_gate, "_strip_own_tokens", lambda payload, surrogates: payload)
+
+    assert _gate_scan_hits(originals, payload, issued) == 1, (
+        "premise: with its exemption stubbed dead the gate blocks this payload again. "
+        "It does not, so the sabotage missed the mechanism"
+    )
+    assert find_in_text(originals, payload, issued=issued) == [], (
+        "this module excludes the coincidence only because the gate does -- which is "
+        "the defect the prescription for this fix named in advance: a checker that "
+        "inherits its exemption from the code it checks is not a second opinion"
+    )
+    assert find_in_digit_heavy_text(originals, payload, issued=issued) == []
+
+
+#: A vaulted value, a token **we** issued, and a payload putting the two in contact.
+#: Every one of these must still be REPORTED: the exclusion is eight characters wide
+#: and the value is not inside those eight characters.
+#:
+#: The last two are the ones that make it an *exact-span* exclusion rather than a
+#: grammar over token-shaped text. ``ACCOUNT_NUMBER`` is a registry literal sitting
+#: inside our own token, and ``panel`` is inside the ``|hint`` tail -- which is the one
+#: field of a token derived from the original's own text (``hint_for`` passes
+#: ``detection.text`` to the gazetteer), so masking it would be masking a projection of
+#: the secret. Both are word-bounded inside the token because ``_``, ``[``, ``]`` and
+#: ``-`` are not alphanumeric.
+_GLUED_TO_OUR_TOKEN: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "value immediately after our token",
+        "8390244",
+        "[FIN_ACCOUNT_NUMBER_a1b2c3d4]",
+        "Account [FIN_ACCOUNT_NUMBER_a1b2c3d4]8390244 closed.",
+    ),
+    (
+        "value immediately before our token",
+        "8390244",
+        "[FIN_ACCOUNT_NUMBER_a1b2c3d4]",
+        "Account 8390244[FIN_ACCOUNT_NUMBER_a1b2c3d4] closed.",
+    ),
+    (
+        "value in the payload and a token elsewhere",
+        "Marguerite Vandenberg",
+        "[PII_NAME_a1b2c3d4]",
+        "The client Marguerite Vandenberg signed; see [PII_NAME_a1b2c3d4].",
+    ),
+    (
+        "registry literal inside our own token",
+        "ACCOUNT_NUMBER",
+        "[FIN_ACCOUNT_NUMBER_a1b2c3d4]",
+        "Account [FIN_ACCOUNT_NUMBER_a1b2c3d4] closed.",
+    ),
+    (
+        "value inside our own hint tail",
+        "panel",
+        "[PII_ADDRESS_989aa4fe|lab-panel-3]",
+        "Site [PII_ADDRESS_989aa4fe|lab-panel-3] sampled.",
+    ),
+)
+
+
+@pytest.mark.parametrize("label,value,token,payload", _GLUED_TO_OUR_TOKEN)
+def test_a_vaulted_value_glued_to_our_own_token_is_still_found(
+    label: str, value: str, token: str, payload: str
+) -> None:
+    """The complement: the exclusion is eight characters wide and not one more.
+
+    An exclusion is only as good as the list of things it does **not** cover, and the
+    cheap way to close the reported false positive is to skip anything token-shaped --
+    which would take a vaulted value glued to a token, sitting in a token's hint, or
+    spelled like a registry literal off the wire with it. The gate calls these its
+    three narrowings; this is the same claim asserted against this module's own scan.
+
+    The value is asserted present with the exclusion **on**, which is the only version
+    of this test worth having: with it off every case passes trivially.
+    """
+    found = find_in_text(frozenset({value}), payload, issued=frozenset({token}))
+    assert found == [value], f"the own-id exclusion swallowed a real leak: {label}"
+
+
+def test_a_vaulted_value_spanning_a_token_boundary_is_still_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disclosure our own token sits in the middle of, and the stream that finds it.
+
+    This is the case masking alone gets **wrong**, and it was found by writing the
+    complement rather than by reading the fix. All twelve digits of the value are on
+    the wire, split by a token this run issued::
+
+        vault  {'987714668699'}
+        wire   'ledger filed 98771466869[PII_ADDRESS_989aa4fe|lab-panel-3]9 today'
+
+        find_in_text(...)                      -> ['987714668699']   # before the fix
+        find_in_text(..., issued={the token})  -> []                 # masking alone
+
+    The regrouped limb compares digits-only streams, so with the id blanked the stream
+    reads ``98771466869`` + ``3`` (from the hint) + ``9`` and the needle is gone. The
+    second stream -- our tokens **deleted** rather than masked
+    (:func:`_harness_strip_own_tokens`) -- is what puts it back.
+
+    Worth naming that the pre-fix scan reported this payload only by **luck**: it was
+    reading the ``989`` out of the id, and the same payload with the id ``c3f7003f``
+    reported clean before the fix and reports the leak after it. So the second stream
+    is not a concession to the old behaviour, it is the answer the old behaviour was
+    reaching by accident. Both ids are exercised below for exactly that reason.
+
+    The second half sabotages **this module's own** fix: with
+    :func:`_harness_strip_own_tokens` stubbed to the identity function the leak must
+    disappear. Without that, an implementation that deleted nothing would satisfy the
+    first half through the lucky id and fail silently on the unlucky one.
+    """
+    value = "987714668699"
+    for token_id in ("989aa4fe", "c3f7003f"):
+        token = f"[PII_ADDRESS_{token_id}|lab-panel-3]"
+        payload = f"ledger filed 98771466869{token}9 today"
+        assert find_in_text(frozenset({value}), payload, issued=frozenset({token})) == [value], (
+            f"a vaulted value split by one of our own tokens went unreported (id {token_id})"
+        )
+
+    token = "[PII_ADDRESS_c3f7003f|lab-panel-3]"
+    payload = f"ledger filed 98771466869{token}9 today"
+    # ``setitem`` on this module's own globals: :func:`find_in_text` resolves the name
+    # at call time, so replacing the binding is the same thing as deleting the stream,
+    # and it needs no import path that a file move could invalidate.
+    monkeypatch.setitem(globals(), "_harness_strip_own_tokens", lambda haystack, issued: haystack)
+    assert find_in_text(frozenset({value}), payload, issued=frozenset({token})) == [], (
+        "the token-excised digit stream is not what finds the straddling leak, so the "
+        "test above is passing for some other reason and this fix is unpinned"
+    )
+
+
+def test_the_own_id_exclusion_refuses_a_token_the_run_did_not_issue() -> None:
+    """Narrowing 1: string equality against the emitted set, never a grammar.
+
+    The payload is assembled from a document the **uploader** wrote, so a rule keyed on
+    "looks like one of our tokens" is a rule an attacker can satisfy: paste
+    ``[FIN_ACCOUNT_NUMBER_8390244f]`` into an uploaded record and the scan stops reading
+    a vaulted account number inside it. The exclusion is ``str.replace`` of surrogates
+    this run actually issued, so a token-shaped string that is not in that set is
+    ordinary payload text.
+
+    Both halves are asserted: the set with a *different* token in it changes nothing,
+    and an empty set changes nothing. A membership test that had silently degenerated
+    into a grammar would pass the second and fail the first.
+    """
+    value, token, frame = _OWN_ID_COINCIDENCES[0]
+    payload = frame.format(token)
+    originals = frozenset({value})
+    other = "[FIN_ACCOUNT_NUMBER_deadbeef]"
+
+    assert issued_token_id(other) is not None, (
+        "premise: the decoy is itself a well-formed token, so what distinguishes it is "
+        "membership and nothing else"
+    )
+    assert find_in_text(originals, payload, issued=frozenset({other})) == [value]
+    assert find_in_text(originals, payload, issued=frozenset()) == [value]
+
+
+def test_the_own_id_exclusion_refuses_a_pseudonym() -> None:
+    """Narrowing 2: the grammar as well as the set, which keeps the fakes scanned.
+
+    A pseudonym is in the emitted set and carries no id, and it is the half of that set
+    that can hide a **real** leak: a fake drawn as ``Rachel Medina`` while ``Medina`` is
+    a real original in the same document puts that surname verbatim on the wire. This
+    harness has caught exactly that once. So membership alone must not exempt anything
+    -- :func:`_harness_own_id_mask` returns ``None`` for a surrogate this module cannot
+    parse as one of our tokens, and that value goes on being read.
+
+    Asserted at both levels: the helper's own answer, and the scan's.
+    """
+    fake = "Rachel Medina"
+    assert _harness_own_id_mask(fake) is None, (
+        "a pseudonym parsed as one of our tokens; every fake in the emitted set is now "
+        "exempt and the collision guard is the only thing left between a real surname "
+        "and the provider"
+    )
+    payload = "Contact Rachel Medina about the transfer."
+    assert find_in_text(frozenset({"Medina"}), payload, issued=frozenset({fake})) == ["Medina"]
+
+
+def test_the_own_id_exclusion_masks_the_id_and_leaves_the_token_the_same_shape() -> None:
+    """The mask is length-preserving and alphanumeric, so no boundary anywhere moves.
+
+    Every bounded form in this module decides with :func:`occurs_as_a_unit`, a rule
+    that keys on whether the adjacent character is alphanumeric. A mask of a different
+    class -- a space, a bracket, deletion -- would be a fold that MOVES a word boundary,
+    and this file has already shipped that mistake once: widening the gate's mark fold
+    glued ``Brightwater`` to ``Corporation`` and the boundary rule then denied a real
+    occurrence (:func:`_haystack_forms`). Asserted structurally rather than left to the
+    behavioural cases, because those can all pass while the property is one edit from
+    being lost.
+    """
+    for _value, token, _frame in _OWN_ID_COINCIDENCES:
+        masked = _harness_own_id_mask(token)
+        assert masked is not None
+        assert len(masked) == len(token), "the mask changed the token's length"
+        differing = [i for i, (a, b) in enumerate(zip(token, masked, strict=True)) if a != b]
+        assert len(differing) <= _HARNESS_ID_LEN, (
+            f"the mask rewrote {len(differing)} characters; the exclusion is the "
+            f"{_HARNESS_ID_LEN}-character id and nothing else"
+        )
+        token_id = issued_token_id(token)
+        assert token_id is not None
+        assert masked.replace(_HARNESS_ID_MASK_CHAR * _HARNESS_ID_LEN, token_id) == token, (
+            "the mask changed something outside the id span"
+        )
+        for index in differing:
+            # ``str.isalnum`` rather than the package's ``ALNUM_RE``, matching
+            # :func:`_reference_occurs_as_a_unit`: the two agree on every ASCII
+            # character and this module's habit is to decide with its own primitives.
+            assert masked[index].isalnum(), (
+                "the mask is not alphanumeric, so it can move a word boundary and the "
+                "bounded forms will disagree with themselves"
+            )
+            assert masked[index] not in _LOWER_HEX, (
+                "the mask is hexadecimal, so a masked id can be read back as a token id"
             )
 
 
@@ -3040,6 +4236,40 @@ def test_no_leak_comparison_in_this_module_bypasses_the_shared_rule() -> None:
             "different things and neither is redundant"
         )
 
+    # The outbound payload and the process log, pinned the same way -- and it is an
+    # asymmetry worth naming that they were not, because assertion 1 is the most
+    # important assertion in this repository. It is the only check anywhere that reads
+    # the bytes the provider was actually handed, and assertion 2b is the only opinion
+    # on the process log; the gate never sees either. Both were structurally
+    # unprotected while the audit limbs were named, so an edit that dropped the payload
+    # scan would have left 100 green runs asserting nothing about the wire, and the
+    # summary would still have printed "100/100 runs clean, 0 leaks".
+    #
+    # The scan AND its assertion, not just the scan: computing `payload_leaks` and not
+    # asserting on it is the cheaper mistake of the two -- it leaves the tally
+    # incrementing and every line looking present -- and naming only the call cannot
+    # see it. That is what these four needles hold that the two above do not.
+    #
+    # The two scan needles now spell the `issued=` argument as well, which is a
+    # STRENGTHENING of this guard rather than an accommodation of a signature change.
+    # `issued` is the only thing that narrows either scan, and it is derived per run:
+    # a body that dropped the argument would silently go back to reporting the
+    # pipeline's own token ids as originals on the wire, and a body that passed a
+    # constant or an empty set there would look identical from here without it. So the
+    # argument is named, and the local it must come from is named with it.
+    for limb in (
+        "issued_surrogates = frozenset(harness.vault.surrogates_for_session(session_id))",
+        "payload_leaks = find_in_text(originals, sent_payload, issued=issued_surrogates)",
+        "assert not payload_leaks",
+        "log_leaks = find_in_digit_heavy_text(originals, logged, issued=issued_surrogates)",
+        "assert not log_leaks",
+    ):
+        assert limb in run_body, (
+            f"the 100-run body no longer contains `{limb}` -- nothing else in this "
+            "repository scans the bytes the provider received or the lines the package "
+            "logged, so removing it makes the headline result vacuous"
+        )
+
 
 #: Production predicates the round-trip *expectation* must never be built from.
 #: Each is a predicate the restorer itself uses, so an expectation phrased in terms
@@ -3139,159 +4369,215 @@ async def test_no_original_ever_leaves_the_process(
     index: int,
 ) -> None:
     seed, kind, strategy = plan_run(index)
-    caplog.set_level(logging.DEBUG)
+    # Everything below runs under ``ledger.watching``. A run that dies before
+    # ``ledger.record()`` used to leave the summary with a bare ``99 != 100`` and no
+    # way to say which run or why; see :class:`RunFailure`. The block re-raises
+    # everything it sees, so no failure here becomes a pass.
+    with ledger.watching(index):
+        caplog.set_level(logging.DEBUG)
 
-    document = generator.generate(seed, kind)
-    doc_id = await harness.store.put(
-        USER_ID, f"{kind}-{seed}.txt", document.encode("utf-8"), DOC_CATEGORY[kind]
-    )
-    session_id, _expires_at = await harness.sessions.create("test-user")
-    calls_before = harness.provider.calls
-    # A per-run prompt carrying a real original from THIS document -- see prompt_for.
-    # The prompt is a third of the outbound payload and the only third a user writes,
-    # and it was a PII-free module constant on all 100 runs until this.
-    prompt = prompt_for(index)
-    result = await harness.orchestrator.run(session_id, USER_ID, doc_id, prompt, strategy)
+        document = generator.generate(seed, kind)
+        doc_id = await harness.store.put(
+            USER_ID, f"{kind}-{seed}.txt", document.encode("utf-8"), DOC_CATEGORY[kind]
+        )
+        session_id, _expires_at = await harness.sessions.create("test-user")
+        calls_before = harness.provider.calls
+        # A per-run prompt carrying a real original from THIS document -- see prompt_for.
+        # The prompt is a third of the outbound payload and the only third a user writes,
+        # and it was a PII-free module constant on all 100 runs until this.
+        prompt = prompt_for(index)
+        result = await harness.orchestrator.run(session_id, USER_ID, doc_id, prompt, strategy)
 
-    # The payload this test scans has to be the payload that was actually sent.
-    # `result.obfuscated_payload` is the orchestrator's own record of it; the
-    # provider wrapper holds the two strings the provider was really handed. If
-    # those ever diverge the whole file measures a string nobody transmitted, so
-    # the identity is asserted rather than assumed, and everything below scans
-    # the boundary-captured copy.
-    assert harness.provider.calls == calls_before + 1, (
-        f"run {index}: expected exactly one provider call, saw "
-        f"{harness.provider.calls - calls_before}"
-    )
-    sent_payload = harness.provider.last_payload
-    assert sent_payload is not None
-    assert sent_payload == result.obfuscated_payload, (
-        f"run {index}: the payload the gate scanned is not the payload the provider "
-        f"received ({len(result.obfuscated_payload)} chars scanned, {len(sent_payload)} sent)"
-    )
+        # The payload this test scans has to be the payload that was actually sent.
+        # `result.obfuscated_payload` is the orchestrator's own record of it; the
+        # provider wrapper holds the two strings the provider was really handed. If
+        # those ever diverge the whole file measures a string nobody transmitted, so
+        # the identity is asserted rather than assumed, and everything below scans
+        # the boundary-captured copy.
+        assert harness.provider.calls == calls_before + 1, (
+            f"run {index}: expected exactly one provider call, saw "
+            f"{harness.provider.calls - calls_before}"
+        )
+        sent_payload = harness.provider.last_payload
+        assert sent_payload is not None
+        assert sent_payload == result.obfuscated_payload, (
+            f"run {index}: the payload the gate scanned is not the payload the provider "
+            f"received ({len(result.obfuscated_payload)} chars scanned, {len(sent_payload)} sent)"
+        )
 
-    originals = harness.vault.originals_for_session(session_id)
-    assert originals, (
-        f"run {index} vaulted nothing, so every leak scan below would be vacuous "
-        f"(kind={kind}, seed={seed})"
-    )
+        originals = harness.vault.originals_for_session(session_id)
+        assert originals, (
+            f"run {index} vaulted nothing, so every leak scan below would be vacuous "
+            f"(kind={kind}, seed={seed})"
+        )
 
-    # The prompt's own value has to be one of the values the scans below hunt for, or
-    # the prompt half of assertion 1 is decorative. Asserted rather than assumed: the
-    # value is drawn from the fixture's planted literals, and if the vault ever stops
-    # holding exactly that string -- a fixture edit, a span boundary moving -- the
-    # prompt would go back to being unscanned bytes and nothing else would say so.
-    prompt_value = drawn_original(seed, kind, PROMPT_ENTITY_TYPES[index % 3])
-    assert prompt_value in originals, (
-        f"run {index}: the value this run put in the user prompt is not in the session "
-        f"vault, so the payload scan is not looking for it and the prompt half of this "
-        f"test measures nothing (kind={kind}, seed={seed}, {mask(prompt_value)})"
-    )
+        # The prompt's own value has to be one of the values the scans below hunt for, or
+        # the prompt half of assertion 1 is decorative. Asserted rather than assumed: the
+        # value is drawn from the fixture's planted literals, and if the vault ever stops
+        # holding exactly that string -- a fixture edit, a span boundary moving -- the
+        # prompt would go back to being unscanned bytes and nothing else would say so.
+        prompt_value = drawn_original(seed, kind, PROMPT_ENTITY_TYPES[index % 3])
+        assert prompt_value in originals, (
+            f"run {index}: the value this run put in the user prompt is not in the session "
+            f"vault, so the payload scan is not looking for it and the prompt half of this "
+            f"test measures nothing (kind={kind}, seed={seed}, {mask(prompt_value)})"
+        )
 
-    mapping = await surrogate_map(harness, session_id, result)
+        mapping = await surrogate_map(harness, session_id, result)
 
-    # --- 0. no surrogate stands for itself ---------------------------------
-    # The pseudonymization collision guard rejects a fake that shares a word with
-    # any original in the document. The degenerate failure of that guard is a
-    # "surrogate" equal to the value it replaces -- the payload would then carry
-    # the real value under cover of being obfuscated, and every later check in
-    # this test would happily pass. Compared on normalised forms, so a
-    # case-mangled or re-spaced identity is caught too.
-    identity = sorted(s for s, original in mapping.items() if normalize(s) == normalize(original))
-    assert not identity, (
-        f"run {index}: {len(identity)} surrogate(s) are identical to the value they "
-        f"replace, so the value was never obfuscated at all: {[mask(v) for v in identity]}"
-    )
+        # The exact strings this run spliced in, read out of the VAULT's own issued
+        # map. Not out of the gate, and not out of ``mapping``: the gate is the code
+        # these scans exist to disagree with, and ``mapping`` is built from
+        # ``result.detections``, which is ``obf.spans`` -- the DOCUMENT half only. A
+        # surrogate the prompt contributed and the document did not would be missing
+        # from it, and an incomplete exclusion set is a flake that comes back on one
+        # channel out of three. ``surrogates_for_session`` is the session cache the
+        # vault fills on every ``put``, so it has both halves, and the session is fresh
+        # per run.
+        issued_surrogates = frozenset(harness.vault.surrogates_for_session(session_id))
+        assert mapping.keys() <= issued_surrogates, (
+            f"run {index}: {len(mapping.keys() - issued_surrogates)} surrogate(s) this run "
+            "spliced into the payload are absent from the vault's issued map, so the own-id "
+            "exclusion below is derived from an incomplete set and would blank the wrong spans"
+        )
 
-    # --- 1. the outbound payload -------------------------------------------
-    # Scanned on the bytes captured at the PROVIDER boundary (asserted identical
-    # to the string the gate saw, above), with NO exemption for bytes the
-    # pipeline wrote itself. A pseudonym that reproduces a real value verbatim
-    # puts that value on the wire no matter which span it sits in, so there is
-    # nothing here to excuse; the pseudonymization collision guard is what keeps
-    # this clean.
-    payload_leaks = find_in_text(originals, sent_payload)
-    if payload_leaks:
-        ledger.leaks += len(payload_leaks)
-    assert not payload_leaks, (
-        f"run {index} ({kind}/{strategy}, seed {seed}): {len(payload_leaks)} original(s) "
-        f"present in the outbound payload: {describe_hits(payload_leaks, sent_payload)}"
-    )
+        def scanned(text: str) -> str:
+            """A haystack as the scans below actually saw it, for the failure messages.
 
-    # --- 2a. the audit trail, through the query API and on disk -------------
-    events = await harness.audit.query(session_id=session_id, limit=10_000)
-    assert events, f"run {index} emitted no audit events"
-    # ``ensure_ascii=False``: the default escapes every non-ASCII character to
-    # ``\uXXXX``, which would hide an accented original from the scan below in a
-    # haystack that provably contains it. See ``_unescape_json_unicode``.
-    audit_json = json.dumps(
-        [event.model_dump() for event in events], default=str, ensure_ascii=False
-    )
-    audit_leaks = find_in_digit_heavy_text(originals, audit_json)
-    audit_leaks += [
-        value
-        for value in find_in_bytes(originals, harness.audit_bytes())
-        if value not in audit_leaks
-    ]
-    if audit_leaks:
-        ledger.leaks += len(audit_leaks)
-    assert not audit_leaks, (
-        f"run {index}: {len(audit_leaks)} original(s) reached the audit log: "
-        f"{describe_hits(audit_leaks, audit_json)} (a value listed as 'byte-limb-only' "
-        "was found in the raw DB file and not in the query view)"
-    )
+            ``describe_hits`` names the limb that fired by re-running the limbs, so
+            handing it the *unmasked* string can name a limb that did not -- the exact
+            misdirection a reviewer cannot afford at the moment assertion 1 goes red.
+            Called only from inside an ``assert`` message, which Python evaluates only
+            on failure, so the clean path pays nothing for it.
+            """
+            return _harness_mask_own_ids(text, issued_surrogates)
 
-    # --- 2b. every log line the package emitted, at DEBUG -------------------
-    # ``log_haystack`` rather than ``caplog.text``: the default formatter renders
-    # no ``extra=`` fields, and that is where this package puts every variable it
-    # logs. Scanning ``caplog.text`` alone checked the constant half of each line.
-    logged = log_haystack(caplog)
-    log_leaks = find_in_digit_heavy_text(originals, logged)
-    if log_leaks:
-        ledger.leaks += len(log_leaks)
-    assert not log_leaks, (
-        f"run {index}: {len(log_leaks)} original(s) reached the log output: "
-        f"{describe_hits(log_leaks, logged)}"
-    )
+        # --- 0. no surrogate stands for itself ---------------------------------
+        # The pseudonymization collision guard rejects a fake that shares a word with
+        # any original in the document. The degenerate failure of that guard is a
+        # "surrogate" equal to the value it replaces -- the payload would then carry
+        # the real value under cover of being obfuscated, and every later check in
+        # this test would happily pass. Compared on normalised forms, so a
+        # case-mangled or re-spaced identity is caught too.
+        identity = sorted(
+            s for s, original in mapping.items() if normalize(s) == normalize(original)
+        )
+        assert not identity, (
+            f"run {index}: {len(identity)} surrogate(s) are identical to the value they "
+            f"replace, so the value was never obfuscated at all: {[mask(v) for v in identity]}"
+        )
 
-    # --- 3. round-trip completeness ----------------------------------------
-    # Both predicates here are the INDEPENDENT ones -- see expected_round_trip.
-    # Leak detection above must never be laxer than the gate; completeness must
-    # never share a predicate with the restorer. Those are different rules, and
-    # running both through one shared helper is what let a token TOKEN_RE could
-    # not see disappear from the expectation, the answer and the residual scan at
-    # the same time.
-    expected = expected_round_trip(result.raw_llm_response, mapping)
-    assert expected, (
-        f"run {index}: the model referenced no surrogate at all, so the round-trip "
-        f"assertion would be vacuous (kind={kind}, seed={seed})"
-    )
-    not_restored = sorted(
-        o for o in expected if not _reference_occurs_as_a_unit(o, result.restored_text)
-    )
-    assert not not_restored, (
-        f"run {index}: {len(not_restored)} of {len(expected)} referenced surrogate(s) were not "
-        f"restored to their originals: {[mask(v) for v in not_restored]}"
-    )
+        # --- 1. the outbound payload -------------------------------------------
+        # Scanned on the bytes captured at the PROVIDER boundary (asserted identical
+        # to the string the gate saw, above), with exactly ONE exclusion: the eight-hex
+        # ids of the tokens this run issued, blanked by exact string occurrence
+        # (``_harness_mask_own_ids``). Those ids are HMAC digests the pipeline drew
+        # itself, and the unbounded limbs read them as payload digits -- reproduced,
+        # not theorised: ``find_in_text({'8390244'}, 'Account
+        # [FIN_ACCOUNT_NUMBER_8390244f] closed.')`` returned ``['8390244']``.
+        #
+        # NOTHING ELSE the pipeline wrote is excused, and the pseudonyms are the
+        # reason: a fake that reproduces a real value verbatim puts that value on the
+        # wire no matter which span it sits in, so ``_harness_own_id_mask`` returns
+        # ``None`` for every surrogate that is not one of our tokens and this scan
+        # reads it exactly as it always has. The literals, the ``|hint`` tail, our
+        # brackets and every character beside, glued to or straddling a token are all
+        # still read.
+        payload_leaks = find_in_text(originals, sent_payload, issued=issued_surrogates)
+        if payload_leaks:
+            ledger.leaks += len(payload_leaks)
+        assert not payload_leaks, (
+            f"run {index} ({kind}/{strategy}, seed {seed}): {len(payload_leaks)} original(s) "
+            "present in the outbound payload: "
+            # Described against the string that was SCANNED, not the raw payload: the
+            # limb names come from re-running the limbs, and re-running them over an
+            # unmasked payload can name a limb that did not fire.
+            f"{describe_hits(payload_leaks, scanned(sent_payload))}"
+        )
 
-    # --- 4. nothing surrogate-shaped survives ------------------------------
-    residual = [match.group(0) for match in TOKEN_RE.finditer(result.restored_text)]
-    assert not residual, f"run {index}: residual token pattern(s) in the answer: {residual[:5]}"
-    # Boundary-anchored, because the restorer replaces surrogates on word
-    # boundaries and a checker that disagrees with the code it checks is wrong in
-    # whichever direction it disagrees. A bare ``in`` here reported a short Faker
-    # draw (``"Rich"``) as a surviving surrogate because it sat inside an ordinary
-    # word -- and since pseudonyms derive from a random per-session key, that red
-    # appeared and vanished between runs. This is Deviation 13's asymmetry pointing
-    # the other way: there the checker was stricter than the code and hid leaks;
-    # here it was looser and invented one.
-    surviving = sorted(s for s in mapping if occurs_as_a_unit(s, result.restored_text))
-    assert not surviving, (
-        f"run {index}: {len(surviving)} issued surrogate(s) survived into the answer: "
-        f"{surviving[:5]}"
-    )
+        # --- 2a. the audit trail, through the query API and on disk -------------
+        events = await harness.audit.query(session_id=session_id, limit=10_000)
+        assert events, f"run {index} emitted no audit events"
+        # ``ensure_ascii=False``: the default escapes every non-ASCII character to
+        # ``\uXXXX``, which would hide an accented original from the scan below in a
+        # haystack that provably contains it. See ``_unescape_json_unicode``.
+        audit_json = json.dumps(
+            [event.model_dump() for event in events], default=str, ensure_ascii=False
+        )
+        audit_leaks = find_in_digit_heavy_text(originals, audit_json)
+        audit_leaks += [
+            value
+            for value in find_in_bytes(originals, harness.audit_bytes())
+            if value not in audit_leaks
+        ]
+        if audit_leaks:
+            ledger.leaks += len(audit_leaks)
+        assert not audit_leaks, (
+            f"run {index}: {len(audit_leaks)} original(s) reached the audit log: "
+            f"{describe_hits(audit_leaks, audit_json)} (a value listed as 'byte-limb-only' "
+            "was found in the raw DB file and not in the query view)"
+        )
 
-    ledger.record(originals=len(originals), restored=len(expected))
+        # --- 2b. every log line the package emitted, at DEBUG -------------------
+        # ``log_haystack`` rather than ``caplog.text``: the default formatter renders
+        # no ``extra=`` fields, and that is where this package puts every variable it
+        # logs. Scanning ``caplog.text`` alone checked the constant half of each line.
+        #
+        # Carries the same own-id exclusion assertion 1 does, and for a measured
+        # reason: ``aiosqlite`` logs every statement it executes at DEBUG *with its
+        # bound parameters*, and the vault binds the surrogate -- so every token this
+        # run emitted is in this haystack verbatim (31/31, 4/4, 37/37, 14/14, 36/36,
+        # 14/14 over six runs). The audit limbs above deliberately do NOT get it: the
+        # same count over the same six runs is 0 in the query view and 0 in the DB
+        # bytes, so there the exclusion would be an identity function claiming to be a
+        # safety argument.
+        logged = log_haystack(caplog)
+        log_leaks = find_in_digit_heavy_text(originals, logged, issued=issued_surrogates)
+        if log_leaks:
+            ledger.leaks += len(log_leaks)
+        assert not log_leaks, (
+            f"run {index}: {len(log_leaks)} original(s) reached the log output: "
+            f"{describe_hits(log_leaks, scanned(logged))}"
+        )
+
+        # --- 3. round-trip completeness ----------------------------------------
+        # Both predicates here are the INDEPENDENT ones -- see expected_round_trip.
+        # Leak detection above must never be laxer than the gate; completeness must
+        # never share a predicate with the restorer. Those are different rules, and
+        # running both through one shared helper is what let a token TOKEN_RE could
+        # not see disappear from the expectation, the answer and the residual scan at
+        # the same time.
+        expected = expected_round_trip(result.raw_llm_response, mapping)
+        assert expected, (
+            f"run {index}: the model referenced no surrogate at all, so the round-trip "
+            f"assertion would be vacuous (kind={kind}, seed={seed})"
+        )
+        not_restored = sorted(
+            o for o in expected if not _reference_occurs_as_a_unit(o, result.restored_text)
+        )
+        assert not not_restored, (
+            f"run {index}: {len(not_restored)} of {len(expected)} referenced surrogate(s) were not "
+            f"restored to their originals: {[mask(v) for v in not_restored]}"
+        )
+
+        # --- 4. nothing surrogate-shaped survives ------------------------------
+        residual = [match.group(0) for match in TOKEN_RE.finditer(result.restored_text)]
+        assert not residual, f"run {index}: residual token pattern(s) in the answer: {residual[:5]}"
+        # Boundary-anchored, because the restorer replaces surrogates on word
+        # boundaries and a checker that disagrees with the code it checks is wrong in
+        # whichever direction it disagrees. A bare ``in`` here reported a short Faker
+        # draw (``"Rich"``) as a surviving surrogate because it sat inside an ordinary
+        # word -- and since pseudonyms derive from a random per-session key, that red
+        # appeared and vanished between runs. This is Deviation 13's asymmetry pointing
+        # the other way: there the checker was stricter than the code and hid leaks;
+        # here it was looser and invented one.
+        surviving = sorted(s for s in mapping if occurs_as_a_unit(s, result.restored_text))
+        assert not surviving, (
+            f"run {index}: {len(surviving)} issued surrogate(s) survived into the answer: "
+            f"{surviving[:5]}"
+        )
+
+        ledger.record(index=index, originals=len(originals), restored=len(expected))
 
 
 # ---------------------------------------------------------------------------
@@ -3590,20 +4876,65 @@ def _audit_file_bytes(db: Path) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def _selected_run_count(request: pytest.FixtureRequest) -> int:
-    """How many of the 100 parametrized runs this pytest invocation actually selected.
+def _selected_run_indices(request: pytest.FixtureRequest) -> frozenset[int]:
+    """*Which* of the 100 parametrized runs this pytest invocation actually selected.
 
     Read off ``session.items`` -- the post-filter collection -- so it reflects
     ``-k``, ``-m``, ``--deselect`` and an explicit node-id list, which is the whole
     point: the summary needs to tell "the runs were never asked for" apart from
     "the runs were asked for and did not happen". Those are different facts and
     only the second one is a finding.
+
+    This used to return a *count*, which was one fact short. Subtracting a count
+    from a count says a run is missing; subtracting a set from a set says **which**
+    one, and that is the difference between ``99 != 100`` and ``run 086 never
+    entered the body``.
+
+    Both facts this reads -- ``originalname`` and ``callspec.params`` -- are pytest
+    internals, and reading them through ``getattr`` means a pytest that stops
+    exposing either yields an *empty* selection rather than an error. That is only
+    safe because :func:`_selected_run_item_count` derives the same population from
+    ``nodeid``, which shares nothing with either attribute, and the caller asserts
+    the two agree. See that function for why counting the same way in both places
+    would have made the guard unable to fire.
     """
-    return sum(
-        1
-        for item in request.session.items
-        if item.originalname == "test_no_original_ever_leaves_the_process"  # type: ignore[attr-defined]
-    )
+    selected: set[int] = set()
+    for item in request.session.items:
+        if getattr(item, "originalname", None) != "test_no_original_ever_leaves_the_process":
+            continue
+        callspec = getattr(item, "callspec", None)
+        index = None if callspec is None else callspec.params.get("index")
+        if isinstance(index, int):
+            selected.add(index)
+    return frozenset(selected)
+
+
+#: How a run item is recognised **without** touching a pytest-internal attribute.
+#:
+#: File-qualified, so a same-named test in another module cannot inflate the count,
+#: and ``[`` on the end so only the parametrized items match. ``nodeid`` is the one
+#: string pytest guarantees on every collected item.
+_RUN_NODEID_MARK = f"{Path(__file__).name}::test_no_original_ever_leaves_the_process["
+
+
+def _selected_run_item_count(request: pytest.FixtureRequest) -> int:
+    """The same population as :func:`_selected_run_indices`, read off a **different fact**.
+
+    This is the check on that function, so it must not be able to fail the same way
+    -- and for one revision it could. It filtered on ``getattr(item, "originalname",
+    None)``, exactly what the function it checks filters on, which made the two agree
+    by construction in the case that matters: if ``originalname`` ever stopped being
+    there, both went to zero together, the caller's ``len(selected) == collected``
+    read ``0 == 0``, and :func:`test_leakage_summary` took the "nothing was selected"
+    branch and **skipped**. The expectation would have shrunk to nothing silently,
+    which is the one outcome that guard exists to make impossible.
+
+    ``nodeid`` shares no machinery with ``originalname`` or with ``callspec.params``,
+    so either of those going away now shows up as ``0 != 100`` on the guard rather
+    than as a green, empty run. Pinned by
+    :func:`test_the_selected_run_expectation_cannot_shrink_silently`.
+    """
+    return sum(1 for item in request.session.items if _RUN_NODEID_MARK in item.nodeid)
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -3637,27 +4968,217 @@ async def test_leakage_summary(
 
     The check is therefore strictly stronger than the one it replaces: it now also
     catches a *partial* selection reporting a summary, which the old form did not.
+
+    **The missing-run limb names the run and the reason.** It used to be
+    ``ledger.runs == selected``, and when it fired for real -- once, on run 086,
+    under heavy concurrent load -- it printed ``assert 99 == 100`` and nothing
+    else. That is the least useful true statement this file can make: it says a
+    run vanished, and the three facts needed to act on it (which run, what
+    exception, from which statement) were all recoverable only from a traceback
+    that was no longer on screen. :meth:`Ledger.diagnosis` supplies those three
+    facts.
+
+    **The set limb is not the old condition restated, and saying it was would have
+    been the wrong reason to trust it.** Implication runs one way only:
+    ``Ledger.runs`` is incremented nowhere but ``record()``, which also adds the
+    index to ``completed``, so ``runs >= len(completed)`` always -- a short count
+    therefore *forces* a selected index to be missing from the set, and the set limb
+    catches everything the old one caught. The converse is false, which is exactly
+    why the count comparison is asserted immediately after rather than instead: a
+    double ``record()`` for one index leaves the set complete and only the count
+    short. Nothing is relaxed, and two states the old assertion passed now fail --
+    one index recorded twice while another recorded not at all, and every run
+    recording under a single hardcoded index.
     """
-    selected = _selected_run_count(request)
-    if selected == 0:
+    selected = _selected_run_indices(request)
+    collected = _selected_run_item_count(request)
+    assert len(selected) == collected, (
+        f"{collected} run item(s) were collected but only {len(selected)} carried a "
+        "parametrized index, so the expected set is smaller than the selection and "
+        "a missing run could hide in the gap"
+    )
+    if not selected:
         pytest.skip(
             "the 100 leakage runs were filtered out of this invocation, so there is "
             "no tally to summarise. Run `pytest -m leakage` for the README number."
         )
 
-    assert ledger.runs == selected, (
-        f"{selected} leakage run(s) were selected but only {ledger.runs} recorded a "
-        "tally -- a run completed without reaching ledger.record(), which means the "
-        "summary is being computed over fewer runs than actually executed"
+    missing = ledger.diagnosis(selected)
+    assert not missing, (
+        f"{len(selected)} leakage run(s) were selected but {len(missing)} never reached "
+        "ledger.record(), so the summary is being computed over fewer runs than were "
+        "asked for. Each one, with the statement it died on:\n  " + "\n  ".join(missing)
     )
-    assert selected == RUNS, (
-        f"only {selected} of {RUNS} leakage runs were selected, so this tally is a "
+    assert ledger.runs == len(selected), (
+        f"{len(selected)} leakage run(s) were selected but the tally counts "
+        f"{ledger.runs} -- every selected index recorded, so one of them recorded twice"
+    )
+    assert len(selected) == RUNS, (
+        f"only {len(selected)} of {RUNS} leakage runs were selected, so this tally is a "
         "subset and must not be quoted as the headline result"
     )
     assert ledger.runs == RUNS, f"expected {RUNS} completed runs, recorded {ledger.runs}"
     assert ledger.leaks == 0, f"{ledger.leaks} leak(s) found across {ledger.runs} runs"
     assert await harness.audit.verify_chain() is True, "audit hash chain broken"
-    print("\n" + ledger.summary())
+    print("\n" + ledger.summary() + "\n" + ledger.timing())
+
+
+def test_a_run_that_dies_before_record_is_named_with_its_reason() -> None:
+    """The regression test for the one failure this harness has ever had.
+
+    Run 086 failed under heavy concurrent load and produced two useless lines:
+    ``99 == 100`` and ``Ledger(runs=99, leaks=0, ...)``. It has not reproduced in
+    seven full-suite runs since, so the *ghost* is not what can be pinned down --
+    what can be pinned down is that the next occurrence answers the three
+    questions the last one could not, and that is what this asserts, by killing a
+    run exactly the way the load killed that one.
+
+    The negative assertion is not decoration. ``mask`` exists because this module
+    never renders an original into output, and a failure line assembled from an
+    arbitrary exception is the obvious place for that habit to break: the
+    exception could have come out of the engine holding a span of the document.
+    So the line carries the exception's *type* and never its message, and this
+    proves it with a message that would be a leak if it were copied through.
+    """
+    # Held in a local rather than written into the ``raise``, because the failure
+    # line quotes the *source* of the failing statement and a literal there would
+    # be quoted legitimately. That is the actual boundary of the guarantee and it
+    # is worth stating: source text can only carry a value that is hardcoded in
+    # this file, and every original here comes out of the generator at runtime.
+    message = "Marguerite Vandenberg"
+    book = Ledger()
+    with pytest.raises(RuntimeError):
+        with book.watching(86):
+            raise RuntimeError(message)
+
+    lines = book.diagnosis(frozenset({86}))
+    assert len(lines) == 1, f"one dead run, one line: {lines}"
+    line = lines[0]
+
+    # Which run -- index, kind, strategy and seed, which is everything needed to
+    # re-run it alone: `pytest -k 086-financial-tokenization-seed90086`.
+    for fact in ("086", "financial", "tokenization", "90086"):
+        assert fact in line, f"the failure line does not say {fact!r}: {line}"
+    # Why, and from where. The line number is this file's, and the source text is
+    # the statement, so the reader knows whether it was an assertion or the pipeline.
+    assert "RuntimeError" in line, line
+    assert "harness line" in line, line
+    assert "raise RuntimeError(message)" in line, f"the failing statement is not quoted: {line}"
+    # And never the value.
+    assert "Vandenberg" not in line, (
+        "the failure line carries the exception message, which is arbitrary text from "
+        f"a process that has been handling originals: {line}"
+    )
+
+    # The tally still says the run did not happen -- watching() re-raised, and a
+    # caught exception is not a recorded run.
+    assert book.runs == 0 and book.completed == set()
+    assert "086-financial-tokenization-seed90086" in book.timing(), book.timing()
+
+
+def test_the_summary_distinguishes_a_run_that_died_from_one_that_never_started() -> None:
+    """Two different faults, two different lines, and neither is a bare count.
+
+    A run missing from the tally has exactly two causes and they call for opposite
+    responses: the body raised (look at the statement) or setup never finished
+    (look at the fixtures). The old assertion could not tell them apart because it
+    subtracted one integer from another.
+    """
+    book = Ledger()
+    never_started = book.diagnosis(frozenset({7}))
+    assert len(never_started) == 1 and "never entered the body" in never_started[0]
+    assert run_id_for(7) in never_started[0], never_started
+
+    # A run that entered, raised nothing, and did not record -- an early return, or
+    # a deleted record() call. Distinct from both of the above.
+    with book.watching(7):
+        pass
+    silent = book.diagnosis(frozenset({7}))
+    assert len(silent) == 1 and "raised nothing" in silent[0], silent
+
+    # And a run that finished is not reported at all.
+    book.record(index=7, originals=3, restored=2)
+    assert book.diagnosis(frozenset({7})) == []
+
+
+def test_the_summary_assertion_prints_the_per_run_diagnosis() -> None:
+    """The diagnosis has to reach the assertion message, not just exist.
+
+    Structural, because the behavioural half above cannot reach it: the summary is
+    an async test over the module-scoped harness, and a second copy of it built to
+    be failed would be a second harness. What is checkable here is that the limb
+    which fires when a run is missing is the one built from
+    :meth:`Ledger.diagnosis` -- if someone puts the count comparison back in front
+    of it, the message a reviewer sees goes back to ``99 == 100``.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    match = re.search(r"^async def test_leakage_summary", source, re.M)
+    assert match is not None, "the summary test has been renamed; this guard is stale"
+    body = source[match.start() :]
+    following = re.search(r"\n(?:async )?def ", body[1:])
+    if following is not None:
+        body = body[: following.start()]
+
+    assert "missing = ledger.diagnosis(selected)" in body, (
+        "the summary no longer computes the per-run diagnosis, so a vanished run is "
+        "back to being reported as a difference between two integers"
+    )
+    diagnosis_at = body.index("assert not missing")
+    count_at = body.index("assert ledger.runs == len(selected)")
+    assert diagnosis_at < count_at, (
+        "the count comparison now fires before the diagnosis, so the message a "
+        "reviewer sees for a vanished run is a bare integer mismatch again"
+    )
+
+
+def test_the_selected_run_expectation_cannot_shrink_silently() -> None:
+    """The two readings of "which runs were selected" must not be able to fail together.
+
+    :func:`_selected_run_indices` reads pytest internals through ``getattr``, so an
+    attribute that goes away yields an *empty* selection rather than an error. The
+    only thing between that and a summary which quietly skips is
+    ``assert len(selected) == collected``, and that guard is worth nothing if the
+    count is derived from the same attribute -- which is what it was: both filtered
+    on ``originalname``, so both would have gone to zero together and the guard would
+    have read ``0 == 0`` while :func:`test_leakage_summary` took the "nothing was
+    selected" branch. A green run measuring nothing is the worst outcome this file
+    has, and it would have printed no README line to say so.
+
+    Asserted on the disagreement directly: an item carrying a run's ``nodeid`` and
+    none of the attributes must be seen by the count and missed by the index reader,
+    which is what makes the guard fire.
+    """
+    nodeid = f"tests/leakage/{_RUN_NODEID_MARK}007-medical-tokenization-seed90007]"
+
+    def as_request(*items: Any) -> pytest.FixtureRequest:
+        session = SimpleNamespace(items=list(items))
+        return cast(pytest.FixtureRequest, SimpleNamespace(session=session))
+
+    healthy = SimpleNamespace(
+        nodeid=nodeid,
+        originalname="test_no_original_ever_leaves_the_process",
+        callspec=SimpleNamespace(params={"index": 7}),
+    )
+    assert _selected_run_indices(as_request(healthy)) == frozenset({7})
+    assert _selected_run_item_count(as_request(healthy)) == 1
+
+    # pytest stops exposing what the index reader needs. The count must NOT follow it
+    # down: 0 == 1 is a red summary, 0 == 0 is a skipped one.
+    stripped = SimpleNamespace(nodeid=nodeid)
+    assert _selected_run_indices(as_request(stripped)) == frozenset()
+    assert _selected_run_item_count(as_request(stripped)) == 1, (
+        "the run-item count is derived from the same attribute the index reader uses, "
+        "so the two collapse together, `len(selected) == collected` reads 0 == 0, and "
+        "the summary skips -- the expectation shrinks to nothing with nothing red"
+    )
+
+    # And the count stays file-qualified: a same-named test in another module is not
+    # one of these 100 runs, and counting it would fire the guard for no reason.
+    elsewhere = SimpleNamespace(
+        nodeid="tests/other/test_elsewhere.py::test_no_original_ever_leaves_the_process[0]",
+        originalname="test_no_original_ever_leaves_the_process",
+    )
+    assert _selected_run_item_count(as_request(elsewhere)) == 0
 
 
 #: A vaulted value, and two payloads carrying it that ONLY a skeleton view finds.

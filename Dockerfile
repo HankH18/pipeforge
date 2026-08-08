@@ -61,5 +61,33 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD curl -fsS http://localhost:8000/health || exit 1
 
+# `--no-access-log` is a disclosure control, not tidiness. uvicorn's access logger
+# writes the request line verbatim -- path *and* query string -- to stdout, which
+# compose pipes straight to the container log. Two of this API's routes carry a
+# credential pair there:
+#
+#   INFO: 127.0.0.1:61853 - "DELETE /sessions/fdc6fb4d29e64c32b6af05cc1de9ae46?user_id=alice HTTP/1.1" 204
+#   INFO: 127.0.0.1:61854 - "GET /documents/doc-abc123?user_id=alice HTTP/1.1" 404
+#
+# (both measured against this exact command, minus the flag). The first line is the
+# whole of what `DELETE /sessions/{id}?user_id=` needs, and that deletion is
+# cryptographic erasure -- irreversible, no undo. `SessionRegistry._handle`
+# (vault/session_registry.py:103) exists precisely to keep that pair out of the log
+# stream, and it logs a truncated SHA-256 instead of the ID for that reason; the
+# access log put the raw pair back one line away, defeating the mask.
+#
+# Turning the logger off rather than filtering it is the honest trade, and it costs
+# less than it looks. Measured by diffing the two runs: the ONLY lines the flag
+# removes are the access lines. The package's own records do not travel this stream
+# at all -- uvicorn's log config touches the `uvicorn*` loggers, nothing installs a
+# handler for `secure_context_pipeline`, so the masked `_handle` records were never
+# printed here and are not what is being given up. What is given up is per-request
+# visibility, and the audit chain already holds it in a masked, access-controlled,
+# tamper-evident form -- which is the copy worth keeping. The alternative, a
+# uvicorn access-log filter rewriting IDs through `_handle`, has to enumerate every
+# id-bearing route and stays wrong the moment one is added; this cannot.
+#
+# It also stops the HEALTHCHECK below from writing 2,880 `GET /health` lines a day
+# into an idle container's log.
 CMD ["uvicorn", "secure_context_pipeline.api.app:create_app", \
-     "--factory", "--host", "0.0.0.0", "--port", "8000"]
+     "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

@@ -20,7 +20,9 @@ So the numbers get a test, on the same terms the rest of this suite uses:
   helper was validated on two files, agreed on both, and was over-counting five
   of the package's 52 modules the whole time. It is now checked file by file
   against ``coverage report`` -- 0 mismatches across 52, totals agreeing at
-  4,511 -- and the exclusion set it depends on has its own tripwire in
+  4,511 when that validation was run and again at **4,778** against the
+  ``--cov`` run section 1 currently pastes -- and the exclusion set it depends on
+  has its own tripwire in
   ``test_the_statement_helper_still_reproduces_coverages_own_column``.
 * Where two sentences in the README must agree, both are parsed and compared.
   A claim that can only be checked against its own restatement is not checked.
@@ -30,31 +32,54 @@ What this file cannot do is run the suite from inside the suite, so the absolute
 number is written down in exactly ONE place, which is what stops the
 section-11 checklist from disagreeing with it again.
 
-**On how strict each assertion is.** Its first version pinned everything exactly,
-and turned the whole suite RED on a two-statement drift in a nineteen-thousand
-statement total -- 0.01%, on a sentence whose claim is a coverage percentage. A
-number that moves on every commit is a liability in a guard test: it trains the
-next reader to reach for the assertion instead of the prose. So the assertions are
-graded, and every one carries a comment saying which grade it got and why. The
-grades, and the rule behind them:
+**On how strict each assertion is, and why the one graded exception went back to
+exact.** The first version of this file pinned everything, and turned the whole
+suite RED on a two-statement drift in a nineteen-thousand statement total --
+0.01%, on a sentence whose claim is a coverage percentage. The response was to
+band the one number that moves fastest, the package + tests + fixtures statement
+sum, at 0.5%: warn inside the band, fail outside it. The reasoning was sound and
+is worth keeping in view -- a number that goes red on every commit trains the next
+reader to edit the assertion instead of the prose -- but the conclusion did not
+survive being measured against the rest of this file. Every assertion here is now
+EXACT, on this argument:
 
-* EXACT where both sides live in this README -- the E501 arithmetic, the deviation
-  count, the boundary counts, the Q1 cross-references. Nothing outside the file can
-  move these, so a mismatch is always an authoring error.
-* EXACT where the number describes ONE artifact and supports an argument rather
-  than a scale -- ``demo.py``'s 632, ``api/app.py``'s line count, the demo-flows
-  collection, the package's own statement count (measured: 0 to +18 per commit over
-  the last eleven). These are correctable in one token, and the failure message
-  always names the replacement.
-* BANDED where the number is a repository-wide total that any added line moves --
-  the package + tests + fixtures statement sum, measured at 0 to +1,463 per commit
-  over the same eleven. It warns with the exact correction inside the band and
-  fails outside it, so the drift is still reported; see
-  ``WHOLE_REPO_DRIFT_TOLERANCE`` for where 0.5% comes from.
+* **The band could not stop the suite going red, because the numbers beside it are
+  pinned exactly and move for the same reasons.** Section 1's pasted block contains
+  a collected-test count and a package denominator, both EXACT, both moved by any
+  commit that adds a test or a line of package code. Replaying the nineteen commits
+  that end at ``b82964a`` (``git ls-tree`` + ``git show`` through
+  ``coverage.parser``, no checkout) gives, per commit, the movement in package
+  statements / three-root statements / lines matching ``def test_`` under
+  ``tests/``::
 
-Nothing was deleted to get there. The one assertion that was loosened -- the
-three-root sum -- kept its full-precision report and gave up only the red/green
-line, and the two beside it stayed exact.
+      +0/+0/+0      +1/+36/+6      +0/-1/+0     +2/+13/+1     +0/+12/+2
+      +1/+5/+0      +0/+0/+0       +6/+46/+6    +0/+14/+2     +0/+0/+0
+      +0/+1463/+155 -3/-6/+0       +18/+35/+2   +1/+83/+4     +17/+561/+41
+      +0/+31/+1     +108/+1093/+60 +0/+9/+1     +38/+527/+39
+
+  **Sixteen** of the nineteen moved the banded total at all. **Fifteen** of those
+  sixteen also moved the package count or the test count, so on fifteen of them the
+  suite was red on an EXACT assertion in this same file whatever the band did. The
+  one exception is ``4624411``, a duplicate import deleted, which moved the total by
+  **one statement**. So the band bought exactly one green run in nineteen commits,
+  and cost an 81-statement blind spot -- which is what it was holding when this was
+  re-derived. (An earlier draft of this paragraph said "eighteen of the nineteen",
+  which counts every replayed commit as a mover; three of them moved nothing at all
+  and four moved no pinned number. Re-derived here rather than carried forward,
+  because an argument for exactness that is itself approximate is not one.)
+* **A tolerance expressed as a fraction of the thing it guards gets weaker exactly
+  as that thing grows.** 0.5% hid 95 statements when it was written and 107 by the
+  time it was re-read; nothing in the mechanism ever revisits that. And a band is
+  memoryless: it cannot tell "this commit moved the total by 81" from "the
+  published number has been 81 wrong for eleven commits", so a per-commit allowance
+  used as a standing one is not a band, it is a hole that widens on its own.
+
+So the grades collapse to one rule -- every published number is re-derived and
+pinned exactly, and every failure message carries the replacement -- and the way
+the suite stays green is the README being correct, which is the property this file
+exists to enforce. Nothing was weakened to get there and nothing was deleted; the
+one assertion that had been loosened was tightened back, and it keeps the
+full-precision correction the banded version reported.
 """
 
 from __future__ import annotations
@@ -62,7 +87,6 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 
 import coverage
@@ -121,38 +145,6 @@ COVERED_ROOTS = ("secure_context_pipeline", "tests", "fixtures")
 #: The line-length limit `pyproject.toml` pins and `E501` now enforces.
 LINE_LIMIT = 100
 
-#: How far the whole-repository statement total may sit from the tree before this
-#: file goes RED, as a fraction of the measured total.
-#:
-#: Measured, not picked. Replaying ``coverage.parser`` over the last eleven commits
-#: -- ``git ls-tree`` plus ``git show``, no checkout -- gives this per-commit
-#: movement in package + tests + fixtures:
-#:
-#:     +5   0   +46   +14   0   +1463   -6   +35   +83   +561   +31
-#:
-#: The median commit moves it by 31 statements. Against a ~19,300 denominator that
-#: is 0.16%, which is noise inside a sentence whose actual claim is "98% of about
-#: nineteen thousand statements" -- and going red on it costs a reviewer a failing
-#: suite for a figure no reader could act on. The two outliers are the commits that
-#: added whole test suites (demo.py/generator/UI behaviour, then audit loop 3's 38
-#: findings): 7.6% and 3.0%, large enough that the published figure reads as simply
-#: wrong to anyone who checks it.
-#:
-#: 0.5% -- about 97 statements at today's scale -- is the cut that separates those
-#: two populations: it absorbs nine of the eleven commits and catches both
-#: suite-sized additions. Nothing is lost inside the band, because the assertion
-#: warns with the exact number the prose should read either way; see
-#: ``test_the_whole_repository_statement_total_is_the_one_coverage_would_report``.
-#:
-#: The package on its own gets no band at all. Over the same eleven commits it moved
-#: 0 to +18 (median 0), which is why it is pinned exactly in
-#: ``test_the_package_only_coverage_line_states_the_denominator_the_package_has``.
-#:
-#: Re-run over the last sixteen commits when this band was next breached, and 0.5% is
-#: still the cut: largest ordinary commit 0.47%, smallest suite-sized one 3.05%. The
-#: replay and the decision not to widen it are recorded at the assertion itself.
-WHOLE_REPO_DRIFT_TOLERANCE = 0.005
-
 
 #: One configured ``Coverage`` for the whole module. Built once because the
 #: exclusion regex is compiled per instance and ``statements()`` is called ~90
@@ -205,6 +197,29 @@ def long_lines(path: Path) -> int:
     )
 
 
+def python_files(root: Path) -> list[Path]:
+    """Every ``.py`` file under ``root``, as the count ``mypy`` prints having checked.
+
+    Counted rather than asked of ``mypy``, for the reason ``long_lines`` is counted
+    rather than asked of ``ruff``: the paragraph this feeds is a claim *about*
+    ``mypy``, and a cold-cache ``--strict`` pass over the tree is not a cost this
+    suite should pay per run. Skips dotted directories (``.venv``, ``.git``),
+    ``__pycache__`` and the ``.egg-info`` tree, which is the whole difference
+    between a naive walk and what ``mypy`` reports: validated against a real run at
+    the commit this was written -- ``52 source files`` for the package and
+    ``checked 91 source files`` for the repository, both exact.
+    """
+    skip = ("__pycache__",)
+    return sorted(
+        path
+        for path in root.rglob("*.py")
+        if not any(
+            part.startswith(".") or part in skip or part.endswith(".egg-info")
+            for part in path.relative_to(root).parts
+        )
+    )
+
+
 def statements(path: Path) -> int:
     """Statement count for one file, as ``coverage`` would report it.
 
@@ -218,7 +233,11 @@ def statements(path: Path) -> int:
     distinction is not pedantry: the earlier version *was* a reimplementation, it
     passed a two-file spot check, and it was over-counting five of the package's
     52 modules. Validated over all 52 against a real ``coverage report`` run: 0
-    mismatches, and the totals agree at 4,511.
+    mismatches, and the totals agreed at 4,511. Re-checked at the total level
+    against the ``--cov`` run section 1 now pastes, on a tree 267 statements
+    larger: this helper sums the package to **4,778** and ``coverage report``
+    prints ``TOTAL 4778``, so the agreement is not an artefact of the tree it was
+    first validated on.
     """
     return len(PythonFileReporter(str(path), coverage=_COVERAGE).lines())
 
@@ -348,10 +367,12 @@ def test_the_pasted_suite_result_accounts_for_every_test_pytest_collects() -> No
     pasted block is a claim about a *green* suite, and if the suite is not green
     the block is wrong in a more interesting way than a stale integer.
 
-    EXACT rather than banded, unlike the whole-repository statement total below.
-    That one is a denominator nobody reads; this one is the line section 11 step 5
-    tells a reviewer to compare their own output against, so a figure that is
-    close is a figure that fails the comparison it was written for.
+    EXACT, and it is the assertion that decided the whole-repository total below
+    should be exact too: this is the line section 11 step 5 tells a reviewer to
+    compare their own output against, so a figure that is close is a figure that
+    fails the comparison it was written for -- and because it moves on every
+    commit that adds a test, banding the statement total beside it could never
+    have kept this block green.
     """
     text = flat(readme_text())
     passed, skipped = (
@@ -458,6 +479,76 @@ def test_the_e501_accounting_adds_up_and_names_the_files_that_still_have_long_li
     )
 
 
+# -- section 1: the two mypy scopes -------------------------------------------
+
+
+def test_the_mypy_paragraph_counts_the_files_the_two_scopes_actually_hold() -> None:
+    """The `--strict` figures, which had rotted by two in a paragraph that predicted it.
+
+    Section 1 states ``mypy`` twice: ``clean, 52 source files`` in the pasted block
+    and ``**package only** -- 52 files`` in the paragraph under it, both describing
+    the ``files = ["secure_context_pipeline"]`` pin; then ``90 files and 129
+    remaining errors`` for ``mypy --strict .``, which ignores that pin. Measured
+    while this was written, the whole-tree run checks **91** files and finds
+    **131** errors -- two adrift in each half, on the same commits that moved the
+    coverage denominators beside it. The paragraph had already called those two
+    "the most rot-prone numbers on this page" and told the reader to re-derive
+    them, which is a caveat, not a guard: it was two wrong under it.
+
+    What is derived here is the two FILE counts, because a file count is a property
+    of the tree. 52 ``.py`` files under ``secure_context_pipeline/`` and 91 across
+    the repository, both agreeing exactly with what ``mypy`` printed on the run the
+    paragraph quotes. Nothing here runs ``mypy``: that would check the paste
+    against the tool it is a paste of, and would add a cold-cache ``--strict`` pass
+    to a suite that already costs eight minutes.
+
+    The error TOTAL is a property of a *run*, like ``missed``/``branches``/
+    ``partial`` below, so it is not re-derived. Its composition is not -- that is
+    arithmetic the paragraph performs on itself, and it is pinned: 54
+    ``attr-defined`` plus 34 ``arg-type`` plus the stated remainder must equal the
+    stated total. That is exactly the E501 defect one paragraph up, where a total
+    was corrected and the split it had been spelled out as was not.
+    """
+    text = flat(readme_text())
+    block_files = as_int(one_match(r"clean, (\d+) source files", text).group(1))
+    # The dash between "package only" and the count is matched as `\S` rather than
+    # written out, so this file stays plain ASCII under RUF001/RUF002.
+    para_files = as_int(one_match(r"\*\*package only\*\* \S (\d+) files", text).group(1))
+    tree_files, errors = (
+        as_int(g)
+        for g in one_match(r"\*\*(\d+) files and (\d+) remaining errors\*\*", text).groups()
+    )
+    attr, arg = (
+        as_int(one_match(rf"\*\*(\d+)\*\* are `{code}`", text).group(1))
+        for code in ("attr-defined", "arg-type")
+    )
+    rest = as_int(one_match(r"the remaining (\d+) are assorted", text).group(1))
+
+    measured_package = len(python_files(REPO_ROOT / "secure_context_pipeline"))
+    measured_tree = len(python_files(REPO_ROOT))
+
+    # EXACT, all three, and the first is the one that matters most: the gate's own
+    # scope is restated twice four lines apart, which is the shape that produced
+    # the section-1-versus-section-11 contradiction this file opens with.
+    assert block_files == para_files, (
+        f"the pasted block says mypy checks {block_files} source files and the paragraph "
+        f"under it says {para_files}; both describe the same `files` pin"
+    )
+    assert para_files == measured_package, (
+        f"`secure_context_pipeline/` holds {measured_package} .py files, not {para_files}; "
+        "both mypy scope statements in section 1 are stale"
+    )
+    assert tree_files == measured_tree, (
+        f"`mypy --strict .` is pointed at {measured_tree} .py files, not {tree_files}; "
+        f"re-run it and update the error total beside the file count"
+    )
+    assert attr + arg + rest == errors, (
+        f"{attr} attr-defined + {arg} arg-type + {rest} assorted is {attr + arg + rest}, but the "
+        f"paragraph states {errors} errors. The composition is what carries this argument, so a "
+        "total corrected without its split is the defect, not a rounding difference"
+    )
+
+
 # -- section 1: whole-repository coverage denominator -------------------------
 
 
@@ -472,27 +563,22 @@ def test_the_whole_repository_statement_total_is_the_one_coverage_would_report()
     and silently drops all 632 of its statements), so the published total is a
     sum of two runs and both addends have to be right.
 
-    Its three assertions are deliberately not equally strict, because the three
-    numbers do not rot at the same rate, and a guard test that goes red on the
-    slowest-moving thing in the tree and the fastest-moving thing in the tree for
-    the same reason teaches a reviewer to ignore it. The first version of this file
-    turned the whole suite RED on a two-statement drift -- 0.01% -- which is a
-    liability, not a check. What each assertion is worth:
+    All three assertions are EXACT, and the third one has been both ways. It was
+    pinned, went red on a two-statement drift, was banded at 0.5% of the measured
+    total -- warn inside, fail outside -- and is pinned again. The re-derivation
+    that put it back is in this module's docstring and is summarised at the
+    assertion; the short version is that the band was found holding 81 statements
+    while the suite was already red on the two exact numbers printed beside it.
 
-    * ``parts + demo == total`` stays EXACT. It is arithmetic the README performs
-      on itself; nothing outside the file can move it, so a mismatch is always an
-      authoring mistake and never drift.
-    * ``demo.py`` stays EXACT. One script, one owner, and 632 is load-bearing three
-      separate times on the page -- it is the number the ``--cov=demo``
-      ``module-not-imported`` trap is argued with, so a wrong 632 makes an argument
-      wrong rather than a figure stale.
-    * The three-root sum is BANDED at ``WHOLE_REPO_DRIFT_TOLERANCE``, whose
-      docstring records the eleven-commit measurement the width comes from.
-
-    Banding it does not lose the report. Inside the band the test warns with the
-    exact number section 1 should read, so ``pytest -q`` still hands over the
-    correction -- which is the behaviour that was actually wanted, rather than a
-    red suite. Outside the band it fails, with the same number in the message.
+    * ``parts + demo == total`` -- arithmetic the README performs on itself;
+      nothing outside the file can move it, so a mismatch is always an authoring
+      mistake and never drift.
+    * ``demo.py`` -- one script, one owner, and the figure is load-bearing three
+      separate times on the page: it is the number the ``--cov=demo``
+      ``module-not-imported`` trap is argued with, so a wrong value makes an
+      argument wrong rather than a figure stale.
+    * The three-root sum -- the fastest-moving number on the page, and the one this
+      test exists for. Exact, with the replacement in the failure message.
     """
     text = flat(readme_text())
     total, parts = (
@@ -516,52 +602,57 @@ def test_the_whole_repository_statement_total_is_the_one_coverage_would_report()
     # EXACT -- a single script, and the figure an argument rests on, not a total.
     assert measured_demo == demo_claim, f"demo.py is {measured_demo} statements, not {demo_claim}"
 
-    # BANDED -- and the correction is emitted whether or not the band is breached,
-    # so drift inside it is reported rather than swallowed. Narrowing this back to
-    # equality is not a strengthening: it was equality, and it went red at 0.01%.
+    # EXACT -- restored from a 0.5% band, which is a tightening and is argued for
+    # rather than asserted. Three findings, in the order they landed.
     #
-    # Re-examined after this assertion went RED again, at 1.70%, on a wave that added
-    # about thirty tests. The question that raised is whether banding was the wrong
-    # call -- it did not stop the red -- so the eleven-commit replay behind
-    # WHOLE_REPO_DRIFT_TOLERANCE was re-run over the last sixteen, five of which
-    # postdate it. Per-commit movement in package + tests + fixtures:
+    # 1. The band was holding 81 statements when it was re-read: 21,347 published
+    #    against 21,428 measured, inside a band that had grown to 107 and passing
+    #    with a warning. Its own docstring had already been re-derived twice by
+    #    hand, which is the tell -- a width that has to be re-justified every time
+    #    it is breached is not absorbing noise.
     #
-    #     +13 +12 +5 0 +46 +14 0 +1463 -6 +35 +83 +561 +31 +1093 +9
-    #     0.08% 0.07% 0.03% 0% 0.28% 0.09% 0% 8.26% 0.03% 0.20% 0.47% 3.05% 0.17%
-    #     5.60% 0.05%
+    # 2. The band could not buy what it was bought for. Its whole case is that a
+    #    number moving on every commit turns the suite red and teaches the reader
+    #    to edit the assertion; but section 1's pasted block also carries the
+    #    collected-test count and the package denominator, both pinned EXACTLY
+    #    here, and both move for the same reasons. Replay of the nineteen commits
+    #    ending at `b82964a`, per commit, as package / three-root / `def test_`:
     #
-    # The two populations are still cleanly separated and the gap is wide: the largest
-    # ordinary commit is 0.47% and the smallest suite-sized one 3.05%, so 0.5% still
-    # sits in empty space rather than on top of the data. Twelve of the fifteen are
-    # absorbed; the three caught are the three that added whole test suites.
+    #        +0/+0/+0       +1/+36/+6      +0/-1/+0     +2/+13/+1     +0/+12/+2
+    #        +1/+5/+0       +0/+0/+0       +6/+46/+6    +0/+14/+2     +0/+0/+0
+    #        +0/+1463/+155  -3/-6/+0       +18/+35/+2   +1/+83/+4     +17/+561/+41
+    #        +0/+31/+1      +108/+1093/+60 +0/+9/+1     +38/+527/+39
     #
-    # So the band is kept, because the red is not evidence against it -- it is the band
-    # working. 1.70% is a suite-sized addition, which is the population 0.5% was cut to
-    # catch, and the honest repair is the one taken here: correct the prose, not the
-    # tolerance. Widening the band to swallow 1.70% would be the loosening this comment
-    # exists to forbid, and it would also erase the distinction from the two exact
-    # assertions above and the exact package denominator below -- those are pinned
-    # because they are stable (demo.py: one file; the package: 0 to +18 a commit), not
-    # because exactness is a style.
+    #    SIXTEEN of the nineteen moved this total; FIFTEEN of those sixteen also
+    #    moved a number pinned exactly in this same file, so on those the suite was
+    #    red whatever the band did. The one exception (`4624411`, a duplicate
+    #    import deleted) moved it by ONE statement. So the band bought exactly one
+    #    green run in nineteen commits, and the 81 it was hiding sat under a suite
+    #    that was red anyway. The "eighteen of nineteen" this comment used to claim
+    #    counted every replayed commit as a mover; it is re-derived above.
     #
-    # The premise the band rests on was checked rather than assumed: `pytest -q` prints
-    # the warnings summary, message and all, so an inside-band drift hands the reader
-    # the exact replacement number on the same run. If a `filterwarnings` entry ever
-    # hides UserWarning, this stops being a graded assertion and becomes a silent one,
-    # and it should go back to EXACT that day.
+    # 3. A fraction of the guarded quantity is the wrong shape for a tolerance: it
+    #    was ~95 statements when written and 107 when re-read, and it widens on its
+    #    own as the tree grows, with nothing in the mechanism to revisit it. It is
+    #    also memoryless -- it cannot distinguish one commit that moved 81 from
+    #    eleven commits during which the published figure was 81 wrong -- so a
+    #    per-commit allowance spent as a standing one never comes back.
+    #
+    # What is NOT the argument: that exactness is a style. `missed`/`branches`/
+    # `partial` below stay banded, because those are properties of a run this file
+    # deliberately does not perform. This number is a property of the source, it is
+    # re-derived here in full, and the failure message names its replacement.
     correction = (
         f"package + tests + fixtures is {measured_parts} statements, not {parts}; "
         f"section 1's whole-repository total should read "
         f"{measured_parts + measured_demo:,} ({measured_parts:,} + {measured_demo})"
     )
-    drift = abs(measured_parts - parts)
-    assert drift <= WHOLE_REPO_DRIFT_TOLERANCE * measured_parts, (
-        f"{correction}. That is {drift / measured_parts:.2%} adrift, past the "
-        f"{WHOLE_REPO_DRIFT_TOLERANCE:.1%} band, which is the size of a commit that adds a "
-        "whole test suite rather than a commit that adds a few tests"
+    assert measured_parts == parts, (
+        f"{correction}. That is {abs(measured_parts - parts)} statements adrift. This "
+        "assertion is exact on purpose: the collected-test count and the package "
+        "denominator in the same block are exact and move on the same commits, so a "
+        "band here hid drift without ever saving a red run"
     )
-    if drift:
-        warnings.warn(f"README statement total is {drift} adrift: {correction}", stacklevel=1)
 
 
 def test_the_package_only_coverage_line_states_the_denominator_the_package_has() -> None:
@@ -573,11 +664,15 @@ def test_the_package_only_coverage_line_states_the_denominator_the_package_has()
     was written it read 4,403 against a package of 4,511. Same failure mode, one
     line up, and the only reason it lasted longer is that nobody had counted it.
 
-    The denominator is pinned EXACTLY rather than banded, and the contrast with the
-    banded whole-repository total is the point: over the last eleven commits the
-    package moved 0 to +18 statements, median 0, while package + tests + fixtures
-    moved 0 to +1,463. One of those is a number a human can keep current and the
-    other is not, so they get different rules. See ``WHOLE_REPO_DRIFT_TOLERANCE``.
+    The denominator is pinned EXACTLY, as the whole-repository total above now is
+    too. It does move less: over the nineteen commits replayed at that assertion,
+    the package moved -3 to +108 statements a commit with a **median of 0** and nine
+    of nineteen at exactly 0, against -6 to +1,463 and a median of +14 for package +
+    tests + fixtures. ("0 to +18, median 0" is what this docstring said, from the
+    earlier eleven-commit window; the nineteen-commit replay contains a +108, so the
+    range is quoted from the wider window now.) But "moves less" turned out to be an
+    argument for keeping a human's correction cheap, not for tolerating a wrong
+    number. The replay that removed the band is recorded at that assertion.
 
     ``missed``, ``branches`` and ``partial`` are properties of a *run*, not of the
     source, so they cannot be re-derived here without paying the eight minutes a
@@ -619,10 +714,13 @@ def test_the_package_only_coverage_line_states_the_denominator_the_package_has()
     # but the column pasted here is ``BrPart`` -- branches taken only one way --
     # and a branch missed entirely contributes two unexecuted exits while showing
     # up as at most one partial. So substituting ``partial`` for the missing exits
-    # can only flatter the result. Measured on the run this paragraph quotes:
-    # (4511-65+1126-57)/(4511+1126) = 97.8%, which coverage rounds and reports as
-    # 98%. Hence: the published percentage may not exceed the bound, and may not
-    # trail it by more than a point.
+    # can only flatter the result. Measured on the run section 1 now pastes:
+    # (4778-61+1216-56)/(4778+1216) = 98.0%, which coverage reports as 98%; on the
+    # earlier run this comment was written against, (4511-65+1126-57)/(4511+1126) =
+    # 97.8%, which it also reported as 98% -- the bound is one point wide in the
+    # worst case and zero in the best, which is why the second assertion allows one.
+    # Hence: the published percentage may not exceed the bound, and may not trail it
+    # by more than a point.
     upper_bound = round((stmts - missed + branches - partial) / (stmts + branches) * 100)
     assert claimed_pct <= upper_bound, (
         f"the pasted counts cannot support {claimed_pct}% branch coverage: they bound it "

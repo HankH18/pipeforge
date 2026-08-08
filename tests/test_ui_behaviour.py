@@ -23,16 +23,23 @@ is the behavioural layer on top of it.
 
 from __future__ import annotations
 
+import importlib
 import json
+import pkgutil
 import re
 import shutil
 import subprocess
+import sys
+from collections.abc import Iterator
 from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
 
+from secure_context_pipeline.api.constants import MAX_AUDIT_PAGE
+from secure_context_pipeline.api.schemas import MAX_ID_LEN, MAX_PROMPT_CHARS
 from secure_context_pipeline.detection.registry import EntityRegistry
+from secure_context_pipeline.errors import PipelineError
 from secure_context_pipeline.models import DOC_CATEGORIES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +57,26 @@ MID = "·"
 #: index.html's own placeholder for panels 2 to 4, kept in ``app.js`` so the reset
 #: and the first paint are one value -- the same arrangement as ``HINT_IDLE``.
 IDLE = "—"
+
+#: What a mark in panel 2 or 3 says when you hover it, one per kind of mark.
+#: Hand-written here, never imported from ``app.js`` -- the module docstring's rule.
+#: They exist as constants only because two tests below assert the same rendering.
+TOK_TIP = (
+    "A surrogate token. The original it stands for is in the vault for this "
+    "session and is not anywhere in this payload; panel 4 puts it back."
+)
+RED_TIP = (
+    "A redaction marker. The value was removed rather than tokenised -- "
+    "irreversible by design, so it does not come back in panel 4."
+)
+
+
+def _ps_tip(entity_type: str) -> str:
+    """The pseudonym tooltip, which names the entity type and no value."""
+    return (
+        f"A PSEUDONYM this run minted for a {entity_type}. It reads like a real value "
+        "and is not one: the original never left the vault."
+    )
 
 HARNESS = r"""
 'use strict';
@@ -98,7 +125,21 @@ globalThis.fetch = async function (path, init) {
     body: typeof body === 'string' ? body : (body ? '[form]' : null),
     form: (body && body.parts) || null,
   });
-  const r = responder(path, init) || { status: 200, body: {} };
+  // Awaited, so a responder may return a promise -- including one that never
+  // settles, which is the only way to script "the API stopped answering". And the
+  // abort signal is honoured, because a real `fetch` REJECTS when its signal fires
+  // and the page's request deadline is built on exactly that rejection; a stub that
+  // ignored the signal would let a timeout test pass with no timeout in the code.
+  const pending = Promise.resolve(responder(path, init));
+  const signal = init && init.signal;
+  const raced = signal
+    ? Promise.race([pending, new Promise(function (_resolve, reject) {
+        const bail = function () { reject(new Error('aborted')); };
+        if (signal.aborted) { bail(); return; }
+        signal.addEventListener('abort', bail);
+      })])
+    : pending;
+  const r = (await raced) || { status: 200, body: {} };
   const status = r.status === undefined ? 200 : r.status;
   const isJson = r.text === undefined;
   return {
@@ -123,7 +164,7 @@ const EXPORTS = '\n  globalThis.UI = { S: S, esc: esc, surAlt: surAlt,' +
   ' renderRestored: renderRestored, renderStats: renderStats,' +
   ' renderAudit: renderAudit, destroySession: destroySession, loadAudit: loadAudit,' +
   ' createSession: createSession, verifyChain: verifyChain, showError: showError,' +
-  ' scopedOut: scopedOut, run: run };' + TAIL;
+  ' scopedOut: scopedOut, run: run, health: health, TIMEOUT: TIMEOUT };' + TAIL;
 (0, eval)(SRC.slice(0, -TAIL.length) + EXPORTS);
 if (!globalThis.UI || typeof globalThis.UI.renderOriginal !== 'function') {
   throw new Error('the export splice did not take');
@@ -261,12 +302,17 @@ def test_render_marks_colours_tokens_markers_and_pseudonyms_apart(tmp_path: Path
     text = "[REDACTED_SSN] & Christina Palmer said [PII_PERSON_1a2b3c4d]"
     dets = _det(surrogate="Christina Palmer", category="PHI")
     out = _run(tmp_path, f"emit({{ html: UI.renderMarks({json.dumps(text)}, [{dets}]) }});")["html"]
+    # The three ``title`` attributes are an ADDITION to what this assertion pinned,
+    # not a relaxation of it: every class here is the one it always asserted, in the
+    # same order, and the equality is still exact. The tooltips arrived with the
+    # panel-2/3 hover text and are asserted in full by
+    # ``test_a_mark_in_panel_two_or_three_says_which_of_the_three_kinds_it_is``.
     assert out == (
-        '<mark class="tok c-RED">[REDACTED_SSN]</mark>'
+        f'<mark class="tok c-RED" title="{RED_TIP}">[REDACTED_SSN]</mark>'
         " &amp; "
-        '<mark class="tok c-PHI">Christina Palmer</mark>'
+        f'<mark class="tok c-PHI" title="{_ps_tip("PERSON")}">Christina Palmer</mark>'
         " said "
-        '<mark class="tok c-PII">[PII_PERSON_1a2b3c4d]</mark>'
+        f'<mark class="tok c-PII" title="{TOK_TIP}">[PII_PERSON_1a2b3c4d]</mark>'
     )
 
 
@@ -285,7 +331,9 @@ def test_render_marks_bounds_the_entity_type_body_at_sixty_four_characters(
     text = ok + " " + too_long
     out = _run(tmp_path, f"emit({{ html: UI.renderMarks({json.dumps(text)}, []) }});")["html"]
     assert out.count("<mark") == 1
-    assert f'<mark class="tok c-PII">{ok}</mark>' in out
+    # The mark now also carries the panel-2/3 hover text; the class and the matched
+    # token -- the two things this test is about -- are unchanged.
+    assert f'<mark class="tok c-PII" title="{TOK_TIP}">{ok}</mark>' in out
     assert out.endswith(" " + too_long)
 
 
@@ -318,7 +366,8 @@ def test_a_short_pseudonym_does_not_bite_a_chunk_out_of_a_longer_one(tmp_path: P
     """
     dets = ", ".join([_det(surrogate="Ann"), _det(surrogate="Ann Smith")])
     out = _run(tmp_path, f'emit({{ html: UI.renderMarks("Ann Smith", [{dets}]) }});')["html"]
-    assert out == '<mark class="tok c-PII">Ann Smith</mark>'
+    # Still one whole mark over the whole string; the tooltip is an addition to it.
+    assert out == f'<mark class="tok c-PII" title="{_ps_tip("PERSON")}">Ann Smith</mark>'
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +515,8 @@ def test_esc_neutralises_every_character_that_can_open_markup(tmp_path: Path) ->
 def test_render_stats_uses_the_pipeline_order_and_formats_durations(tmp_path: Path) -> None:
     """Stage timings read in pipeline order, not in whatever order the JSON arrived.
 
-    ``STAT_ORDER`` is the pipeline's own sequence; keys the API adds later are
-    appended rather than dropped, so a new stat still shows up. Durations render to
+    ``STAT_META``'s key order is the pipeline's own sequence; keys the API adds later
+    are appended rather than dropped, so a new stat still shows up. Durations render to
     one decimal with a unit, counts as integers -- the difference between "12.3 ms"
     and "12.345".
     """
@@ -475,11 +524,154 @@ def test_render_stats_uses_the_pipeline_order_and_formats_durations(tmp_path: Pa
     out = _run(
         tmp_path, f"UI.renderStats({json.dumps(stats)}); emit({{ html: el('stats').innerHTML }});"
     )
+    # The literal moved when the strip stopped printing 22 counters in one styling;
+    # every property this assertion existed to pin is unchanged and still pinned here.
+    # ``detect_ms`` before ``total_ms`` is the declared order and not the JSON's;
+    # ``later_addition`` is a key ``STAT_META`` has never heard of and is APPENDED, not
+    # dropped and not titled; 12.34 renders "12.3 ms" and 2.6 renders "3". What is new
+    # is the class on each chip -- ``stat muted`` for a timing, bare ``stat`` for a
+    # count -- and the ``title`` carrying the counter's meaning, which is the whole
+    # point of the change and is asserted in its own right below.
     assert out["html"] == (
-        '<span class="stat"><i>detect_ms</i>1.0 ms</span>'
-        '<span class="stat"><i>total_ms</i>12.3 ms</span>'
+        '<span class="stat muted" title="TIMING. Detection over the document.">'
+        "<i>detect_ms</i>1.0 ms</span>"
+        '<span class="stat muted" title="TIMING. The whole run, end to end.">'
+        "<i>total_ms</i>12.3 ms</span>"
         '<span class="stat"><i>later_addition</i>3</span>'
     )
+
+
+#: One rendered chip: ``(class, title, key, value)``. Deliberately a parse of the real
+#: markup rather than a second renderer -- every expected string below is hand-written.
+_CHIP = re.compile(
+    r'<span class="(?P<cls>[^"]*)"(?: title="(?P<title>[^"]*)")?>'
+    r"<i>(?P<key>[^<]*)</i>(?P<value>[^<]*)</span>"
+)
+
+#: A run that reports every shape of counter the strip can print: a timing, three
+#: volume counts, and all three counters whose clean reading is 0 -- one of them
+#: non-zero. Deliberately supplied in an order NO grouping would produce by accident,
+#: so "safety first, timings last" is a property of the code and not of this literal.
+_MIXED_STATS = {
+    "total_ms": 12.34,
+    "vault_misses": 0,
+    "egress_rescan_warnings": 3,
+    "unresolved_lost": 2,
+    "detect_ms": 1.0,
+    "entities_detected": 54,
+    "unresolved_fabricated": 0,
+    "tokens_issued": 32,
+}
+
+
+def test_the_stats_strip_tells_a_safety_counter_apart_from_a_stopwatch(
+    tmp_path: Path,
+) -> None:
+    """A reviewer must be able to see which of the 22 numbers is the security claim.
+
+    The strip printed every counter in one identical chip with no key, so
+    ``egress_rescan_warnings 3`` sat beside ``detect_ms 412.6 ms`` in the same grey
+    box -- measured on ``fixtures/medical_note.txt``, which reports 22 of them. Two
+    things were unavailable to a reviewer from the page alone: which numbers are the
+    guarantee, and whether a non-zero one is fine. Both are now on the page: the
+    timings recede to ``stat muted``, the three counters whose clean reading is 0
+    carry the verdict colour of the value they are showing (``stat badge ok`` /
+    ``stat badge err``), and every counter the build knows carries its meaning as a
+    ``title``.
+
+    Ordering is asserted because it is the cheapest half of the signal: the safety
+    counters lead, and no arrangement of the input dict changes that.
+    """
+    out = _run(
+        tmp_path,
+        f"UI.renderStats({json.dumps(_MIXED_STATS)}); emit({{ html: el('stats').innerHTML }});",
+    )
+    chips = [m.groupdict() for m in _CHIP.finditer(out["html"])]
+    assert [c["key"] for c in chips] == [
+        # Safety first, in the pipeline's own sequence...
+        "entities_detected",
+        "tokens_issued",
+        "egress_rescan_warnings",
+        "vault_misses",
+        "unresolved_fabricated",
+        "unresolved_lost",
+        # ...and the stopwatch last.
+        "detect_ms",
+        "total_ms",
+    ], out["html"]
+    by_key = {c["key"]: c for c in chips}
+    # A timing is dim. A count of what the run did is not.
+    assert by_key["detect_ms"]["cls"] == "stat muted"
+    assert by_key["total_ms"]["cls"] == "stat muted"
+    assert by_key["entities_detected"]["cls"] == "stat"
+    assert by_key["tokens_issued"]["cls"] == "stat"
+    # `egress_rescan_warnings` is a SAFETY counter and is deliberately NOT painted
+    # red at 3: a high-severity re-hit raises EGRESS_BLOCKED and the payload never
+    # reaches the provider, so a warning is by construction a hit the gate decided
+    # not to deny. Colouring it would teach a reviewer to ignore the colour.
+    assert by_key["egress_rescan_warnings"]["cls"] == "stat"
+    # The three whose clean reading is 0, showing what they actually read.
+    assert by_key["vault_misses"]["cls"] == "stat badge ok"
+    assert by_key["unresolved_fabricated"]["cls"] == "stat badge ok"
+    assert by_key["unresolved_lost"]["cls"] == "stat badge err", "2 lost tokens is not clean"
+    # Every counter the build knows says what it counts, in words.
+    unexplained = [c["key"] for c in chips if not (c["title"] or "").strip()]
+    assert unexplained == [], f"counters printed with no meaning: {unexplained}"
+    assert "not a leak" in by_key["egress_rescan_warnings"]["title"], (
+        "the one counter whose non-zero value looks alarming and is not has to say so"
+    )
+    assert "0 is the clean reading" in by_key["vault_misses"]["title"]
+    # The values are untouched by any of the above.
+    assert [c["value"] for c in chips] == ["54", "32", "3", "0", "0", "2", "1.0 ms", "12.3 ms"]
+
+
+def test_the_same_counter_turns_red_when_it_stops_reading_clean(tmp_path: Path) -> None:
+    """The colour has to be the value's, not the key's.
+
+    Painting ``vault_misses`` green because it is *usually* zero would make the strip
+    reassuring on exactly the run where it should not be -- the vault-miss path
+    ``demo.py`` and ``test_vault_miss_on_deobfuscation`` exist to demonstrate. Same
+    key, two values, two classes.
+    """
+    body = (
+        "UI.renderStats({ vault_misses: 0 }); const clean = el('stats').innerHTML;"
+        "UI.renderStats({ vault_misses: 1 }); const miss = el('stats').innerHTML;"
+        "emit({ clean: clean, miss: miss });"
+    )
+    out = _run(tmp_path, body)
+    assert 'class="stat badge ok"' in out["clean"] and "</i>0</span>" in out["clean"]
+    assert 'class="stat badge err"' in out["miss"] and "</i>1</span>" in out["miss"]
+
+
+def test_the_page_carries_a_key_to_the_stats_strip_that_a_run_cannot_wipe() -> None:
+    """Three styles mean nothing without a row saying what they mean.
+
+    The key is a static part of ``index.html`` and sits OUTSIDE ``#stats``, because
+    ``resetRun`` assigns ``$('stats').innerHTML = ''`` on every run -- a key placed
+    inside the strip would survive exactly until the first click of Run. It is its own
+    named ``<section>`` for the same reason every other block on this page is: a bare
+    ``<section>`` is a landmark only when it has an accessible name.
+    """
+    elements, by_id = _page()
+    keys = [
+        n
+        for n in elements
+        if n["tag"] == "section" and _accessible_name(n, elements, by_id) == "stats strip key"
+    ]
+    assert len(keys) == 1, "the stats-strip key is missing or has been renamed"
+    key = keys[0]
+    assert "stats" not in key["ancestors"], "a key inside #stats is wiped by resetRun"
+    assert key["attrs"].get("id") != "stats"
+    text = _flat(key["text"])
+    # Each of the three states app.js can emit, named in words a reviewer can act on.
+    assert "green" in text and "clean value of 0" in text
+    assert "red" in text and "audit tail" in text
+    assert "dim" in text and "not a safety signal" in text
+    assert "hover any counter" in text, "the per-counter meanings are tooltips; say so"
+    # The swatches have to be the classes app.js actually emits, or the key is
+    # explaining a colour that appears nowhere.
+    swatches = [n["attrs"].get("class", "") for n in elements if n["tag"] == "i"]
+    assert "badge ok" in swatches and "badge err" in swatches, swatches
 
 
 # ---------------------------------------------------------------------------
@@ -805,8 +997,12 @@ def test_a_run_fills_all_four_panels_from_one_pipeline_response(tmp_path: Path) 
     )
     title = f"PERSON {MID} PSEUDO {MID} score 0.90 {MID} Ann"
     assert out["p1"] == f'<mark class="c-PII" title="{title}">Bob</mark> met Carl.'
+    # Both marks grew the panel-2/3 hover text. The routing this line pins -- which
+    # field feeds panel 2, and which class each of the two kinds of mark gets -- is
+    # unchanged, and the equality is still exact.
     assert out["p2"] == (
-        '<mark class="tok c-PII">Ann</mark> met <mark class="tok c-RED">[REDACTED_PERSON]</mark>.'
+        f'<mark class="tok c-PII" title="{_ps_tip("PERSON")}">Ann</mark> met '
+        f'<mark class="tok c-RED" title="{RED_TIP}">[REDACTED_PERSON]</mark>.'
     )
     # Was ``== "Ann met Carl."``, i.e. panel 3 carrying no highlighting at all. That
     # is the one panel a reviewer reads as the provider's-eye view, and under
@@ -814,13 +1010,111 @@ def test_a_run_fills_all_four_panels_from_one_pipeline_response(tmp_path: Path) 
     # value -- the failure README line 2069 calls "the dangerous one". The routing
     # this test exists to pin is unchanged and still asserted: the marked text is
     # ``raw_llm_response``'s and no other field's.
-    assert out["p3"] == '<mark class="tok c-PII">Ann</mark> met Carl.'
+    assert out["p3"] == f'<mark class="tok c-PII" title="{_ps_tip("PERSON")}">Ann</mark> met Carl.'
     assert out["p4"] == '<mark class="rest">Bob</mark> met Carl.'
-    assert out["counters"] == ["13 chars " + MID + " 1 spans", "26 chars", "13 chars", "13 chars"]
-    assert out["stats"] == '<span class="stat"><i>total_ms</i>5.5 ms</span>'
+    # Panel 1's counter reads "spans masked" rather than "spans": it counts
+    # ``result.detections``, which the orchestrator fills from ``obf.spans`` -- the
+    # spans the ENGINE acted on -- and NOT ``stats.entities_detected``, which is what
+    # the detector returned. The two are different numbers on a real document and the
+    # header used to name neither. See ``test_the_two_span_counts_on_the_page_are_each
+    # _labelled_for_what_they_count``. Everything else this line pinned is unchanged:
+    # one span, and the three character counts that prove the panels are fed different
+    # fields.
+    assert out["counters"] == [
+        "13 chars " + MID + " 1 spans masked", "26 chars", "13 chars", "13 chars",
+    ]
+    # The chip grew a class and a title; the timing, its formatting and the fact that
+    # this response's single stat is the only chip rendered are unchanged.
+    assert out["stats"] == (
+        '<span class="stat muted" title="TIMING. The whole run, end to end.">'
+        "<i>total_ms</i>5.5 ms</span>"
+    )
     assert out["banner"] == f"<b>RUN_OK</b> run_id r-1 {MID} strategy pseudonymize"
     assert out["auditRun"] == "run_id r-1"
     assert out["busy"] is False, "the buttons must be re-enabled after the run"
+
+
+def test_the_two_span_counts_on_the_page_are_each_labelled_for_what_they_count(
+    tmp_path: Path,
+) -> None:
+    """Panel 1's header and ``entities_detected`` are different numbers, and both say so.
+
+    On ``fixtures/medical_note.txt`` as ``medical`` the header read "52 spans" three
+    lines under a strip reading ``entities_detected 54``, and nothing on the page
+    reconciled them. Measured through ``PipelineOrchestrator.run`` on that fixture:
+
+    * ``entities_detected`` is ``len(detections)`` -- what the DETECTOR returned over
+      the document text, 54, before the engine applied any policy;
+    * panel 1's count is ``len(result.detections)``, which the orchestrator fills from
+      ``obf.spans`` -- one entry per span the ENGINE acted on, 52, every one of them a
+      splice into the outbound payload.
+
+    "52 of 54" is the tempting label and it is false in both directions:
+    ``ObfuscationEngine._plan`` dropped 3 of the 54 at the ``MIN_SWEEP_LEN`` = 3
+    enforceability floor ("MD", "RN", "MD", all typed ``ADDRESS``), and
+    ``_sweep_residual`` ADDED one the detector never returned ("Larkspur Valley
+    Hospital", already vaulted this session under another surface form): 54 - 3 + 1 =
+    52, and neither set contains the other.
+
+    The reply below reproduces exactly that shape -- two masked spans against
+    ``entities_detected`` 3 -- and both numbers have to name their own set.
+    """
+    body = RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }").replace(
+        "stats: { total_ms: 5.5 },",
+        "stats: { entities_detected: 3, total_ms: 5.5 },",
+    ).replace(
+        "action: 'PSEUDO', score: 0.9, surrogate: 'Ann' }],",
+        "action: 'PSEUDO', score: 0.9, surrogate: 'Ann' },"
+        "{ start: 8, end: 12, category: 'PII', entity_type: 'PERSON',"
+        " action: 'REDACTED', score: 0.4, surrogate: null }],",
+    ) + """
+await UI.run();
+emit({
+  c1: el('c1').textContent, c1title: el('c1').title || '',
+  stats: el('stats').innerHTML,
+});
+"""
+    out = _run(tmp_path, body)
+    # The header names its own set. Not "2 spans", which said nothing about which of
+    # the page's two span numbers it was.
+    assert out["c1"] == "13 chars " + MID + " 2 spans masked"
+    # ...and points at the other number, by name, with the reason they differ.
+    tip = out["c1title"]
+    assert "entities_detected" in tip, tip
+    assert "Neither is a subset of the other" in tip, tip
+    assert "54 detected, 3 dropped, 1 swept in, 52 masked" in tip, tip
+    # The claim the earlier attempt correctly refused to write must not come back.
+    assert "2 of 3" not in tip and "2 of 3" not in out["c1"]
+    # And the strip's own counter points back, so the reconciliation is reachable from
+    # whichever of the two numbers the reviewer looked at first.
+    chips = {m.group("key"): m.group("title") or "" for m in _CHIP.finditer(out["stats"])}
+    assert chips["entities_detected"].startswith("SAFETY."), chips
+    assert "before any policy ran" in chips["entities_detected"]
+    assert "The header of panel 1 counts a different set" in chips["entities_detected"]
+    assert "neither is a subset of the other" in chips["entities_detected"]
+
+
+def test_a_refused_run_does_not_leave_the_span_reconciliation_on_an_empty_counter(
+    tmp_path: Path,
+) -> None:
+    """``resetRun`` clears the counter, so it has to clear the counter's tooltip too.
+
+    ``C1_TITLE`` states one run's arithmetic. Left behind, a tooltip saying "54
+    detected, 3 dropped, 1 swept in, 52 masked" hangs off a blank counter above a
+    refused run's empty panels -- the previous run still talking, which is the exact
+    cross-run mixture ``resetRun`` exists to prevent.
+    """
+    body = RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }") + """
+await UI.run();
+const after = { c1: el('c1').textContent, title: el('c1').title || '' };
+el('file').files = [];
+await UI.run();
+emit({ after: after, cleared: el('c1').textContent, title: el('c1').title || '' });
+"""
+    out = _run(tmp_path, body)
+    assert out["after"]["c1"].endswith("spans masked") and out["after"]["title"] != ""
+    assert out["cleared"] == ""
+    assert out["title"] == "", "the previous run's span arithmetic is still on the page"
 
 
 def test_a_run_sends_the_session_document_and_strategy_it_was_configured_with(
@@ -902,6 +1196,288 @@ emit({ seen: seen, cls: el('banner').className });
     assert "the egress gate refused" in out["EGRESS_BLOCKED"]
     assert out["HTTP_500"] == "<b>HTTP_500</b> raw detail"
     assert len({out[k] for k in out}) == 4
+
+
+# ---------------------------------------------------------------------------
+# the code-to-sentence table
+# ---------------------------------------------------------------------------
+#: One realistic error body per code the API can answer with, and a fragment of
+#: the sentence the page must produce for it. Every body here is the shape the
+#: named raise site actually builds -- ``api/routes/documents.py`` for the upload
+#: codes, ``api/middleware.py::_send_too_large`` for ``REQUEST_TOO_LARGE``,
+#: ``api/errors.py::_validation_handler`` for ``VALIDATION_ERROR``, and the
+#: ``__init__`` of the matching ``PipelineError`` subclass for the rest -- so a
+#: sentence that reads a field the API never sends fails here.
+#:
+#: The fragments are hand-written. Nothing in this file calls the table under test
+#: to build an expectation, and each one names a CONTROL or an ACTION rather than
+#: restating the code: that is the property the blob did not have, and a fragment
+#: that only echoed the code would pass against the blob too.
+_CODE_SENTENCES: tuple[tuple[str, dict[str, object], str], ...] = (
+    (
+        "UNPROCESSABLE_DOCUMENT",
+        {"reason": "unsupported_document_type", "suffix": ".xyz", "detected": "unknown"},
+        "Choose a .txt, .md, .pdf or .docx with the file picker.",
+    ),
+    ("EMPTY_UPLOAD", {"bytes": 0}, "Choose a document with text in it with the file picker"),
+    (
+        "UPLOAD_TOO_LARGE",
+        {"max_bytes": 16 * 1024 * 1024, "bytes": 32 * 1024 * 1024},
+        "Choose a smaller file with the file picker",
+    ),
+    (
+        "REQUEST_TOO_LARGE",
+        {"max_bytes": 17 * 1024 * 1024, "bytes": 32 * 1024 * 1024},
+        "Choose a smaller file with the file picker.",
+    ),
+    (
+        "INVALID_DOC_CATEGORY",
+        {"value": "misc"},
+        "Choose medical, legal, financial or general in the Category dropdown",
+    ),
+    (
+        "VALIDATION_ERROR",
+        {"errors": 1, "fields": "body.doc_id"},
+        "The API rejected doc_id.",
+    ),
+    (
+        "BAD_REQUEST",
+        {"status": 400},
+        "Re-choose the file with the file picker",
+    ),
+    (
+        "NOT_FOUND",
+        {"doc_id": "0f2c"},
+        "check the User ID field still matches the session owner",
+    ),
+    (
+        "AUDIT_SCOPE_REQUIRED",
+        {"reason": "session_id_or_run_id_required"},
+        'Press "Create session" first.',
+    ),
+    (
+        "VAULT_MISS",
+        {"session_id": "3f", "token_id": "PII_NAME_0a1b2c3d"},
+        "has no vault entry to restore it from",
+    ),
+    ("CRYPTO_AUTH_FAILED", {"scope": "vault_row"}, "that is the tamper check firing"),
+    ("NOT_READY", {}, "Wait a few seconds and press the button again."),
+    ("CONFIG_ERROR", {"reason": "anthropic_api_key_missing"}, "Correct the API environment"),
+    (
+        "DETECTION_ERROR",
+        {"chunk_index": 3, "reason": "model_unavailable"},
+        "Try another document with the file picker",
+    ),
+    (
+        "DETECTION_INVARIANT",
+        {"reason": "overlapping_spans"},
+        "refused to continue rather than obfuscate",
+    ),
+    ("PIPELINE_ERROR", {"reason": "unknown_strategy"}, "the server log carries the traceback"),
+    ("LLM_ERROR", {"model": "claude"}, "Only the obfuscated payload was ever sent"),
+    (
+        "LLM_REFUSAL",
+        {"model": "claude", "stop_reason": "refusal", "category": "self_harm", "attempt": 1},
+        "Reword the prompt and run again.",
+    ),
+    (
+        "LLM_TRANSPORT_ERROR",
+        {"model": "claude", "reason": "timeout", "attempts": 3, "status_code": None},
+        "check the API key and network",
+    ),
+    (
+        "LLM_RESPONSE_ERROR",
+        {"model": "claude", "reason": "no_text_blocks", "stop_reason": "end_turn"},
+        "set the provider to mock to keep the demo moving",
+    ),
+    ("SESSION_EXPIRED", {"session_id": "3f"}, 'Press "Create session" for a new one'),
+    ("RATE_LIMITED", {"retry_after_seconds": 4}, "Wait 4 seconds and retry."),
+    ("EGRESS_BLOCKED", {"reason": "vault_original", "hit_count": 2}, "No provider call was made."),
+)
+
+
+def _banners(tmp_path: Path, cases: object) -> dict[str, str]:
+    """Drive ``showError`` once per ``(code, detail)`` pair; return the banner HTML."""
+    body = f"""
+const cases = {json.dumps(cases)};
+const seen = {{}};
+for (const c of cases) {{
+  UI.showError({{ code: c[0], detail: c[1] }});
+  seen[c[0]] = el('banner').innerHTML;
+}}
+emit({{ seen: seen }});
+"""
+    return _run(tmp_path, body)["seen"]
+
+
+def test_every_api_error_code_gets_an_actionable_sentence(tmp_path: Path) -> None:
+    """A banner must name a control or an action, not end in the detail map.
+
+    What shipped was ``NO_FILE`` and ``NO_CATEGORY`` written as instructions and
+    every other code rendered as ``<code> {"reason":"unsupported_document_type",
+    "suffix":".xyz","detected":"unknown"}``. The blob is accurate and it is not an
+    answer: it names no control on the page, and a reviewer reading it during the
+    live review learns only that something in a document they cannot see was wrong.
+
+    Two assertions per code, and the second is the one that binds. A sentence
+    checked only for a substring can still be followed by the blob it was supposed
+    to replace, so the rendering is also required to carry no ``{"`` -- with one
+    exception, argued at the assertion.
+    """
+    seen = _banners(tmp_path, [[code, detail] for code, detail, _ in _CODE_SENTENCES])
+    for code, _, fragment in _CODE_SENTENCES:
+        assert seen[code].startswith(f"<b>{code}</b> "), seen[code]
+        assert fragment.replace('"', "&quot;") in seen[code], f"{code}: {seen[code]}"
+        if code == "EGRESS_BLOCKED":
+            # The one code that still appends its detail, and deliberately: `reason`
+            # (vault_original / detector_rescan / independent_pattern / gate_exception)
+            # and `hit_count` are the demo's evidence that the gate fired and which
+            # exit it took, and app.js's comment there calls that load-bearing. The
+            # sentence must still come FIRST, which is what the blob-free codes get
+            # for free.
+            assert seen[code].index("No provider call") < seen[code].index("{&quot;")
+            continue
+        assert "{&quot;" not in seen[code], f"{code} still ends in a detail blob: {seen[code]}"
+
+
+def test_the_sentence_table_covers_every_error_class_the_package_defines(tmp_path: Path) -> None:
+    """The list above must be the API's vocabulary, not the codes I remembered.
+
+    ``_CODE_SENTENCES`` is hand-written, so on its own it proves only that the codes
+    somebody thought of are explained. The domain half of the vocabulary is
+    discoverable: every ``PipelineError`` subclass carries a ``code``, and the 500 /
+    502 / 404 handlers in ``api/errors.py`` answer with that attribute verbatim. This
+    walks the package for them -- the same discovery ``test_crypto.py`` uses for the
+    detail ceiling -- and requires every code it finds to appear in the list. That is
+    half of the guard and the cheap half; the test above is the other, and the two
+    compose: a subclass added to a fourth module fails HERE until it is listed, and
+    listing it fails THERE until ``app.js`` has a sentence for it.
+
+    The transport-only codes (``NOT_READY``, ``EMPTY_UPLOAD``, ``UPLOAD_TOO_LARGE``,
+    ``REQUEST_TOO_LARGE``, ``RATE_LIMITED``, ``UNPROCESSABLE_DOCUMENT``,
+    ``AUDIT_SCOPE_REQUIRED``, ``VALIDATION_ERROR``, ``BAD_REQUEST``) have no class to
+    walk -- they are string literals at the raise sites -- so they stay in the list
+    above and are covered by the test before this one.
+    """
+    importlib.import_module("secure_context_pipeline")
+    package = sys.modules["secure_context_pipeline"]
+    for module in pkgutil.walk_packages(package.__path__, f"{package.__name__}."):
+        importlib.import_module(module.name)
+
+    def walk(cls: type[PipelineError]) -> Iterator[type[PipelineError]]:
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from walk(sub)
+
+    codes = {PipelineError.code} | {sub.code for sub in walk(PipelineError)}
+    assert len(codes) >= 11, f"subclass discovery found only {sorted(codes)} -- the walk is broken"
+    listed = {code for code, _, _ in _CODE_SENTENCES}
+    assert codes <= listed, f"no sentence for {sorted(codes - listed)}"
+
+
+def test_an_unknown_error_code_still_renders_everything_the_body_carried(
+    tmp_path: Path,
+) -> None:
+    """A code the table has never heard of must not be swallowed or generalised.
+
+    The table is a mirror of an API that will grow, and the failure mode of a mirror
+    is the code added tomorrow. Two wrong answers were available and both look tidy:
+    render nothing, or render "something went wrong". Either makes the NEWEST failure
+    the quietest thing on the page -- the one case where the raw map is the best
+    information there is. Falling through to the previous rendering keeps it.
+    """
+    seen = _banners(
+        tmp_path,
+        [
+            ["FUTURE_CODE", {"reason": "not_yet_invented", "count": 7}],
+            ["HTTP_418", {}],
+        ],
+    )
+    assert seen["FUTURE_CODE"] == (
+        "<b>FUTURE_CODE</b> {&quot;reason&quot;:&quot;not_yet_invented&quot;,&quot;count&quot;:7}"
+    )
+    # An empty map still renders nothing rather than the literal "{}" -- the half of
+    # this path that was already fixed, kept honest by the code that broke it.
+    assert seen["HTTP_418"] == "<b>HTTP_418</b> "
+
+
+def test_the_size_refusals_state_the_ceiling_and_the_size_that_hit_it(tmp_path: Path) -> None:
+    """The two 413s carry the only numbers on this page a reviewer can act on.
+
+    ``{"max_bytes":16777216,"bytes":33554432}`` is the ceiling and the overshoot in
+    the unit nothing displays files in. Both are folded into the sentence in MB, and
+    the two codes must stay distinguishable: ``REQUEST_TOO_LARGE`` is the whole
+    multipart body counted by the ASGI middleware and ``UPLOAD_TOO_LARGE`` is the
+    file field alone, which is why their ceilings differ by the framing slack.
+
+    Expectations are hand-computed from powers of two, not from the constants: 16 MiB
+    is 16 MB in this sentence because the divisor is 1048576, and if that divisor ever
+    became 1000000 this test says so.
+    """
+    seen = _banners(
+        tmp_path,
+        [
+            ["UPLOAD_TOO_LARGE", {"max_bytes": 16 * 1024 * 1024, "bytes": 33 * 1024 * 1024}],
+            ["REQUEST_TOO_LARGE", {"max_bytes": 17 * 1024 * 1024, "bytes": 33 * 1024 * 1024}],
+        ],
+    )
+    assert "the ceiling is 16 MB, this one is 33 MB" in seen["UPLOAD_TOO_LARGE"]
+    assert "the ceiling is 17 MB, this one is 33 MB" in seen["REQUEST_TOO_LARGE"]
+    # A body missing both numbers: the sentence has to survive it without printing
+    # "undefined MB", which is the one rendering worse than the blob it replaced.
+    bare = _banners(tmp_path, [["UPLOAD_TOO_LARGE", {}]])["UPLOAD_TOO_LARGE"]
+    assert "undefined" not in bare and "NaN" not in bare, bare
+    assert bare == "<b>UPLOAD_TOO_LARGE</b> That document is larger than this server accepts. " + (
+        "Choose a smaller file with the file picker — fixtures/ has documents that fit."
+    )
+
+
+def test_a_pdf_with_no_text_layer_is_reported_with_its_page_count(tmp_path: Path) -> None:
+    """``pdf_all_pages_failed`` is the upload failure a scanned PDF produces.
+
+    The page count is the one number that separates "this file was never read" from
+    "this file was read and every page of it was blank", and it is the difference
+    between re-picking the file and going to find a text-bearing copy.
+    """
+    seen = _banners(
+        tmp_path,
+        [["UNPROCESSABLE_DOCUMENT", {"reason": "pdf_all_pages_failed", "pages": 12, "bytes": 900}]],
+    )["UNPROCESSABLE_DOCUMENT"]
+    assert "all 12 pages came back empty" in seen, seen
+    assert "scan with no text layer" in seen
+
+
+def test_a_validation_error_names_the_field_and_the_limit_that_bounds_it(
+    tmp_path: Path,
+) -> None:
+    """The 422 that says which field failed must also say what the field allows.
+
+    ``_validation_handler`` reduces FastAPI's body to ``{errors, fields}`` on purpose
+    -- the default body embeds the caller's own ``input``, which on this API is
+    derived from a document -- so the ceiling is not in the response and cannot be.
+    The page therefore carries it, and a carried number drifts: these assertions read
+    ``MAX_ID_LEN``, ``MAX_PROMPT_CHARS`` and ``MAX_AUDIT_PAGE`` out of the Python that
+    enforces them and require each to appear in the banner ``app.js`` produces for
+    that field. Nothing is shared between the two sides -- the expectation comes from
+    importing ``api/schemas.py``, the actual from node evaluating ``app.js`` -- so
+    raising a ceiling in Python turns this red instead of leaving the sentence
+    telling a reviewer a limit that stopped being true.
+    """
+    seen = _banners(tmp_path, [["VALIDATION_ERROR", {"errors": 1, "fields": "body.prompt"}]])
+    prompt = seen["VALIDATION_ERROR"]
+    assert "The API rejected prompt." in prompt, prompt
+    assert f"1 to {MAX_PROMPT_CHARS} characters" in prompt, prompt
+    ids = _banners(tmp_path, [["VALIDATION_ERROR", {"errors": 2, "fields": "body.user_id"}]])
+    assert f"1 to {MAX_ID_LEN} characters" in ids["VALIDATION_ERROR"], ids
+    page = _banners(tmp_path, [["VALIDATION_ERROR", {"errors": 1, "fields": "query.limit"}]])
+    assert f"1 to {MAX_AUDIT_PAGE} rows" in page["VALIDATION_ERROR"], page
+    # Two fields at once, and a field with no ceiling of its own: the sentence still
+    # has to name what was rejected rather than fall back to the map.
+    both = _banners(
+        tmp_path, [["VALIDATION_ERROR", {"errors": 2, "fields": "body.doc_id,body.strategy"}]]
+    )["VALIDATION_ERROR"]
+    assert "The API rejected doc_id, strategy." in both, both
+    assert "{&quot;" not in both, both
 
 
 def test_a_run_with_nothing_to_run_on_is_refused_before_any_request(tmp_path: Path) -> None:
@@ -1660,7 +2236,12 @@ emit({ p3: el('p3').innerHTML, c3: el('c3').textContent });
 """
     )
     out = _run(tmp_path, body)
-    assert out["p3"] == '<mark class="tok c-PII">Jamie Cain</mark>, MD reviewed the chart.'
+    # The mark grew the hover text that says, in words, the thing this docstring says
+    # the colour alone could not: "Jamie Cain" is a fake. Same class, same span.
+    assert out["p3"] == (
+        f'<mark class="tok c-PII" title="{_ps_tip("PERSON")}">Jamie Cain</mark>'
+        ", MD reviewed the chart."
+    )
     assert out["c3"] == "34 chars", "the counter must still describe raw_llm_response"
 
 
@@ -1691,7 +2272,8 @@ def test_panel_two_does_not_highlight_the_instruction_block_s_own_example(
         f" {json.dumps(payload)}.indexOf('<' + 'DOCUMENT' + '>')) }});",
     )["html"]
     assert out.count("<mark") == 1, out
-    assert '<mark class="tok c-PHI">[PHI_NAME_11112222]</mark>' in out
+    # Plus the hover text; the one mark and its class are what this test is about.
+    assert f'<mark class="tok c-PHI" title="{TOK_TIP}">[PHI_NAME_11112222]</mark>' in out
     assert "like [PHI_NAME_1a2b3c4d]." in out, "the documentation example is plain text"
     assert "Who is [PHI_NAME_deadbeef]?" in out, "a token the reviewer typed is not ours"
 
@@ -2085,5 +2667,430 @@ emit(out);
     assert "No text could be extracted" in out["inflight"]
     assert "No text could be extracted" in out["p1"]
     assert "scanned image with no text layer" in out["p1"]
-    assert out["c1"] == "0 chars " + MID + " 0 spans"
+    # "spans masked", not "spans": the counter now says which of the page's two span
+    # numbers it is. The property this line pins -- that an empty extraction is
+    # reported as zero of everything rather than left blank -- is unchanged.
+    assert out["c1"] == "0 chars " + MID + " 0 spans masked"
     assert out["banner"].startswith("<b>RUN_OK</b>"), "the run did succeed; the document is empty"
+
+
+# ---------------------------------------------------------------------------
+# UI audit loop 6 -- the page's own failure modes: a request that never answers,
+# a session abandoned rather than destroyed, a mark that says nothing, a header
+# badge frozen at load time, and a chain walk that can be started twice.
+# ---------------------------------------------------------------------------
+#: A responder that never settles. A real ``fetch`` is only *rejected* by its abort
+#: signal, and the harness honours that, so this is the whole of "the API stopped
+#: answering": no reply, no error, no close.
+NEVER = "function () { return new Promise(function () {}); }"
+
+
+def test_a_request_that_never_answers_gives_the_controls_back(tmp_path: Path) -> None:
+    """A stalled reply used to lock every control on the page until a reload.
+
+    ``setBusy(true)`` disables Run, Destroy, Create session, the file picker and both
+    ``<select>``s for the whole of a request, and ``api`` had no deadline: a server
+    killed mid-run, a proxy holding the socket open, a laptop suspended between the
+    send and the answer, all left the page dead with the spinner turning and ``#banner``
+    empty. Measured in this harness against a fetch that never settles, before the fix:
+    ``btn-run``, ``btn-destroy``, ``btn-session``, ``#file``, ``#category`` and
+    ``#strategy`` all read ``disabled: true`` and stayed that way.
+
+    The budgets are shortened to milliseconds here for the obvious reason. What is
+    being exercised is the deadline, the abort and the release, not their length.
+    """
+    body = (
+        RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+        + """
+UI.TIMEOUT.fast = 10;
+UI.TIMEOUT.slow = 10;
+respond("""
+        + NEVER
+        + """);
+await UI.run();
+emit({
+  banner: el('banner').innerHTML,
+  disabled: ['btn-run', 'btn-destroy', 'btn-session', 'file', 'category', 'strategy']
+    .map((id) => el(id).disabled),
+  spinHidden: el('spin').hidden,
+  busy: UI.S.busy,
+});
+"""
+    )
+    out = _run(tmp_path, body)
+    assert out["banner"].startswith("<b>REQUEST_TIMEOUT</b>"), out["banner"]
+    assert "stopped waiting and gave the controls back" in out["banner"]
+    assert "may still be running on the server" in out["banner"], (
+        "an aborted request is not a request that did not happen; the banner must say so"
+    )
+    assert out["disabled"] == [False] * 6, "every control the run held must be released"
+    assert out["spinHidden"] is True
+    assert out["busy"] is False
+
+
+def test_the_two_posts_that_do_server_side_work_get_the_longer_budget(
+    tmp_path: Path,
+) -> None:
+    """One deadline for every call would have to abort runs the server was answering.
+
+    ``/pipeline/run`` may legitimately spend ``llm_timeout_s`` (60 s) on each of
+    ``MAX_ATTEMPTS`` (3) provider attempts plus two backoff sleeps capped at
+    ``MAX_BACKOFF_S`` (10 s) -- 200 s of ceiling before detection, obfuscation and the
+    gate's three passes are counted -- so it is held to ``TIMEOUT.slow``. A document
+    text read is a database fetch and a decrypt, and is held to ``TIMEOUT.fast``.
+
+    Both halves are asserted from one scenario, because "the slow one is slower" is
+    only worth anything alongside "the fast one is fast": the text read is hung with
+    ``fast`` at 10 ms and must give up, and the pipeline call is hung with ``slow``
+    far out of reach and must still be waiting when the test looks.
+    """
+    hung_text = RUN_SETUP.replace(
+        "return { status: 200, body: { text: 'Bob met Carl.', chars: 13 } };",
+        "return new Promise(function () {});",
+    ).replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+    out = _run(
+        tmp_path,
+        hung_text
+        + """
+UI.TIMEOUT.fast = 10;
+UI.TIMEOUT.slow = 60000;
+await UI.run();
+emit({ banner: el('banner').innerHTML, busy: UI.S.busy });
+""",
+    )
+    assert out["banner"].startswith("<b>REQUEST_TIMEOUT</b>"), (
+        "a hung /documents/{id}/text is held to the fast budget"
+    )
+    assert out["busy"] is False
+
+    hung_run = RUN_SETUP.replace(
+        "if (path === '/pipeline/run') return PIPELINE_REPLY(RESULT);",
+        "if (path === '/pipeline/run') return new Promise(function () {});",
+    )
+    still = _run(
+        tmp_path,
+        hung_run
+        + """
+UI.TIMEOUT.fast = 10;
+// Not 240000: the pending deadline keeps node's event loop alive until it fires,
+// and 1 s is already a hundred times the fast budget being ruled out.
+UI.TIMEOUT.slow = 1000;
+UI.run();
+await settle();
+await settle();
+emit({ banner: el('banner').innerHTML, busy: UI.S.busy });
+""",
+    )
+    assert still["banner"] == "", (
+        "the pipeline call must not be abandoned at the fast budget -- the server is "
+        "allowed 200 s for the provider alone"
+    )
+    assert still["busy"] is True, "and the page is still, correctly, waiting"
+
+
+#: A second ``POST /sessions`` answers with this; the first answers ``sess-old``.
+REPLACEMENT_SETUP = """
+respond((path, init) => {
+  const m = (init && init.method) || 'GET';
+  if (path === '/sessions' && m === 'POST') {
+    return { status: 200, body: { session_id: MINTED.shift(), expires_at: 1700000000 } };
+  }
+  if (m === 'DELETE') return DELETE_REPLY;
+  if (path.indexOf('/audit') === 0) {
+    if (path.indexOf('""" + PROBE_MARK + """') >= 0) {
+      return { status: 200, body: { events: [PROBE_ROW] } };
+    }
+    return { status: 200, body: { events: [] } };
+  }
+  return { status: 200, body: {} };
+});
+const MINTED = ['sess-old-000000', 'sess-new-000000'];
+el('user').value = 'alice';
+await UI.createSession();
+calls.length = 0;
+await UI.createSession();
+emit({
+  live: UI.S.sessionId,
+  last: UI.S.lastSessionId,
+  banner: el('banner').innerHTML,
+  kind: el('banner').className,
+  sent: calls.map((c) => c.method + ' ' + c.path),
+});
+"""
+
+
+def test_creating_a_second_session_destroys_the_one_it_replaces(tmp_path: Path) -> None:
+    """"Create session" over a live session used to abandon it, not replace it.
+
+    No ``DELETE`` was issued, so the previous session key and its vault rows -- the
+    rows that map a token back to an original value -- stayed in the server's process
+    memory until the TTL reaped them, and the page had just nulled ``lastSessionId``,
+    so no control on it could ever erase them. Measured in this harness before the fix:
+    the second click issued ``POST /sessions`` and one audit ``GET``, and nothing else.
+    On a page whose largest button demonstrates irreversible erasure, the small one
+    above it quietly created the opposite.
+
+    The erasure is *proved*, not assumed, for the reason ``destroyConfirmed`` exists:
+    ``DELETE /sessions`` answers 204 for a session it did not touch, so the claim in
+    the banner is made only when ``VAULT_DESTROY`` carries ``existed=1``.
+    """
+    out = _run(
+        tmp_path,
+        "const DELETE_REPLY = { status: 204 };\nconst PROBE_ROW = "
+        + DESTROYED_ROW
+        + ";\n"
+        + REPLACEMENT_SETUP,
+    )
+    assert out["live"] == "sess-new-000000"
+    deletes = [c for c in out["sent"] if c.startswith("DELETE ")]
+    # The OLD id, and the owner the OLD session was created for -- same rule as
+    # ``destroySession``: the field can drift, and a non-owner delete erases nothing.
+    assert deletes == ["DELETE /sessions/sess-old-000000?user_id=alice"], out["sent"]
+    assert any(PROBE_MARK in c for c in out["sent"]), (
+        "the erasure has to be read back out of the log, not inferred from the 204"
+    )
+    assert out["kind"] == "banner ok"
+    assert "was destroyed first" in out["banner"]
+    assert "existed=1" in out["banner"]
+    assert "sess-old-000…" in out["banner"], "name the session that was erased"
+
+
+def test_a_replacement_the_log_does_not_confirm_is_not_called_an_erasure(
+    tmp_path: Path,
+) -> None:
+    """``existed=0`` means the delete touched nothing, and the banner must say so.
+
+    Same trap as the Destroy button's: the 204 is deliberately not an ownership
+    oracle, so a replacement whose ``VAULT_DESTROY`` row reads ``existed=0`` left a
+    live session behind. Claiming the erasure there would be the exact false claim
+    ``destroyConfirmed`` was written to stop, moved to a different button.
+    """
+    out = _run(
+        tmp_path,
+        "const DELETE_REPLY = { status: 204 };\nconst PROBE_ROW = "
+        + UNTOUCHED_ROW
+        + ";\n"
+        + REPLACEMENT_SETUP,
+    )
+    assert out["live"] == "sess-new-000000", "the new session is live either way"
+    assert out["kind"] == "banner warn", "an unproved erasure is not a green outcome"
+    assert "existed=0" in out["banner"]
+    assert "STILL LIVE" in out["banner"]
+    assert "was destroyed first" not in out["banner"]
+
+
+def test_a_replacement_whose_delete_failed_says_the_old_vault_is_still_there(
+    tmp_path: Path,
+) -> None:
+    """A refused DELETE must not be swallowed by the click that succeeded.
+
+    The new session exists by the time the delete runs, so the failure cannot throw
+    the click away -- it has to be reported instead. The failing code is named because
+    it is the difference between "expired already" and "the server refused you".
+    """
+    out = _run(
+        tmp_path,
+        "const DELETE_REPLY = { status: 429, body: { code: 'RATE_LIMITED' } };\n"
+        "const PROBE_ROW = " + DESTROYED_ROW + ";\n" + REPLACEMENT_SETUP,
+    )
+    assert out["live"] == "sess-new-000000"
+    assert out["kind"] == "banner warn"
+    assert "could not be deleted (RATE_LIMITED)" in out["banner"]
+    assert "STILL LIVE" in out["banner"]
+    assert not any(PROBE_MARK in c for c in out["sent"]), (
+        "there is nothing to confirm when the delete itself was refused"
+    )
+
+
+def test_a_mark_in_panel_two_or_three_says_which_of_the_three_kinds_it_is(
+    tmp_path: Path,
+) -> None:
+    """Panels 2 and 3 highlighted three different things and explained none of them.
+
+    Panel 1's marks have carried entity type, action, score and surrogate since the
+    first build. The two panels that show the SUBSTITUTE carried no ``title`` at all,
+    so the only thing separating a vault-backed token, an irreversible redaction
+    marker and a realistic fake was a colour -- and the legend beside it names a
+    CATEGORY, not a kind. Panel 3 is where that bites: "Jamie Cain, MD" in PHI green,
+    in the provider's-eye view, with nothing on the page saying it is a fake this run
+    minted rather than a clinician out of the document.
+
+    The tooltips name no original value, which is the point: panels 2 and 3 do not
+    hold one. The pseudonym tip names the entity TYPE, which the payload's own
+    bracketed tokens print in clear anyway.
+    """
+    text = "[FIN_ACCOUNT_NUMBER_1a2b3c4d] and [REDACTED_SSN] for Christina Palmer"
+    dets = ", ".join(
+        [
+            _det(surrogate="Christina Palmer", category="PHI", entity_type="PERSON"),
+            _det(surrogate="[FIN_ACCOUNT_NUMBER_1a2b3c4d]", category="FIN"),
+        ]
+    )
+    out = _run(
+        tmp_path, f"emit({{ html: UI.renderMarks({json.dumps(text)}, [{dets}]) }});"
+    )["html"]
+    assert out == (
+        f'<mark class="tok c-FIN" title="{TOK_TIP}">[FIN_ACCOUNT_NUMBER_1a2b3c4d]</mark>'
+        " and "
+        f'<mark class="tok c-RED" title="{RED_TIP}">[REDACTED_SSN]</mark>'
+        " for "
+        f'<mark class="tok c-PHI" title="{_ps_tip("PERSON")}">Christina Palmer</mark>'
+    )
+    # The three sentences have to differ, or the tooltip is decoration: the whole
+    # point is that a reviewer can tell a restorable token from an irreversible
+    # redaction from a fake.
+    assert len({TOK_TIP, RED_TIP, _ps_tip("PERSON")}) == 3
+    # And none of them may carry a value. "Bob" is the original behind the pseudonym
+    # in every other scenario in this file; it must not appear here.
+    assert "Bob" not in out
+
+
+def test_a_pseudonym_with_no_detection_behind_it_still_gets_an_honest_tooltip(
+    tmp_path: Path,
+) -> None:
+    """The category fallback is ``PII``; the tooltip must not invent an entity type.
+
+    ``renderMarks`` colours an unclassifiable pseudonym ``PII`` rather than dropping
+    the highlight. The tooltip follows the same rule -- it says a pseudonym was minted
+    and declines to name a type it does not have, because a wrong type in a tooltip is
+    worse than no type.
+    """
+    out = _run(
+        tmp_path,
+        'emit({ html: UI.renderMarks("Ann", [{ surrogate: "Ann" }]) });',
+    )["html"]
+    assert out == f'<mark class="tok c-PII" title="{_ps_tip("detected value")}">Ann</mark>'
+
+
+def test_a_dead_api_moves_the_header_badge_it_used_to_leave_reading_ok(
+    tmp_path: Path,
+) -> None:
+    """The health badge was written once, at load, and then never moved again.
+
+    Kill the server mid-demo and every action banners ``NETWORK_UNREACHABLE`` while the
+    header still reads a green "ok · mock/... · en_core_web_lg", describing a process
+    that is gone -- the two halves of the UI reporting one fact differently, which is
+    the complaint ``api``'s network branch was written to fix in the first place. The
+    class matters as much as the text: ``health()``'s own catch set the words and left
+    ``class="badge muted"``, so the one badge that says the API is down was dim grey,
+    indistinguishable from the "health: …" it starts as.
+    """
+    out = _run(
+        tmp_path,
+        """
+respond(() => ({ status: 200, body: { status: 'ok', llm_provider: 'mock',
+  llm_model: 'm', spacy_model: 'en_core_web_lg' } }));
+await UI.health();
+const before = el('health').className + ' | ' + el('health').textContent;
+// The server dies. `fetch` REJECTS -- it does not answer -- which is the shape
+// `api` turns into NETWORK_UNREACHABLE.
+respond(() => { throw new TypeError('Failed to fetch'); });
+UI.S.sessionId = 'sess-1';
+await UI.verifyChain();
+emit({ before: before, cls: el('health').className,
+       text: el('health').textContent, banner: el('banner').innerHTML });
+""",
+    )
+    assert out["before"] == "badge ok | ok · mock/m · en_core_web_lg"
+    assert out["banner"].startswith("<b>NETWORK_UNREACHABLE</b>")
+    assert out["text"] == "health: unreachable"
+    assert out["cls"] == "badge err", "the page's colour for a failed outcome, not dim grey"
+
+
+def test_the_chain_walk_cannot_be_started_twice(tmp_path: Path) -> None:
+    """Verify chain is the one button ``setBusy`` leaves alive, and it had no guard.
+
+    The walk is priced in ROWS (``audit.py``: 5,000 per token, burst 24) and charged on
+    success, so on a log of any size an impatient double-click spends the bucket and
+    the second answer is the 429 the ``RATE_LIMITED`` sentence describes -- a throttle
+    the page inflicted on itself and then reported as though the server had. One
+    in-flight walk, one request.
+    """
+    out = _run(
+        tmp_path,
+        """
+let release;
+respond(() => new Promise((r) => { release = () => r({ status: 200,
+  body: { valid: true, length: 41 } }); }));
+const first = UI.verifyChain();
+await settle();
+const during = el('btn-verify').disabled;
+fire('btn-verify', 'click');
+fire('btn-verify', 'click');
+await settle();
+const mid = calls.length;
+release();
+await first;
+await settle();
+emit({ during: during, mid: mid, after: el('btn-verify').disabled,
+       calls: calls.length, badge: el('verify-badge').textContent });
+""",
+    )
+    assert out["during"] is True, "the button is held while its own request is in flight"
+    assert out["mid"] == 1, "two more clicks during the walk must issue no more requests"
+    assert out["calls"] == 1
+    assert out["after"] is False, "and released when it finishes"
+    assert out["badge"] == "chain: VALID · 41 events (whole log)"
+
+
+def test_a_refused_run_reloads_the_audit_tail_whatever_refused_it(tmp_path: Path) -> None:
+    """Only two error codes used to refresh the tail; every other one left it stale.
+
+    ``resetRun`` blanks the four panels, the stats row and the ``#audit-run`` LABEL and
+    deliberately does not touch the table, and the ``catch`` reloaded it for
+    ``EGRESS_BLOCKED`` and ``SESSION_EXPIRED`` alone. So a provider failure, a 429, a
+    ``NOT_FOUND`` or a dead socket left the PREVIOUS run's rows sitting under an
+    emptied label beside panel 1's new document -- the cross-run mixture the rest of
+    the reset exists to prevent, on the rows a reviewer reads as the evidence.
+    """
+    body = RUN_SETUP.replace(
+        "PIPELINE_REPLY(RESULT)",
+        "{ status: 502, body: { code: 'LLM_TRANSPORT_ERROR',"
+        " detail: { attempts: 3, reason: 'timeout' } } }",
+    ) + """
+el('audit-body').innerHTML = '<tr><td>RUN N-1</td></tr>';
+await UI.run();
+emit({
+  banner: el('banner').innerHTML,
+  audit: calls.filter((c) => c.path.indexOf('/audit') === 0).map((c) => c.path),
+  body: el('audit-body').innerHTML,
+});
+"""
+    out = _run(tmp_path, body)
+    assert out["banner"].startswith("<b>LLM_TRANSPORT_ERROR</b>")
+    assert len(out["audit"]) == 1, out["audit"]
+    assert "session_id=sess-1" in out["audit"][0]
+    assert "run_id=" not in out["audit"][0], "the 502 names no run, so the scope is the session"
+    assert "RUN N-1" not in out["body"], "the previous run's rows must not survive the refusal"
+
+
+def test_the_two_red_keys_in_the_legend_are_not_the_same_square() -> None:
+    """"[REDACTED_*]" and "not restored (vault miss)" mean opposite things.
+
+    One is a policy redaction that WORKED; the other is the single value the run failed
+    to give back. ``.unres`` distinguishes itself from ``.c-RED`` with a wavy underline
+    -- and the legend swatch is an empty ``<i>``, so there is no text to underline. The
+    two keys were therefore painted ``#3a1418`` and ``#4a1512``: 1.09:1 against each
+    other, two dark red squares nothing on the page tells apart.
+
+    The property asserted is the one an empty 10x10 box can carry: the swatch fill is
+    not a single flat colour, so it cannot collapse onto the flat key beside it
+    whatever the two hues do.
+    """
+    css = (REPO_ROOT / "secure_context_pipeline" / "ui" / "style.css").read_text(
+        encoding="utf-8"
+    )
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    # The premise: the swatches really are empty, so hue is the only channel a flat
+    # fill has and `text-decoration` reaches nothing.
+    assert '<i class="unres"></i>' in html
+    assert '<i class="c-RED"></i>' in html
+    swatch = re.search(r"(?m)^i\.unres\s*\{([^}]*)\}", css)
+    assert swatch, "style.css has no `i.unres` rule -- has the legend been restyled?"
+    fill = re.search(r"background\s*:([^;]*);", swatch.group(1))
+    assert fill, f"`i.unres` declares no background: {swatch.group(1).strip()}"
+    colours = re.findall(r"#[0-9a-fA-F]{6}\b|var\(\s*--[\w-]+\s*\)", fill.group(1))
+    assert len(colours) >= 2, (
+        "the not-restored swatch is a single flat fill again, so it is one hue away "
+        f"from the [REDACTED_*] key beside it: {fill.group(1).strip()}"
+    )

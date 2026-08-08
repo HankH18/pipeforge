@@ -16,6 +16,7 @@ import logging
 import os
 import secrets
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -25,6 +26,7 @@ from anthropic.types import Message, RefusalStopDetails, TextBlock, ThinkingBloc
 
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.errors import ConfigError, PipelineError
+from secure_context_pipeline.llm import mock_provider
 from secure_context_pipeline.llm.anthropic_provider import (
     ANTHROPIC_LOGGER_NAME,
     EFFORT,
@@ -338,6 +340,108 @@ async def test_mock_provider_preserves_every_token_hash() -> None:
 async def test_mock_provider_emits_exactly_one_coreference_sentence() -> None:
     output = await MockProvider().complete("sys", TOKENIZED_PAYLOAD, model="mock-1")
     assert output.count(COREFERENCE_SENTENCE) == 1
+
+
+#: Vocabulary that ties a sentence to one document class. Three domains, because
+#: the property is "neutral", not "not medical": a template rewritten into legal
+#: or financial prose would be exactly as wrong for the other three fixtures.
+_CATEGORY_SPECIFIC_WORDS = (
+    # medical
+    "patient",
+    "chart",
+    "clinical",
+    "intake",
+    "discharge",
+    "encounter",
+    "diagnos",
+    "medication",
+    "symptom",
+    # legal
+    "plaintiff",
+    "defendant",
+    "docket",
+    "deposition",
+    "counsel",
+    # financial
+    "invoice",
+    "portfolio",
+    "brokerage",
+    "premium",
+)
+
+
+def test_the_mocks_own_prose_is_not_tied_to_one_document_class() -> None:
+    """The provider never sees ``doc_category``, so its prose must fit all four fixtures.
+
+    The mock is handed a payload and a model name -- build doc section 9.6 fixes
+    that interface and nothing may be added to it -- so one fixed set of sentences
+    is emitted for every document. Those sentences were clinical ("The intake note
+    lists ...", "... chart was reviewed during the encounter.", "The patient's
+    condition remains stable."), and three of the four shipped fixtures are not
+    clinical: ``legal_memo.txt``, ``legal_brief_large.txt`` and
+    ``financial_disclosure.txt``. In a live review the UI's panel 3 (raw answer)
+    and panel 4 (restored answer) are read as the product's output, and in three
+    runs out of four they described a docket filing or a brokerage statement as a
+    patient chart.
+
+    The check is over the template constants rather than over one generated
+    answer, and that is deliberate: which templates a payload reaches depends on
+    how many tokens it carries, so sampling one response would leave the unreached
+    sentences unpinned -- and those are the ones a later edit would put a clinical
+    word back into. The quoted-excerpt block is excluded by construction here; it
+    is verbatim source text, and a medical document is *supposed* to read as one.
+    """
+    authored = (
+        *mock_provider._SENTENCE_TEMPLATES,
+        *mock_provider._POSSESSIVE_TEMPLATES,
+        mock_provider._HEADER,
+        EXCERPT_HEADER,
+        COREFERENCE_SENTENCE,
+    )
+    # Non-vacuity: the words really are the kind of word these templates contain.
+    assert any("record" in sentence for sentence in authored)
+    for sentence in authored:
+        lowered = sentence.lower()
+        for word in _CATEGORY_SPECIFIC_WORDS:
+            assert word not in lowered, f"{sentence!r} is written for one document class"
+
+
+async def test_a_legal_payload_gets_an_answer_a_legal_reviewer_can_read() -> None:
+    """End to end on the shape of ``fixtures/legal_memo.txt``: no clinical words out.
+
+    The constant-level test above pins the templates; this one pins the assembled
+    answer, which is what the reviewer actually reads. Only the mock's own prose is
+    in scope -- lines quoted verbatim from the payload are removed first, since the
+    mock is required to echo those unchanged (they are the restorer's only anchors
+    under pseudonymization).
+
+    The co-reference is asserted here too, because dropping the clinical wording
+    must not drop the *property*: the closing sentence still refers to an entity
+    the model was never shown, still carries no surrogate, and is still emitted
+    exactly once, so the restorer still has nothing to resolve (locked decision #8).
+    """
+    payload = "\n".join(
+        (
+            "<DOCUMENT>",
+            f"Plaintiff {SURROGATES[0]} filed suit on the date below.",
+            f"Matter {SURROGATES[4]} was assigned to the Northern District.",
+            f"Retainer drawn on account {SURROGATES[3]}.",
+            "</DOCUMENT>",
+        )
+    )
+    output = build_response(payload)
+
+    quoted = set(payload.splitlines())
+    authored = "\n".join(
+        line for line in output.splitlines() if line.removeprefix("- ") not in quoted
+    ).lower()
+    assert "record" in authored, "nothing of the mock's own prose survived the filter"
+    for word in _CATEGORY_SPECIFIC_WORDS:
+        assert word not in authored, f"the mock wrote {word!r} into an answer about a legal memo"
+
+    assert output.count(COREFERENCE_SENTENCE) == 1
+    assert SURROGATE_TOKEN_RE.search(COREFERENCE_SENTENCE) is None
+    assert TOKEN_RE.search(COREFERENCE_SENTENCE) is None
 
 
 def test_mock_output_is_a_pure_function_of_the_payload() -> None:
@@ -1273,6 +1377,55 @@ def test_llm_response_repr_masks_the_model_output() -> None:
         assert "Marisol" not in rendered
         assert "***" in rendered
         assert "input_tokens=10" in rendered
+
+
+async def test_the_llm_call_event_carries_the_stage_timings_that_have_no_event(
+    tmp_path: Path,
+) -> None:
+    """Build doc 9.5.1: timings land in ``PipelineResult.stats`` **and** audit detail.
+
+    Only the first half held. ``DETECT`` carried ``elapsed_ms`` and ``LLM_CALL``
+    carried its own, but steps 4 (obfuscate) and 5 (inject) reached
+    ``stats["obfuscate_ms"]`` / ``stats["inject_ms"]`` and stopped there: the
+    ``OBFUSCATE`` events the engine emits carry occurrences, strategy and tier and
+    no timing at all. So a compliance query over ``audit.db`` alone -- which is the
+    only artifact that outlives the process -- could reconstruct detection and
+    model latency with a hole between them, covering the stage that does most of
+    the work. ``fetch_ms`` on ``DETECT`` is the precedent for where a step with no
+    event of its own puts its number, and ``LLM_CALL`` is the first
+    orchestrator-emitted event after both of these.
+
+    The harness is imported from ``test_egress_gate`` rather than rebuilt. It is
+    ~120 lines of stubs around a real ``PipelineOrchestrator``, and a second copy
+    would be a second thing to keep true; this test adds one assertion to a rig
+    that already exists. What belongs here is the assertion, because the event
+    being asserted about is the record of the provider call.
+    """
+    from tests.test_egress_gate import _orchestrator
+
+    trace: list[str] = []
+    orchestrator, audit = await _orchestrator(
+        tmp_path, document="Nothing sensitive in this note.", originals=set(), trace=trace
+    )
+    try:
+        result = await orchestrator.run("sess-llm-detail", "user-1", "doc-1", "Summarise this.")
+        events = await audit.query(run_id=result.run_id)
+        (called,) = [event for event in events if event.event_type == "LLM_CALL"]
+    finally:
+        await audit.close()
+
+    for stage in ("obfuscate_ms", "prompt_obfuscate_ms", "inject_ms"):
+        assert stage in called.detail, f"section 9.5.1 stage {stage} reaches no audit detail"
+        # Recorded to the same precision the other timings are, and non-negative.
+        # `round(x, 3)` of a `perf_counter` delta cannot be negative, so a negative
+        # here means the number came from somewhere other than the stage clock.
+        assert isinstance(called.detail[stage], float)
+        assert called.detail[stage] >= 0.0
+        assert called.detail[stage] == round(result.stats[stage], 3), (
+            f"{stage} in the audit trail disagrees with the one in PipelineResult.stats"
+        )
+    # The provider's own timing is still its own, not overwritten by a stage.
+    assert called.detail["elapsed_ms"] == round(result.stats["llm_ms"], 3)
 
 
 def test_transport_error_carries_only_machine_detail() -> None:

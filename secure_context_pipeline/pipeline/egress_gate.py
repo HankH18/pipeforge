@@ -261,6 +261,7 @@ from secure_context_pipeline.errors import MAX_DETAIL_VALUE_LEN, EgressBlockedEr
 from secure_context_pipeline.models import AuditEvent, Detection, EgressReport
 from secure_context_pipeline.surrogates import REDACTION_RE, STRICT_TOKEN_RE
 from secure_context_pipeline.textrules import (
+    ALNUM_RE,
     boundary_guards,
     delimited_parts,
     occurs_as_a_unit,
@@ -343,6 +344,17 @@ MIN_IDENTIFIER_DIGITS: Final = 7
 #: five six-digit originals expects 2.2e-4 spurious blocks. A spurious block is also
 #: the direction this gate is allowed to be wrong in -- it denies a request, it does
 #: not release a value.
+#:
+#: **That budget has since been spent and then reclaimed, and the paragraph above is
+#: kept because the arithmetic in it is what sized the defect.** "Allowed to be wrong
+#: in" was doing more work than it looks: measured on the shipped corpus, the token-ID
+#: channel cost 1.3e-02 spurious blocks per 100-run suite -- observed twice in 27
+#: executions and the cause of a long-standing intermittent failure in the leakage
+#: harness -- and each one told a caller its own correct output was a PII leak. It is
+#: closed at the source rather than by moving this floor: pass 1 no longer reads our
+#: own emitted token IDs at all (:func:`_mask_own_tokens`), so the 8-hex ID is no
+#: longer one of the landing sites this arithmetic counts. The floor stays at six
+#: because the leak it exists for is unchanged.
 #:
 #: **The 32-hex ``run_id`` arithmetic that argued for seven belongs to a different
 #: scanner.** It is the leakage harness that scans the audit database, where run IDs
@@ -539,8 +551,10 @@ class EgressGate:
         started = time.perf_counter()
         try:
             async with asyncio.timeout(self._timeout_s):
-                report = await self._run_passes(payload, session_id, surrogates, run_id, started)
-                await self._emit_pass(session_id, run_id, report)
+                report, warned_types = await self._run_passes(
+                    payload, session_id, surrogates, run_id, started
+                )
+                await self._emit_pass(session_id, run_id, report, warned_types)
         except EgressBlockedError:
             raise
         except Exception as exc:
@@ -566,7 +580,15 @@ class EgressGate:
         surrogates: frozenset[str],
         run_id: str | None,
         started: float,
-    ) -> EgressReport:
+    ) -> tuple[EgressReport, list[str]]:
+        """Run the three passes. Returns the report and the pass-2 warning TYPES.
+
+        The types travel beside the report rather than on it because
+        :class:`~secure_context_pipeline.models.EgressReport` is the shape the
+        orchestrator turns into run stats, and a warning type is audit-trail
+        material: it names what the gate saw, which is a question asked after the
+        fact, by someone reading the log. See :meth:`_emit_pass`.
+        """
         originals = self._vault.originals_for_session(session_id)
 
         # --- pass 1: known originals, raw and normalised -------------------
@@ -592,7 +614,12 @@ class EgressGate:
         # a payload whose scan never completed. Pinned by
         # ``test_the_timeout_bounds_pass_one_and_not_only_the_detector`` and
         # ``test_a_long_pass_one_does_not_stall_unrelated_coroutines``.
-        leaked_count = await asyncio.to_thread(self._scan_originals, payload, originals)
+        # ``surrogates`` reaches pass 1 for ONE purpose: the cores of the tokens this
+        # run emitted are not payload text, so the unbounded limbs must not read a
+        # vaulted digit run out of an HMAC-derived token id and call it a leak. The
+        # argument, the three narrowings that keep it exact-span, and why a pseudonym
+        # in the same set is NOT exempted are all at :func:`_mask_own_tokens`.
+        leaked_count = await asyncio.to_thread(self._scan_originals, payload, originals, surrogates)
         if leaked_count:
             await self._emit_block(
                 session_id, run_id, reason="vault_original", hit_count=leaked_count
@@ -608,10 +635,16 @@ class EgressGate:
         # payload-side passes: they ask different questions of the same text, and a
         # hole in one that is not a hole in the other would be a bug in the harder
         # direction to see.
-        protected = self._protected_spans(payload, surrogates)
+        #
+        # Built in two pieces rather than by re-running the matchers, so the two lists
+        # cannot drift: ``protected`` is exactly ``bracketed`` plus the surrogate
+        # occurrences. Pass 2 needs the split because only the bracketed half carries
+        # the argument for excusing a merely-overlapping detection.
+        bracketed = self._bracketed_spans(payload)
+        protected = bracketed + self._surrogate_spans(payload, surrogates)
 
         # --- pass 2: detector re-scan, minus our own surrogates ------------
-        blocked_types, warnings = await self._rescan(payload, protected)
+        blocked_types, warnings, warned_types = await self._rescan(payload, protected, bracketed)
         if blocked_types:
             types = _clamp(",".join(sorted(set(blocked_types))))
             await self._emit_block(
@@ -650,29 +683,43 @@ class EgressGate:
                 run_id=None if run_id is None else _clamp(run_id),
             )
 
-        return EgressReport(
-            payload_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-            payload_chars=len(payload),
-            originals_scanned=len(originals),
-            rescan_warnings=warnings,
-            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        return (
+            EgressReport(
+                payload_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                payload_chars=len(payload),
+                originals_scanned=len(originals),
+                rescan_warnings=warnings,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            ),
+            warned_types,
         )
 
-    def _scan_originals(self, payload: str, originals: frozenset[str]) -> int:
+    def _scan_originals(
+        self, payload: str, originals: frozenset[str], surrogates: frozenset[str] = frozenset()
+    ) -> int:
         """Count originals present in the payload. Never records WHICH value matched.
 
-        Deliberately scans the **raw** payload, with no exemption for spans this
-        pipeline emitted -- there is no ``surrogates`` argument here on purpose. An
-        earlier version masked out its own surrogates so that a coincidental
-        pseudonym collision would not block, and that was a mistake worth recording:
-        a fake drawn as "Rachel Medina" while "Medina" is a real original puts that
-        surname verbatim on the wire, and masking the surrogate span *hid* the leak
-        instead of explaining it. The 100-run harness caught it.
+        Scans the payload with **one** exemption, and the exemption is exactly the
+        eight-hex ids of the tokens this run emitted (:func:`_mask_own_tokens`, which
+        carries the whole argument and the three narrowings it rests on). ``surrogates``
+        defaults to empty, and with it empty this is byte-for-byte the scan it has
+        always been -- the mask is the identity function, so a caller that does not
+        supply the set gets the strict behaviour rather than a silent hole.
 
-        The exemption belongs upstream, where it can be made true rather than
-        assumed: the pseudonymization collision guard now rejects any fake sharing a
-        word with any original in the document, so the gate is free to stay maximally
-        strict here. Pass 2 keeps its skip-list because a *detector* re-hit on a
+        **The exemption is a token-core exemption, not a surrogate exemption**, and
+        that distinction is the lesson this docstring used to record as an absolute.
+        An earlier version masked out its own surrogates *wholesale* so that a
+        coincidental pseudonym collision would not block, and that was a mistake worth
+        keeping: a fake drawn as "Rachel Medina" while "Medina" is a real original
+        puts that surname verbatim on the wire, and masking the surrogate span *hid*
+        the leak instead of explaining it. The 100-run harness caught it. A pseudonym
+        is still scanned here, in full, for exactly that reason -- it is text a
+        gazetteer chose, it can equal a real original, and only the *upstream*
+        collision guard can make its absence true rather than assumed. What is
+        exempted is a string every character of which is ours: a registry literal and
+        an HMAC-derived id no uploader can steer.
+
+        Pass 2 keeps its own wider skip-list because a *detector* re-hit on a
         well-formed fake is a different question from a byte-exact original.
 
         Each original is compared in five bounded forms -- seven haystacks, since two
@@ -755,6 +802,8 @@ class EgressGate:
         :func:`_occurs_as_a_unit` doing the rejecting; the scale answer is an
         Aho-Corasick automaton built incrementally per session (README Q1).
         """
+        unmasked = payload
+        payload = _mask_own_tokens(payload, surrogates)
         payload_norm = normalize(payload)
         payload_folded = _fold_decimal_digits(_strip_invisible(payload_norm))
         payload_skeleton, payload_boundary = _skeleton_views(payload)
@@ -822,7 +871,7 @@ class EgressGate:
             decoded=payload_decoded,
             decoded_boundary=payload_decoded_boundary,
         )
-        payload_digits: str | None = None
+        payload_digit_views: tuple[str, ...] | None = None
         hits = 0
         for original in originals:
             if len(original.strip()) < MIN_ORIGINAL_LEN:
@@ -868,9 +917,9 @@ class EgressGate:
                 continue
             regrouped = _regrouped_identifier_needle(folded)
             if regrouped is not None:
-                if payload_digits is None:
-                    payload_digits = _digits_only(payload_folded)
-                if regrouped in payload_digits:
+                if payload_digit_views is None:
+                    payload_digit_views = _digit_views(payload_folded, unmasked, surrogates)
+                if any(regrouped in view for view in payload_digit_views):
                     hits += 1
                     continue
             if any(
@@ -881,14 +930,16 @@ class EgressGate:
         return hits
 
     async def _rescan(
-        self, payload: str, protected: list[tuple[int, int]]
-    ) -> tuple[list[str], int]:
+        self, payload: str, protected: list[tuple[int, int]], bracketed: list[tuple[int, int]]
+    ) -> tuple[list[str], int, list[str]]:
         """Re-detect on the payload, ignoring spans that are our own output.
 
         Takes the protected spans rather than the surrogate set because pass 3 needs
         the same list, and computing it twice would let the two passes disagree about
         what our own output is -- the exact class of divergence this module keeps
-        finding in itself.
+        finding in itself. ``bracketed`` is the subset of ``protected`` that carries
+        the leniency argument below; see :meth:`_protected_spans` for why the two
+        halves cannot share one rule.
 
         **This pass is not an independent opinion, and that is why pass 3 exists.**
         It runs the same ``Detector`` that ran at detect time, over text derived from
@@ -932,21 +983,39 @@ class EgressGate:
         re-derives both sets from the shipped registry and this constant and fails the
         day someone gives a high-severity entity an ``only_in_doc_categories``.
 
-        **A detection is skipped on any overlap with a protected span, not only on
-        containment**, and the lenient direction is the deliberate one. The detector
-        legitimately returns spans a shade wider than ours -- it claims the whole
-        ``[PII_NAME_1a2b3c4d]`` including the closing bracket, while the protected
-        core stops at the hash -- so demanding containment would false-block every
-        tokenized run on its own placeholders, and a gate that blocks everything
-        protects nothing. What makes the leniency affordable is that a protected span
-        is now bounded on both sides by characters we chose: it is ``[`` plus one
-        unbroken word run, so a value straddling its edge would have to be one the
-        detector reads *through* our bracket or our category literal.
+        **A detection is skipped on any overlap with a BRACKETED protected span, and
+        only on containment for a surrogate one.** The lenient direction is the
+        deliberate one for the bracketed halves: the detector legitimately returns
+        spans a shade wider than ours -- it claims the whole ``[PII_NAME_1a2b3c4d]``
+        including the closing bracket, while the protected core stops at the hash --
+        so demanding containment there would false-block every tokenized run on its
+        own placeholders, and a gate that blocks everything protects nothing. What
+        makes that leniency affordable is that such a span is bounded on both sides by
+        characters we chose: it is ``[`` plus one unbroken word run, so a value
+        straddling its edge would have to be one the detector reads *through* our
+        bracket or our category literal.
+
+        **That argument does not extend to the surrogate limb, and applying it there
+        released a high-severity finding.** A surrogate span is matched by bare string
+        equality (:meth:`_protected_spans`) -- no bracket, no category literal, no
+        minimum length -- so a pseudonym is spliced into the document's own prose with
+        the document's own characters on both sides, and a longer value can straddle
+        its edge with nothing anomalous about it. Measured on the shipped detector and
+        registry: with ``5551234`` in the surrogate set, ``Vendor account 5551234567
+        remains open.`` is ``ACCOUNT_NUMBER@1.00`` over ``[15:25]`` against a protected
+        ``[15:22]``; the overlap excused it and the gate released a payload its own
+        detector had just typed as a high-severity identifier. Containment is the right
+        rule there and costs nothing the bracketed argument was buying: what pass 2 must
+        never re-flag is text *we wrote*, and a detection reaching past the end of a
+        string we wrote is by definition not that.
+        ``test_a_high_severity_hit_outside_our_own_output_always_blocks`` already
+        computes its oracle with containment over the emitted set, so this makes the
+        gate agree with the property that was already being asserted of it.
         """
         detections = await self._detector.detect(payload, None)
 
         blocked: list[str] = []
-        warnings = 0
+        warned: list[str] = []
         for det in detections:
             # Two different questions, and they had one threshold between them.
             #
@@ -995,16 +1064,20 @@ class EgressGate:
             )
             if det.score < floor:
                 continue
-            if _overlaps(det.start, det.end, protected):
+            if _explained_by_our_output(det.start, det.end, protected, bracketed):
                 continue
             if det.entity_type in self._high_severity:
                 blocked.append(det.entity_type)
             else:
                 # NER-typed re-hit: a fake name the generator produced contextually.
                 # Logged, not blocked -- blocking here would make pseudonymization
-                # unusable without improving the guarantee.
-                warnings += 1
-        return blocked, warnings
+                # unusable without improving the guarantee. The TYPE is kept because
+                # the count alone is undiagnosable: ``egress_rescan_warnings 3`` on a
+                # panel whose claim is "nothing original got out" reads as three near
+                # leaks, and nothing recorded what they were. Types only, never
+                # values, so the warning discloses nothing the payload did not.
+                warned.append(det.entity_type)
+        return blocked, len(warned), warned
 
     @staticmethod
     def _protected_spans(payload: str, surrogates: frozenset[str]) -> list[tuple[int, int]]:
@@ -1097,11 +1170,48 @@ class EgressGate:
         full for every detection, so a sort would cost O(n log n) per call and buy
         nothing. Ordering only starts to matter if that linear scan is ever replaced
         by a search, which is the change that should introduce the sort.
+
+        **The two halves are also built separately**, because pass 2 does not apply
+        the same overlap rule to both: see :meth:`_bracketed_spans` and
+        :meth:`_rescan`. This method is the union of them, in that order, and it is
+        what pass 3 uses -- there, every span is a string we wrote and the question is
+        only whether a pattern hit is one of them.
+        """
+        return EgressGate._bracketed_spans(payload) + EgressGate._surrogate_spans(
+            payload, surrogates
+        )
+
+    @staticmethod
+    def _bracketed_spans(payload: str) -> list[tuple[int, int]]:
+        """The half of :meth:`_protected_spans` whose edges are characters we chose.
+
+        On the left, our ``[``; on the right, our token hash (the span stops at group
+        3, before the closing bracket and any ``|hint``) or our closing bracket for a
+        redaction marker. Both ends being ours is the whole of the argument
+        that lets pass 2 skip a detection merely *overlapping* one: a value straddling
+        such an edge would have to be one the detector read through our bracket or our
+        category literal. Kept as its own list so the argument travels with the spans
+        it is true of, rather than being applied to the surrogate half, where it is
+        false.
         """
         spans: list[tuple[int, int]] = [
             (m.start(), m.end(3)) for m in STRICT_TOKEN_RE.finditer(payload)
         ]
         spans.extend(m.span() for m in REDACTION_RE.finditer(payload))
+        return spans
+
+    @staticmethod
+    def _surrogate_spans(payload: str, surrogates: frozenset[str]) -> list[tuple[int, int]]:
+        """Every occurrence of a string this run emitted. String equality, nothing else.
+
+        No grammar and no minimum length: the orchestrator hands ``check()`` the exact
+        surrogates the engine issued, so the span cannot absorb text we did not write.
+        That strength is also the reason pass 2 demands *containment* against these --
+        a fake is spliced into the document's own prose, so both of its edges are the
+        document's characters and a longer value can straddle one with nothing
+        anomalous about it.
+        """
+        spans: list[tuple[int, int]] = []
         for surrogate in surrogates:
             if not surrogate:
                 continue
@@ -1112,7 +1222,29 @@ class EgressGate:
         return spans
 
     # ------------------------------------------------------------------
-    async def _emit_pass(self, session_id: str, run_id: str | None, report: EgressReport) -> None:
+    async def _emit_pass(
+        self,
+        session_id: str,
+        run_id: str | None,
+        report: EgressReport,
+        warned_types: list[str],
+    ) -> None:
+        """Record the release, including WHAT pass 2 warned about.
+
+        ``rescan_warnings`` alone is undiagnosable and sits on a panel whose whole
+        claim is "nothing original got out": ``egress_rescan_warnings 3`` reads as
+        three near-misses, and until this row carried the types there was nowhere to
+        look them up -- ``_rescan`` incremented a counter and dropped
+        ``det.entity_type`` on the floor. Measured on the shipped medical fixture,
+        the three are ``ADDRESS,ADDRESS,ADDRESS``: the detector re-typing "MD" and
+        "RN" out of the pseudonymized clinician lines, which is a false positive
+        rather than a near leak, and one nobody could see.
+
+        Sorted, deduplicated and comma-joined, mirroring ``entity_types`` on the
+        block path, and clamped to the audit detail ceiling the same way. **Types
+        only, never values** -- an audit row that quoted the warned text would put
+        payload content into the log the gate exists to keep values out of.
+        """
         if self._audit is None:
             return
         await self._audit.emit(
@@ -1127,6 +1259,7 @@ class EgressGate:
                     "payload_chars": report.payload_chars,
                     "originals_scanned": report.originals_scanned,
                     "rescan_warnings": report.rescan_warnings,
+                    "rescan_warning_types": _clamp(",".join(sorted(set(warned_types)))),
                     "elapsed_ms": round(report.elapsed_ms, 3),
                 },
             )
@@ -1211,6 +1344,335 @@ def _clamp(value: str) -> str:
 
 def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     return any(start < s_end and end > s_start for s_start, s_end in spans)
+
+
+def _explained_by_our_output(
+    start: int, end: int, protected: list[tuple[int, int]], bracketed: list[tuple[int, int]]
+) -> bool:
+    """Whether a pass-2 detection is accounted for by something this pipeline wrote.
+
+    Two rules, because the two kinds of protected span earn different ones and giving
+    them one rule released a high-severity finding -- the argument is at
+    :meth:`EgressGate._rescan`. A ``bracketed`` span (token core, redaction marker) is
+    bounded by characters we chose, so any *overlap* excuses the detection. Everything
+    else -- the surrogate occurrences, matched by bare string equality inside the
+    document's own prose -- excuses it only by *containment*.
+
+    ``bracketed`` is a subset of ``protected``, so the containment test covers the
+    bracketed spans too; it is the weaker of the two there and never the deciding one.
+    """
+    if _overlaps(start, end, bracketed):
+        return True
+    return any(s_start <= start and end <= s_end for s_start, s_end in protected)
+
+
+#: What each character of one of our own emitted **token ids** is rewritten to before
+#: pass 1 reads the payload. See :func:`_mask_own_tokens`.
+#:
+#: An ASCII lowercase letter, and the three properties that make this one inert are
+#: the reason it is not a more decorative choice:
+#:
+#: * it is **alphanumeric** under :data:`~secure_context_pipeline.textrules.ALNUM_RE`,
+#:   which is the alphabet the word-boundary rule and ``_INTERIOR_SEPARATOR`` both
+#:   key on, so a neighbour that was glued to a token is still glued to it and a
+#:   neighbour that was bounded by our ``[`` is still bounded by it. The mask cannot
+#:   move a boundary, in either direction;
+#: * it is **not a digit**, which is the whole point -- the digit-run, whole-value and
+#:   regrouped limbs read digits, and a token id's digits are what they were colliding
+#:   with;
+#: * it is **ASCII, NFKC-stable, casefold-stable, not a mark and not invisible**, so
+#:   every derived haystack (``normalize``, :func:`_strip_invisible`,
+#:   :func:`_fold_decimal_digits`, :func:`_skeleton_views`,
+#:   :func:`_decode_transport_escapes`) leaves it exactly as it is, and an ASCII
+#:   payload stays ASCII -- so none of their fast paths is lost.
+#:
+#: ``q`` rather than ``a`` or ``e`` because it is outside the hex alphabet the id it
+#: replaces is drawn from, so a mask can never be read back as a token id, and no
+#: English word runs it three times (:data:`MIN_ORIGINAL_LEN`). A vaulted original of
+#: ``qqq`` would collide with the mask, which is a *block*, not a release.
+_OWN_ID_MASK_CHAR: Final = "q"
+
+
+def _own_token_mask(surrogate: str) -> str | None:
+    """``surrogate`` with its 8-hex token id blanked, or ``None`` if it is not ours.
+
+    ``None`` for every surrogate that is not a :data:`STRICT_TOKEN_RE` **fullmatch**,
+    and that conjunction -- *in the emitted set* **and** *shaped like a token we
+    emit* -- is the whole safety argument of the exemption; :func:`_mask_own_tokens`
+    states it. Neither half is dropped for the other's sake: the set alone would
+    exempt pseudonyms, the grammar alone would exempt anything token-shaped in the
+    uploaded document.
+
+    **The span is group 3 and nothing else** -- the id, not the whole token core that
+    :meth:`EgressGate._bracketed_spans` protects in pass 2. The exemption is only as
+    defensible as the argument that the exempted characters cannot carry a secret, so
+    it is cut to exactly the field that argument is about:
+    :func:`~secure_context_pipeline.crypto.keys.derive_token_id` is an HMAC under the
+    session key, truncated to eight hex characters -- unsteerable, unpredictable, and
+    carrying no projection of the original. Every other field keeps being read:
+
+    * the **category and type literals** (``PII``, ``ACCOUNT_NUMBER``) are ours, but
+      they are ours by *configuration*, and a vault holding a value spelled like a
+      registry type is a coincidence this gate can keep blocking on for free -- see
+      :func:`_mask_own_tokens` for the measurement, which is why this is a residual
+      rather than a second exemption;
+    * the ``|hint`` tail, which is :meth:`EgressGate._protected_spans` narrowing 2 and
+      is *stronger* here than it is there: the hint alphabet ``[a-z0-9-]`` spells an
+      SSN, and a hint is looked up **by the original's own text**
+      (``StrategyBase.hint_for`` passes ``detection.text`` to the gazetteer), so it is
+      the one field of a token that is derived from the value. Masking it would be
+      masking a projection of the secret;
+    * our ``[``, ``_`` and ``]``, which are the boundary characters every occurrence
+      test keys on.
+
+    Per-character rather than ``_OWN_ID_MASK_CHAR * 8`` so that the mask preserves
+    :data:`~secure_context_pipeline.textrules.ALNUM_RE` class per character even if
+    the id alphabet ever admits something that is not alphanumeric; today ``[0-9a-f]``
+    makes the two spellings identical.
+    """
+    match = STRICT_TOKEN_RE.fullmatch(surrogate)
+    if match is None:
+        return None
+    start, end = match.start(3), match.end(3)
+    masked = "".join(
+        _OWN_ID_MASK_CHAR if ALNUM_RE.match(ch) else ch for ch in surrogate[start:end]
+    )
+    return surrogate[:start] + masked + surrogate[end:]
+
+
+def _mask_own_tokens(payload: str, surrogates: frozenset[str]) -> str:
+    """The payload with our own emitted token IDs blanked, for pass 1 only.
+
+    **The defect this closes.** The unbounded limbs -- :func:`_identifier_needles` and
+    the regrouped digit skeleton -- have no adjacency or boundary requirement, which
+    is exactly what lets them catch a regrouped or glued identifier. So they read our
+    own surrogates as if they were payload text, and a token id is eight hex
+    characters whose digits sometimes *are* the vaulted digits::
+
+        vault  {'8390244'}
+        wire   'Account [FIN_ACCOUNT_NUMBER_8390244f] closed.'   -> 1 hit
+        vault  {'552140'}
+        wire   'Chart: [PHI_MRN_a552140f] reviewed.'             -> 1 hit
+
+    Both are ``EgressBlockedError(reason="vault_original")`` on a run in which
+    nothing leaked: the caller is told its own correct output is a PII leak. The
+    per-landing-site arithmetic is at :data:`MIN_IDENTIFIER_RUN_DIGITS`
+    (~1.8e-7 for a six-digit needle in one 8-hex id); the rate that made it worth
+    fixing is an *observation* rather than a derivation from that -- 1.3e-02 spurious
+    blocks per 100-run suite, seen twice in 27 executions of the leakage harness --
+    and it is recorded here as one, because nothing in this file re-derives it.
+
+    **What this removes is the landing sites that are ours, which is not the whole
+    channel**, and the difference is measured rather than glossed. Two limbs read
+    digits without an adjacency rule, and they have very different surfaces: the
+    identifier needle looks *inside one 8-hex id* (all of which this now blanks), and
+    the regrouped needle looks inside the payload's whole digit stream -- **7,078
+    digits** on the shipped corpus's 104 documents, of which our token ids are around
+    2%. So a vaulted all-digit value can still meet its own digits by coincidence in
+    the *document's* dates, amounts and figures, and that is untouched here: measured
+    over those 104 documents with every planted value tokenised out, zero spurious
+    digit-stream hits either way. What this function is entitled to claim is the
+    narrow thing: the pipeline no longer blocks a run because of a string the pipeline
+    itself wrote.
+
+    **Why an exemption is defensible in pass 1 at all**, given that
+    :meth:`EgressGate._scan_originals` spent years arguing the opposite. The argument
+    it was making is about *pseudonyms* and it is still correct: a fake drawn as
+    ``Rachel Medina`` while ``Medina`` is a real original puts that surname verbatim
+    on the wire, and exempting the fake **hides a real leak**. The 100-run harness
+    caught that once already. Nothing here relaxes it -- a pseudonym is not a
+    :data:`STRICT_TOKEN_RE` fullmatch, so :func:`_own_token_mask` returns ``None`` for
+    it and pass 1 reads it exactly as it always has.
+
+    What the **id** has and a pseudonym does not is that it is a projection of nothing:
+    :func:`~secure_context_pipeline.crypto.keys.derive_token_id` is an HMAC under the
+    session key truncated to eight hex characters. An uploader cannot steer it, cannot
+    predict it and cannot encode anything in it -- so a needle found inside one is a
+    coincidence with a random string, never a disclosure, and re-drawing the id makes
+    the hit go away. That last sentence is the *test* this rests on rather than a
+    figure of speech: the differential fuzz classifies every case the exemption
+    releases by re-drawing the id 16 times from the same distribution and demanding
+    the pre-exemption scanner agree each time.
+
+    "Cannot steer it" is worth one line of adversarial arithmetic rather than
+    assertion, since the id *is* a function of a value an uploader chooses:
+    ``HMAC-SHA256(session_key, entity_type || 0x00 || normalize(value))`` truncated
+    to 32 bits. Choosing the input does not choose the output without the key, so
+    aiming one id at another value's digits is a 2^32 search against a secret,
+    per-session key with one upload per attempt -- and what it would buy is that pass
+    1 stops reading **eight characters** that are on the wire either way. It buys
+    nothing about the target value itself: if that value is anywhere else in the
+    payload, every limb still finds it there, which is what the placement tests pin.
+
+    **Three narrowings keep that true**, and each one is a hole if it is dropped:
+
+    1. **String equality against the emitted set, never a grammar over the payload.**
+       The strings blanked are the ones the orchestrator hands ``check()``, i.e. the
+       ones this run actually spliced in. A grammar-only rule would let an *uploaded
+       document* carry token-shaped text and have pass 1 skip it -- the payload is
+       assembled from a document the uploader wrote.
+    2. **The grammar as well as the set**, which is the narrowing in the other
+       direction: it is what keeps the pseudonym half of the same set scanned.
+    3. **Exact span, and the span is the ID.** Not the token, not the core pass 2
+       protects: only group 3 of the string we emitted (:func:`_own_token_mask`). The
+       replacement is per-character and length-preserving and every other character --
+       our ``[``, our ``_``, the literals, the ``|hint`` tail, our ``]`` -- is kept
+       verbatim, so the mask is the same *shape* as what it replaces and no boundary
+       anywhere in the payload moves or changes class. That is what makes this a hole
+       of exactly eight characters per token and not one more: a vaulted value beside
+       a token, glued to a token, straddling its bracket, or split across it is still
+       read by every limb. Pinned by
+       ``test_a_vaulted_value_glued_to_our_own_token_still_blocks``.
+
+    **What the fuzz found the exemption also removes**, stated because it is a real
+    behaviour change and not the headline one: a *letter-carrying* identifier whose
+    digits the payload regroups -- ``K563704`` vaulted, ``5637-04`` on the wire -- was
+    sometimes blocked by an id collision and now is not. No limb covers that shape on
+    purpose (:func:`_regrouped_identifier_needle` refuses a value with letters in it,
+    because identifier shapes collide by prefix), so the block was never the rule
+    working; it was the rule being wrong in a lucky direction. 46 cases in 120,000
+    differential ones, every one of them gone when the id is re-drawn.
+
+    **What that leaves open, measured rather than argued.** A vaulted value spelled
+    like a category or an entity type -- ``ACCOUNT_NUMBER``, ``NAME``, ``PII`` -- is
+    word-bounded inside every token of that type (``_`` is a boundary,
+    :data:`~secure_context_pipeline.textrules.ALNUM`), so pass 1 still blocks on it.
+    That is the pre-existing behaviour and it is deliberately not fixed here: the
+    literals are ours by *configuration*, which is a weaker claim than the HMAC one
+    and not one worth spending an exemption on. Over the shipped registry's 20 entity
+    types times four categories -- every token core the pipeline can emit -- and the
+    10,355 originals the generator plants across 26 seeds x 4 kinds, the number of
+    planted values that occur word-bounded in any of them is **zero**. Pinned by
+    ``test_the_id_only_exemption_leaves_the_registry_literals_scanned``.
+
+    **Redaction markers are deliberately NOT exempted**, though they are the other
+    half of :meth:`EgressGate._protected_spans`. Two reasons, and the first is
+    decisive:
+
+    * a marker is protected there by :data:`REDACTION_RE` **alone** -- markers are not
+      in the surrogate set, so there is no string-equality leg to stand on, and a
+      grammar-only exemption in pass 1 is precisely the hole narrowing 1 exists to
+      refuse. ``REDACTION_RE``'s type body is ``[A-Z][A-Z0-9_]*``, so an uploaded
+      document containing ``[REDACTED_MRN5567281]`` would blank a vaulted MRN. The
+      marker grammar is guessable in a way an HMAC id is not, which is the entire
+      difference between the two halves;
+    * a marker carries no hex and therefore none of the collision this function
+      exists to remove. ``[REDACTED_<TYPE>]`` is a registry type name, so the only
+      value it can collide with is one that *is* a bounded word of that name --
+      measured over the shipped registry and generator corpus: zero.
+
+    Scanning our own markers costs a block we could have avoided only for a vault
+    holding a value spelled like an entity type, which is the direction this gate is
+    allowed to be wrong in. ``test_pass_one_still_reads_inside_a_redaction_marker``
+    pins the refusal.
+
+    **THE SIBLING INSTANCE THIS DOES NOT CLOSE, named here because closing one half
+    of a two-instance defect and calling it fixed is how it comes back.** The leakage
+    harness scans the outbound payload with its *own* independently derived scan
+    (``tests/leakage/test_leakage_harness.py::find_in_text``, applied to
+    ``sent_payload`` in ``test_no_original_ever_leaves_the_process``), and that scan
+    carries the same unbounded identifier and digit-skeleton limbs with **no surrogate
+    exemption at all**. Verified, not inferred -- on the two payloads at the top of
+    this docstring it returns ``['8390244']`` and ``['552140']``. So the same
+    coincidence that used to stop the run here now reaches the harness's assertion
+    instead, and reads as *"original present in the outbound payload"*, which is a
+    worse-looking red for the same non-event. That file belongs to the harness and the
+    fix belongs there rather than here, and it is deliberately **not** "import
+    ``_mask_own_tokens``": a checker that inherits the exemption from the code it
+    checks has stopped being a second opinion. What it needs is its own exclusion,
+    derived from the ``TokenRecord``s the run issued.
+
+    Cost: one ``str.replace`` pass per emitted token, all at C level, and skipped
+    outright when the run emitted nothing (redaction-only runs, and every existing
+    caller that passes no surrogates -- for which this is the identity function and
+    pass 1 is byte-for-byte the scan it always was). Measured on a 54 KB payload
+    carrying 251 distinct tokens in 230 places: **3.5 ms** for this function, and
+    **38.6 ms -> 51.5 ms** for a whole pass 1 over 202 originals. The rest of that
+    difference is the second digit view (:func:`_digit_views`), which is the other
+    half of the exemption and is priced there.
+    """
+    if not surrogates:
+        return payload
+    masked = payload
+    # Longest first, so a token that is a substring of another (a hinted token
+    # contains no other token, but nothing here depends on that) is not blanked out
+    # from under the longer one. A surrogate we fail to blank is the old behaviour,
+    # which is the strict direction.
+    for surrogate in sorted(surrogates, key=len, reverse=True):
+        replacement = _own_token_mask(surrogate)
+        if replacement is None:
+            continue
+        masked = masked.replace(surrogate, replacement)
+    return masked
+
+
+def _strip_own_tokens(payload: str, surrogates: frozenset[str]) -> str:
+    """The payload with our own emitted tokens **removed**, hint and all.
+
+    Deletion rather than masking, and for exactly one consumer: the digit stream
+    :func:`_digit_views` builds. Deleting text is not safe in general -- it glues the
+    neighbours together and takes a word boundary with them, which is the defect
+    :func:`_skeleton_views` exists to work around -- but the digit stream has no
+    boundaries to lose. :func:`_digits_only` already discards every non-digit
+    character, so removing a whole token from it and removing only that token's
+    digits are the same operation, and neither can move anything else.
+
+    Same membership test as :func:`_mask_own_tokens`: emitted **and** a
+    :data:`STRICT_TOKEN_RE` fullmatch. A pseudonym's digits stay in the stream, since
+    a fake is not covered by the argument that makes any of this safe.
+    """
+    stripped = payload
+    for surrogate in sorted(surrogates, key=len, reverse=True):
+        if _own_token_mask(surrogate) is None:
+            continue
+        stripped = stripped.replace(surrogate, "")
+    return stripped
+
+
+def _digit_views(folded: str, unmasked: str, surrogates: frozenset[str]) -> tuple[str, ...]:
+    """Every digit stream :func:`_regrouped_identifier_needle` is compared against.
+
+    A **union of two views**, never a swap -- the pattern :func:`_skeleton_views` uses
+    for the same reason: each view sees a payload the other cannot, and OR-ing two
+    projections of one payload can only ever add hits.
+
+    1. **The masked payload's digits.** Our token ids are gone (they are what the
+       exemption is for), and everything else -- including a ``|hint``'s digits -- is
+       still payload. That view is what keeps the ``|hint`` bypass closed here: a hint
+       spelled ``123-45-6789`` and a vaulted ``123456789`` are found by *no other
+       limb*, since the bounded forms want the separators and the identifier needle
+       wants them absent.
+    2. **The payload with our tokens deleted outright.** Necessary because view 1
+       leaves our own non-id digits in the stream, and they can *break* a genuine
+       disclosure rather than create one. Measured, and this is the whole reason this
+       function exists rather than a single stream::
+
+           vault  {'987714668699'}
+           wire   'ledger filed 98771466869[PII_ADDRESS_989aa4fe|lab-panel-3]9 ...'
+
+       The value's twelve digits are all there, split by one of our tokens. With only
+       view 1, the ``3`` of ``lab-panel-3`` lands between them and the needle is
+       absent. The pre-exemption scanner blocked this payload -- but only by luck:
+       it was reading the ``9`` out of the id, and the same payload with the id
+       ``c3f7003f`` was released. So view 2 is not a concession to the old behaviour,
+       it is the answer the old behaviour was reaching by accident.
+
+    The second view costs a deletion pass plus a ``normalize`` over the payload, and
+    is built at most once per scan, lazily, and only when some vaulted value has a
+    regrouped needle at all -- i.e. only for an all-digit original carrying
+    :data:`MIN_IDENTIFIER_DIGITS` digits. It is skipped entirely when the run emitted
+    no tokens, and de-duplicated when the two views agree. Measured on the payload
+    :func:`_mask_own_tokens` prices -- 54 KB, 251 tokens, 202 originals of which 200
+    have a regrouped needle, i.e. the worst case for this path: 4.2 ms for
+    :func:`_strip_own_tokens` and ~5 ms for the projection, inside a pass 1 that goes
+    from 38.6 ms to 51.5 ms once the whole exemption is on.
+    """
+    views = [_digits_only(folded)]
+    if surrogates:
+        excised = _strip_own_tokens(unmasked, surrogates)
+        if excised != unmasked:
+            views.append(_digits_only(_fold_decimal_digits(_strip_invisible(normalize(excised)))))
+    return tuple(dict.fromkeys(views))
 
 
 #: Characters that render as nothing, so a value carrying one discloses exactly what

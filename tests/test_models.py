@@ -1,7 +1,7 @@
 """Content-exposure tests for :mod:`secure_context_pipeline.models` and ``config``.
 
 Build doc section 16 is the requirement: no original entity value may ever be
-logged, printed, ``repr``-ed, or embedded anywhere. A model has **three** ways to
+logged, printed, ``repr``-ed, or embedded anywhere. A model has **four** ways to
 emit its fields, and until this module existed only one field (``Detection.text``)
 was checked on any of them:
 
@@ -15,6 +15,12 @@ was checked on any of them:
   ``model_copy().__dict__``, and ``model_dump(serialize_as_any=True)``, which asks
   pydantic to serialize by runtime type and so skips every ``field_serializer``.
   **Not masked**, and not maskable while the value must stay readable.
+* **``pydantic.ValidationError``** -- raised *instead of* a model when construction
+  is refused, so nothing declared on the class has run yet and no mask on it can
+  apply. It carries the whole input mapping in ``errors()[0]["input"]`` and an
+  elided excerpt of it in ``str(exc)``. **Not masked**, and named here because a
+  taxonomy that stops at three exits reads as complete and is not; see
+  ``test_a_refused_construction_is_the_fourth_exit_and_carries_the_input_dict``.
 
 This module's docstring used to say there were exactly two, and ``models.py`` and
 ``config.py`` said so too. That was measurably false in the worse direction:
@@ -1167,3 +1173,171 @@ def test_the_prompt_cap_comment_names_the_pass_that_rewrites_the_prompt() -> Non
         "premise: the code-object check can tell present from absent, so the two "
         "assertions above are not passing for free."
     )
+
+
+# ---------------------------------------------------------------------------
+# The FOURTH exit: the model that was never built
+# ---------------------------------------------------------------------------
+def test_a_refused_construction_is_the_fourth_exit_and_carries_the_input_dict() -> None:
+    """``models.py`` said "there are *three* exits". There are four.
+
+    The first three are all reads of a model that exists, which is what hid this
+    one: a ``ValidationError`` is raised *instead of* the model, so no
+    ``__repr__`` and no ``field_serializer`` declared on the class has run, and
+    none of them could apply if they had. Pydantic attaches the caller's whole
+    input mapping to the error -- ``errors()[0]["input"]`` verbatim, plus a
+    middle-elided excerpt inside ``str(exc)`` -- so a ``Detection`` that is
+    refused emits the very ``text`` the accepted ``Detection`` masks on two exits.
+
+    Two things are asserted, and the second is the reason this is a test rather
+    than a paragraph. That the channel exists, measured on the exact model whose
+    ``text`` field is the package's only provider-ward original. And that it is
+    **not specific to the span-order check** that exposed it: a plain missing-field
+    rejection carries the same dict, so "move that one validator to field level"
+    would narrow the channel and leave the taxonomy just as wrong.
+
+    Deliberately not asserting that the leak is closed. It cannot be closed at this
+    layer, and the containment is elsewhere and already tested: ``api/errors.py``
+    rewrites every ``RequestValidationError`` to field names and counts, and
+    ``errors.py``'s hierarchy caps structured detail at
+    :data:`MAX_DETAIL_VALUE_LEN`. What this pins is that the boundary is *stated*.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        models.Detection(
+            entity_type="NAME",
+            category=EntityCategory.PII,
+            start=5,
+            end=0,
+            text=CANARY,
+            score=0.5,
+        )
+    reported = excinfo.value.errors()[0]["input"]
+    assert isinstance(reported, Mapping), (
+        "premise: pydantic attaches the input as a mapping for an after-validator; "
+        f"got {type(reported).__name__}, so the assertion below would be vacuous"
+    )
+    assert reported.get("text") == CANARY, (
+        "the fourth exit closed. That is good news and this test is now the stale "
+        "half: delete the entry and the 'four exits' prose in models.py with it."
+    )
+
+    # The same channel, reached without the span-order validator, so nobody can
+    # read this as one validator's problem.
+    with pytest.raises(ValidationError) as missing:
+        models.Detection(  # type: ignore[call-arg]
+            entity_type="NAME",
+            category=EntityCategory.PII,
+            start=0,
+            end=len(CANARY),
+            text=CANARY,
+        )
+    assert any(
+        isinstance(err["input"], Mapping) and err["input"].get("text") == CANARY
+        for err in missing.value.errors()
+    ), "a missing-field rejection no longer carries the input dict"
+
+    # And the prose has to name it. Checking for the mechanism rather than an exact
+    # sentence, for the reason
+    # `test_models_and_config_docstrings_describe_the_third_exit` states.
+    doc = models.__doc__ or ""
+    counted = doc.lower().replace("*", "")
+    assert "four exits" in counted, "models.py still counts three exits"
+    assert "three exits" not in counted, (
+        "models.py claims both counts. The taxonomy is the guarantee, so it has to "
+        "have one number in it."
+    )
+    for token in ("ValidationError", "input"):
+        assert token in doc, (
+            f"models.py's exit taxonomy does not mention {token!r}. A three-exit story "
+            "reads as complete and is not: a refused construction emits what an "
+            "accepted one masks."
+        )
+
+
+def test_no_docstring_in_models_still_claims_an_audit_row_cannot_hold_an_original() -> None:
+    """The retracted claim, hunted in the module that declares the ceilings.
+
+    ``AuditEvent``'s length caps make a row incapable of holding *content* -- a
+    paragraph, a note, a document. They were also, for a while, described as making
+    it "incapable of holding an original value", which is a different and false
+    statement: ``"John Smith"``, ``"MRN 4823910"``, an SSN and an e-mail all fit
+    inside 64 characters, and no length check can recognise a name.
+    ``audit/logger.py``, ``api/schemas.py`` and the README each retract it in so
+    many words; two copies survived here, in the module docstring and on
+    ``AuditEvent`` itself -- the two places a reader checking the guarantee lands
+    first.
+
+    Scanned as source text rather than as ``__doc__`` so class and field docstrings
+    are covered together, and phrased as a ban on the *claim* rather than a
+    requirement for particular replacement wording, which would break on any honest
+    rewrite. The positive half of the statement is asserted too: deleting the
+    sentence and saying nothing would also pass a pure ban.
+    """
+    source = inspect.getsource(models)
+    lowered = " ".join(source.lower().split())
+    for retracted in (
+        "no field capable of holding an original",
+        "cannot hold an original",
+        "cannot *hold* an original",
+    ):
+        assert retracted not in lowered, (
+            f"models.py still asserts {retracted!r}. The ceilings bound content, not "
+            "identifiers; the no-originals property belongs to the call sites and is "
+            "measured by the leakage harness."
+        )
+    assert "cannot hold content" in lowered or "cannot hold *content*" in lowered, (
+        "the claim was deleted rather than corrected. The true, narrower statement -- "
+        "the ceilings make a row incapable of holding content -- is load-bearing for "
+        "the audit design and has to survive the retraction."
+    )
+    assert "leakage harness" in lowered, (
+        "models.py retracts the schema-level claim without naming what replaced it. "
+        "The no-originals property is measured, not asserted, and prose that drops "
+        "the measurement leaves a reader with nothing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Settings' pluggable seams: open by config string, or closed by a Literal
+# ---------------------------------------------------------------------------
+def test_every_pluggable_seam_is_selectable_by_config_string() -> None:
+    """Build doc sections 8, 9.3 and 9.6 all say "one class + one registry entry".
+
+    Three seams make that promise -- the LLM provider, the key provider, and the
+    obfuscation strategy -- and only the first kept it. The other two declared
+    ``Settings`` fields as closed ``Literal``s, so a class registered through the
+    documented seam could be written, registered, and never *named*: pydantic
+    refused the string before the registry that knows about it was consulted, and
+    both ``build_key_provider``'s ``unknown_key_provider`` branch and
+    ``build_strategy``'s ``unknown_strategy`` branch were unreachable from a
+    validated ``Settings``. Measured: ``key_provider="aws_kms"`` and
+    ``strategy="redaction"`` each raised ``literal_error`` while
+    ``llm_provider="openai"`` was accepted.
+
+    This lives in the file that already cross-checks ``models.py`` against
+    ``config.py`` because it is a statement about ``Settings``' field declarations,
+    and it is quantified over the three seams rather than written three times, so a
+    fourth pluggable field that ships as a ``Literal`` fails here.
+
+    Fail-closed is asserted alongside, because widening a field without it would
+    trade an unreachable branch for a silent acceptance -- and for ``strategy``
+    the check has to be at *construction*: ``build_strategy`` runs per span inside
+    the engine, so leaving it there would turn a config typo into an HTTP 500 on
+    every run instead of a refusal at startup.
+    """
+    key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+    for field in ("llm_provider", "key_provider", "strategy"):
+        annotation = Settings.model_fields[field].annotation
+        assert typing.get_origin(annotation) is not typing.Literal, (
+            f"Settings.{field} is a closed Literal, so a class registered through the "
+            "documented plug-in seam cannot be selected by config string and the "
+            "registry's own unknown-name branch is dead code"
+        )
+        assert annotation is str, f"Settings.{field} should be a plain str; got {annotation}"
+
+    # `strategy` is the one validated here rather than downstream, so it is the one
+    # whose refusal this file can and must observe.
+    with pytest.raises(PipelineError) as excinfo:
+        Settings(master_key=key, strategy="no-such-strategy")
+    assert excinfo.value.detail["reason"] == "unknown_strategy"
+    assert Settings(master_key=key, strategy="pseudonymization").strategy == "pseudonymization"

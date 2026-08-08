@@ -789,6 +789,55 @@ async def test_a_late_note_unrestorable_cannot_resurrect_a_destroyed_session(
     assert vault.cached_session_ids() == frozenset()
 
 
+async def test_a_late_note_unrestorable_is_refused_after_the_apis_logout_order(
+    vault: SessionVault, session_registry: SessionRegistry
+) -> None:
+    """The same guard, in the order the shipped product actually logs out in.
+
+    The test above destroys the vault *first*, with the key still live -- the
+    order ``destroy``'s tombstone was written for, and an order nothing in the
+    product uses. ``DELETE /sessions/{id}`` pops the key and then calls the vault
+    (``routes/sessions.py``), the TTL reaper reaches ``vault.destroy`` through
+    ``sessions.sweep()`` with the key already dropped, and ``demo.py`` does the
+    same. So every shipped path arrived at ``destroy`` with ``registry.key()``
+    already raising, ``if key_still_live`` recorded nothing, and the guard the
+    test above proves out was inert in production.
+
+    Measured on these objects before the fix: after a complete key-first logout,
+    ``originals_for_session`` was empty and ``_destroyed`` was empty, and one late
+    ``note_unrestorable`` put the value straight back --
+    ``frozenset({'Priya Raghunathan'})`` -- in a cache that no destroy path will
+    ever visit again, held until the process exits. Plaintext surviving logout is
+    the one thing this module exists to prevent, and it survived *silently*: the
+    registry holds no reference to that cache, so nothing downstream reports it.
+
+    ``destroy`` therefore tombstones when the session had a live key **or** a
+    cache. Both halves are asserted here: the tombstone is the mechanism, and the
+    empty ``originals_for_session`` is the property.
+    """
+    session_id, _ = await session_registry.create("test-user")
+
+    # A cache exists before logout -- this is the redact-band needle the gate
+    # reads, and the thing a late call would rebuild.
+    vault.note_unrestorable(session_id, VALUE_A)
+    assert vault.originals_for_session(session_id) == frozenset({VALUE_A})
+
+    # The API's order, exactly: key first, vault second.
+    assert await session_registry.destroy(session_id) is True
+    await vault.destroy(session_id)
+    assert session_id in vault._destroyed, "the key-first logout recorded no tombstone"
+    assert vault.originals_for_session(session_id) == frozenset()
+
+    vault.note_unrestorable(session_id, VALUE_B)
+    assert vault.originals_for_session(session_id) == frozenset(), (
+        "a late redact-band note rebuilt the cache of a session logged out via the API"
+    )
+    assert vault.cached_session_ids() == frozenset(), (
+        "a destroyed session was re-created by note_unrestorable"
+    )
+    assert VALUE_B not in f"{vault!r} {vault}"
+
+
 def _is_self_caches(node: ast.expr) -> bool:
     """Whether ``node`` is the expression ``self._caches``."""
     return (
@@ -1139,15 +1188,15 @@ async def test_destroy_races_concurrent_writes(
 async def test_logout_in_api_order_is_final_for_in_flight_writes(
     vault: SessionVault, session_registry: SessionRegistry, db_path: Path
 ) -> None:
-    """The API pops the key *first*, so no tombstone is recorded. It must still hold.
+    """The API pops the key *first*, so ``put``'s refusal cannot come from a tombstone.
 
     ``DELETE /session/{id}`` runs ``registry.destroy()`` then ``vault.destroy()``,
     which is the opposite of the order the tombstone was written for -- by the
-    time ``destroy`` runs, ``registry.key()`` already raises and nothing is
-    tombstoned. The property has to come from somewhere else, and it does:
-    ``put`` reads the key and queues on ``self._lock`` in one scheduling step,
-    and ``asyncio.Lock`` wakes waiters FIFO, so a write either lands before this
-    ``destroy`` (and is cleaned up by it) or finds the key already gone.
+    time ``destroy`` runs, ``registry.key()`` already raises. The property has to
+    come from somewhere other than the tombstone, and it does: ``put`` reads the
+    key and queues on ``self._lock`` in one scheduling step, and ``asyncio.Lock``
+    wakes waiters FIFO, so a write either lands before this ``destroy`` (and is
+    cleaned up by it) or finds the key already gone.
 
     Yields are swept on **both** sides, and that is not symmetry for its own
     sake. Sweeping only the logout side measures the race from one end: a single
@@ -1203,7 +1252,20 @@ async def test_logout_in_api_order_is_final_for_in_flight_writes(
         # ``SessionExpiredError`` from ``registry.key()``, not ``VaultMissError``.
         with pytest.raises(SessionExpiredError):
             await vault.get_by_surrogate(session_id, record.surrogate)
-        assert not vault._destroyed, "the API order must not accumulate tombstones"
+        # This read ``assert not vault._destroyed`` -- "the API order must not
+        # accumulate tombstones" -- and that premise is what the tombstone fix
+        # deliberately changed, so the assertion is inverted rather than dropped.
+        # It was never one of this test's confidentiality claims (those are the
+        # four above, and every one of them is untouched); it recorded that the
+        # key-first order left ``_destroyed`` empty. That emptiness is exactly what
+        # made ``note_unrestorable``'s guard inert in every shipped destruction
+        # path, so ``destroy`` now tombstones a session that had a cache whichever
+        # order it is logged out in -- and this session had one, from ``put_value``
+        # above. Asserting the ID *is* present is strictly the stronger claim: it
+        # pins the guard's precondition instead of pinning its absence.
+        assert session_id in vault._destroyed, (
+            "a logged-out session that held a cache must be tombstoned in either order"
+        )
 
     assert outcomes == {"stored", "refused"}, (
         f"the sweep did not exercise both sides of the race: {outcomes}"
@@ -1234,10 +1296,10 @@ async def test_put_reads_the_session_key_inside_the_lock(
       destroy that follows collects it.
     * key read **outside** the lock: the writer is parked holding nothing, the
       whole logout completes -- recording no tombstone, because in this order
-      the key is already gone by the time ``destroy`` looks -- and the write
-      then acquires a free lock, sees an empty ``_destroyed``, and files a
-      durable row plus a plaintext cache for a session that no longer exists,
-      with nothing left to collect either.
+      the key is already gone *and* the write that would have left a cache has
+      not happened yet -- and the write then acquires a free lock, sees an empty
+      ``_destroyed``, and files a durable row plus a plaintext cache for a
+      session that no longer exists, with nothing left to collect either.
 
     The assertions are therefore on the *residue*, not on which side won the
     race: either interleaving may store the value, but neither may leave it
@@ -1278,7 +1340,18 @@ async def test_put_reads_the_session_key_inside_the_lock(
         pass
     await destroyer
 
-    assert not vault._destroyed, "the API order records no tombstone; that is the premise here"
+    # This read ``assert not vault._destroyed`` and was a premise, not a claim:
+    # under the old ``if key_still_live`` condition the key-first order recorded
+    # nothing. It records one now whenever the session had a cache, and in the
+    # *correct* (inside-the-lock) arrangement it does: the writer parks holding
+    # the lock, so its ``put`` lands before ``destroy`` can start and ``destroy``
+    # finds the cache it created. Hoist the key read back out of the lock and this
+    # goes the other way -- no cache at destroy, so no tombstone -- which makes the
+    # assertion a second, independent discriminator for the very ordering defect
+    # this test exists for, on top of the residue checks below.
+    assert session_id in vault._destroyed, (
+        "the write did not land inside the lock, so destroy saw no cache to tombstone"
+    )
     assert vault.originals_for_session(session_id) == frozenset(), (
         "a write that lost the race rebuilt the plaintext cache of a destroyed session"
     )
@@ -1391,9 +1464,18 @@ async def test_destroy_records_no_tombstone_for_a_key_that_died_while_it_queued(
     its logout awaits ``registry.destroy`` to completion *before* calling
     ``vault.destroy``, so the two never overlap and the stale read never
     happens.
+
+    **The session deliberately holds no cache**, and that is what keeps the
+    tombstone a discriminator here. ``destroy``'s condition is ``key_still_live or
+    cache is not None``: with a cache present both the stale and the correct
+    liveness read tombstone, and the assertion below would hold for the broken
+    ordering too. This test used to ``put_value`` first, which under the current
+    condition would have made it vacuous rather than failing -- the worst
+    direction. Removing that line is what preserves the property it was written
+    for; the control at the end keeps the assertion from passing merely because
+    nothing tombstones at all.
     """
     session_id, _ = await session_registry.create("test-user")
-    await put_value(vault, session_registry, session_id, VALUE_A)
 
     await vault._lock.acquire()
     destroyer = asyncio.create_task(vault.destroy(session_id))
@@ -1409,6 +1491,13 @@ async def test_destroy_records_no_tombstone_for_a_key_that_died_while_it_queued(
 
     assert vault._destroyed == set(), "a tombstone was recorded for an already-dead key"
     assert vault.cached_session_ids() == frozenset()
+
+    # Control: the same destroy on a session whose key IS still live does record
+    # one, so the assertion above is measuring the liveness read rather than a
+    # guard that never fires.
+    live_id, _ = await session_registry.create("test-user")
+    await vault.destroy(live_id)
+    assert vault._destroyed == {live_id}
 
 
 async def test_a_close_queued_ahead_of_a_write_fails_closed(

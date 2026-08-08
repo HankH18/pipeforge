@@ -17,7 +17,9 @@ module's own docstring says it exists to prevent.
 
 from __future__ import annotations
 
+import string
 from datetime import date, timedelta
+from itertools import product
 
 import pytest
 
@@ -273,10 +275,46 @@ def test_a_composite_offset_indexes_the_untrimmed_span() -> None:
     ],
 )
 def test_a_span_with_a_trivial_constituent_is_left_whole(text: str, why: str) -> None:
-    """A run too short to be a date in any spelling refuses the whole split.
+    """A constituent that is not a date in its own right refuses the whole split.
 
     All-or-nothing is the rule: a partial split vaults some constituents and leaves the
     rest in a rump span the pipeline has already decided is not an entity. The blank row
     covers the other early return -- a span with nothing in it is not a list of dates.
+
+    **Which guard these rows reach.** The two short rows are named for their length, but
+    length is not what refuses them: ``split_composite_date`` checks
+    ``len(constituent) < _MIN_CONSTITUENT_LEN`` and then ``parse_source_date(...) is
+    None``, and ``"12"`` and ``"1"`` would be refused by the second even if the first
+    were gone -- setting ``_MIN_CONSTITUENT_LEN`` to 1 leaves all 94 tests in this file
+    green. So this test pins the *outcome*, which is the behaviour worth pinning, and
+    the length guard is pinned as what it actually is -- a redundant pre-filter -- by
+    :func:`test_the_length_guard_is_a_pre_filter_the_parse_guard_already_subsumes`.
     """
     assert split_composite_date(text) == (), why
+
+
+def test_the_length_guard_is_a_pre_filter_the_parse_guard_already_subsumes() -> None:
+    """No 1- or 2-character run parses as a date, so ``_MIN_CONSTITUENT_LEN`` decides nothing.
+
+    ``_MIN_CONSTITUENT_LEN``'s own comment says a short run "cannot be a date in any
+    spelling this table knows", and this is that claim checked instead of asserted.
+    Exhaustive over every 1- and 2-character string on the alphabet a constituent can be
+    drawn from -- printable ASCII minus the three single-character delimiters
+    ``DELIMITER_RE`` splits on, and minus whitespace-only runs, which
+    ``delimited_parts`` drops before a constituent is ever formed. 8,372 candidates,
+    measured at 9 ms, which is why it is exhaustive rather than sampled.
+
+    The constant is kept rather than deleted: as a pre-filter it still saves a
+    ``dateutil`` call on a run that cannot succeed, and its comment gives that as the
+    reason ("keeps the fallback from being asked a question it might answer
+    creatively"). What was wrong was believing it was a *decision*. If this test ever
+    goes red, the guard has stopped being redundant and the row that newly parses is
+    the interesting fact -- the assertion prints it.
+    """
+    alphabet = [c for c in string.printable if c not in ",;&" and c.strip()]
+    candidates = [*alphabet, *("".join(pair) for pair in product(alphabet, repeat=2))]
+    parsing = [s for s in candidates if parse_source_date(s) is not None]
+    assert not parsing, (
+        "these short runs parse as dates, so _MIN_CONSTITUENT_LEN is now a real "
+        f"decision and needs a test of its own: {parsing}"
+    )

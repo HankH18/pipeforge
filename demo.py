@@ -44,6 +44,7 @@ import asyncio
 import base64
 import difflib
 import hashlib
+import logging
 import math
 import os
 import re
@@ -241,6 +242,53 @@ def wrapped(prefix: str, body: str, *, style: Callable[[str], str] | None = None
 
 def kv(key: str, value: str) -> None:
     wrapped(f"  {key:<14}", value)
+
+
+class _LogCapture(logging.Handler):
+    """Holds the package's log records until the framed output is finished.
+
+    demo.py configures no logging handler, so every record the package emits used
+    to fall through to :data:`logging.lastResort`, which prints the bare message --
+    no level, no logger name -- straight to stderr at WARNING and above. One record
+    fires on an ordinary run: ``egress_gate.py:1162`` logs
+    ``"EGRESS BLOCKED -- provider call suppressed"`` during section 6c. On a tty
+    stderr and stdout share the terminal, so that unlabelled line landed *inside*
+    the 80-column frame, between the fail-closed premise and its first ``[PASS]``
+    row -- in the middle of the artifact a reviewer reads first.
+
+    Two fixes were rejected before this one. ``logging.basicConfig`` labels the line
+    but still interleaves it into the frame, which is the larger half of the defect.
+    A ``NullHandler`` with ``propagate = False`` keeps the frame clean by throwing
+    the records away -- acceptable for *this* record, because section 6c already
+    reports the same block as its own ``[PASS]`` row, but wrong as a rule: a
+    security demo that silently discards its library's warnings would hide the one
+    that mattered. Buffering keeps both properties, and costs one list.
+
+    Nothing here changes ``egress_gate``: warning on a block is correct behaviour
+    for a library, and the demo is what was mis-configured.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(f"{record.levelname} {record.name}: {record.getMessage()}")
+
+
+def _replay_captured_logs(capture: _LogCapture) -> None:
+    """Print anything the package logged, after the frame has closed.
+
+    Silent when there is nothing to say, so the common path prints no extra
+    section. The records go to stderr, which is where they were already going --
+    only the timing and the labelling change.
+    """
+    if not capture.records:
+        return
+    print(file=sys.stderr)
+    print(dim(f"-- package log ({len(capture.records)} record(s))"), file=sys.stderr)
+    for line in capture.records:
+        print(dim(f"   {line}"), file=sys.stderr)
 
 
 def _clean(text: str) -> str:
@@ -1464,6 +1512,12 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return EXIT_USAGE
 
+    # Attached to the package root, not to the root logger: this buffers what
+    # secure_context_pipeline says and leaves everyone else's logging alone.
+    capture = _LogCapture()
+    package_logger = logging.getLogger("secure_context_pipeline")
+    package_logger.addHandler(capture)
+
     try:
         return asyncio.run(run_demo(args))
     except ConfigError as exc:
@@ -1472,6 +1526,11 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:  # pragma: no cover -- interactive only
         print("\ninterrupted", file=sys.stderr)
         return EXIT_USAGE
+    finally:
+        # In `finally` so the records survive the error paths above, which are
+        # exactly the runs where a warning is worth reading.
+        package_logger.removeHandler(capture)
+        _replay_captured_logs(capture)
 
 
 if __name__ == "__main__":

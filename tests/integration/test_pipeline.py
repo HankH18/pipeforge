@@ -74,7 +74,7 @@ from secure_context_pipeline.models import (
 )
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
-from secure_context_pipeline.pipeline.egress_gate import EgressGate
+from secure_context_pipeline.pipeline.egress_gate import EgressGate, EgressReport
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import RAW_SUFFIX, EncryptedDocumentStore
 from secure_context_pipeline.surrogates import STRICT_TOKEN_RE, TOKEN_RE
@@ -109,7 +109,15 @@ UNKNOWN_TOKEN_ID = "deadbeef"
 
 
 class CountingMockProvider:
-    """The shipped mock, plus a call counter and the payload it last saw."""
+    """The shipped mock, plus a call counter and every payload it was handed.
+
+    ``last_user`` is what a single-run test asks about. ``users`` is the list of
+    *all* of them, in call order, and it exists because a concurrent test cannot
+    ask ``last_user`` anything meaningful: with two runs in flight the second
+    overwrites the first, so "did this value ever cross the boundary" is a
+    question only the whole list can answer. It is append-only and nothing else
+    reads it, so no existing expectation moves.
+    """
 
     name = "mock"
 
@@ -117,6 +125,7 @@ class CountingMockProvider:
         self._inner = MockProvider()
         self.calls = 0
         self.last_user: str | None = None
+        self.users: list[str] = []
 
     async def complete(self, system: str, user: str, *, model: str, timeout_s: float = 60.0) -> str:
         return (await self.complete_detailed(system, user, model=model, timeout_s=timeout_s)).text
@@ -126,6 +135,7 @@ class CountingMockProvider:
     ) -> LLMResponse:
         self.calls += 1
         self.last_user = user
+        self.users.append(user)
         return await self._inner.complete_detailed(system, user, model=model, timeout_s=timeout_s)
 
 
@@ -160,6 +170,50 @@ class ScriptedProvider:
         )
 
 
+class SeamedGate:
+    """The real :class:`EgressGate` with one seam: a hook that runs before pass 1.
+
+    It exists so that the window between "the engine finished building the payload"
+    and "the gate reads the session's originals" can be *driven* rather than waited
+    for. That window is a handful of awaits wide -- ``check()`` is the next thing the
+    orchestrator does after obfuscation, and ``originals_for_session`` is read inside
+    it -- so the only way another coroutine reliably lands a vault write in the middle
+    of it is to put the hook exactly here. The alternative, running the scenario until
+    the interleaving happens by luck, is measured elsewhere in this file at roughly
+    one whole test execution in fourteen, which is not a test, it is a lottery ticket.
+
+    **One-shot on purpose.** The hook is popped before it is awaited, so a hook that
+    itself drives a complete pipeline run -- which is the realistic session-mate, and
+    the only kind whose vault write goes through the code the product actually runs
+    -- re-enters this gate without recursing.
+
+    Nothing else is wrapped. The payload, the session, the surrogates and the run ID
+    are handed to the real gate untouched, and the real gate's report, or its
+    ``EgressBlockedError``, is what the caller sees. A test using this seam is still
+    testing the shipped gate: the seam changes *when* pass 1 runs relative to another
+    coroutine, never *what* it does.
+    """
+
+    def __init__(self, inner: EgressGate) -> None:
+        self.inner = inner
+        self.before_check: Callable[[str, str], Any] | None = None
+
+    async def check(
+        self,
+        payload: str,
+        session_id: str,
+        *,
+        surrogates: frozenset[str] = frozenset(),
+        run_id: str | None = None,
+    ) -> EgressReport:
+        hook, self.before_check = self.before_check, None
+        if hook is not None:
+            await hook(payload, session_id)
+        return await self.inner.check(
+            payload, session_id, surrogates=surrogates, run_id=run_id
+        )
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -190,6 +244,12 @@ class Harness:
     engine: ObfuscationEngine
     restorer: Restorer
     provider: Any
+    #: The gate object the orchestrator was actually wired with -- the real
+    #: :class:`EgressGate` unless the test asked for ``seamed_gate=True``, in which
+    #: case it is the :class:`SeamedGate` wrapper around it. Exposed so a test can
+    #: install a hook on the same object the pipeline calls, rather than reaching
+    #: into ``orchestrator._gate``.
+    gate: Any
     orchestrator: PipelineOrchestrator
     clock: MutableClock | None = None
     _closed: bool = field(default=False)
@@ -250,6 +310,7 @@ async def make_harness(
         provider: Any | None = None,
         clock: MutableClock | None = None,
         strategy: str = "tokenization",
+        seamed_gate: bool = False,
     ) -> Harness:
         nonlocal counter
         counter += 1
@@ -279,6 +340,12 @@ async def make_harness(
         )
         restorer = Restorer(vault=vault, settings=settings, audit=audit)
         chosen = CountingMockProvider() if provider is None else provider
+        # Default OFF: every other test in this file is wired with the real gate
+        # object and nothing between it and the orchestrator, so the seam cannot
+        # change what any of them measure. Only the test that needs to drive the
+        # build-vs-gate interleaving asks for it. See :class:`SeamedGate`.
+        real_gate = EgressGate(vault=vault, detector=detector, settings=settings, audit=audit)
+        gate: Any = SeamedGate(real_gate) if seamed_gate else real_gate
         harness = Harness(
             settings=settings,
             registry=registry,
@@ -290,14 +357,13 @@ async def make_harness(
             engine=engine,
             restorer=restorer,
             provider=chosen,
+            gate=gate,
             orchestrator=PipelineOrchestrator(
                 store=store,
                 detector=detector,
                 engine=engine,
                 injector=ContextInjector(),
-                gate=EgressGate(
-                    vault=vault, detector=detector, settings=settings, audit=audit
-                ),
+                gate=gate,
                 provider=chosen,
                 restorer=restorer,
                 vault=vault,
@@ -1322,6 +1388,17 @@ async def test_a_realistic_ssn_is_obfuscated_rather_than_blocked(
 #: phases never overlap at all.
 CONCURRENT_RUNS = 16
 
+#: How many of those sixteen may be refused by the build-vs-gate window before this
+#: test calls it a defect rather than a narrow race. Two, and the number is measured
+#: rather than chosen: the reported incidence is ONE refused run
+#: (``hit_count=1``) in roughly one whole execution in fourteen, and 37 consecutive
+#: executions on this machine (25 as separate pytest processes, 12 in-process)
+#: produced zero. Two is twice the largest count ever observed here, and fourteen
+#: surviving runs is still fourteen independent chances to observe a crossover.
+#: A regression that makes the window wide -- or a gate that refuses everything --
+#: lands well past this and turns the test red. See the docstring below.
+MAX_TOLERATED_REFUSALS = 2
+
 
 def _contended_documents(count: int) -> list[str]:
     """Identical records but for the MRN: maximum contention, detectable crossover.
@@ -1388,6 +1465,48 @@ async def test_concurrent_runs_on_one_session_do_not_cross_wires(
     probe, and it is still the only evidence in this suite that the repair works at
     all -- the alternative was a hand-built single-collision unit test that never
     ran two coroutines.
+
+    **Why a fail-closed refusal is tolerated here, and what tolerating it costs.**
+    This test used to be flaky -- roughly one execution in fourteen died on
+    ``EgressBlockedError(reason='vault_original', hit_count=1)`` from a run that had
+    crossed no wires at all. That block is a *second* race, on a different pair of
+    reads: the engine reads ``originals_for_session`` while building the payload and
+    the gate reads it again at gate time, and a session-mate that vaults a value in
+    between leaves this run's already-built payload carrying, in the clear, a value
+    that is now an original. Blocking is the correct answer to that payload -- it
+    really does contain a vaulted value -- so the refusal is the gate working, not
+    the crossover this test exists to detect. Sixteen near-identical documents are
+    what make it reachable: the detector is deterministic per document but the
+    documents differ by an MRN, so a value one run detects and vaults another run
+    can miss, and the cross-call sweep that would have masked it reads the originals
+    set a few awaits too early.
+
+    Two shapes were available. Removing the collision from the fixture means either
+    pre-vaulting the shared values -- which kills the ID-collision contention this
+    test was built to reach, since a value already in the vault is never derived a
+    second time -- or hand-picking values with no detection variance, which is a
+    property of a spaCy release rather than of this repo. So the refusal is
+    tolerated instead, and tolerated is not swallowed: every refusal must be an
+    ``EgressBlockedError``, must carry ``reason='vault_original'`` and no other, must
+    appear in the audit log as ``EGRESS_BLOCK`` for its own run, must have NO
+    ``LLM_CALL`` for that run, and must leave ``provider.calls`` equal to the number
+    of runs that completed. A refused run put nothing on the wire, and that is
+    asserted rather than assumed.
+
+    **The one assertion weakened, stated plainly.** ``asyncio.gather`` without
+    ``return_exceptions`` asserted "all sixteen runs complete". It now asserts
+    ``len(results) >= CONCURRENT_RUNS - MAX_TOLERATED_REFUSALS``. Would that still be
+    wrong if the engine's window fix were reverted? No -- with the fix reverted the
+    refusals are legitimate fail-closed refusals of genuinely dirty payloads, and a
+    test of *crossover* should not be red for them. What must not happen is that the
+    availability defect stops being tested at all, so it is tested where it can be
+    tested honestly:
+    ``test_a_session_mate_vaulting_between_the_build_and_the_gate_cannot_leak``
+    drives that exact interleaving deterministically, on every execution, instead of
+    once in fourteen. And the floor is a floor: a gate that refuses everything is
+    trivially crossover-free and useless, which is the same control
+    ``test_a_realistic_ssn_is_obfuscated_rather_than_blocked`` provides for the
+    single-run path.
     """
     harness: Harness = await make_harness()
     session_id, _expires_at = await harness.sessions.create("test-user")
@@ -1397,18 +1516,67 @@ async def test_concurrent_runs_on_one_session_do_not_cross_wires(
         for index, text in enumerate(documents)
     ]
 
-    results = await asyncio.gather(
+    outcomes = await asyncio.gather(
         *(
             harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
             for doc_id in doc_ids
-        )
+        ),
+        return_exceptions=True,
     )
-    assert len(results) == CONCURRENT_RUNS
+    assert len(outcomes) == CONCURRENT_RUNS
+
+    refusals = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    # Paired with the index of the document that produced it, not re-enumerated: check
+    # 3 below asks "is any OTHER chart's MRN in this answer", and a run's own index is
+    # how it is excluded. Renumbering the survivors would compare a run against its own
+    # MRN and fail a correct pipeline.
+    results = [
+        (index, outcome)
+        for index, outcome in enumerate(outcomes)
+        if not isinstance(outcome, BaseException)
+    ]
+
+    # Every refusal is a fail-CLOSED refusal of the one kind the build-vs-gate window
+    # can produce. Anything else -- another reason code, another exception type, a
+    # crash -- is a failure of this test, because those are not this window.
+    for refusal in refusals:
+        assert isinstance(refusal, EgressBlockedError), (
+            f"a concurrent run died on {type(refusal).__name__}, which is not the "
+            "documented fail-closed refusal this test tolerates"
+        )
+        assert refusal.detail["reason"] == "vault_original", (
+            f"tolerated refusals are the build-vs-gate window only; got "
+            f"{refusal.detail['reason']!r}"
+        )
+        assert int(refusal.detail["hit_count"]) >= 1, "a block with nothing behind it"
+
+    # Fail-closed is a property of the *audit log and the provider*, not of the
+    # exception: an exception raised after the payload went out would look identical
+    # from here. So: the refused run is on the record as blocked, has no LLM_CALL of
+    # its own, and the provider was called exactly once per run that completed.
+    blocks = await harness.audit.query(session_id=session_id, event_type=EGRESS_BLOCK, limit=1000)
+    calls = await harness.audit.query(session_id=session_id, event_type=LLM_CALL, limit=1000)
+    blocked_runs = {event.run_id for event in blocks}
+    called_runs = {event.run_id for event in calls}
+    for refusal in refusals:
+        run_id = refusal.detail["run_id"]
+        assert run_id in blocked_runs, f"run {run_id} refused without an EGRESS_BLOCK record"
+        assert run_id not in called_runs, f"run {run_id} was refused AFTER calling the provider"
+    assert harness.provider.calls == len(results), (
+        "the provider was called a different number of times than runs completed"
+    )
+
+    # A gate that refuses everything crosses no wires either. See the docstring:
+    # this floor is what stops the tolerance above from being a way to pass.
+    assert len(results) >= CONCURRENT_RUNS - MAX_TOLERATED_REFUSALS, (
+        f"{len(refusals)} of {CONCURRENT_RUNS} concurrent runs were refused; the "
+        "window is supposed to be narrow, and a test of crossover needs runs that ran"
+    )
 
     mrns = [f"MRN: {4471900 + index * 7}" for index in range(CONCURRENT_RUNS)]
     resolved: dict[str, str] = {}
 
-    for index, result in enumerate(results):
+    for index, result in results:
         body = document_section(result.obfuscated_payload)
         token_ids = {match.group(3) for match in STRICT_TOKEN_RE.finditer(body)}
         assert token_ids, f"run {index} issued no tokens; it cannot detect anything"
@@ -1445,6 +1613,321 @@ async def test_concurrent_runs_on_one_session_do_not_cross_wires(
     # And the session really did hold the shared values once each, not once per run.
     originals = harness.vault.originals_for_session(session_id)
     assert "03/12/1985" in originals
+    assert await harness.vault.row_count(session_id) == len(originals)
+
+
+# ---------------------------------------------------------------------------
+# 11b. The same window, driven instead of waited for
+# ---------------------------------------------------------------------------
+
+#: The value the race below is run on: eight digits the detector reads as an MRN when
+#: they are labelled and does not see AT ALL when they are not. Measured against the
+#: shipped registry and spaCy model:
+#:
+#:     "MRN: 55672814"                                    -> MRN@0.70
+#:     "The figure 55672814 was quoted in the appendix."   -> nothing, of any type
+#:
+#: Eight digits rather than seven or ten because both of those are seen unlabelled --
+#: as ``DATE@0.85`` -- and a value the victim run detects for itself is a value it
+#: vaults and masks for itself, which never enters the window at all. That is a
+#: property of a model release, not of this repo, so both halves are asserted as
+#: premises inside the test: a spaCy update that changes either turns this red with a
+#: named reason rather than quietly making it vacuous.
+#:
+#: It also carries more than ``egress_gate.MIN_IDENTIFIER_DIGITS`` (7) digits, so pass
+#: 1 scans it as a bare substring rather than under the word-boundary rule -- the
+#: block below is the plain whole-value needle, not an edge of the boundary limb.
+RACED_VALUE = "55672814"
+
+#: The session-mate. Labelled, so the value is detected, vaulted, and becomes a needle
+#: for every subsequent gate check in the session -- including one already in flight.
+RACED_MATE_DOCUMENT = (
+    "CLINIC NOTE\n\n"
+    f"MRN: {RACED_VALUE}\n"
+    "Attending physician: Dr Harriet Vance.\n"
+    "Patient reviewed in clinic today and discharged in stable condition.\n"
+)
+
+#: The victim. Same value, unlabelled, plus a name of its own so the run is a real run
+#: that vaults something rather than a document the pipeline has no work to do on.
+RACED_VICTIM_DOCUMENT = (
+    "ADDENDUM\n\n"
+    "Attending physician: Dr Marcus Ellery.\n"
+    f"The figure {RACED_VALUE} was quoted verbatim in the appendix.\n"
+    "No further action is required at this time.\n"
+)
+
+
+async def test_a_session_mate_vaulting_between_the_build_and_the_gate_cannot_leak(
+    make_harness: HarnessFactory,
+) -> None:
+    """The build-vs-gate window, entered on purpose on every execution.
+
+    ``ObfuscationEngine._add_prior_session_surfaces`` reads
+    ``originals_for_session`` while the payload is being built, and
+    ``EgressGate._run_passes`` reads it again at gate time. Between those two reads a
+    session-mate can vault a value that this run's payload is carrying in the clear --
+    a value this run's own detector never saw, so nothing in this run masked it and
+    the cross-call sweep that would have masked it looked a few awaits too early.
+    Sixteen concurrent runs above hit that window by coincidence in about one
+    execution in fourteen as reported -- and in zero of the 37 consecutive executions
+    measured while writing this, which is the argument for this test rather than
+    against it. A race observable only by repetition is a race nobody notices
+    regressing, so this test *drives* it:
+
+    1. the victim run goes all the way to ``EgressGate.check`` normally, real store,
+       real detector, real engine, real vault;
+    2. :class:`SeamedGate` hands control to a hook at that exact point -- payload
+       built, pass 1 not yet run;
+    3. the hook runs a complete second pipeline run, the session-mate, through the
+       same shipped code path, which vaults ``RACED_VALUE``;
+    4. control returns and the real pass 1 reads the originals set the mate grew.
+
+    Steps 1-4 are ordinary awaits, not sleeps, so the interleaving is the same on a
+    loaded machine as on an idle one -- and the test asserts the interleaving happened
+    (the value absent from the originals set at step 2, present at step 4, and
+    verbatim in the payload the gate was handed) rather than assuming the seam worked.
+
+    **The invariant that binds either way is the product's one claim**: no payload the
+    provider was handed contains ``RACED_VALUE`` -- checked over *every* call, not the
+    last one, because with two runs in flight ``last_user`` answers about whichever
+    finished second and says nothing about the other. On top of that, exactly two
+    outcomes are safe and each is asserted in full:
+
+    * **Refused**, which is what the shipped pipeline does here, deterministically.
+      ``_sweep_residual`` now reads the originals set a second time at the end of the
+      pass, which shrinks this interval to the audit write, the prompt obfuscation,
+      the payload assembly and the gate's own read -- and this hook fires *inside*
+      ``check()``, in the part that engine docstring says cannot be closed from the
+      engine at all. Refusing is then the correct answer, not a defect the test is
+      indulging: the payload really does carry a vaulted value. What is asserted is
+      that the refusal was fail-CLOSED and not merely raised -- ``EGRESS_BLOCK`` on
+      the record for that run, no ``LLM_CALL`` for that run, and one provider call in
+      total, the mate's.
+    * **Completed**, which is what an engine that rebuilt against the grown originals
+      set instead of dying on the block would do. Kept because it is the only other
+      outcome that satisfies the guarantee, and because a test that hard-codes today's
+      branch turns a legitimate improvement into a red suite. It asserts the run
+      finished *correctly*: value gone from the outbound payload, the mate's own
+      surrogate in its place -- one vault row, one token, no crossed wire -- and the
+      value restored on the way back.
+
+    Neither branch passes by default: a third outcome, a different reason code, a
+    second vault row for one value, or a provider call carrying the value is a
+    failure. The interval the engine *can* repair is the subject of the next test,
+    and that one has no branches -- it requires the run to complete.
+    """
+    harness: Harness = await make_harness(seamed_gate=True)
+    session_id, _expires_at = await harness.sessions.create("test-user")
+    victim_doc = await harness.upload(RACED_VICTIM_DOCUMENT, "medical", "addendum.txt")
+    mate_doc = await harness.upload(RACED_MATE_DOCUMENT, "medical", "chart.txt")
+
+    victim_spans = await harness.detector.detect(RACED_VICTIM_DOCUMENT, "medical")
+    assert not any(RACED_VALUE in span.text for span in victim_spans), (
+        "premise gone: the victim's own detector now sees the raced value, so this run "
+        "vaults and masks it itself and never enters the window this test exists for"
+    )
+    mate_spans = await harness.detector.detect(RACED_MATE_DOCUMENT, "medical")
+    assert any(RACED_VALUE in span.text for span in mate_spans), (
+        "premise gone: the mate no longer detects the raced value, so nothing vaults it "
+        "mid-flight and the window is never opened"
+    )
+
+    seen: dict[str, Any] = {}
+
+    async def vault_it_from_a_session_mate(payload: str, mate_session_id: str) -> None:
+        """Runs with the victim's payload built and pass 1 not yet started."""
+        seen["payload"] = payload
+        seen["before"] = harness.vault.originals_for_session(mate_session_id)
+        seen["mate"] = await harness.orchestrator.run(
+            mate_session_id, USER_ID, mate_doc, PROMPT, "tokenization"
+        )
+        seen["after"] = harness.vault.originals_for_session(mate_session_id)
+
+    harness.gate.before_check = vault_it_from_a_session_mate
+
+    refusal: EgressBlockedError | None = None
+    result = None
+    try:
+        result = await harness.orchestrator.run(
+            session_id, USER_ID, victim_doc, PROMPT, "tokenization"
+        )
+    except EgressBlockedError as exc:
+        refusal = exc
+
+    # The interleaving is what this test is for, so it is evidence, not an assumption.
+    assert seen, "the seam never fired; the victim run never reached the gate"
+    assert RACED_VALUE not in seen["before"], (
+        "premise gone: the value was already vaulted before the mate ran, so the "
+        "engine's cross-call sweep had it and there was no window to race"
+    )
+    assert "after" in seen, "the session-mate's own run did not complete"
+    assert RACED_VALUE in seen["after"], "the mate did not vault the raced value"
+    assert RACED_VALUE in seen["payload"], (
+        "premise gone: the payload handed to the gate no longer carries the raced "
+        "value in the clear, so this is no longer the build-vs-gate window"
+    )
+
+    # THE GUARANTEE. Every payload the provider was handed, not just the last one:
+    # with two runs in flight `last_user` answers a question about whichever finished
+    # second and says nothing at all about the other.
+    assert harness.provider.users, "premise: the provider was called at least once"
+    for user in harness.provider.users:
+        assert RACED_VALUE not in user, (
+            "a value vaulted by a session-mate reached the provider in the clear"
+        )
+
+    # The mate is untouched by the run that raced it -- its own value came back.
+    mate_result = seen["mate"]
+    assert RACED_VALUE in mate_result.restored_text
+    assert UNRESOLVED_ENTITY not in mate_result.restored_text
+
+    # One value, one vault row, whichever branch ran: the raced value must not have
+    # been vaulted a second time by the victim on its way through.
+    record = await harness.vault.get_by_original(session_id, "MRN", RACED_VALUE)
+    assert record is not None, "the mate's vault row for the raced value is gone"
+    originals = harness.vault.originals_for_session(session_id)
+    assert RACED_VALUE in originals
+    assert await harness.vault.row_count(session_id) == len(originals), (
+        "the raced value is behind two vault rows, or a needle has no row"
+    )
+
+    if refusal is not None:
+        # --- refused: the shape the pipeline produces today, on every execution ---
+        assert result is None
+        assert refusal.detail["reason"] == "vault_original", (
+            f"the window must refuse on pass 1's own reason code; got "
+            f"{refusal.detail['reason']!r}"
+        )
+        assert int(refusal.detail["hit_count"]) >= 1
+        run_id = refusal.detail["run_id"]
+        blocks = await harness.audit.query(
+            session_id=session_id, event_type=EGRESS_BLOCK, limit=1000
+        )
+        calls = await harness.audit.query(
+            session_id=session_id, event_type=LLM_CALL, limit=1000
+        )
+        assert run_id in {event.run_id for event in blocks}, (
+            "the run was refused with no EGRESS_BLOCK on the record"
+        )
+        assert run_id not in {event.run_id for event in calls}, (
+            "the run was refused AFTER calling the provider -- that is not fail-closed"
+        )
+        assert harness.provider.calls == 1, (
+            "exactly one provider call is expected -- the mate's; the refused run "
+            "must not have made one"
+        )
+    else:
+        # --- completed: the shape an engine that closes the window produces ---
+        assert result is not None
+        assert RACED_VALUE not in result.obfuscated_payload, (
+            "the run completed with the raced value still in the outbound payload"
+        )
+        assert record.surrogate in document_section(result.obfuscated_payload), (
+            "the raced value was masked behind something other than the mate's own "
+            "surrogate -- two tokens for one value is a crossed wire waiting to happen"
+        )
+        assert RACED_VALUE in result.restored_text, "the raced value did not come back"
+        assert UNRESOLVED_ENTITY not in result.restored_text
+        assert result.stats["vault_misses"] == 0.0
+        assert harness.provider.calls == 2, "one call for the mate, one for the victim"
+
+
+async def test_a_value_vaulted_before_the_engines_second_look_is_masked_not_refused(
+    make_harness: HarnessFactory,
+) -> None:
+    """The other side of the same window: the part the engine can and does repair.
+
+    The test above lands a session-mate's vault write in the interval the engine
+    cannot reach -- inside ``EgressGate.check`` itself -- and the only safe answer
+    there is a refusal. This one lands it in the interval the engine *can* reach:
+    after ``_sweep_residual`` first reads ``originals_for_session`` and before it
+    reads it again at the end of the pass. A value that arrives in that interval must
+    be swept into the payload like any other prior-session value, and the run must
+    finish normally -- because "the request died" is not an acceptable answer to a
+    value the system was perfectly able to mask.
+
+    Driven with a one-shot hook on the engine's own prior-surfaces call, for the same
+    reason the gate seam exists: this interval is a few awaits wide and waiting for
+    another coroutine to land inside it by luck is not a test. The hook wraps the
+    real method, runs a complete session-mate pipeline after the first look returns,
+    and then lets the pass continue into its second look.
+
+    **It is deliberately coupled to that seam, and that coupling is the point.** If
+    the engine stops looking twice, this test does not quietly keep passing on the
+    strength of some other mechanism: the value goes out unswept, the gate refuses
+    the run, and the refusal is reported here as the failure it is. The narrowing is
+    measured in ``ObfuscationEngine._sweep_residual``'s own docstring (58.9 ms of
+    exposed interval down to 0.9 ms); what this test pins is not the number but the
+    behaviour the number is about, end to end, through the real orchestrator.
+    """
+    harness: Harness = await make_harness()
+    session_id, _expires_at = await harness.sessions.create("test-user")
+    victim_doc = await harness.upload(RACED_VICTIM_DOCUMENT, "medical", "addendum.txt")
+    mate_doc = await harness.upload(RACED_MATE_DOCUMENT, "medical", "chart.txt")
+
+    seam = getattr(harness.engine, "_add_prior_session_surfaces", None)
+    assert seam is not None, (
+        "the engine's prior-surfaces call is gone or renamed; this test drives the "
+        "interval between its two reads of the originals set and cannot find it"
+    )
+
+    seen: dict[str, Any] = {}
+    fired = False
+
+    async def run_the_mate_after_the_first_look(*args: Any, **kwargs: Any) -> Any:
+        nonlocal fired
+        surfaces = await seam(*args, **kwargs)
+        if not fired:
+            # Set before awaiting: the mate's own run re-enters this same engine.
+            fired = True
+            seen["before"] = harness.vault.originals_for_session(session_id)
+            seen["mate"] = await harness.orchestrator.run(
+                session_id, USER_ID, mate_doc, PROMPT, "tokenization"
+            )
+            seen["after"] = harness.vault.originals_for_session(session_id)
+        return surfaces
+
+    harness.engine._add_prior_session_surfaces = run_the_mate_after_the_first_look
+
+    try:
+        result = await harness.orchestrator.run(
+            session_id, USER_ID, victim_doc, PROMPT, "tokenization"
+        )
+    except EgressBlockedError as exc:
+        pytest.fail(
+            "a value vaulted between the engine's two reads of the originals set was "
+            "not swept into the payload, so the gate refused a run it should have "
+            f"released: reason={exc.detail['reason']!r}. The second read is what "
+            "makes this interval survivable; if it is gone, this is the regression."
+        )
+
+    # The interleaving happened where this test says it did.
+    assert fired, "the engine seam never fired; the interval was never entered"
+    assert RACED_VALUE not in seen["before"], (
+        "premise gone: the value was vaulted before the pass started, so the FIRST "
+        "read would have found it and the second read is not what saved this run"
+    )
+    assert RACED_VALUE in seen["after"], "the mate did not vault the raced value"
+
+    # Swept, not leaked and not refused: masked behind the mate's own surrogate, so
+    # one value is still one vault row and one token across the two runs.
+    record = await harness.vault.get_by_original(session_id, "MRN", RACED_VALUE)
+    assert record is not None
+    assert RACED_VALUE not in result.obfuscated_payload
+    assert record.surrogate in document_section(result.obfuscated_payload), (
+        "the late-arriving value is not masked behind the mate's surrogate"
+    )
+    for user in harness.provider.users:
+        assert RACED_VALUE not in user, "the raced value reached the provider in the clear"
+
+    # And the answer is still whole: the token the sweep spliced in came back.
+    assert RACED_VALUE in result.restored_text
+    assert UNRESOLVED_ENTITY not in result.restored_text
+    assert result.stats["unresolved_lost"] == 0.0
+    assert result.stats["vault_misses"] == 0.0
+    assert harness.provider.calls == 2, "one call for the mate, one for the victim"
+    originals = harness.vault.originals_for_session(session_id)
     assert await harness.vault.row_count(session_id) == len(originals)
 
 

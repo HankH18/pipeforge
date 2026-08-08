@@ -362,8 +362,23 @@ def test_non_restorable_types_are_exactly_the_types_the_registry_removes(
         for entity_type in generator.expected_entities(seed, kind)
     }
     removed = {t for t in planted_types if registry.action_of(t) is not None}
+    # The subset assertion that used to sit below this line could not fail on its own:
+    # `removed` is a comprehension *over* `planted_types`, so `removed <= planted_types`
+    # holds by construction, and once the equality above passes the subset claim follows
+    # necessarily. It is replaced rather than deleted because what it was reaching for --
+    # non-vacuity -- is a real hole, and it was not closing it. Emptying the frozenset
+    # alone makes the equality red, but emptying it *together with* the registry actions
+    # in entities.yaml leaves this test green and the sibling
+    # test_non_restorable_types_are_really_planted_in_the_legal_documents green too: that
+    # one's whole body is a `for entity_type in NON_RESTORABLE_ENTITY_TYPES` loop, which
+    # asserts nothing over an empty set. Both would then be passing while "these types
+    # are never on the wire" covered no types at all.
     assert set(generator.NON_RESTORABLE_ENTITY_TYPES) == removed
-    assert generator.NON_RESTORABLE_ENTITY_TYPES <= planted_types
+    assert generator.NON_RESTORABLE_ENTITY_TYPES, (
+        "NON_RESTORABLE_ENTITY_TYPES is empty, so every assertion phrased over it -- "
+        "here and in test_non_restorable_types_are_really_planted_in_the_legal_documents "
+        "-- is vacuously true and the round-trip exclusion covers nothing"
+    )
 
 
 @pytest.mark.parametrize("kind", ["legal", "legal_brief_large"])

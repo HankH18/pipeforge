@@ -210,7 +210,8 @@ def load_registry(path: str | Path | None = None) -> EntityRegistry:
 
     Raises :class:`ConfigError` on a missing file, malformed YAML, a duplicate
     entity name, an entity name the surrogate grammar cannot express, an unknown
-    category, a reference to a missing gazetteer, or an uncompilable pattern.
+    category, an unknown document category, a reference to a missing gazetteer, an
+    unknown per-entity ``strategy:``, or an uncompilable pattern.
     """
     registry_path = Path(path) if path is not None else Path("entities.yaml")
     if not registry_path.is_file():
@@ -290,6 +291,26 @@ def load_registry(path: str | Path | None = None) -> EntityRegistry:
             raise ConfigError(reason="registry_unknown_doc_category", entity_type=spec.name[:64])
         if spec.gazetteer and not (GAZETTEER_DIR / spec.gazetteer).is_file():
             raise ConfigError(reason="registry_gazetteer_missing", entity_type=spec.name[:64])
+        # A per-entity `strategy:` typo used to load clean and then raise inside the
+        # request that first touched the entity. `build_strategy` refuses an unknown
+        # name -- correctly, "never silently fall back to a weaker mode" -- but it
+        # only runs once a document containing that entity is obfuscated, and
+        # `ConfigError` subclasses `PipelineError`, so the symptom is an HTTP 500 on
+        # every such run rather than a startup failure. `SCP_STRATEGY`, the global
+        # spelling of the same setting, has always been validated by `Settings`; the
+        # per-entity override was the one spelling nothing checked.
+        #
+        # The check reads `available_strategies()` rather than a list of names
+        # written out here, for the reason `_compilable` gives above: a checker that
+        # does not share the semantics of the thing it checks is the mistake this
+        # codebase keeps finding. Imported inside the function because
+        # `obfuscation.strategies.base` imports this module for `EntityRegistry`, so
+        # a module-level import is a cycle.
+        if spec.strategy is not None:
+            from secure_context_pipeline.obfuscation.strategies.base import available_strategies
+
+            if spec.strategy not in available_strategies():
+                raise ConfigError(reason="registry_unknown_strategy", entity_type=spec.name[:64])
         if not spec.is_recognizer_backed:
             raise ConfigError(
                 reason="registry_entity_has_no_recognizer", entity_type=spec.name[:64]

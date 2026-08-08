@@ -94,10 +94,34 @@ CONTENT_SECURITY_POLICY = (
 #: JSON; ``no-referrer`` keeps a ``doc_id`` or ``run_id`` in a URL out of an
 #: outbound ``Referer``, which on a page whose premise is "nothing reaches a
 #: third party" would be the one header that did.
+#:
+#: ``no-store`` is the third, and it was the one this set forgot on the one route
+#: that needed it most. ``GET /documents/{doc_id}/text`` returns **decrypted
+#: original plaintext** -- ``routes/documents.py`` calls it one of exactly two
+#: endpoints allowed to -- and it shipped with no ``Cache-Control`` at all
+#: (measured: a 200 carrying PHI came back with ``content-security-policy``,
+#: ``x-content-type-options`` and ``referrer-policy`` and nothing else). Absent
+#: the header, that body is storable by any intermediary and by the browser's
+#: own back/forward and disk caches, so the plaintext outlives both the request
+#: and the session TTL on a machine the process does not control. The design was
+#: already reasoning about exactly this class of browser-level leakage one
+#: paragraph up, for a ``doc_id`` in a ``Referer``; the plaintext itself is the
+#: stronger case.
+#:
+#: Stamped on **every** response rather than on that one route, which is the
+#: correct blast radius here for the reason the ``METERED_METHODS`` comment gives
+#: about path allow-lists: a per-route header is a list that goes stale the moment
+#: a route is added, and this is a JSON API plus a three-file demo UI, so there is
+#: no response whose cacheability is worth more than the guarantee. ``no-store``
+#: alone, not the ``no-cache, no-store, must-revalidate, max-age=0`` cargo cult:
+#: ``no-store`` is defined to forbid *any* storage in *any* cache (RFC 9111
+#: section 5.2.2.5), and the rest are directives about revalidating a stored
+#: response, which by then cannot exist.
 SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
     ("content-security-policy", CONTENT_SECURITY_POLICY),
     ("x-content-type-options", "nosniff"),
     ("referrer-policy", "no-referrer"),
+    ("cache-control", "no-store"),
 )
 
 #: Starlette renamed ``HTTP_413_REQUEST_ENTITY_TOO_LARGE`` and
@@ -189,6 +213,57 @@ AUDIT_PROOF_REFILL_PER_SECOND = 0.5
 #: this process cannot impose on itself.
 WRITE_BURST = 256
 WRITE_REFILL_PER_SECOND = 8.0
+
+#: Expired sessions one request may be charged with finishing off. Belongs to
+#: :func:`~secure_context_pipeline.api.deps.reap_expired_sessions`.
+#:
+#: The TTL reaper runs on the request path -- expiry is *discovered* on access,
+#: so the moment a request sweeps the registry is the moment there is something
+#: to reap, and that is still the right place for it. What was missing is a
+#: bound. ``SessionRegistry.sweep()`` returns **every** ID awaiting destruction,
+#: not the ones this caller caused, and each one costs a ``vault.destroy`` (a
+#: SQLite DELETE) plus two hash-chained audit rows. So the request that happened
+#: to arrive next paid for every other caller's expiries: measured on this build,
+#: 258 anonymous sessions created at ``session_ttl_seconds=1`` and then reaped in
+#: a single call took **311 ms**, all of it inside one request. ``POST /sessions``
+#: needs no session and no credential, so filling ``SessionRegistry._unreaped`` is
+#: free at :data:`WRITE_REFILL_PER_SECOND` per caller with no cap on callers.
+#:
+#: 16 is one to two of these per millisecond of added latency (~1.2 ms each,
+#: measured), which is small next to the ~200 ms a warm ``POST /pipeline/run``
+#: already costs, and it is a *constant* rather than a function of how many
+#: sessions somebody else let expire. The residual is not dropped: it stays in
+#: :attr:`Services.reap_backlog` and the next request takes the next slice, so
+#: throughput under steady load is 16 x the request rate, which exceeds the
+#: expiry rate whenever sessions are being created by requests at all.
+#:
+#: **There is deliberately no companion ceiling on the queue**, and that is worth
+#: stating because there was one -- 4 096 IDs, evicted oldest-first -- and it was a
+#: leak, not a bound. The argument for it was that dropping is safe because
+#: ``_sweep_locked`` pops the key before an ID can reach the queue, so the rows a
+#: dropped ID leaves behind are undecryptable garbage. True of the SQLite rows and
+#: **false of the process**: ``SessionVault.destroy`` is the only thing that pops
+#: ``SessionVault._caches[session_id]``, and that dict holds originals *already
+#: decrypted*, which need no key. An evicted ID is never offered again -- the
+#: registry drains its unreaped set once -- so its plaintext stayed resident for
+#: the life of the process, its rows stayed on disk unreclaimable, it was never
+#: tombstoned, and neither ``SESSION_EXPIRE`` nor ``VAULT_DESTROY`` was ever
+#: written for it. Measured: flood 4 096 IDs behind one real expired session and
+#: the victim's ``['943-41-9520']`` is still in ``_caches`` after the whole backlog
+#: drains. The ceiling did not bound memory; it capped the cheap half (a 32-char
+#: ID) by abandoning the expensive half forever.
+#:
+#: What bounds the queue instead is the drain, because the queue is fed *by
+#: requests and drained by the same requests*. An ID enters only when a session
+#: expires, a session exists only because some request minted it, and every
+#: request -- ``POST /sessions`` included -- reaps up to 16. Fill is at most one
+#: per request; drain is 16 per request. A backlog can only be a burst of expiries
+#: followed by silence, and it is then bounded by the sessions that burst created,
+#: each entry being strictly smaller than the registry entry it replaced (an ID,
+#: against an ID plus a 32-byte key plus an expiry plus a ``user_id``) and strictly
+#: smaller than the vault state it is the handle for. Dropping the handle is what
+#: makes the memory unbounded; keeping it is what lets it be freed.
+MAX_REAP_PER_REQUEST = 16
 
 #: Distinct callers a :class:`_RateLimiter` will track. The limiter must not
 #: become the exhaustion primitive it exists to remove, so the map is bounded and

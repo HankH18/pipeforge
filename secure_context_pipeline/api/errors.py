@@ -10,7 +10,7 @@ below and in :mod:`secure_context_pipeline.api.app`'s module docstring.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from fastapi import FastAPI, Request, Response
 from fastapi import status as http_status
@@ -82,17 +82,57 @@ async def _api_error_handler(request: Request, exc: Exception) -> Response:
     return _json(exc.status_code, exc.code, dict(exc.detail))
 
 
+#: Stand-in for the caller's own key in an ``extra="forbid"`` rejection. See
+#: :func:`_field_name`.
+EXTRA_FIELD_MARKER = "<extra>"
+
+
+def _field_name(err: Mapping[str, object]) -> str:
+    """The dotted location of one validation failure, with no caller bytes in it.
+
+    Every part of a pydantic ``loc`` is a name from the *schema* -- except for an
+    ``extra_forbidden`` error, where the last part is the key the **caller**
+    invented. ``SessionCreateRequest`` and ``PipelineRunRequest`` both declare
+    ``extra="forbid"``, so joining ``loc`` verbatim reflected up to
+    :data:`MAX_DETAIL_VALUE_LEN` characters of attacker-chosen text straight back
+    out of the 422 body: measured on this build, a body carrying
+    ``{"evil_field_<script>": 1}`` answered
+    ``{"code":"VALIDATION_ERROR","detail":{"errors":1,"fields":"body.evil_field_<script>"}}``.
+
+    That is small -- 64 characters, JSON-escaped, on a response with
+    ``content-type: application/json``, ``nosniff`` and a ``default-src 'none'``
+    CSP, so it is not a live XSS -- but this module's own docstring promises "no
+    error path can echo a caller's input back", and ``app.py`` repeats it. A
+    guarantee with one unstated exception is the shape this project keeps finding
+    and fixing, so the exception is removed rather than documented.
+
+    ``body.<extra>`` keeps the part a client can act on (an unexpected key, and
+    where) and drops the part only the caller already knows. The ``errors`` count
+    beside it still reports how many there were; the *names* dedupe to one entry.
+    """
+    raw = err.get("loc")
+    # `errors()` is `list[Any]` to mypy, so the shape is checked rather than trusted;
+    # an entry that is not a sequence of parts contributes nothing to the name and
+    # certainly must not be `str()`-ed wholesale into the body.
+    loc: tuple[object, ...] = tuple(raw) if isinstance(raw, tuple | list) else ()
+    if err.get("type") == "extra_forbidden" and loc:
+        loc = (*loc[:-1], EXTRA_FIELD_MARKER)
+    return ".".join(str(part) for part in loc)
+
+
 async def _validation_handler(request: Request, exc: Exception) -> Response:
     """Rewrite FastAPI's validation body to field names and counts.
 
     The default body embeds the offending ``input``. A malformed
     ``/pipeline/run`` body would therefore echo the user's prompt back inside an
     error response, and a future endpoint that accepted document text would echo
-    that. Reporting *which fields* failed is all a client needs.
+    that. Reporting *which fields* failed is all a client needs -- and the field
+    name itself is laundered through :func:`_field_name`, because under
+    ``extra="forbid"`` the name is the caller's too.
     """
     if not isinstance(exc, RequestValidationError):  # pragma: no cover
         raise exc
-    fields = sorted({".".join(str(part) for part in err.get("loc", ())) for err in exc.errors()})
+    fields = sorted({_field_name(err) for err in exc.errors()})
     logger.info(
         "request rejected",
         extra={

@@ -141,6 +141,30 @@
 
 <section class="stats" id="stats" role="status" aria-live="polite" aria-label="run stats"></section>
 
+<!-- The key to the strip above. It printed 22 raw counter names -- `egress_rescan_warnings
+     3` in the same grey chip as `detect_ms 412.6 ms` -- so nothing said which numbers are
+     the security claim and which are stopwatch readings, and nothing said whether 3
+     warnings beside a green RUN_OK is fine. (It is: a high-severity re-hit blocks the run
+     outright, so a warning is by construction something the gate decided not to deny.)
+     app.js now styles the strip in three states and gives every counter it knows a
+     plain-English meaning as a tooltip; this row is what tells a reviewer the styling
+     means anything at all.
+
+     It lives OUTSIDE #stats on purpose: app.js owns that element's innerHTML and
+     `resetRun` empties it on every run, so a key placed inside would vanish at the first
+     click of Run. The three swatches reuse .badge rules style.css already ships -- the
+     page's CSP is `style-src 'self'`, so no new rule can be declared from here, and the
+     stylesheet is not this change's to edit. -->
+<section class="legend" aria-label="stats strip key">
+  <span class="key"><i class="badge ok"></i>green &mdash; a safety counter reading its clean
+    value of 0</span>
+  <span class="key"><i class="badge err"></i>red &mdash; the same counter, non-zero: the
+    audit tail below says which token</span>
+  <span class="key">plain &mdash; a count of what the run did to your data</span>
+  <span class="key muted">dim &mdash; a stage timing, not a safety signal</span>
+  <span class="key muted">hover any counter for what it actually counts</span>
+</section>
+
 <section class="legend" aria-label="highlight legend">
   <span class="key"><i class="c-PII"></i>PII</span>
   <span class="key"><i class="c-PHI"></i>PHI</span>

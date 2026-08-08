@@ -318,6 +318,26 @@ class PipelineOrchestrator:
                     "output_tokens": llm.output_tokens,
                     "elapsed_ms": round(stats["llm_ms"], 3),
                     "payload_sha256": report.payload_sha256,
+                    # Steps 4 and 5 ride here for the same reason ``fetch_ms`` rides
+                    # on DETECT: build doc section 7 fixes the event-type vocabulary
+                    # and neither step has a member of it, while section 9.5.1
+                    # requires every stage's timing to land in ``PipelineResult
+                    # .stats`` *and* audit ``detail``. Only the first half was true
+                    # -- the OBFUSCATE events the engine emits carry occurrences,
+                    # strategy and tier but no timing -- so a compliance query over
+                    # audit.db alone could reconstruct detect and LLM latency and
+                    # nothing in between, which is where the bulk of a run's own
+                    # work happens. Counts and milliseconds only; no content.
+                    #
+                    # LLM_CALL is the first orchestrator-emitted event after both
+                    # steps, which means a run the gate blocks carries neither
+                    # number. That is the correct trade rather than an oversight:
+                    # the alternative is widening the gate's fixed EGRESS_BLOCK
+                    # detail shape, and a blocked run's latency budget is not the
+                    # question anyone asks of a block.
+                    "obfuscate_ms": round(stats["obfuscate_ms"], 3),
+                    "prompt_obfuscate_ms": round(stats["prompt_obfuscate_ms"], 3),
+                    "inject_ms": round(stats["inject_ms"], 3),
                 },
             )
         )

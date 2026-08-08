@@ -48,7 +48,6 @@ import base64
 import binascii
 import functools
 from pathlib import Path
-from typing import Literal
 
 from pydantic import AliasChoices, Field, field_serializer, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -60,6 +59,39 @@ __all__ = ["DEFAULT_REGISTRY_PATH", "PACKAGE_ROOT", "Settings", "get_settings"]
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_REGISTRY_PATH = PACKAGE_ROOT.parent / "entities.yaml"
+
+
+#: Strategy names that need no registry lookup to validate. **A fast path, not a
+#: gate:** a name that is not here is looked up in the live registry rather than
+#: refused, so the closed-set behaviour this replaced does not survive in it.
+#:
+#: The lookup it skips is not cheap and it is not layered the way the rest of this
+#: module is. ``obfuscation.strategies.base`` imports ``Settings`` from here, so
+#: importing it at module scope is a cycle; and reaching it pulls in
+#: ``detection.registry`` with ``regex`` and ``yaml`` behind it -- measured at 116
+#: ms of import plus 62 ms to load the built-in strategy modules, paid by every
+#: process that so much as constructs a ``Settings``. Deferring it costs nothing on
+#: the two names the package ships and everything is still checked for the third:
+#: a plug-in name reaches :func:`_check_strategy_is_registered`, which imports the
+#: registry it was registered in -- by which point that module is loaded anyway,
+#: because registration happens on import.
+_BUILTIN_STRATEGIES: frozenset[str] = frozenset({"tokenization", "pseudonymization"})
+
+
+def _check_strategy_is_registered(name: str) -> None:
+    """Refuse a ``strategy`` no strategy registry knows, at construction time.
+
+    See the ``strategy`` field for why this check lives here rather than in
+    ``build_strategy``: that function runs per span, so leaving the check to it
+    would convert a startup refusal into a per-request 500.
+    """
+    if name in _BUILTIN_STRATEGIES:
+        return
+    from secure_context_pipeline.obfuscation.strategies.base import available_strategies
+
+    known = available_strategies()
+    if name not in known:
+        raise ConfigError(reason="unknown_strategy", strategy=name[:64], known=",".join(known))
 
 
 class Settings(BaseSettings):
@@ -103,14 +135,47 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 16000
 
     # --- obfuscation ---------------------------------------------------------
-    strategy: Literal["tokenization", "pseudonymization"] = "tokenization"
+    # `str` plus a registry check in `_check` below, not a closed Literal. Build doc
+    # section 9.3 makes a strategy "new class + registry entry", selected "by config
+    # string", and `tests/test_obfuscation.py::test_dummy_strategy_plugs_in_with_
+    # zero_engine_changes` claims "nothing else moves" -- while a Literal here meant
+    # a strategy registered through the documented `@register_strategy` seam could
+    # never be *named* by `SCP_STRATEGY`, and `build_strategy`'s
+    # `ConfigError("unknown_strategy")` branch was unreachable from a validated
+    # Settings. Measured: `Settings(strategy="redaction")` raised `literal_error`
+    # before any registry was consulted.
+    #
+    # Why the check is here rather than left to `build_strategy`, which is where the
+    # equivalent `llm_provider` check lives: `build_provider` runs once, in the
+    # lifespan. `build_strategy` runs *per span* inside the engine, so widening this
+    # field without a check would have turned an unknown `SCP_STRATEGY` from a
+    # startup refusal into an HTTP 500 on every run that touches an entity -- the
+    # same defect shape the per-entity `strategy:` override has. Fail-closed and
+    # fail-early are both preserved.
+    strategy: str = "tokenization"
     threshold_obfuscate: float = Field(default=0.5, ge=0.0, le=1.0)
     threshold_redact: float = Field(default=0.3, ge=0.0, le=1.0)
 
     # --- session / storage ---------------------------------------------------
     session_ttl_seconds: int = Field(default=3600, gt=0)
     data_dir: Path = Path("./data")
-    key_provider: Literal["env", "mock_kms"] = "env"
+    # `str`, not `Literal["env", "mock_kms"]`, for exactly the reason `llm_provider`
+    # above is a `str`. `crypto/keys.py::build_key_provider` says "Select a provider
+    # by config string. Adding a real KMS = one class + one entry", README section 3
+    # sells `KeyProvider` as "cloud-compatible by construction", and build doc
+    # section 8 makes the row config-selectable -- while a closed Literal here
+    # refused `SCP_KEY_PROVIDER=aws_kms` before `build_key_provider` was ever
+    # consulted, so the third entry was unreachable and the `unknown_key_provider`
+    # branch was dead code. Measured: `Settings(key_provider="aws_kms")` raised
+    # `literal_error` while `llm_provider="openai"` was accepted -- one seam widened,
+    # its twin not.
+    #
+    # Nothing is loosened. `build_key_provider` raises
+    # `ConfigError(reason="unknown_key_provider")` for a name it has no class for,
+    # and it runs inside `EncryptedDocumentStore.__init__`, which the lifespan
+    # builds during startup -- so an unknown name still fails closed, still before
+    # the first request, just at the layer that actually knows what is registered.
+    key_provider: str = "env"
 
     # --- detection tuning ----------------------------------------------------
     registry_path: Path = DEFAULT_REGISTRY_PATH
@@ -170,6 +235,7 @@ class Settings(BaseSettings):
             )
         if self.llm_provider == "anthropic" and not self.anthropic_api_key:
             raise ConfigError(reason="anthropic_selected_without_api_key")
+        _check_strategy_is_registered(self.strategy)
         return self
 
     def master_key_bytes(self) -> bytes:

@@ -107,7 +107,19 @@ MUTATION_CLASSES: Final[tuple[str, ...]] = (*DOC_MUTATION_CLASSES, MUTATION_VERB
 #: The one deliberate co-reference.  Build doc section 9.7 / README Q2: under
 #: tokenization the referent was never exposed, so this is left un-restored on
 #: purpose and the demo shows the honest limitation rather than hiding it.
-COREFERENCE_SENTENCE: Final = "The patient's condition remains stable."
+#:
+#: **Category-neutral wording, deliberately.**  This was "The patient's condition
+#: remains stable." -- a clinical sentence appended to *every* answer, including
+#: the ones the reviewer reads for ``fixtures/legal_memo.txt``,
+#: ``fixtures/legal_brief_large.txt`` and ``fixtures/financial_disclosure.txt``.
+#: Three of the four shipped fixtures are not medical records, so the closing line
+#: of the restored answer described a docket filing and a brokerage statement as a
+#: patient chart.  The *property* being demonstrated is what matters and it is
+#: unchanged: this is a bare definite description standing in for an entity the
+#: model was never shown, carrying no surrogate, so the restorer has nothing to
+#: resolve and leaves it alone.  "The individual named above" is that same
+#: un-restorable co-reference in prose that is true of any document category.
+COREFERENCE_SENTENCE: Final = "The individual named above remains the subject of this record."
 
 #: How many token-free input lines are quoted back verbatim.
 MAX_ECHO_LINES: Final = 6
@@ -118,16 +130,34 @@ EXCERPT_HEADER: Final = "Key excerpts from the source material:"
 
 _HEADER: Final = "Summary of the reviewed record."
 
+#: The carrier prose each echoed token is wrapped in.  **Category-neutral, and
+#: that is a correctness property of the demo rather than a style preference.**
+#: These read "The intake note lists {}.", "The assessment section retains {}."
+#: and "The discharge summary mentions {}." -- clinical sentences emitted for
+#: every document, because the provider is handed a payload and never a
+#: ``doc_category``.  Three of the four shipped fixtures are not clinical
+#: (``legal_memo.txt``, ``legal_brief_large.txt``, ``financial_disclosure.txt``),
+#: so the UI's panel 3 (raw model answer) and panel 4 (restored answer) -- the two
+#: panels a reviewer reads as the product's output -- described a docket filing as
+#: a patient chart in three runs out of four.
+#:
+#: Widening the provider interface to carry the category was the alternative and is
+#: the wrong trade: :class:`~secure_context_pipeline.llm.base.LLMProvider` is copied
+#: verbatim from build doc section 9.6 and nothing may be added to it, and a mock
+#: that branches on the document class would also stop being one fixed adversary
+#: for the restorer.  Wording that is true of a chart, a memo and a disclosure
+#: alike costs nothing and is correct for all of them.  The mutation catalogue --
+#: the thing the restorer is actually graded against -- is untouched by this.
 _SENTENCE_TEMPLATES: Final[tuple[str, ...]] = (
-    "The intake note lists {}.",
+    "The record lists {}.",
     "Correspondence in the file references {}.",
-    "The assessment section retains {}.",
-    "Billing records cite {}.",
-    "The discharge summary mentions {}.",
+    "The summary section retains {}.",
+    "Supporting documents cite {}.",
+    "The closing section mentions {}.",
 )
 
 _POSSESSIVE_TEMPLATES: Final[tuple[str, ...]] = (
-    "{} chart was reviewed during the encounter.",
+    "{} record was reviewed in preparing this summary.",
     "{} file remains open pending follow-up.",
 )
 
