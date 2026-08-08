@@ -349,7 +349,7 @@ correctness content, and it is now the *only* thing `ruff` is not gating.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py`
-and `fixtures/` — it is **98%** of **22,814** statements: **22,163** for the package plus
+and `fixtures/` — it is **98%** of **22,815** statements: **22,164** for the package plus
 `tests/` plus `fixtures/`, and `demo.py`'s **651** on top of that. It is published as its two
 addends because it is the most rot-prone number on this page — every test module added moves it,
 and it was 55 statements adrift within one commit of being written — so

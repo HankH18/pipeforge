@@ -705,7 +705,11 @@ async def test_regenerating_one_component_does_not_desync_the_others(env: Env) -
     )
     # The retry happened for the right reason, and it did not ship the real word.
     assert full.split()[0] != "John"
-    assert "Smith" not in full
+    # Word-bounded for the same reason as the sibling assertion in
+    # test_name_and_client_identity_pseudonymize_to_the_same_person: `full` is a
+    # GENERATED two-part fake, so a drawn surname of "Smithson" or "Smithers" would
+    # fail a substring check while being a perfectly correct obfuscation.
+    assert not re.search(r"\bSmith\b", full), f"the original surname survived: {full!r}"
 
 
 async def test_name_component_linking_survives_a_collision_regeneration(env: Env) -> None:
@@ -851,7 +855,23 @@ async def test_name_and_client_identity_pseudonymize_to_the_same_person(env: Env
     # answer is a real two-part fake carrying neither component of the real name.
     assert not STRICT_TOKEN_RE.fullmatch(first), "both degraded to a token"
     assert len(first.split()) == 2, first
-    assert "John" not in first and "Smith" not in first
+    # Word-bounded, not substring -- the identical defect this file already fixed once
+    # at test_name_component_linking_gives_a_consistent_fake_surname, and a sibling I
+    # failed to sweep for at the time. `assert "John" not in first` asks whether four
+    # characters occur ANYWHERE, and the pseudonym is a GENERATED name: measured at
+    # 4 failures in 300 fresh master keys (1.3%), every one on Faker drawing the
+    # surname "Johnson" -- 'Jason Johnson', 'Patrick Johnson', 'Thomas Johnson',
+    # 'Susan Johnson'. Each of those is a correct answer the test called a leak, so it
+    # failed precisely when obfuscation worked.
+    #
+    # The contract is that the ORIGINAL does not survive as a value, and a value is a
+    # word. A plain \b rather than textrules.word_bounded_pattern: borrowing the
+    # product's own boundary rule to check the product's output would make a shared
+    # bug invisible to both.
+    for original in ("John", "Smith"):
+        assert not re.search(rf"\b{re.escape(original)}\b", first), (
+            f"the original {original!r} survived as a word in the pseudonym: {first!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
