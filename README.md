@@ -251,25 +251,25 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-2203 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
+2279 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
                              #   The skip is the real-network LLM smoke test.
-                             #   Without node it is 35 skipped -- the 34 UI behaviour tests go
+                             #   Without node it is 64 skipped -- the 63 UI behaviour tests go
                              #   with it. See Path B above.
-                             #   2204 collected: 134 leakage + 5 bench + rest unit + integration
+                             #   2280 collected: 134 leakage + 5 bench + rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 98% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   4511 statements, 64 missed; 1126 branches, 55 partial (package only; see below)
+                             #   4549 statements, 64 missed; 1136 branches, 55 partial (package only; see below)
 ```
 
 **On the scope of that mypy line, because "clean" is doing less work than it looks.**
 `pyproject.toml` pins `files = ["secure_context_pipeline"]`, so `mypy --strict` type-checks the
 **package only** — 52 files. The test suite is roughly half the repository by line count and is
 **not** covered by that gate. Run against the whole tree — `mypy --strict .`, which ignores the
-`files` pin — it is **89 files and 114 remaining errors**, none of which is a latent bug: **52**
+`files` pin — it is **89 files and 121 remaining errors**, none of which is a latent bug: **52**
 are `attr-defined` from monkeypatching module-level re-exports (a legitimate test idiom that
 `--strict` dislikes), **32** are `arg-type` where tests construct `Detection(category="PII")`
-with a bare `str` instead of the `EntityCategory` enum, and the remaining 30 are assorted
+with a bare `str` instead of the `EntityCategory` enum, and the remaining 37 are assorted
 narrowing complaints. Re-derive rather than trust: `mypy --strict . 2>&1 | tail -1` for the
 totals and `| grep -oE '\[[a-z-]+\]$' | sort | uniq -c | sort -rn` for the split. Those two
 absolute counts are the most rot-prone numbers on this page — they move every time a test file
@@ -288,7 +288,7 @@ one-line config change.
 
 **And the same question about the `ruff` line, which had a real hole in it until recently.**
 `ruff check .` is the *linter*. `ruff format` is the *formatter*, it is **not** in the gate, and
-`ruff format --check .` reports **26 files** that would be reformatted. That was cosmetic on its
+`ruff format --check .` reports **27 files** that would be reformatted. That was cosmetic on its
 own; what made it a defect is that `pyproject.toml` disabled `E501` with the comment "line length
 handled by formatter" — so line length was enforced by the formatter, the formatter never ran,
 and the stated 100-column limit was enforced by nothing. There were **145** violations, four of
@@ -309,13 +309,13 @@ clinical notes, privileged memoranda. The detector is fed those strings verbatim
 moves a span offset and changes what the recall table measures; they are also inside
 triple-quoted blocks, where `# noqa` cannot reach. Every other long line was fixed rather than
 exempted, and a planted 110-column line in `config.py` was confirmed to fail the gate, so the
-rule is enforced rather than merely configured. The remaining 26-file formatter divergence is
+rule is enforced rather than merely configured. The remaining 27-file formatter divergence is
 left as a known, stated gap: reformatting the tree wholesale is a large cosmetic diff with no
 correctness content, and it is now the *only* thing `ruff` is not gating.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py`
-and `fixtures/` — it is **98%** of **20,145** statements: **19,513** for the package plus
+and `fixtures/` — it is **98%** of **20,672** statements: **20,040** for the package plus
 `tests/` plus `fixtures/`, and `demo.py`'s **632** on top of that. It is published as its two
 addends because it is the most rot-prone number on this page — every test module added moves it,
 and it was 55 statements adrift within one commit of being written — so
@@ -351,7 +351,7 @@ demo is the first artefact a reviewer runs, and until this pass its `--dump-wire
 fail-closed demonstration, its destruction demonstration and its entire argument surface had no
 test. `ui/app.js` had no *execution* tests either — only checks that read it as text — and now
 has behavioural ones driven through `node`, **which is why node is a prerequisite for that
-claim and for nothing else**: on a host without it, those 34 tests skip and this sentence is a
+claim and for nothing else**: on a host without it, those 63 tests skip and this sentence is a
 statement about a run that did not happen. Path B says how to check.
 
 **Every number in this section was stale until an adversarial review pass re-measured them**, and
@@ -615,6 +615,36 @@ closing one later is a red rather than a silent widening of the claim:
   outage: at a floor of 5, `of the` becomes a needle that matches the shipped fixtures 67 times.
   Pinned by
   `test_egress_gate.py::test_the_floor_s_corpus_measurement_is_the_one_the_docstring_quotes`.
+
+**A fifth limit, and it is a different kind: organisation names are not an entity type at all.**
+The four above are *scan* limitations — a value the vault holds that the payload can still carry
+out. This one sits earlier: the build doc's section 6.2 registry defines the entity set and has
+no `ORG`, `EMPLOYER` or `PAYER` type, so an organisation name is never detected, never vaulted,
+and therefore never something the gate could look for. It reaches the provider by design.
+
+It is called out here because the demo makes it look like an inconsistency rather than a
+decision, and a reviewer will see that before reading any of this. In `medical_note.txt` the
+hospital **is** obfuscated and the insurance carrier three lines away is not:
+
+```
+...filed with Pinnacle Grove Benefit Trust under member ID [PHI_INSURANCE_ID_7ad98951].
+...the primary care panel at [PII_ADDRESS_cd988587], and the insurance authorisation...
+```
+
+The asymmetry is an artifact of NER labelling, not policy: `ADDRESS` is backed by Presidio's
+`LOCATION`, and spaCy tags "Larkspur Valley **Hospital**" as a LOCATION while "Pinnacle Grove
+Benefit **Trust**" is an ORG, which nothing maps. So one org is protected by accident and its
+neighbour is not.
+
+Adding an `ORG` type would close it in about four lines of `entities.yaml` and is deliberately
+not done: the registry is the specified entity set, inventing a requirement is not the same as
+meeting one, and a new type changes detection across every fixture and every recall number on
+this page. What *is* done is making the gap measurable — `fixtures/generator.py` now plants the
+organisation names it writes, so they are counted ground truth rather than invisible: 72 distinct
+values across 26 seeds x four kinds, appearing 163 times in the four committed fixture files. Planting them does not close the gap and is not claimed to: nothing
+detects them, they never round-trip, and `expected_entities` documents `ORG` as the one planted
+class no registry entity claims. Whether organisation names belong in scope is a product
+decision, and it is one this submission records rather than makes.
 
 **Two of those four — partial disclosure and the glued-into-a-longer-word shape — are blind spots
 the harness and the gate mostly share**, because both resolve to the same occurrence rule — so
@@ -2521,10 +2551,10 @@ reviewer can regenerate and diff:
 
 | Fixture | Words | Distinct planted values | Entity types |
 |---|---|---|---|
-| `medical_note.txt` | 393 | 28 | 10 |
-| `legal_memo.txt` | 475 | 29 | 8 |
-| `financial_disclosure.txt` | 306 | 32 | 8 |
-| `legal_brief_large.txt` | **12,062** | **272** | 8 |
+| `medical_note.txt` | 393 | 30 | 11 |
+| `legal_memo.txt` | 475 | 32 | 9 |
+| `financial_disclosure.txt` | 306 | 36 | 9 |
+| `legal_brief_large.txt` | **12,062** | **298** | 9 |
 
 The large brief is the specification's "~12,000 words, 200+ distinct entities" artifact — it is
 the Q1 discussion document, the input to the full-pipeline benchmark, and the reason the
@@ -2663,7 +2693,7 @@ docker history --no-trunc secure-context-pipeline:1.0.0 \
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python -m spacy download en_core_web_lg
-node --version         # optional -- without it the 34 UI behaviour tests skip, silently
+node --version         # optional -- without it the 63 UI behaviour tests skip, silently
 python demo.py && echo "demo exit 0"
 ```
 
@@ -2677,7 +2707,7 @@ ledger too.
 pytest -q            # expect WITH node: the pass count §1 pastes, 1 skipped (the real-network
                      #   LLM smoke test), and no failures. That pass count is written down in
                      #   exactly one place -- §1 -- so this step cannot drift out of agreement
-                     #   with it, which is what it did. Without node: 35 skipped --
+                     #   with it, which is what it did. Without node: 64 skipped --
                      #   tests/test_ui_behaviour.py goes with it, and §1's app.js
                      #   execution-test claim is uncovered on your run.
 pytest -m leakage -q # expect: 100/100 runs clean, 0 leaks

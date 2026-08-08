@@ -32,6 +32,8 @@ from secure_context_pipeline.detection.detector import (
     PRESIDIO_LOGGER_NAME,
     DetectionInvariantError,
     Detector,
+    _collapse_degenerate_runs,
+    _restore_offset,
     _verify_offsets,
     chunk_text,
     get_analyzer,
@@ -53,7 +55,7 @@ from secure_context_pipeline.detection.registry import (
     EntitySpec,
     load_registry,
 )
-from secure_context_pipeline.errors import ConfigError
+from secure_context_pipeline.errors import ConfigError, DetectionError
 from secure_context_pipeline.models import Detection
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.vault.session_registry import SessionRegistry
@@ -3743,6 +3745,143 @@ async def test_the_analysis_window_never_scans_the_document_more_than_twice_over
     )
 
 
+# --- degenerate-run normalisation -----------------------------------------------
+# spaCy's tokenizer is quadratic in the length of one unbroken run of a character it
+# splits per-character: 90 ms for 1,000 underscores, 357 ms for 2,000, 1,432 ms for
+# 4,000, 5,668 ms for 8,000, 22,938 ms for 16,000. So the *longest letterless run
+# handed to the analyzer* is the quantity the cost lives in, and it is what these
+# tests assert on -- a wall-clock assertion would measure how busy the machine is
+# instead. End to end the difference is 7,070 ms -> 17 ms on an 8 KB document of
+# underscores, with the same detections either side.
+_LETTERLESS_RUN_RE = re.compile(r"[\W_]+")
+
+# The head and tail the collapse keeps. Read off the module rather than restated, so
+# retuning either constant retunes the bound instead of reddening the test.
+_LONGEST_KEPT_RUN = detector_module._DEGENERATE_HEAD + detector_module._DEGENERATE_TAIL
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "No degenerate run here at all: MRN 4471902, DOB 1985-03-12.",
+        "-" * _LONGEST_KEPT_RUN,  # exactly at the bound, must be left alone
+        "-" * (_LONGEST_KEPT_RUN + 1),  # one past it, must collapse
+        "_" * 400,
+        "_" * 400 + "trailing",
+        "leading" + "*" * 400,
+        "before" + "=" * 200 + "middle" + "\n \n" * 90 + "after",
+        "Signature: " + "_" * 300 + "\n\nPhysician: David Ochoa\n",
+    ],
+)
+def test_collapsing_a_degenerate_run_is_exactly_invertible(text: str) -> None:
+    """Every character that survives the collapse maps back onto itself.
+
+    ``_analyze_sync`` hands the collapsed text to Presidio and then translates the
+    result offsets back with ``_restore_offset``. If that translation is off by even
+    one character the detector vaults one string and splices another -- the failure
+    ``DetectionInvariantError`` exists to catch, except that here it *cannot* catch
+    it: ``_to_detection`` re-slices ``detection.text`` out of the original document,
+    so a mis-translated span is self-consistent and simply masks the wrong text.
+    The inverse property has to be asserted directly, and it is asserted per
+    character rather than per fixture span so an off-by-one anywhere shows up.
+    """
+    collapsed, breaks = _collapse_degenerate_runs(text)
+    for index, char in enumerate(collapsed):
+        assert text[_restore_offset(breaks, index)] == char, f"offset {index} of {len(collapsed)}"
+    # The end offset is one past the last character and is what a span's ``end``
+    # carries, so it needs its own case: nothing iterates over it above.
+    assert _restore_offset(breaks, len(collapsed)) == len(text)
+    # Only letterless characters may go. Anything else is a value being dropped
+    # before the analyzer ever sees it, which is a leak rather than a slow request.
+    assert re.sub(r"[\W_]", "", collapsed) == re.sub(r"[\W_]", "", text)
+    assert len(collapsed) <= len(text)
+
+
+def test_the_collapse_bound_is_where_it_says_it_is() -> None:
+    """Nothing is rewritten up to the bound; one character past it, one goes.
+
+    Two directions, both worth pinning. A threshold that drifted *down* would rewrite
+    ordinary separators across the whole corpus for no gain -- 40 dashes on their own
+    line is a 42-character letterless stretch once the newlines either side are
+    counted, and it costs nothing to tokenize. A threshold that drifted *up* would
+    let the quadratic back in. The exact-bound case is the one an off-by-one in the
+    regex quantifier moves.
+    """
+    at_bound = "Signed" + "_" * _LONGEST_KEPT_RUN + "here"
+    assert _collapse_degenerate_runs(at_bound) == (at_bound, [])
+
+    past_bound = "Signed" + "_" * (_LONGEST_KEPT_RUN + 1) + "here"
+    collapsed, breaks = _collapse_degenerate_runs(past_bound)
+    assert collapsed == at_bound, "one character past the bound drops exactly one character"
+    assert breaks == [(len("Signed") + detector_module._DEGENERATE_HEAD, 1)]
+
+    ordinary = "Section break\n" + "-" * 40 + "\nSigned: " + "_" * 40 + "\nend"
+    assert _collapse_degenerate_runs(ordinary) == (ordinary, [])
+
+
+async def test_a_long_letterless_run_never_reaches_the_tokenizer(
+    detector: Detector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The text handed to spaCy carries no letterless run past the collapse bound.
+
+    This is the assertion that binds the fix to the call path. ``EgressGate`` pass 2
+    re-runs this same detector over the outbound payload, so the cost was paid twice
+    per request; both go through ``_analyze_sync``, which is where the collapse
+    lives, so spying on the engine covers both.
+    """
+    text = (
+        "Patient name: Margaret Whitfield\nDOB: 1985-03-12\n"
+        "Signature: " + "_" * 4000 + "\n"
+        "Attending physician: David Ochoa\nMRN: 4471902\n"
+    )
+    # ``monkeypatch`` rather than a hand-rolled restore: the engine is the
+    # process-wide singleton every other test in this file shares, so leaving a spy
+    # on it would poison the rest of the session.
+    engine = detector.analyzer
+    unpatched = engine.analyze
+    analysed: list[str] = []
+
+    def spy(**kwargs: Any) -> list[Any]:
+        analysed.append(str(kwargs["text"]))
+        return list(unpatched(**kwargs))
+
+    monkeypatch.setattr(engine, "analyze", spy)
+    hits = await detector.detect(text, "medical")
+
+    assert analysed, "the spy must have seen the analyzer being called"
+    longest = max(
+        (len(run.group(0)) for body in analysed for run in _LETTERLESS_RUN_RE.finditer(body)),
+        default=0,
+    )
+    assert longest <= _LONGEST_KEPT_RUN, (
+        f"the analyzer was handed a {longest}-character letterless run; the tokenizer "
+        f"is quadratic in that length"
+    )
+    assert "MRN" in types_of(hits), "the fixture must still detect through the run"
+
+
+async def test_offsets_survive_a_collapsed_run(detector: Detector) -> None:
+    """Entities after a collapsed run keep their absolute offsets in the original.
+
+    Separate from the invertibility property above because that one never runs
+    Presidio: this is the end-to-end claim that a document with a signature rule in
+    the middle still masks the right characters on the far side of it.
+    """
+    text = (
+        "Patient name: Margaret Whitfield\nDOB: 1985-03-12\n"
+        "Signature: " + "_" * 4000 + "\n"
+        "Attending physician: David Ochoa\nMRN: 4471902\n"
+    )
+    hits = await detector.detect(text, "medical")
+
+    assert spans_of(hits, "MRN") == [(text.index("4471902"), text.index("4471902") + 7)]
+    names = [d for d in hits if d.entity_type in {"NAME", "CLIENT_IDENTITY"}]
+    assert any(d.text == "David Ochoa" for d in names), [d.text for d in names]
+    for detection in hits:
+        assert text[detection.start : detection.end] == detection.text
+
+
 async def test_entity_past_a_paragraph_boundary_keeps_absolute_offsets(
     detector: Detector, settings: Settings
 ) -> None:
@@ -5338,3 +5477,73 @@ async def test_an_all_caps_field_label_is_still_trimmed(
     text = "Patient name: David Ochoa\n    DOB: 1974-03-02\n"
     names = [d.text for d in await detector.detect(text, "medical") if d.entity_type == "NAME"]
     assert names == ["David Ochoa"], names
+
+
+@pytest.mark.parametrize(
+    "timeout_s,expect_deadline", [(0.05, True), (30.0, False)]
+)
+async def test_no_chunk_starts_after_the_detect_deadline(
+    registry: EntityRegistry,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_s: float,
+    expect_deadline: bool,
+) -> None:
+    """The deadline bounds work STARTED, and that is the only bound available here.
+
+    Stage-3 detection had no wall-clock bound at all, while the egress gate wrapped its
+    own work in ``asyncio.timeout(DEFAULT_TIMEOUT_S)`` -- and pass 2 of that gate *is* a
+    detector run, so the same operation was bounded on one side and unbounded on the
+    other.
+
+    The obvious fix is an ``asyncio.timeout`` around the ``gather``, and it is wrong.
+    Chunks run in ``asyncio.to_thread`` and Python threads cannot be cancelled: the
+    timeout would free the caller while the worker threads kept burning CPU and holding
+    pool slots, so later requests would queue behind work nobody was waiting for. It
+    would read as the stronger guarantee while delivering less than this one.
+
+    So the deadline is checked after the semaphore is acquired -- the last instant
+    before work begins -- and it refuses to START a chunk rather than pretending to stop
+    one. The bound that buys: ``detect_timeout_s`` plus the chunks already running, at
+    most ``detect_concurrency`` of them, each capped by ``chunk_max_chars``.
+
+    Asserted on the CALL COUNT, not just on the exception. A test that only caught
+    ``DetectionError`` would pass if every chunk ran and the last one happened to raise,
+    which is the failure this is written to exclude: the claim is that later work never
+    starts. ``detect_concurrency`` is pinned to 1 so "started" is unambiguous, and the
+    generous arm proves the document really does need all ten chunks -- otherwise the
+    tight arm could pass because there was nothing left to skip.
+    """
+    calls: list[int] = []
+    real = Detector._analyze_sync
+
+    def slow(self: Detector, body: str, entities: tuple[str, ...]) -> list[Any]:
+        calls.append(len(body))
+        time.sleep(0.02)
+        return real(self, body, entities)
+
+    monkeypatch.setattr(Detector, "_analyze_sync", slow)
+    scoped = settings.model_copy(
+        update={
+            "chunk_max_chars": 120,
+            "detect_concurrency": 1,
+            "detect_timeout_s": timeout_s,
+        }
+    )
+    # Ten paragraphs, each its own chunk: chunk_text splits on blank lines.
+    text = "\n\n".join(f"Patient Marcus Webb {i} was seen in clinic." for i in range(10))
+    chunks = chunk_text(text, scoped.chunk_max_chars)
+    assert len(chunks) >= 5, f"premise: the document must need several chunks, got {len(chunks)}"
+
+    if expect_deadline:
+        with pytest.raises(DetectionError) as caught:
+            await Detector(registry, scoped).detect(text, "medical")
+        assert caught.value.detail["reason"] == "detect_deadline"
+        assert len(calls) < len(chunks), (
+            f"every chunk ran anyway: {len(calls)} of {len(chunks)} started despite the deadline"
+        )
+    else:
+        await Detector(registry, scoped).detect(text, "medical")
+        assert len(calls) == len(chunks), (
+            f"premise: a generous deadline must run all {len(chunks)} chunks, ran {len(calls)}"
+        )

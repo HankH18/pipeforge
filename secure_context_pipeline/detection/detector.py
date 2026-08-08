@@ -24,6 +24,7 @@ import logging
 import re
 import threading
 import time
+from bisect import bisect_right
 from collections.abc import Sequence
 from typing import Any
 
@@ -327,6 +328,86 @@ def chunk_text(text: str, max_chars: int) -> list[tuple[int, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Degenerate-run normalisation
+# ---------------------------------------------------------------------------
+# spaCy's tokenizer is quadratic in the length of an unbroken run of a character it
+# splits into one token apiece, and an underscore signature rule or a ``*****``
+# markdown separator is exactly that shape. Measured on ``en_core_web_lg`` with
+# nothing else in the loop, tokenizing ``'Signature: ' + '_' * n``:
+#
+#     n =  1,000     90 ms       n =  4,000   1,432 ms      n = 16,000  22,938 ms
+#     n =  2,000    357 ms       n =  8,000   5,668 ms
+#
+# A clean 4x per doubling, against 119 ms for 4,050 characters of ordinary prose.
+# ``_`` ``*`` ``=`` ``#`` all do it (~4,000 tokens from 4,000 characters); ``.``
+# ``-`` ``/`` and whitespace do not. End to end that made an 8 KB document of
+# underscores cost 15.1 s -- as long as the shipped 83 KB ``legal_brief_large.txt``
+# -- where 8 KB of prose costs 0.8 s, and the pipeline pays it twice because
+# ``EgressGate`` pass 2 re-runs this detector over the payload. Every route is
+# anonymous, so a ~20x CPU amplification is reachable by anyone who can POST a file.
+#
+# Such a run carries no entity by construction: every registry pattern and every NER
+# span contains at least one letter or digit, so a stretch containing neither can be
+# shortened before the analyzer sees it without any value going unvaulted -- the
+# worst a boundary landing in the dropped middle can do is move a span's edge across
+# punctuation. ``[\W_]`` is that stretch: every character that is neither a Unicode
+# letter nor a Unicode digit (``\W`` alone would exempt ``_``, the reported case).
+#
+# Only the middle goes. Keeping a head and a tail leaves the sentence structure spaCy
+# reads either side of the run intact -- the blank line before it, the newline after
+# -- rather than fusing two paragraphs into one.
+#
+# The quadratic term is *per run*, so bounding every run at 64 characters makes total
+# tokenizer cost linear in document length rather than merely shifting the threshold.
+# Measured through ``Detector.detect`` on 7,950 characters of underscores: 7,070 ms
+# before, 16.7 ms after, with the same two detections either side. The shape that
+# still survives -- 64-character runs separated by single letters, which the collapse
+# leaves alone by design -- costs 1,455 ms at 8 KB against 389 ms for 8 KB of prose:
+# 3.7x rather than the 18x it was. What is left is a bound on absolute cost, which
+# this is not and is not meant to be; the detect phase still has no wall-clock ceiling
+# of the kind ``EgressGate.DEFAULT_TIMEOUT_S`` gives pass 2.
+_DEGENERATE_HEAD = 32
+_DEGENERATE_TAIL = 32
+_DEGENERATE_RUN_RE = re.compile(rf"[\W_]{{{_DEGENERATE_HEAD + _DEGENERATE_TAIL + 1},}}")
+
+
+def _collapse_degenerate_runs(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """``(text with over-long letterless runs shortened, offset breakpoints)``.
+
+    Breakpoints are ascending ``(offset in the collapsed text, characters dropped
+    before that offset)`` pairs, and are the only thing that can translate an
+    analyzer result back onto the original -- see :func:`_restore_offset`.
+    """
+    matches = list(_DEGENERATE_RUN_RE.finditer(text))
+    if not matches:
+        return text, []
+
+    pieces: list[str] = []
+    breaks: list[tuple[int, int]] = []
+    cursor = 0
+    dropped = 0
+    for match in matches:
+        start, end = match.span()
+        pieces.append(text[cursor : start + _DEGENERATE_HEAD])
+        join = start + _DEGENERATE_HEAD - dropped
+        dropped += end - start - _DEGENERATE_HEAD - _DEGENERATE_TAIL
+        breaks.append((join, dropped))
+        cursor = end - _DEGENERATE_TAIL
+    pieces.append(text[cursor:])
+    return "".join(pieces), breaks
+
+
+def _restore_offset(breaks: Sequence[tuple[int, int]], offset: int) -> int:
+    """Translate ``offset`` in collapsed text back into the text it was collapsed from.
+
+    Monotonic, and exact everywhere a character survived -- which is everywhere an
+    entity can start or end, because the dropped characters are letterless.
+    """
+    index = bisect_right(breaks, offset, key=lambda item: item[0])
+    return offset + (breaks[index - 1][1] if index else 0)
+
+
+# ---------------------------------------------------------------------------
 # Overlap resolution
 # ---------------------------------------------------------------------------
 def resolve_overlaps(
@@ -582,11 +663,34 @@ class Detector:
         # twice over, however small ``chunk_max_chars`` is configured.
         overlap = min(CHUNK_OVERLAP_CHARS, self._settings.chunk_max_chars)
 
+        # A deadline on STARTING a chunk, checked after the semaphore is acquired --
+        # which is the last instant before work would begin, and therefore the only
+        # place the check bounds anything. Checked before acquiring instead, a chunk
+        # could sit in the queue past the deadline and then start anyway.
+        #
+        # What this buys, stated exactly, because the obvious stronger claim is false:
+        # no chunk STARTS after the deadline, so the wall clock is bounded by
+        # ``detect_timeout_s`` plus the duration of the chunks already running --
+        # at most ``detect_concurrency`` of them, each capped by ``chunk_max_chars``.
+        # It is NOT "detect returns within detect_timeout_s", and it cannot be:
+        # ``asyncio.to_thread`` hands the work to a thread, and Python threads are not
+        # cancellable. An ``asyncio.timeout`` around the gather below would have read
+        # like the stronger claim while delivering less than this one -- the caller
+        # would be freed and the CPU would keep burning, with the orphaned threads
+        # holding pool slots so later requests queued behind work nobody awaited.
+        #
+        # Measured for scale: the largest shipped fixture (12,062 words) detects in
+        # 2,816 ms against a 30 s deadline, so this fires on pathological input and
+        # contention rather than in the normal case.
+        deadline = time.perf_counter() + self._settings.detect_timeout_s
+
         async def analyse(index: int, offset: int, body: str) -> list[Any]:
             # Widened past the chunk's own end so an entity straddling the boundary
             # is seen whole; offsets stay relative to ``offset`` either way.
             window = text[offset : offset + len(body) + overlap]
             async with semaphore:
+                if time.perf_counter() > deadline:
+                    raise DetectionError(chunk_index=index, reason="detect_deadline")
                 try:
                     return await asyncio.to_thread(self._analyze_sync, window, entities)
                 except Exception as exc:
@@ -626,13 +730,25 @@ class Detector:
 
     # -- internals ---------------------------------------------------------
     def _analyze_sync(self, body: str, entities: tuple[str, ...]) -> list[Any]:
-        """Runs on a worker thread -- never on the event loop (section 16)."""
+        """Runs on a worker thread -- never on the event loop (section 16).
+
+        The single choke point both callers of the detector go through: ``detect``
+        here and ``EgressGate`` pass 2, which re-enters by calling ``detect`` again.
+        Collapsing degenerate runs here therefore covers both, and covers every
+        chunk, without either of them knowing about it. Offsets returned are relative
+        to ``body``, exactly as they were before the collapse existed.
+        """
+        normalized, breaks = _collapse_degenerate_runs(body)
         results: list[Any] = self.analyzer.analyze(
-            text=body,
+            text=normalized,
             language=LANGUAGE,
             entities=list(entities),
             ad_hoc_recognizers=self._recognizers,
         )
+        if breaks:
+            for result in results:
+                result.start = _restore_offset(breaks, result.start)
+                result.end = _restore_offset(breaks, result.end)
         return results
 
     def _entities_for(self, doc_category: str | None) -> tuple[str, ...]:

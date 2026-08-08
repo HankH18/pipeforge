@@ -147,6 +147,10 @@ LINE_LIMIT = 100
 #: The package on its own gets no band at all. Over the same eleven commits it moved
 #: 0 to +18 (median 0), which is why it is pinned exactly in
 #: ``test_the_package_only_coverage_line_states_the_denominator_the_package_has``.
+#:
+#: Re-run over the last sixteen commits when this band was next breached, and 0.5% is
+#: still the cut: largest ordinary commit 0.47%, smallest suite-sized one 3.05%. The
+#: replay and the decision not to widen it are recorded at the assertion itself.
 WHOLE_REPO_DRIFT_TOLERANCE = 0.005
 
 
@@ -515,6 +519,36 @@ def test_the_whole_repository_statement_total_is_the_one_coverage_would_report()
     # BANDED -- and the correction is emitted whether or not the band is breached,
     # so drift inside it is reported rather than swallowed. Narrowing this back to
     # equality is not a strengthening: it was equality, and it went red at 0.01%.
+    #
+    # Re-examined after this assertion went RED again, at 1.70%, on a wave that added
+    # about thirty tests. The question that raised is whether banding was the wrong
+    # call -- it did not stop the red -- so the eleven-commit replay behind
+    # WHOLE_REPO_DRIFT_TOLERANCE was re-run over the last sixteen, five of which
+    # postdate it. Per-commit movement in package + tests + fixtures:
+    #
+    #     +13 +12 +5 0 +46 +14 0 +1463 -6 +35 +83 +561 +31 +1093 +9
+    #     0.08% 0.07% 0.03% 0% 0.28% 0.09% 0% 8.26% 0.03% 0.20% 0.47% 3.05% 0.17%
+    #     5.60% 0.05%
+    #
+    # The two populations are still cleanly separated and the gap is wide: the largest
+    # ordinary commit is 0.47% and the smallest suite-sized one 3.05%, so 0.5% still
+    # sits in empty space rather than on top of the data. Twelve of the fifteen are
+    # absorbed; the three caught are the three that added whole test suites.
+    #
+    # So the band is kept, because the red is not evidence against it -- it is the band
+    # working. 1.70% is a suite-sized addition, which is the population 0.5% was cut to
+    # catch, and the honest repair is the one taken here: correct the prose, not the
+    # tolerance. Widening the band to swallow 1.70% would be the loosening this comment
+    # exists to forbid, and it would also erase the distinction from the two exact
+    # assertions above and the exact package denominator below -- those are pinned
+    # because they are stable (demo.py: one file; the package: 0 to +18 a commit), not
+    # because exactness is a style.
+    #
+    # The premise the band rests on was checked rather than assumed: `pytest -q` prints
+    # the warnings summary, message and all, so an inside-band drift hands the reader
+    # the exact replacement number on the same run. If a `filterwarnings` entry ever
+    # hides UserWarning, this stops being a graded assertion and becomes a silent one,
+    # and it should go back to EXACT that day.
     correction = (
         f"package + tests + fixtures is {measured_parts} statements, not {parts}; "
         f"section 1's whole-repository total should read "

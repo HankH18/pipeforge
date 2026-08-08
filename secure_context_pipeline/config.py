@@ -116,6 +116,20 @@ class Settings(BaseSettings):
     registry_path: Path = DEFAULT_REGISTRY_PATH
     chunk_max_chars: int = Field(default=8000, gt=0)
     detect_concurrency: int = Field(default=4, gt=0)
+    #: Deadline for a whole ``Detector.detect`` call, in seconds. Matches the egress
+    #: gate's ``DEFAULT_TIMEOUT_S`` so the same operation is bounded the same way on
+    #: both sides -- pass 2 of the gate IS a detector run, and it was bounded there
+    #: while stage-3 detection was not bounded at all.
+    #:
+    #: This is a deadline on STARTING work, not a cancellation, and the difference is
+    #: the whole reason it is spelled this way. Chunks run in ``asyncio.to_thread`` and
+    #: Python threads cannot be cancelled: an ``asyncio.timeout`` around the gather
+    #: would free the caller while the worker threads kept burning CPU and holding
+    #: pool slots, so later requests would queue behind work nobody is waiting for.
+    #: See :meth:`~secure_context_pipeline.detection.detector.Detector.detect` for the
+    #: bound this actually buys, which is real but is NOT "detect finishes within
+    #: ``detect_timeout_s``".
+    detect_timeout_s: float = Field(default=30.0, gt=0)
     spacy_model: str = "en_core_web_lg"
 
     @field_validator("data_dir", "registry_path")

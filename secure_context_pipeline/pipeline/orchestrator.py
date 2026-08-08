@@ -240,6 +240,10 @@ class PipelineOrchestrator:
         tokens = _merge_tokens(obf.tokens, prompt_obf.tokens)
         stats["tokens_issued"] = float(len(tokens))
         stats["prompt_tokens_issued"] = float(len(tokens) - len(obf.tokens))
+        # 4c-bis. What the payload actually CARRIES, next to what the caller asked
+        #     for. See :func:`_pseudonyms_issued` -- this is the run reporting on its
+        #     own output shape rather than echoing ``chosen``.
+        stats["pseudonyms_issued"] = float(_pseudonyms_issued(tokens))
 
         # 4d. Distinct originals must own distinct surrogates, checked here rather
         #     than trusted. See :func:`_assert_surrogates_are_distinct`.
@@ -357,7 +361,12 @@ class PipelineOrchestrator:
             extra={
                 "run_id": run_id,
                 "session_id": session_id,
+                # The strategy ASKED for and the shape actually emitted, side by
+                # side: see :func:`_pseudonyms_issued` for why one line cannot be
+                # trusted to imply the other. Counts only -- never a surrogate.
                 "strategy": chosen,
+                "tokens_issued": int(stats["tokens_issued"]),
+                "pseudonyms_issued": int(stats["pseudonyms_issued"]),
                 "total_ms": round(stats["total_ms"], 1),
             },
         )
@@ -692,10 +701,12 @@ class PipelineOrchestrator:
         # contains -- the restorer's surrogate pass is gated on this map being
         # non-empty, not on the strategy string, so supplying it under tokenization
         # is exactly what makes the mixed case restore.
+        #
+        # The shape test itself lives in :func:`_is_pseudonym`, shared with the
+        # ``pseudonyms_issued`` stat so that what the run REPORTS about its output
+        # and what it actually maps for restoration cannot drift apart.
         mapping = {
-            token.surrogate: ""
-            for token in tokens
-            if token.surrogate and not STRICT_TOKEN_RE.fullmatch(token.surrogate)
+            token.surrogate: "" for token in tokens if _is_pseudonym(token.surrogate)
         }
         return mapping or None
 
@@ -755,6 +766,54 @@ def _merge_tokens(
         seen.add(record.token_id)
         merged.append(record)
     return merged
+
+
+def _is_pseudonym(surrogate: str) -> bool:
+    """True if ``surrogate`` is a realistic fake rather than a hash token.
+
+    One predicate, used by both the pseudonym restore map
+    (:meth:`PipelineOrchestrator._surrogate_map`) and the ``pseudonyms_issued``
+    stat, on purpose: the stat's whole job is to report what that map -- and
+    therefore the payload -- contains, so the two must agree by construction. A
+    second copy of the shape test is a second place for them to disagree, and a
+    disagreement here is exactly the class of defect this stat exists to expose.
+    """
+    return bool(surrogate) and STRICT_TOKEN_RE.fullmatch(surrogate) is None
+
+
+def _pseudonyms_issued(tokens: Sequence[TokenRecord]) -> int:
+    """How many of this run's surrogates are pseudonyms, from the RECORDS.
+
+    ``strategy`` is what the caller *asked for*; this is what the payload actually
+    carries, and the two come apart. The vault has no strategy dimension: a run
+    reuses whatever record an earlier call in the same session minted (the long
+    comment in :meth:`PipelineOrchestrator._surrogate_map` explains why that reuse
+    is correct and must not be "fixed"). Tokenize a document and then re-run the
+    same session under pseudonymization, and every surrogate on the wire is a hash
+    token while ``PipelineResult.strategy`` -- and the UI banner reading it -- says
+    ``pseudonymization``. Nothing else in the response contradicted that, so the
+    only honest signal was invisible.
+
+    Reported as a **count alongside** ``tokens_issued`` rather than as an
+    ``effective_strategy`` label, for three reasons:
+
+    * No single label is true. Pseudonymization is *legitimately* mixed at the
+      record level -- ``PseudonymizationStrategy.make_surrogate`` emits a fake for
+      the identifier and temporal tiers and a ``plain_token`` for the content tier
+      -- so an ordinary, correct run would be relabelled "mixed" and the label
+      would carry no information.
+    * ``PipelineResult.strategy`` is documented as a value from a closed literal
+      set (``tests/test_models.py``), so it is the wrong field to widen, and adding
+      a new field means editing the response model.
+    * ``stats`` is the run's self-report and the UI renders every key it finds
+      (``ui/app.js`` orders a known prefix and appends the rest), so a count lands
+      on the reviewer's screen next to the banner with no schema change.
+
+    So ``pseudonyms_issued == 0`` beside ``tokens_issued == 52`` on a run that asked
+    for pseudonymization is the report the response was missing. This changes only
+    what the run says about itself -- nothing about what it emits.
+    """
+    return sum(1 for token in tokens if _is_pseudonym(token.surrogate))
 
 
 def _assert_surrogates_are_distinct(

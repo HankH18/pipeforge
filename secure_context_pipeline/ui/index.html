@@ -16,12 +16,22 @@
 </head>
 <body>
 
+<!-- Accessibility: every verdict this page exists to show -- RUN_OK, EGRESS_BLOCKED,
+     SESSION_EXPIRED, VAULT_DESTROYED -- is delivered by mutating an element, and a
+     mutation on a plain <div> is announced to nobody. The four surfaces app.js
+     rewrites with an outcome (#banner, #health, #session-badge, #verify-badge) and
+     the stats row therefore carry a live-region role; the bulk surfaces (the four
+     <pre> bodies, the audit <tbody>) deliberately do NOT -- a 4000-character panel
+     read aloud on every run is worse than silence -- so instead each is inside a
+     named region a user can navigate to on purpose. role="alert" and role="status"
+     imply their own aria-live/aria-atomic; the explicit attributes are for the AT
+     that still wants them. None of this needs a line of JS: the roles are static. -->
 <header>
   <h1>Secure Context Pipeline <span class="sub">demo instrument</span></h1>
-  <div id="health" class="badge muted">health: …</div>
+  <div id="health" class="badge muted" role="status" aria-live="polite">health: …</div>
 </header>
 
-<section class="controls">
+<section class="controls" aria-label="pipeline controls">
   <div class="grp">
     <label for="user">user_id</label>
     <input id="user" value="demo-user" size="12">
@@ -29,7 +39,7 @@
 
   <div class="grp">
     <button id="btn-session" class="go">Create session</button>
-    <span id="session-badge" class="badge muted">no session</span>
+    <span id="session-badge" class="badge muted" role="status" aria-live="polite">no session</span>
   </div>
 
   <!-- Build doc section 9.10 calls this an "upload fixture dropdown". It is not one,
@@ -52,14 +62,31 @@
       <option value="financial_disclosure.txt" data-cat="financial">financial_disclosure.txt</option>
       <option value="legal_brief_large.txt" data-cat="legal">legal_brief_large.txt</option>
     </select>
-    <input type="file" id="file" accept=".txt,.md,.pdf,.docx">
+    <!-- The only control that loads a document was the one control on the page with no
+         accessible name: a screen reader announced it as "Choose File, button", and the
+         one visible <label> in this group points at the <select> beside it, so sighted
+         users were misdirected too. Without a file every Run answers NO_FILE, so an
+         unnamed picker is the demo failing to start. The hint carries the sentence that
+         tells the two controls apart ("a preset, not an upload"), so it is this input's
+         description rather than decoration. -->
+    <label for="file">document</label>
+    <input type="file" id="file" accept=".txt,.md,.pdf,.docx" aria-describedby="fixture-hint">
     <span class="hint" id="fixture-hint"></span>
   </div>
 
+  <!-- The first option was `(none)`, selectable and the default, and the natural path
+       -- Choose File, Run -- left it there. entities.yaml gates entities behind
+       `only_in_doc_categories`, so unset silently switches whole rule sets off:
+       measured on fixtures/financial_disclosure.txt at (none), a green RUN_OK over a
+       payload carrying "balance $2,200,613.34" and the whole wire ledger verbatim.
+       The placeholder is `disabled` rather than deleted because a <select> with no
+       empty option selects its FIRST option, which would submit `medical` for every
+       document nobody categorised -- trading a silent omission for a silent wrong
+       answer. Unset, `ensureDoc` refuses the run with NO_CATEGORY. -->
   <div class="grp">
     <label for="category">doc_category</label>
     <select id="category">
-      <option value="">(none)</option>
+      <option value="" disabled selected>choose a category</option>
       <option value="medical">medical</option>
       <option value="legal">legal</option>
       <option value="financial">financial</option>
@@ -81,48 +108,90 @@
   </div>
 </section>
 
-<section class="controls danger" id="review-pair">
-  <span class="tag">LIVE REVIEW &mdash; vault-miss demo: click <b>Run</b>, then <b>Destroy session</b>, then <b>Run</b> again</span>
+<section class="controls danger" id="review-pair" aria-label="live review sequence">
+  <!-- Names what the sequence actually demonstrates. It read "vault-miss demo", which
+       this flow cannot produce: /pipeline/run calls _require_session before it reaches
+       services.orchestrator.run, so a destroyed session is refused 401 SESSION_EXPIRED
+       before the vault is consulted. Measured against the running API, the three steps
+       log VAULT_DESTROY and exactly zero VAULT_MISS rows. app.js's destroy banner and
+       README Deviation 56 were corrected when that was found; this string was missed,
+       leaving the retracted claim alive in the copy printed first and largest -- and
+       contradicting the banner three lines below it. The genuine vault-miss path is a
+       model inventing a token inside a *live* session: demo.py and
+       test_vault_miss_on_deobfuscation exercise it. -->
+  <span class="tag">LIVE REVIEW &mdash; irreversible erasure: click <b>Run</b>, then
+    <b>Destroy session</b>, then <b>Run</b> again &mdash; the second run is refused with
+    SESSION_EXPIRED before the vault is consulted, and the audit tail shows
+    VAULT_DESTROY</span>
   <button id="btn-run" class="go big">Run <span id="spin" class="spin" hidden></span></button>
   <button id="btn-destroy" class="danger-btn big">Destroy session</button>
 </section>
 
-<div id="banner" class="banner" hidden></div>
+<div id="banner" class="banner" role="alert" aria-live="assertive" aria-atomic="true" hidden></div>
 
-<section class="stats" id="stats"></section>
+<!-- The half that requiring a category does NOT fix: a WRONG one. Measured on
+     fixtures/legal_memo.txt submitted as `medical`, all five CASE_STRATEGY sentences
+     reach the provider verbatim while `entities_detected` reads 38 -- the same number
+     the correct `legal` run reports -- so every metric on the page rated the weakened
+     run equal or better and nothing signalled reduced protection. After each run
+     app.js names the `only_in_doc_categories` rule sets this category did not use.
+     role="status" and not "alert": it is a standing fact about the run, delivered
+     beside the verdict rather than instead of it. -->
+<div id="scope-note" class="banner warn" role="status" aria-live="polite" aria-atomic="true" hidden></div>
 
-<section class="legend">
+<section class="stats" id="stats" role="status" aria-live="polite" aria-label="run stats"></section>
+
+<section class="legend" aria-label="highlight legend">
   <span class="key"><i class="c-PII"></i>PII</span>
   <span class="key"><i class="c-PHI"></i>PHI</span>
   <span class="key"><i class="c-LEGAL"></i>LEGAL</span>
   <span class="key"><i class="c-FIN"></i>FIN</span>
   <span class="key"><i class="c-RED"></i>[REDACTED_*]</span>
   <span class="key"><i class="rest"></i>restored region</span>
+  <!-- The failure key. [UNRESOLVED_ENTITY] used to be painted with .rest, the
+       colour above, so the one value the pipeline FAILED to restore was the one it
+       advertised as restored: panel 4 emitted 33 of these marks against a
+       restored_count of 32. app.js gives it .unres now; without a key here a
+       reviewer sees a colour the legend does not explain. -->
+  <span class="key"><i class="unres"></i>not restored (vault miss)</span>
 </section>
 
+<!-- Each panel is its own region, named by the static half of its heading only. The
+     side-by-side comparison of the four payloads is the whole point of the page, and
+     without a region a user arrowing through 300 lines of panel 2 has no cue as to
+     which payload is being read. The name points at the title span, not the <h2>: the
+     <h2> also holds #c1..#c4, which app.js rewrites on every run ("412 chars · 9
+     spans"), and a region whose name changes under you is worse than an unnamed one. -->
 <main class="panels">
-  <div class="panel">
-    <h2>1 · Original text <span id="c1" class="count"></span></h2>
+  <div class="panel" role="region" aria-labelledby="h-p1">
+    <h2><span id="h-p1">1 · Original text</span> <span id="c1" class="count"></span></h2>
     <pre id="p1" class="body">Create a session, choose a file, press Run.</pre>
   </div>
-  <div class="panel">
-    <h2>2 · Outbound obfuscated payload <span id="c2" class="count"></span></h2>
+  <div class="panel" role="region" aria-labelledby="h-p2">
+    <h2><span id="h-p2">2 · Outbound obfuscated payload</span> <span id="c2" class="count"></span></h2>
     <pre id="p2" class="body">—</pre>
   </div>
-  <div class="panel">
-    <h2>3 · Raw LLM response <span id="c3" class="count"></span></h2>
+  <div class="panel" role="region" aria-labelledby="h-p3">
+    <h2><span id="h-p3">3 · Raw LLM response</span> <span id="c3" class="count"></span></h2>
     <pre id="p3" class="body">—</pre>
   </div>
-  <div class="panel">
-    <h2>4 · Restored response <span id="c4" class="count"></span></h2>
+  <div class="panel" role="region" aria-labelledby="h-p4">
+    <h2><span id="h-p4">4 · Restored response</span> <span id="c4" class="count"></span></h2>
     <pre id="p4" class="body">—</pre>
   </div>
 </main>
 
-<section class="audit">
-  <h2>Audit tail <span id="audit-run" class="count"></span>
+<section class="audit" aria-labelledby="audit-h">
+  <!-- aria-label pins the heading's name to its own text. This <h2> is a flex row that
+       also carries the Verify button and the chain badge, so its name was computed as
+       "Audit tail Verify chain chain: unverified" and then rewritten to "...chain: VALID
+       - 41 events" the moment the button was pressed: a section title with a control
+       label welded on, that renames itself. The controls stay inside the heading because
+       the layout that right-aligns them (.audit h2 button { margin-left: auto }) lives in
+       style.css, and the CSP here forbids an inline style. -->
+  <h2 id="audit-h" aria-label="Audit tail">Audit tail <span id="audit-run" class="count"></span>
     <button id="btn-verify">Verify chain</button>
-    <span id="verify-badge" class="badge muted">chain: unverified</span>
+    <span id="verify-badge" class="badge muted" role="status" aria-live="polite">chain: unverified</span>
   </h2>
   <div class="tablewrap">
     <table id="audit-table">

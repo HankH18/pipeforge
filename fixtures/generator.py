@@ -29,7 +29,7 @@ real are deliberately drawn from reserved or never-issued ranges:
 * **People** are Faker-generated; **organisations, firms, hospitals and carriers**
   are invented compound names.
 
-Three notes for consumers of :func:`expected_entities`:
+Four notes for consumers of :func:`expected_entities`:
 
 1.  For *most* pattern-backed entity types the planted literal is the whole span
     the registry regex will match (e.g. ``"HbA1c of 8.2"``, ``"settlement demand
@@ -48,10 +48,12 @@ Three notes for consumers of :func:`expected_entities`:
 
     Anything asserting over these types must use the value the vault holds, which
     is what ``vault.originals_for_session`` returns and what the leakage harness
-    scans. Measured on the committed fixtures: 129 of 850 planted occurrences are
-    not fully inside a detected span, almost all of them ``CASE_ID`` (124) plus
-    ``ACCOUNT_NUMBER`` (4) and ``MRN`` (1) -- so "every one fully inside a
-    detected span" was never true either.
+    scans. Measured on the committed fixtures, ``ORG`` (note 4) aside: 129 of 850
+    planted occurrences are not fully inside a detected span, almost all of them
+    ``CASE_ID`` (124) plus ``ACCOUNT_NUMBER`` (4) and ``MRN`` (1) -- so "every one
+    fully inside a detected span" was never true either.  Counting ``ORG`` it is
+    292 of 1,013, because **all 163** organisation-name occurrences in the shipped
+    corpus sit outside every detected span; that is note 4's point, measured.
 2.  ``PRIVILEGED_MARKER`` (``action: strip``) and ``CASE_STRATEGY``
     (``action: redact``) do not round-trip by design -- the span is removed or
     replaced rather than tokenised.  They are still returned, because they must
@@ -66,17 +68,32 @@ Three notes for consumers of :func:`expected_entities`:
     framing is used.  Planting a value the detector misses roughly one seed in
     ten would make a 100-run leakage harness flaky, so addresses exercise the
     recogniser without being part of the must-not-leak contract.  Every entity
-    type that *is* returned was verified to be fully covered by a real
-    ``Detector.detect`` span at every occurrence.
+    type that *is* returned, ``ORG`` excepted, was verified to be fully covered
+    by a real ``Detector.detect`` span at every occurrence.
+4.  ``ORG`` is ground truth for a class of value **no registry entity claims**.
+    Every document here writes organisation names -- carriers, hospitals,
+    corporate parties, banks, law firms -- and for the whole history of this file
+    not one of them was planted.  An unplanted value is invisible to the ground
+    truth, and invisible is not the same as safe: measured on the committed
+    medical note, ``"Pinnacle Grove Benefit Trust"`` reached the provider verbatim
+    twice, in both strategies, while the leakage harness stayed 100/100 clean,
+    because a harness cannot fail on a value nothing told it to look for.
+    Planting them makes the gap measurable.  It does not close it, and the
+    consequence is stated here rather than hidden: ``entities.yaml`` defines no
+    organisation entity, so nothing detects these literals, they are never
+    vaulted, and they do **not** round-trip.  Whether organisation names belong
+    inside the boundary is a product decision, and this is not that decision --
+    it is what lets the decision be taken against a measurement.
 
 ``NAME`` and ``CLIENT_IDENTITY`` both resolve to Presidio's ``PERSON``
 recogniser, and which of the two a given span comes back as depends on overlap
 resolution; the split in the returned mapping is descriptive only.
 
-Every planted literal was checked against the real ``Detector.detect`` -- 60
-seeds of the three short documents and 20 seeds of the large brief, 10,735
-planted-value occurrences in all, every one of them fully inside a detected
-span.  Reaching that took three fixture-side rules that are load-bearing and
+Every planted literal *other than* ``ORG`` was checked against the real
+``Detector.detect`` -- 60 seeds of the three short documents and 20 seeds of the
+large brief, 10,735 planted-value occurrences in all, every one of them fully
+inside a detected span.  ``ORG`` is the deliberate exception and note 4 above
+says why.  Reaching that took three fixture-side rules that are load-bearing and
 should survive any edit to the prose:
 
 * person names always sit mid-sentence behind a lower-case role noun
@@ -579,6 +596,12 @@ def _build_medical(fake: Faker, rng: random.Random) -> tuple[str, dict[str, list
     # -- plant --------------------------------------------------------------
     for value in (p_full, p_last, kin_full, doc_full, rn_full):
         led.plant("NAME", value)
+    # The hospital and the carrier -- module docstring note 4.  The header renders
+    # the facility upper-cased; what goes in the ledger is the title-case literal
+    # the body uses, and every needle scan in this repo folds case, so the header
+    # occurrence is covered by the same entry.
+    led.plant("ORG", facility)
+    led.plant("ORG", carrier)
     led.plant("DOB", dob)
     for value in (admit, labs_on, note_on, followup, *prior):
         led.plant("DATE", value)
@@ -707,6 +730,9 @@ def _build_legal_memo(fake: Faker, rng: random.Random) -> tuple[str, dict[str, l
     led.plant("PRIVILEGED_MARKER", "attorney-client")
     led.plant("PRIVILEGED_MARKER", "work product")
     led.plant("CLIENT_IDENTITY", client_full)
+    # The client company and both law firms -- module docstring note 4.
+    for value in (client_org, opp_firm, own_firm):
+        led.plant("ORG", value)
     for value in (
         author_full,
         assoc_full,
@@ -811,12 +837,21 @@ def _build_financial(fake: Faker, rng: random.Random) -> tuple[str, dict[str, li
     bal_brokerage = _money(rng, 900_000, 2_400_000, True)
     bal_trust = _money(rng, 100_000, 400_000, True)
 
+    # The four institutions this document names.  They were prose literals, which
+    # is how they stayed out of the ledger; bound to names here so the values
+    # planted below are the same objects the text renders, not a restatement that
+    # can drift away from it.
+    bank = "Harbor Point Savings"
+    brokerage_firm = "Ridgeline Securities"
+    escrow_agent = "Ridgeline Escrow"
+    vendor = "Bellhaven Marine Supply"
+
     ledger_rows: list[tuple[str, str, str]] = []
     descriptions = (
-        "outbound wire to Ridgeline Escrow",
+        f"outbound wire to {escrow_agent}",
         "payroll deposit",
         "quarterly distribution received",
-        "vendor payment, Bellhaven Marine Supply",
+        f"vendor payment, {vendor}",
         "brokerage transfer in",
         "property tax withdrawal",
         "insurance premium debit",
@@ -854,6 +889,9 @@ def _build_financial(fake: Faker, rng: random.Random) -> tuple[str, dict[str, li
     # ADDRESS is deliberately NOT planted -- see the module docstring. The street
     # lines below are real content and the detector does tag ADDRESS spans in
     # this document; they are simply not part of the must-not-leak contract.
+    # The bank, the broker, the escrow agent and the vendor -- docstring note 4.
+    for value in (bank, brokerage_firm, escrow_agent, vendor):
+        led.plant("ORG", value)
     led.plant("PHONE", phone)
     led.plant("PHONE", phone_prep)
     led.plant("EMAIL", email)
@@ -888,10 +926,10 @@ PART II -- SPOUSE AND CO-FILER
 
 PART III -- DEPOSIT AND BROKERAGE HOLDINGS
 
-    Primary operating account {acct_operating[8:]} at Harbor Point Savings, balance {bal_operating}.
-    Reserve {acct_reserve} at Harbor Point Savings, balance {bal_reserve}.
-    Brokerage {acct_brokerage} at Ridgeline Securities, balance {bal_brokerage}.
-    Trust custody {acct_trust} at Harbor Point Savings, balance {bal_trust}.
+    Primary operating account {acct_operating[8:]} at {bank}, balance {bal_operating}.
+    Reserve {acct_reserve} at {bank}, balance {bal_reserve}.
+    Brokerage {acct_brokerage} at {brokerage_firm}, balance {bal_brokerage}.
+    Trust custody {acct_trust} at {bank}, balance {bal_trust}.
 
 PART IV -- TRANSACTION LEDGER (first quarter)
 
@@ -901,7 +939,7 @@ PART IV -- TRANSACTION LEDGER (first quarter)
 PART V -- LIABILITIES
 
     Mortgage secured by the residence at {street_home}, {city_home}, outstanding
-    principal {mortgage}, serviced by Harbor Point Savings.
+    principal {mortgage}, serviced by {bank}.
     Equipment note held against the rental property at {street_rental}, {city_rental},
     outstanding balance {note_balance}.
 
@@ -988,11 +1026,11 @@ def _slot_workproduct(rng: random.Random, led: _Ledger, pools: _BriefPools) -> s
 
 
 def _slot_org(rng: random.Random, led: _Ledger, pools: _BriefPools) -> str:
-    return pools.orgs.any(rng)
+    return led.plant("ORG", pools.orgs.any(rng))
 
 
 def _slot_firm(rng: random.Random, led: _Ledger, pools: _BriefPools) -> str:
-    return pools.firms.any(rng)
+    return led.plant("ORG", pools.firms.any(rng))
 
 
 def _slot_date(rng: random.Random, led: _Ledger, pools: _BriefPools) -> str:
@@ -1320,6 +1358,14 @@ def _build_legal_brief(fake: Faker, rng: random.Random) -> tuple[str, dict[str, 
 
     plaintiff_org = _ORG_NAMES[1]
     defendant_org = _ORG_NAMES[0]
+    # Both parties -- docstring note 4 -- each planted in a form the document is
+    # guaranteed to carry.  The caption upper-cases both, and for the plaintiff
+    # that is its only certain occurrence: every other mention comes from an
+    # ``{org}`` slot, which draws at random and may not draw it at all.  The
+    # defendant is named title-case by the submission line and the footer, so its
+    # entry is the title-case literal and the caption form folds into it.
+    led.plant("ORG", plaintiff_org.upper())
+    led.plant("ORG", defendant_org)
 
     header = f"""PRIVILEGED AND CONFIDENTIAL -- ATTORNEY WORK PRODUCT
 

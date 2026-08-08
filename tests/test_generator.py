@@ -69,6 +69,60 @@ SIGNATURE_TYPES = {
 }
 
 
+#: The last word of an organisation name, as English writes one. Restated from the
+#: register rather than read off the generator's pools: a list imported from the code
+#: under test would shrink in step with a pool that lost an entry.
+ORG_SUFFIXES = frozenset(
+    {
+        "Alliance",
+        "Center",
+        "Corp",
+        "Escrow",
+        "Group",
+        "Health",
+        "Holdings",
+        "Hospital",
+        "Inc",
+        "LLC",
+        "LLP",
+        "Partners",
+        "Plan",
+        "Savings",
+        "Securities",
+        "Services",
+        "Supply",
+        "System",
+        "Systems",
+        "Trust",
+        "Utilities",
+    }
+)
+
+#: A run of title-case words (``&`` and the two bare-capital company forms included).
+ORG_PHRASE_RE = re.compile(r"\b(?:[A-Z][a-z]+|LLC|LLP|&)(?:\s(?:[A-Z][a-z]+|LLC|LLP|&))+")
+
+#: The fewest organisation names each document is known to name, so an empty scan
+#: cannot pass for a clean one.
+ORG_FLOORS = {"medical": 2, "legal": 3, "financial": 4, "legal_brief_large": 15}
+
+
+def organisation_phrases(text: str) -> set[str]:
+    """Every title-case phrase in ``text`` that ends on a company-name suffix.
+
+    Structural, not a list of the names the generator happens to ship: a new
+    carrier, hospital or corporate party added to a pool is caught by the same rule
+    that catches the ones here today. The phrase ends at the LAST suffix word in the
+    run, so "Cascade Meridian Health Plan" is one name and not two.
+    """
+    found: set[str] = set()
+    for match in ORG_PHRASE_RE.finditer(text):
+        words = match.group(0).split()
+        tail = max((i for i, word in enumerate(words) if word in ORG_SUFFIXES), default=0)
+        if tail:
+            found.add(" ".join(words[: tail + 1]))
+    return found
+
+
 def all_planted(mapping: dict[str, list[str]]) -> set[str]:
     """Every distinct literal in an ``expected_entities`` mapping, type ignored."""
     return {value for values in mapping.values() for value in values}
@@ -222,6 +276,61 @@ def test_every_planted_literal_appears_in_the_document(seed: int, kind: str) -> 
         if value not in document
     ]
     assert missing == []
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("kind", generator.KINDS)
+def test_every_organisation_the_document_names_is_in_the_ledger(seed: int, kind: str) -> None:
+    """The other half of the ground-truth contract, and the half that was missing.
+
+    ``test_every_planted_literal_appears_in_the_document`` checks the mapping against
+    the text. Nothing checked the text against the mapping, so a value the generator
+    wrote into a document and never handed to ``led.plant`` was invisible: not in the
+    expected set, therefore not something any downstream test could fail on. The
+    carrier and the hospital in the medical note were exactly that, and the carrier
+    name reached the provider verbatim -- twice, in both strategies -- with the
+    leakage harness reporting 100/100 clean the whole time.
+
+    Phrased over the class rather than over the two literals that were found, because
+    the defect is the class: this scans the rendered document for anything shaped like
+    an organisation name and requires each one to be in the ledger. Case-folded on
+    both sides -- the medical header and the brief's caption upper-case the name they
+    render, and every needle scan in this repo folds case, so one ledger entry covers
+    both spellings.
+    """
+    document = generator.generate(seed, kind)
+    found = organisation_phrases(document)
+    assert len(found) >= ORG_FLOORS[kind], (
+        f"{kind}/{seed}: the scan found {len(found)} organisation-shaped phrases, "
+        f"fewer than the {ORG_FLOORS[kind]} this document is known to name -- the "
+        "scan has stopped seeing them, so its silence means nothing"
+    )
+    planted = {value.upper() for value in generator.expected_entities(seed, kind).get("ORG", [])}
+    unplanted = sorted(name for name in found if name.upper() not in planted)
+    assert unplanted == [], (
+        f"{kind}/{seed}: organisation name(s) written into the document but never "
+        f"planted, so no test can fail on them: {unplanted}"
+    )
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_the_medical_note_s_carrier_and_hospital_are_planted(seed: int) -> None:
+    """The reported instance, pinned by position rather than by literal.
+
+    Both names are read back out of the document -- the facility off the header line,
+    the carrier off the insurance line -- so this stays true for every seed and fails
+    if either stops being planted, whichever names the pools happen to hold.
+    """
+    document = generator.generate(seed, "medical")
+    orgs = generator.expected_entities(seed, "medical").get("ORG", [])
+    planted = {value.upper() for value in orgs}
+
+    facility = document.splitlines()[0].strip()
+    carrier = re.search(r"^\s*Insurance: (.+?), member ID ", document, re.MULTILINE)
+    assert carrier is not None, "the insurance line has been reworded; re-derive it here"
+
+    assert facility.upper() in planted, facility
+    assert carrier.group(1).upper() in planted, carrier.group(1)
 
 
 @pytest.mark.parametrize("kind", generator.KINDS)

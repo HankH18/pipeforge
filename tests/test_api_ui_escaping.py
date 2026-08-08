@@ -35,8 +35,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_JS = REPO_ROOT / "secure_context_pipeline" / "ui" / "app.js"
+STYLE_CSS = REPO_ROOT / "secure_context_pipeline" / "ui" / "style.css"
 
 #: A single-quoted, double-quoted or backtick literal, whole.
 _LITERAL = re.compile(r"""^(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`)$""")
@@ -355,13 +358,21 @@ def test_the_escaping_checker_catches_every_way_the_control_can_be_removed() -> 
     """
     source = APP_JS.read_text(encoding="utf-8")
     mutations = {
+        # Both sinks moved rather than changed: panel 3 now goes through the marking
+        # renderer (it was the one panel with no highlighting, so an outbound
+        # pseudonym read as a real value), and panel 1 branches on an empty
+        # extraction. The mutation is still "delete the control from this sink".
         "panel 3 renders the LLM response raw": (
-            "$('p3').innerHTML = esc(result.raw_llm_response);",
+            "$('p3').innerHTML = renderMarks(result.raw_llm_response, result.detections, 0);",
             "$('p3').innerHTML = result.raw_llm_response;",
         ),
         "panel 1 renders the document text raw": (
-            "$('p1').innerHTML = esc(doc.text);",
-            "$('p1').innerHTML = doc.text;",
+            "$('p1').innerHTML = doc.chars ? esc(doc.text) : esc(NO_TEXT);",
+            "$('p1').innerHTML = doc.chars ? doc.text : esc(NO_TEXT);",
+        ),
+        "renderMarks emits a raw unscanned head": (
+            "let out = esc(text.slice(0, start));",
+            "let out = text.slice(0, start);",
         ),
         "the error banner renders a response body raw": (
             "el.innerHTML = '<b>' + esc(code) + '</b> ' + esc(msg);",
@@ -387,9 +398,16 @@ def test_the_escaping_checker_catches_every_way_the_control_can_be_removed() -> 
             "'\">' + esc(m[0]) + '</mark>'",
             "'\">' + m[0] + '</mark>'",
         ),
+        # The restored region is now emitted per piece, because the one piece that is
+        # NOT a restored value -- restorer.py's [UNRESOLVED_ENTITY] sentinel -- is
+        # split out of the same gap and marked as itself.
         "renderRestored marks a raw restored region": (
-            "'<mark class=\"rest\">' + esc(gap) + '</mark>'",
-            "'<mark class=\"rest\">' + gap + '</mark>'",
+            "'<mark class=\"rest\">' + esc(parts[k]) + '</mark>'",
+            "'<mark class=\"rest\">' + parts[k] + '</mark>'",
+        ),
+        "renderRestored emits a raw unresolved sentinel": (
+            "esc(UNRESOLVED + own) + '</mark>'",
+            "(UNRESOLVED + own) + '</mark>'",
         ),
         "renderRestored appends a raw literal run": ("out += esc(lit);", "out += lit;"),
         "renderRestored bails out to raw text": (
@@ -430,10 +448,39 @@ def test_no_regex_source_in_the_ui_carries_an_unbounded_quantifier() -> None:
     128k run, a frozen tab. Bounded, the same inputs are 0 ms and 1 ms. No shipped
     fixture triggers it (longest whitespace run: 46 characters), which is why it
     survived: this asserts the property rather than waiting for a fixture to grow.
+
+    The property was real and the ENUMERATION was not. This looked only for
+    ``const <NAME>_SRC = <string>;``, so by construction it could see ``MARKS_SRC``
+    and ``TOLERANT_SRC`` and nothing else -- and the file also declares three regex
+    *literals*, one of which had the same defect. ``EDGE_CLOSE`` was ``/[*_`]+$/``,
+    unanchored at the start, so on a markdown run that is not at the end of the
+    string the engine restarts a maximal match at every position inside the run and
+    fails ``$`` each time: measured in node, 100 ms at 8,000 characters, 398 ms at
+    16,000, 1,609 ms at 32,000, and 6.7 s through ``renderRestored`` at 64,000. A
+    green run over an incomplete enumeration is not evidence about the file, so the
+    literals are enumerated too, and the enumeration is checked for completeness
+    against an independent census -- a fourth pattern fails this test until it is
+    looked at.
     """
     source = APP_JS.read_text(encoding="utf-8")
     grammars = re.findall(r"^\s*const (\w*_SRC) = ([\s\S]*?);$", source, re.MULTILINE)
     assert grammars, "no regex-source constants found in app.js -- has it been renamed?"
+    literals = re.findall(r"^\s*const ([A-Z_][A-Z0-9_]*) = (/.*/[a-z]*);$", source, re.MULTILINE)
+    assert literals, "no regex literals found in app.js -- has the finder stopped matching?"
+
+    # The census is deliberately a DIFFERENT rule from the finder above: every
+    # top-level `const NAME =` whose right-hand side begins with a slash holds a
+    # regex, whatever it looks like after that. If the two disagree, the finder has
+    # stopped seeing a pattern that exists, which is the failure this test just had.
+    census = {
+        name
+        for name, rhs in re.findall(r"^\s*const ([A-Z_][A-Z0-9_]*) = (.*)$", source, re.MULTILINE)
+        if rhs.lstrip().startswith("/")
+    }
+    assert {name for name, _ in literals} == census, sorted(
+        census.symmetric_difference({name for name, _ in literals})
+    )
+    grammars = grammars + literals
 
     offenders: list[str] = []
     for name, literal in grammars:
@@ -447,3 +494,117 @@ def test_no_regex_source_in_the_ui_carries_an_unbounded_quantifier() -> None:
         + ", ".join(offenders)
         + " -- bound them the way surrogates.py bounds TOKEN_RE"
     )
+
+
+# ---------------------------------------------------------------------------
+# style.css -- the control boundary (WCAG 2.1 1.4.11 Non-text Contrast, AA)
+#
+# This lives here rather than in ``test_ui_behaviour.py`` for the reason given at
+# the top of this module: it is a static property of a shipped asset, and it must
+# run on machines with no JS runtime. Nothing below shares an expression with the
+# stylesheet -- CSS states colours, this states the arithmetic over them.
+# ---------------------------------------------------------------------------
+#: A six-digit hex colour, whole.
+_HEX = re.compile(r"#[0-9a-fA-F]{6}\b")
+#: ``var(--name)``, as the stylesheet spells its indirections.
+_VAR = re.compile(r"var\(\s*(--[\w-]+)\s*\)")
+
+
+def _relative_luminance(colour: str) -> float:
+    """WCAG 2.1 relative luminance of a ``#rrggbb`` string.
+
+    The definition, not an approximation: each channel is scaled to 0..1, linearised
+    through the sRGB transfer curve, then weighted 0.2126/0.7152/0.0722.
+    """
+    channels = []
+    for offset in (1, 3, 5):
+        c = int(colour[offset : offset + 2], 16) / 255
+        channels.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+    red, green, blue = channels
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def _contrast(one: str, other: str) -> float:
+    """The WCAG contrast ratio between two ``#rrggbb`` strings, 1.0 .. 21.0."""
+    first, second = _relative_luminance(one), _relative_luminance(other)
+    return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+
+
+def _block(css: str, selector: str) -> str:
+    """The declarations of the rule that ``selector`` starts, verbatim.
+
+    Anchored at the start of a line so that ``body`` cannot be answered by ``.body``
+    and ``.controls`` cannot be answered by ``.controls.danger``.
+    """
+    match = re.search(r"(?m)^" + re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    assert match, f"style.css has no `{selector}` rule -- has the UI been restyled?"
+    return match.group(1)
+
+
+def _colour(block: str, prop: str, root: dict[str, str]) -> str:
+    """The colour a declaration resolves to, following one level of ``var()``."""
+    match = re.search(prop + r"\s*:([^;]*);", block)
+    assert match, f"no `{prop}` declaration in `{block.strip()}`"
+    value = match.group(1)
+    var = _VAR.search(value)
+    if var:
+        assert var.group(1) in root, f"undefined custom property {var.group(1)}"
+        value = root[var.group(1)]
+    found = _HEX.findall(value)
+    assert len(found) == 1, f"`{prop}: {value.strip()}` is not one plain hex colour"
+    return found[0].lower()
+
+
+def test_the_control_border_stays_visible_against_fill_and_surround() -> None:
+    """`input`, `select` and the plain `button` must read as controls, not as text.
+
+    WCAG 2.1 1.4.11 (AA) asks 3:1 for "the visual information required to identify
+    a user interface component" -- for these, the 1px border, since the fill only
+    beats the bar behind it by 1.11:1 and cannot carry the cue on its own.
+
+    Shipped, that border was `--line` (#2b3542): 1.55:1 against the field fill
+    #0b0f14 and 1.39:1 against `.controls`' #151b23, i.e. an edge the eye does not
+    reliably separate from the surface. Run and Destroy escaped it only because
+    `button.go` and `button.danger-btn` set a border-colour of their own.
+
+    The four surfaces below are every background a bordered control sits on in
+    `index.html`: the control bar, the red Destroy bar, the audit panel (the
+    "Verify chain" button lives in its `h2`) and the page itself.
+    """
+    css = STYLE_CSS.read_text(encoding="utf-8")
+    root = dict(re.findall(r"(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{6})\s*;", _block(css, ":root")))
+
+    controls = _block(css, "input, select, button")
+    border = _colour(controls, "border", root)
+    surfaces = {
+        "the control's own fill": _colour(controls, "background", root),
+        ".controls (the control bar)": _colour(_block(css, ".controls"), "background", root),
+        ".controls.danger (Destroy bar)": _colour(
+            _block(css, ".controls.danger"), "background", root
+        ),
+        ".panel (audit panel h2)": _colour(_block(css, ".panel"), "background", root),
+        "body (the page)": _colour(_block(css, "body"), "background", root),
+    }
+    thin = {
+        f"{where} {surface}: {_contrast(border, surface):.2f}:1"
+        for where, surface in surfaces.items()
+        if _contrast(border, surface) < 3.0
+    }
+    assert thin == set(), (
+        f"the control border {border} falls under WCAG 1.4.11's 3:1 against "
+        + ", ".join(sorted(thin))
+    )
+
+
+def test_the_contrast_arithmetic_rejects_the_hairline_it_replaced() -> None:
+    """The check above must be able to fail, so measure the value it was written for.
+
+    #2b3542 on #0b0f14 is the shipped-before pairing; 1.55:1 is the hand-computed
+    ratio from the audit. A checker that cannot reproduce the failure it exists to
+    prevent is decoration.
+    """
+    assert _contrast("#2b3542", "#0b0f14") == pytest.approx(1.547, abs=0.005)
+    assert _contrast("#2b3542", "#151b23") == pytest.approx(1.394, abs=0.005)
+    # Anchors on the ends of the scale: identical colours are 1:1, black on white 21:1.
+    assert _contrast("#151b23", "#151b23") == pytest.approx(1.0)
+    assert _contrast("#000000", "#ffffff") == pytest.approx(21.0)

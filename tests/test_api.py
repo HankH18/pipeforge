@@ -1536,8 +1536,23 @@ async def test_the_demo_ui_sends_the_credentials_every_route_requires() -> None:
     assert "user_id" in request, "the UI's audit query must present a user_id"
 
     # Logout is owner-scoped too, and the same silence applies.
-    assert "'?user_id=' + encodeURIComponent(userId())" in app_js, (
+    #
+    # Was ``"'?user_id=' + encodeURIComponent(userId())" in app_js``. The requirement
+    # is unchanged and is still asserted; the exact expression it was pinned to was
+    # itself the defect. ``userId()`` re-reads the live input field, so a field
+    # retyped mid-demo sent a NON-OWNER delete -- which this route answers 204 while
+    # destroying nothing, deliberately, because 204 must not be an ownership oracle --
+    # and the UI printed "gone, irreversibly" over a session that then ran again with
+    # 200. The UI sends the owner captured at create instead. Narrowed to the logout
+    # URL and strengthened: the field reader must not be what scopes it.
+    logout = app_js.split("await api('DELETE', '/sessions/'", 1)
+    assert len(logout) == 2, "the UI must call the logout route"
+    logout_url = logout[1].split(";", 1)[0]
+    assert "'?user_id=' + encodeURIComponent(" in logout_url, (
         "the UI's logout must present a user_id"
+    )
+    assert "userId()" not in logout_url, (
+        "logout must be scoped by the owner recorded for the session, not by the live field"
     )
 
 

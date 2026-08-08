@@ -1631,6 +1631,91 @@ async def test_a_second_run_under_a_different_strategy_restores_the_first_run_s_
     assert second.stats["vault_misses"] == 0
 
 
+async def test_a_run_reports_the_surrogate_shape_it_emitted_not_the_one_it_asked_for(
+    make_harness: HarnessFactory,
+) -> None:
+    """The other ordering: tokenize first, then ask the same session to pseudonymize.
+
+    Reuse is the *documented* behaviour and the test above is why it has to stay --
+    the vault has no strategy dimension, so a run splices whatever record an earlier
+    call in the session minted, and ``_surrogate_map`` deliberately keys off the
+    RECORDS so a pseudonym minted earlier still restores under a later tokenization
+    run. Reverse the order and the same rule bites the caller instead of the
+    restorer: every surrogate on the wire is a hash token, while
+    ``PipelineResult.strategy`` -- and the banner in ``ui/app.js`` that prints it --
+    says ``pseudonymization``. Measured on the shipped demo document: 52 detections,
+    all 52 carrying bracketed token surrogates identical to the previous run's,
+    reported as a pseudonymization run.
+
+    Nothing in the response contradicted the label, which is what made it a
+    reporting defect rather than an emission one. ``stats["pseudonyms_issued"]`` is
+    the contradiction: derived from the records this run actually issued, so it
+    reads 0 exactly when the payload carries no pseudonyms, whatever was requested.
+
+    The expected value is derived HERE from the response's own surrogate strings by
+    a different test than the production code uses -- "does it start with ``[``"
+    rather than ``STRICT_TOKEN_RE`` -- so a stat that shared the pipeline's regex
+    bug, or that was hardcoded to a constant, fails one of the two directions. Both
+    directions are asserted: the reused-token run must report 0, and the fresh
+    session must report more than 0 for the same document and the same request.
+    """
+    harness: Harness = await make_harness()
+    text = (
+        "Clinical note.\n\n"
+        "Patient Marguerite Vandenberg was seen by Dr. Alan Reed today.\n"
+    )
+    doc_id = await harness.upload(text, "medical", "mixed-order.txt")
+    session_id, _ = await harness.sessions.create(USER_ID)
+
+    first = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+    tokens = {d.surrogate for d in first.detections if d.surrogate}
+    assert tokens, "premise: run 1 minted surrogates"
+    assert first.stats["pseudonyms_issued"] == 0, (
+        "a tokenization run issued something that is not a token"
+    )
+
+    second = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "pseudonymization"
+    )
+
+    # Premise, held by string equality rather than by shape: run 2 put run 1's own
+    # tokens on the wire. This is the documented reuse, not a defect to fix here.
+    reused = {d.surrogate for d in second.detections if d.surrogate}
+    assert reused == tokens, "premise: run 2 reused run 1's records verbatim"
+    assert second.strategy == "pseudonymization", (
+        "premise: the caller asked for pseudonymization and the response echoes it"
+    )
+
+    # The fix: the run reports the shape it emitted. Zero pseudonyms, next to a
+    # non-zero token count and a banner saying pseudonymization.
+    assert second.stats["tokens_issued"] > 0
+    assert second.stats["pseudonyms_issued"] == _unbracketed(reused)
+    assert second.stats["pseudonyms_issued"] == 0
+
+    # Same document, same request, fresh session: pseudonyms really are issued, so
+    # the zero above is a property of the payload and not of the statistic.
+    fresh_session, _ = await harness.sessions.create(USER_ID)
+    fresh = await harness.orchestrator.run(
+        fresh_session, USER_ID, doc_id, PROMPT, "pseudonymization"
+    )
+    minted = {d.surrogate for d in fresh.detections if d.surrogate}
+    assert fresh.stats["pseudonyms_issued"] == _unbracketed(minted) > 0
+
+
+def _unbracketed(surrogates: set[str]) -> int:
+    """Surrogates that are not bracketed markers -- i.e. realistic fakes.
+
+    Deliberately NOT ``STRICT_TOKEN_RE``: the production stat is derived from that
+    regex, and a check sharing the machinery it checks is not evidence. Every
+    marker this pipeline emits is wrapped in ``[...]`` (``surrogates.py``
+    ``format_surrogate``), and no pseudonym generator produces a leading bracket,
+    so the first character separates the two shapes independently.
+    """
+    return sum(1 for s in surrogates if not s.startswith("["))
+
+
 @pytest.mark.parametrize(
     "name",
     ["René Müller", "Chloé Dubois", "Jörg Königsberg", "Åsa Lindqvist", "Iñaki Errázuriz"],

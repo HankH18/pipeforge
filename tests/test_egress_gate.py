@@ -4807,17 +4807,28 @@ def test_the_floor_s_corpus_measurement_is_the_one_the_docstring_quotes() -> Non
         for entity_type, values in expected_entities(seed, kind).items()
         for value in values
     }
-    assert len(pairs) == 8472, "distinct (type, value) pairs across 26 seeds x 4 kinds"
-    assert len({value for _, value in pairs}) == 8462, (
+    # These five counts moved by exactly the 72 ORG pairs the generator started
+    # planting (8472 -> 8544, 8462 -> 8534, 8390 -> 8462). Organisation names are
+    # ground truth for a class NO registry entity claims -- the build doc's section
+    # 6.2 registry has no ORG type -- so they are catalogued to make the gap
+    # measurable, not because anything is expected to detect them. See the note in
+    # fixtures/generator.py.
+    #
+    # What did NOT move is the finding this test exists to defend: `excluded` is
+    # still 358 and `by_type` below is byte-identical, because no organisation name
+    # in the corpus is short enough to fall under the floor. The percentage shifts
+    # 4.3 -> 4.2 on the denominator alone. Re-measured, not adjusted to fit.
+    assert len(pairs) == 8544, "distinct (type, value) pairs across 26 seeds x 4 kinds"
+    assert len({value for _, value in pairs}) == 8534, (
         "distinct planted VALUES -- ten of them are planted under two entity types, "
         "which is why this is not the count above"
     )
 
     multi = {(t, v) for t, v in pairs if len(_components(v)) >= 2}
     excluded = {(t, v) for t, v in multi if sum(map(len, _components(v))) < MIN_JOINED_ALNUM_LEN}
-    assert len({v for _, v in multi}) == 8390, "multi-component distinct values"
+    assert len({v for _, v in multi}) == 8462, "multi-component distinct values"
     assert len(excluded) == 358, "values the floor refuses a separator needle"
-    assert round(100 * len(excluded) / len({v for _, v in multi}), 1) == 4.3
+    assert round(100 * len(excluded) / len({v for _, v in multi}), 1) == 4.2
 
     by_type = collections.Counter(t for t, _ in excluded)
     assert dict(by_type) == {"AMOUNT": 286, "LAB_RESULT": 69, "NAME": 3}, (

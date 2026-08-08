@@ -2,6 +2,11 @@
   --bg: #0d1117; --panel: #151b23; --line: #2b3542; --fg: #d8e0ea; --dim: #8b98a8;
   --ok: #3fb950; --warn: #d29922; --err: #f85149; --go: #2f6feb;
   --pii: #58a6ff; --phi: #56d364; --legal: #bc8cff; --fin: #e3b341; --red: #ff7b72; --rest: #2ee6c5;
+  /* Controls carry their own edge: WCAG 2.1 1.4.11 wants 3:1 for the boundary that says
+     "this is a field", and --line manages 1.55:1 against the field fill #0b0f14 and 1.39:1
+     against the bar behind it. #5e6c7c measures 3.58 and 3.23. --line stays where it is for
+     dividers and panel edges -- decoration, and out of 1.4.11's scope. */
+  --control-line: #5e6c7c;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; } /* author display rules below must not defeat it */
@@ -24,7 +29,7 @@ code { color: var(--dim); }
 label { color: var(--dim); }
 .hint { color: var(--dim); font-size: 11px; }
 input, select, button { font: inherit; background: #0b0f14; color: var(--fg);
-  border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
+  border: 1px solid var(--control-line); border-radius: 4px; padding: 4px 6px; }
 input[type=file] { max-width: 230px; }
 button { cursor: pointer; }
 button:disabled { opacity: .5; cursor: progress; }
@@ -70,6 +75,15 @@ mark.tok { font-weight: bold; }
 .c-FIN, i.c-FIN { color: var(--fin); background: #3d2f0b; }
 .c-RED, i.c-RED { color: var(--red); background: #4a1512; }
 .rest, i.rest { color: #062b25; background: var(--rest); font-weight: bold; }
+/* [UNRESOLVED_ENTITY] -- a token the vault could not resolve. It used to be painted
+   with .rest, the "restored region" colour, so the ONE value the pipeline failed to
+   restore was the one it advertised as restored: panel 4 emitted 33 rest marks against
+   a restored_count of 32. app.js now gives it its own class, but the class had no rule,
+   so it fell back to bare `mark` (no background) and read as ordinary bold text. A
+   failure has to look like one -- error colour and a wavy underline, deliberately
+   unlike both .rest (teal, success) and .c-RED (solid, a policy redaction that WORKED). */
+.unres, i.unres { color: var(--err); background: #3a1418;
+  text-decoration: underline wavy var(--err); }
 
 .audit { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
 .audit h2 { display: flex; align-items: center; gap: 10px; }
