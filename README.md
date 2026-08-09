@@ -280,15 +280,15 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-2689 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
+2690 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
                              #   The skip is the real-network LLM smoke test.
                              #   Without node it is 111 skipped -- the 110 UI behaviour tests go
                              #   with it. See Path B above.
-                             #   2690 collected: 158 leakage + 7 bench + rest unit + integration
+                             #   2691 collected: 158 leakage + 7 bench + rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 97% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   5036 statements, 79 missed; 1270 branches, 57 partial (package only; see below)
+                             #   5041 statements, 79 missed; 1272 branches, 57 partial (package only; see below)
 ```
 
 **One test is failing on the working tree this block was measured from, and the block says so
@@ -373,7 +373,7 @@ correctness content, and it is now the *only* thing `ruff` is not gating.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py`
-and `fixtures/` — it is **98%** of **24,992** statements: **24,341** for the package plus
+and `fixtures/` — it is **98%** of **25,012** statements: **24,361** for the package plus
 `tests/` plus `fixtures/`, and `demo.py`'s **651** on top of that. It is published as its two
 addends because it is the most rot-prone number on this page — every test module added moves it,
 and it was 55 statements adrift within one commit of being written — so

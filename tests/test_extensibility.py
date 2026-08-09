@@ -47,8 +47,12 @@ payload had already left the process.
 from __future__ import annotations
 
 import base64
+import os
 import re
 import secrets
+import shutil
+import subprocess
+import sys
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -670,3 +674,66 @@ async def test_the_restorer_still_refuses_a_strategy_nobody_registered(
     with pytest.raises(PipelineError) as exc:
         await harness.restorer.restore(session_id, "nothing to do", strategy="shroudd")
     assert exc.value.detail["reason"] == "unknown_strategy"
+
+
+def test_a_strategy_shipped_as_its_own_file_is_discovered(tmp_path: Path) -> None:
+    """A strategy in its own module must register with no edit to the base class.
+
+    The existing third-strategy test declares its class INLINE, in a module pytest
+    imports anyway -- so `@register_strategy` runs whether or not discovery works.
+    It tests the decorator, not the seam, and it stayed green while the seam was
+    broken: `_load_builtins` walked a hardcoded
+    `_BUILTIN_MODULES = ("tokenization", "pseudonymization")`, so a strategy shipped
+    as a FILE in the strategies package was never imported and `build_strategy`
+    could not find it. Adding one meant editing a tuple in the base class, which is
+    the "zero harness code" requirement failing in the one way its own test could
+    not see.
+
+    So this test writes a real file into a real copy of the package and asks
+    `available_strategies()` -- the public discovery entry point -- whether it is
+    there. It never imports the module itself, because importing it would run the
+    decorator and reproduce exactly the blind spot described above.
+
+    Run in a subprocess against a copied package rather than the live one: discovery
+    caches into a module-level dict, and dropping a file into the real tree would
+    leak a strategy into every later test in the session.
+    """
+    pkg_root = tmp_path / "secure_context_pipeline"
+    shutil.copytree(Path(__file__).resolve().parents[1] / "secure_context_pipeline", pkg_root)
+    (pkg_root / "obfuscation" / "strategies" / "plugin_probe.py").write_text(
+        "from secure_context_pipeline.obfuscation.strategies.base import (\n"
+        "    ObfuscationStrategy,\n"
+        "    RestoreMode,\n"
+        "    register_strategy,\n"
+        ")\n"
+        "\n"
+        "\n"
+        "@register_strategy\n"
+        "class PluginProbeStrategy(ObfuscationStrategy):\n"
+        "    name = 'plugin_probe'\n"
+        "    restores_via = RestoreMode.TOKEN_ID\n"
+        "\n"
+        "    async def make_surrogate(self, detection, token_id, vault, *, session_id):\n"
+        "        return '[PROBE]'\n",
+        encoding="utf-8",
+    )
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "from secure_context_pipeline.obfuscation.strategies.base import "
+        "available_strategies\n"
+        "print(','.join(available_strategies()))\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    names = result.stdout.strip().split(",")
+    assert "plugin_probe" in names, (
+        "a strategy shipped as its own file was not discovered, so 'adding a new "
+        f"strategy touches zero harness code' is false: {names}"
+    )
+    # Non-vacuity: the copy is a working package, not an empty one.
+    assert {"tokenization", "pseudonymization"} <= set(names), names
