@@ -13,14 +13,20 @@ identifiers, nothing copied from a fixture of a real record.
 from __future__ import annotations
 
 import asyncio
+import base64
+import secrets
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
+from secure_context_pipeline.api.app import create_app
+from secure_context_pipeline.audit import logger as audit_logger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.aead import decrypt, doc_aad, encrypt
 from secure_context_pipeline.crypto.keys import build_key_provider
@@ -1100,8 +1106,20 @@ async def test_a_failed_metadata_insert_leaves_no_orphan(
 
     connection.execute = failing_execute  # type: ignore[method-assign]
     try:
-        with pytest.raises(sqlite3.OperationalError):
+        # WAS ``pytest.raises(sqlite3.OperationalError)``. The subject of this test
+        # is the unwind, not the exception class, and the class changed for a
+        # reason that is itself a fix: a raw driver exception escaping a store
+        # method is a bare ``500 Internal Server Error`` with no ``code`` and no
+        # security headers at the HTTP boundary, which is what
+        # ``DocumentStoreUnavailableError`` exists to replace. The driver error is
+        # asserted below as the ``__cause__``, so this pair is strictly stronger
+        # than the single check it replaces: it still fails if ``put`` stops
+        # raising, and it now also fails if the refusal is invented rather than
+        # chained from a real failure.
+        with pytest.raises(document_store.DocumentStoreUnavailableError) as caught:
             await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+        assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+        assert caught.value.detail["operation"] == "put"
     finally:
         connection.execute = real_execute  # type: ignore[method-assign]
 
@@ -1160,8 +1178,13 @@ async def kill_mid_put(store: EncryptedDocumentStore, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(connection, "execute", failing_execute)
     monkeypatch.setattr(store, "_unlink_quietly", no_cleanup)
-    with pytest.raises(sqlite3.OperationalError):
+    # WAS ``pytest.raises(sqlite3.OperationalError)``; see the note in
+    # ``test_a_failed_metadata_insert_leaves_no_orphan``. This helper only needs
+    # ``put`` to die after both blobs land, and the ``__cause__`` check keeps it
+    # honest about what killed it.
+    with pytest.raises(document_store.DocumentStoreUnavailableError) as caught:
         await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+    assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
     monkeypatch.undo()
 
 
@@ -1295,3 +1318,354 @@ async def test_malformed_doc_id_never_reaches_the_filesystem(
             await accessor(USER_A, hostile_doc_id)
         assert err.value.code == "NOT_FOUND"
     assert opened == []
+
+
+# --- 12. a documents.db this process cannot read ----------------------------
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+API_OWNER = "alice"
+
+#: One occurrence of each entity, no value that is a substring of another -- the
+#: same shape ``tests/test_api.py`` uses, so what the ASGI test below measures is
+#: the refusal and not the detector.
+API_DOC_TEXT = """CLINIC INTAKE RECORD
+
+Patient name: David Ochoa.
+
+MRN: 9224297.
+
+Phone: (704) 555-0151.
+"""
+
+
+async def api_run(http: AsyncClient, session_id: str, doc_id: str) -> Any:
+    return await http.post(
+        "/pipeline/run",
+        json={
+            "user_id": API_OWNER,
+            "doc_id": doc_id,
+            "prompt": "Summarise this record in two sentences.",
+            "session_id": session_id,
+        },
+    )
+
+
+def wreck_every_page_but_the_header(path: Path) -> None:
+    """Garbage every page of a real SQLite file except page 1, keeping its length.
+
+    Genuinely corrupt, not a patched raise. The length is what gets past ``open``:
+    the header records the database size in pages, so a *short* file is rejected
+    outright while a full-length file whose data pages are dead is opened happily
+    and fails only when something reads one. Page 1 survives because that is where
+    the schema lives, and ``_connection`` runs ``CREATE TABLE IF NOT EXISTS`` and
+    has to parse it.
+
+    :func:`integrity_check` on the result reports ``database disk image is
+    malformed``, and every test below calls it rather than trusting this function.
+    """
+    data = bytearray(path.read_bytes())
+    page = 4096
+    assert len(data) >= 2 * page, "database is too small for this corruption to be meaningful"
+    for start in range(page, len(data), page):
+        data[start : start + page] = (b"\xde\xad\xbe\xef" * (page // 4))[: len(data) - start]
+    path.write_bytes(bytes(data))
+
+
+def drop_metadata_files(settings: Settings) -> None:
+    """Delete ``documents.db`` and its WAL sidecars, leaving every blob in place.
+
+    The state a next ``_connection()`` rebuilds an empty schema over -- which is
+    how the control in the sweep test gets a *readable* database with no rows.
+    """
+    main = db_path(settings)
+    main.unlink(missing_ok=True)
+    for suffix in ("-wal", "-shm"):
+        Path(f"{main}{suffix}").unlink(missing_ok=True)
+
+
+def integrity_check(path: Path) -> str:
+    """``PRAGMA integrity_check`` through the stdlib driver, errors included."""
+    connection = sqlite3.connect(path)
+    try:
+        try:
+            return str(connection.execute("PRAGMA integrity_check").fetchone())
+        except sqlite3.DatabaseError as exc:
+            return f"{type(exc).__name__}: {exc}"
+    finally:
+        connection.close()
+
+
+async def store_two_and_wreck(store: EncryptedDocumentStore, settings: Settings) -> str:
+    """Store two documents, then physically wreck the metadata file underneath.
+
+    Closed and re-opened around the corruption rather than written behind SQLite's
+    back, so the page cache cannot mask it: the returned store reads the same bytes
+    a restarted process would. Two documents, not one, so that a sweep which
+    deletes "everything" is visibly different from one that deletes nothing.
+    """
+    doc_id = await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+    await store.put(USER_A, "second.txt", SYNTHETIC_BYTES, None)
+    await store.close()
+    wreck_every_page_but_the_header(db_path(settings))
+    assert "malformed" in integrity_check(db_path(settings)), (
+        f"the file is still readable, so nothing below measures a refusal: "
+        f"{integrity_check(db_path(settings))}"
+    )
+    await store._connection()
+    return doc_id
+
+
+async def test_a_corrupt_metadata_database_refuses_get_category_rather_than_unclassified(
+    store: EncryptedDocumentStore, settings: Settings
+) -> None:
+    """``None`` is a filing decision; an unreadable file is not one.
+
+    The two are one keystroke apart and the cheap fix -- ``except sqlite3.Error:
+    return None`` -- is silent by construction. Measured on the real detector with
+    a medical intake record: category ``medical`` yields 5 detections, ``None``
+    yields 4, and the one that disappears is ``DATE``, which carries
+    ``only_in_doc_categories: [medical]``. The date went to the provider in
+    cleartext inside a ``200`` whose egress gate reported clean.
+    """
+    doc_id = await store_two_and_wreck(store, settings)
+
+    with pytest.raises(document_store.DocumentStoreUnavailableError) as caught:
+        await store.get_category(USER_A, doc_id)
+
+    error = caught.value
+    # Not `StoreAuthError`, which would be indistinguishable from "no such
+    # document", and not `None`, which is a real category answer.
+    assert not isinstance(error, StoreAuthError)
+    assert error.code == "DOCUMENT_STORE_UNAVAILABLE"
+    assert error.detail["reason"] == "document_store_unreadable"
+    assert error.detail["operation"] == "get_category"
+    assert error.detail["store_db"] == "documents.db"
+    assert error.detail["error"] == "DatabaseError"
+    assert isinstance(error.__cause__, sqlite3.DatabaseError)
+
+    # Nothing derived from the driver or the filesystem: `api/errors.py` writes
+    # this map into the HTTP body verbatim.
+    rendered = f"{error!r} {error} {sorted(error.detail.items())}"
+    assert str(db_path(settings)) not in rendered
+    assert str(settings.data_dir) not in rendered
+    assert "malformed" not in rendered
+    # ...and the remedy is something an operator can act on, spelled out here
+    # rather than compared to the imported constant, which would pass against
+    # `remedy: ""`.
+    remedy = str(error.detail["remedy"])
+    assert remedy == document_store.UNREADABLE_STORE_REMEDY
+    assert "restore" in remedy and "re-upload" in remedy
+
+
+async def test_a_corrupt_metadata_database_refuses_list_docs_rather_than_answering_empty(
+    store: EncryptedDocumentStore, settings: Settings
+) -> None:
+    """An empty library is a fact about a user, not about a broken file."""
+    await store_two_and_wreck(store, settings)
+    with pytest.raises(document_store.DocumentStoreUnavailableError) as caught:
+        await store.list_docs(USER_A)
+    assert caught.value.detail["operation"] == "list_docs"
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+
+
+async def test_a_corrupt_metadata_database_refuses_put_and_leaves_no_orphan_blob(
+    store: EncryptedDocumentStore, settings: Settings
+) -> None:
+    """An upload against an unreadable index refuses, and unwinds both blobs.
+
+    Metadata is the source of truth, so a ``doc_id`` returned for a row that was
+    never written names a document nothing can ever reach -- and two blobs that
+    nothing can ever delete, because ``sweep_orphans`` needs to read the same file.
+    """
+    await store_two_and_wreck(store, settings)
+    before = sorted(path.name for path in blob_dir(settings).iterdir())
+
+    with pytest.raises(document_store.DocumentStoreUnavailableError) as caught:
+        await store.put(USER_A, "third.txt", SYNTHETIC_BYTES, "medical")
+
+    assert caught.value.detail["operation"] == "put"
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+    assert sorted(path.name for path in blob_dir(settings).iterdir()) == before
+
+
+async def test_a_corrupt_metadata_database_refuses_the_sweep_before_a_single_unlink(
+    store: EncryptedDocumentStore, settings: Settings
+) -> None:
+    """The dangerous one: here degrading is not a smaller answer, it is a larger act.
+
+    ``sweep_orphans`` deletes every blob whose ``doc_id`` is missing from the set
+    the SELECT returned, so ``known`` is a *keep* list. A read failure swallowed
+    into an empty set does not collect fewer orphans -- it deletes the whole store.
+    The control below measures exactly that, on a readable database: with the rows
+    gone, the identical call removes all 4 blobs. So the assertion that the corrupt
+    run removes 0 is measuring the refusal and not an empty directory.
+    """
+    await store_two_and_wreck(store, settings)
+    before = sorted(path.name for path in blob_dir(settings).iterdir())
+    assert len(before) == 4, before
+
+    with pytest.raises(document_store.DocumentStoreUnavailableError) as caught:
+        await store.sweep_orphans(min_age_seconds=0)
+
+    assert caught.value.detail["operation"] == "sweep_orphans"
+    assert sorted(path.name for path in blob_dir(settings).iterdir()) == before
+
+    # The control: an EMPTY keep-list over a readable database really does delete
+    # everything, so the refusal above is what stood between the corruption and
+    # the blobs.
+    await store.close()
+    drop_metadata_files(settings)
+    async with EncryptedDocumentStore(settings) as fresh:
+        assert await fresh.sweep_orphans(min_age_seconds=0) == 4
+    assert list(blob_dir(settings).iterdir()) == []
+
+
+async def test_the_blob_read_path_still_answers_while_the_metadata_database_is_rubble(
+    store: EncryptedDocumentStore, settings: Settings
+) -> None:
+    """Why the refusal has to come from ``get_category``, stated as a measurement.
+
+    ``get_text`` and ``get_raw`` open a file and decrypt it; they never touch
+    SQLite. So a corrupt ``documents.db`` does not make them return empty text --
+    it makes them keep working, which is exactly why the fail-closed behaviour has
+    to be proved at the methods that DO query the database rather than assumed for
+    the store as a whole. The orchestrator calls ``get_text`` and then
+    ``get_category``, so the run is refused one line after this succeeds.
+    """
+    doc_id = await store_two_and_wreck(store, settings)
+
+    assert await store.get_raw(USER_A, doc_id) == SYNTHETIC_BYTES
+    assert await store.get_text(USER_A, doc_id) != ""
+    assert "Marisol" in await store.get_text(USER_A, doc_id)
+
+
+def test_the_document_store_and_the_audit_log_share_one_unreadable_rule() -> None:
+    """One rule for three files, checked rather than asserted in a comment.
+
+    This proves agreement, not correctness -- the corrupt-file tests above are what
+    prove the rule is right. It exists because ``documents.db`` reproduced the audit
+    log's defect exactly, long after that one was fixed, and a tuple copied into a
+    second module with no link between them is how that happens again.
+    """
+    assert document_store._UNREADABLE == audit_logger._UNREADABLE
+    assert document_store._UNREADABLE == (sqlite3.Error, ValueError, TypeError)
+
+
+async def test_a_corrupt_document_store_refuses_a_pipeline_run_over_the_real_asgi_app(
+    tmp_path: Path,
+) -> None:
+    """The reported defect at the boundary a reviewer actually sees.
+
+    The sibling of ``test_api.py::test_a_corrupt_audit_log_refuses_the_run_as_a_typed_503``,
+    on the third of the three SQLite stores. A fresh app on its own data directory,
+    a healthy run first, then the live ``documents.db`` physically wrecked on disk
+    and the same request repeated. Nothing is monkeypatched -- no patched accessor,
+    no injected raise -- so what is asserted is the behaviour of the shipped code on
+    a file SQLite genuinely cannot read.
+
+    ``raise_app_exceptions`` is left at its default ``True``, which is load-bearing:
+    anything still escaping unhandled makes this test *error* with that exception
+    rather than read a status code off a Starlette-generated 500. The old behaviour
+    -- ``sqlite3.DatabaseError`` out of ``get_category``, rendered as ``500
+    text/plain Internal Server Error`` with no CSP and no ``nosniff`` -- cannot pass
+    this test by accident.
+
+    The fail-closed half is asserted positively as well as negatively. The
+    tempting degradation here answers ``200`` with an empty document: measured, 0
+    entities detected, the egress gate clean, and a summary of a document that was
+    never read. So this checks not merely that the status is an error but that the
+    response carries no ``detections`` and no clean-bill-of-health body.
+    """
+    settings = Settings(
+        master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        data_dir=tmp_path / "corrupt-documents-data",
+        registry_path=REPO_ROOT / "entities.yaml",
+        llm_provider="mock",
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        services = app.state.services
+        provider_calls = 0
+        real_complete = services.orchestrator._provider.complete_detailed
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal provider_calls
+            provider_calls += 1
+            return await real_complete(*args, **kwargs)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://scp.test") as http:
+            with mock.patch.object(
+                services.orchestrator._provider, "complete_detailed", counting
+            ):
+                session_id = (
+                    await http.post("/sessions", json={"user_id": API_OWNER})
+                ).json()["session_id"]
+                doc_id = (
+                    await http.post(
+                        "/documents",
+                        files={"file": ("intake.txt", API_DOC_TEXT.encode(), "text/plain")},
+                        data={"user_id": API_OWNER, "doc_category": "medical"},
+                    )
+                ).json()["doc_id"]
+
+                # Control: the identical request succeeds on a healthy store, and
+                # really does detect something -- otherwise "0 detections" below
+                # would be the normal answer rather than the fail-open signature.
+                healthy = await api_run(http, session_id, doc_id)
+                assert healthy.status_code == 200, healthy.text
+                assert provider_calls == 1, "premise: a healthy run reaches the provider"
+                assert healthy.json()["stats"]["entities_detected"] >= 3
+                assert "David Ochoa" in healthy.json()["restored_text"]
+
+                # Wreck the file under the live app. Closed and reopened rather
+                # than written behind SQLite's back, so the page cache cannot mask
+                # it: this is the same file the next request opens.
+                await services.store.close()
+                wreck_every_page_but_the_header(settings.data_dir / "documents.db")
+                assert "malformed" in integrity_check(settings.data_dir / "documents.db")
+                await services.store._connection()
+
+                refused = await api_run(http, session_id, doc_id)
+
+    # FIRST, before anything about the shape of the answer: the run was refused
+    # before the payload was sent.
+    assert provider_calls == 1, "the refused run must not have reached the provider"
+
+    body = refused.json()
+    assert body["code"] == "DOCUMENT_STORE_UNAVAILABLE"
+    assert body["detail"]["reason"] == "document_store_unreadable"
+    assert body["detail"]["operation"] == "get_category"
+    assert body["detail"]["store_db"] == "documents.db"
+    assert body["detail"]["error"] == "DatabaseError"
+    assert body["detail"]["remedy"] == document_store.UNREADABLE_STORE_REMEDY
+
+    # 500 is what the `PipelineError` catch-all in `api/errors.py` answers, and it
+    # is pinned rather than loosened to `>= 500` so the remaining gap is visible:
+    # the audit sibling answers **503** because that module registers
+    # `AuditUnavailableError` explicitly, and registering this class the same way is
+    # a change in `api/errors.py`, outside this change's grant. When that
+    # registration lands this line becomes 503 -- deliberately, not by accident.
+    assert refused.status_code == 500, refused.text
+
+    # Fail CLOSED, asserted as the absence of the fail-open answer: no detections,
+    # no restored text, no clean bill of health over a document nothing read.
+    assert "detections" not in body
+    assert "restored_text" not in refused.text
+    assert "entities_detected" not in refused.text
+
+    # The bare 500 was `text/plain`, carried no `code`, and had none of these
+    # headers, because ServerErrorMiddleware renders outside the middleware that
+    # adds them.
+    assert refused.headers["content-type"].startswith("application/json")
+    assert "Internal Server Error" not in refused.text
+    assert refused.headers["x-content-type-options"] == "nosniff"
+    csp = refused.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in csp
+    assert "default-src 'none'" in csp
+
+    # No filesystem path and no driver text in the body.
+    assert str(settings.data_dir) not in refused.text
+    assert "malformed" not in refused.text
+    assert "sqlite" not in refused.text.lower()
+    assert "Traceback" not in refused.text

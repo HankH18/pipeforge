@@ -215,6 +215,7 @@ from secure_context_pipeline.errors import VaultMissError
 from secure_context_pipeline.models import Detection
 from secure_context_pipeline.obfuscation.strategies.base import (
     ObfuscationStrategy,
+    RestoreMode,
     StrategyContext,
     register_strategy,
 )
@@ -480,6 +481,13 @@ class PseudonymizationStrategy(ObfuscationStrategy):
     """Tier-dispatching pseudonymizer. See the module docstring for the policy."""
 
     name = "pseudonymization"
+
+    #: The Tier-1 and Tier-2 branches of :meth:`make_surrogate` return fakes with no
+    #: token ID in them, so the restorer cannot get those back without the run's
+    #: surrogate map. Declared for the *hardest* shape this class emits, not the
+    #: commonest: the Tier-3/Tier-4 branches fall back to ``plain_token`` and are
+    #: restored by the token pass, which runs either way.
+    restores_via = RestoreMode.SURROGATE_LOOKUP
 
     def __init__(self, ctx: StrategyContext) -> None:
         super().__init__(ctx)

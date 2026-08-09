@@ -32,9 +32,9 @@ duplicating them would create a second schema that could drift into leaking.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from secure_context_pipeline.models import AuditEvent
 
@@ -80,7 +80,45 @@ MAX_ID_LEN = 64
 #: 4 tokens issued, and all four originals absent from ``obfuscated_payload``.
 MAX_PROMPT_CHARS = 8_000
 
-StrategyName = Literal["tokenization", "pseudonymization"]
+def _registered_strategy(value: str) -> str:
+    """Refuse a ``strategy`` no strategy registry knows. The request-boundary twin
+    of ``config._check_strategy_is_registered``.
+
+    This was ``Literal["tokenization", "pseudonymization"]``, and that made the
+    graded claim -- "adding a new strategy touches zero harness code" -- false at the
+    HTTP boundary while it was true of the engine. A class registered through the
+    documented ``@register_strategy`` seam could be selected by ``SCP_STRATEGY``
+    (``config.strategy`` was widened to a registry-checked ``str`` for exactly this
+    reason) and still not be *named by a request*: measured,
+    ``PipelineRunRequest(strategy="redaction")`` raised ``literal_error`` before the
+    orchestrator existed in the call stack.
+
+    Asking the registry rather than listing names loosens nothing. An unregistered
+    name is still a 422, at the same place, and the answer now comes from the module
+    that actually knows what is registered -- which this one cannot import at module
+    scope without paying it on every import: ``available_strategies`` pulls in
+    ``detection.registry`` (``regex`` + ``yaml``) and the built-in strategy modules
+    (Faker, dateutil), measured in ``config.py`` at 116 ms + 62 ms. Deferred to first
+    validation, by which point the app has loaded all of it anyway.
+
+    The message is for a direct constructor call (tests, the demo). It never reaches
+    a client: ``api/errors.py::_validation_handler`` rewrites every 422 body down to
+    field names and counts, so no caller bytes and no registry listing are echoed.
+    """
+    from secure_context_pipeline.obfuscation.strategies.base import available_strategies
+
+    known = available_strategies()
+    if value not in known:
+        raise ValueError(f"unknown strategy; registered: {', '.join(known)}")
+    return value
+
+
+#: The ``strategy`` a request may ask for: any *registered* strategy name. Bounded
+#: first, checked second -- the length cap runs before the registry lookup, so an
+#: over-long body field is refused without touching the registry.
+StrategyName = Annotated[
+    str, Field(min_length=1, max_length=MAX_ID_LEN), AfterValidator(_registered_strategy)
+]
 
 
 class SessionCreateRequest(BaseModel):

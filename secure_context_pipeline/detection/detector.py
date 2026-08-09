@@ -33,7 +33,10 @@ from presidio_analyzer.nlp_engine import NlpEngineProvider
 
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.daterules import split_composite_date
-from secure_context_pipeline.detection.recognizers import build_recognizers
+from secure_context_pipeline.detection.recognizers import (
+    build_recognizers,
+    gazetteer_occurrences,
+)
 from secure_context_pipeline.detection.registry import (
     TIER_TEMPORAL,
     EntityRegistry,
@@ -47,6 +50,7 @@ __all__ = [
     "CONTEXT_WINDOW_AFTER",
     "CONTEXT_WINDOW_BEFORE",
     "DEFAULT_SPACY_MODEL",
+    "GAZETTEER_MERGE_MAX_STEPS",
     "PRESIDIO_LOGGER_NAME",
     "DetectionInvariantError",
     "Detector",
@@ -201,6 +205,23 @@ _SOFT_BREAK = re.compile(r"(?<=[.!?])[ \t]+|\n+")
 # mechanically, so widening a registry quantifier past this fails there rather than
 # silently reintroducing boundary truncation.
 CHUNK_OVERLAP_CHARS = 512
+
+# How many times ``Detector._merge_gazetteer_run`` may widen one span. Each step
+# appends the tail of one further gazetteer term, so this is a bound on the length
+# of the term CHAIN a single detection can absorb, not on characters.
+#
+# Two is what the shipped gazetteers can actually reach, measured by pairing all 208
+# diagnosis terms and all 170 medication terms against each other: exactly 4 pairs
+# overlap word-wise (``gestational diabetes``/``type 1 diabetes``/``type 2 diabetes``
+# each into ``diabetes mellitus``, and ``overactive bladder`` into ``bladder
+# cancer``), and no term begins with ``mellitus`` or ``cancer``, so no chain of three
+# exists. Four is that doubled -- headroom for a gazetteer edit, and still small
+# enough that a pathological future term list cannot walk a span across a paragraph.
+#
+# Termination does not depend on it: every step strictly increases the span's end,
+# which is bounded by the document length. The cap bounds OVER-CAPTURE, which is the
+# failure mode the merge rule introduces and the one worth a hard ceiling.
+GAZETTEER_MERGE_MAX_STEPS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +790,15 @@ class Detector:
         self._custom_names = frozenset(
             name for name, spec in registry.entities.items() if spec.patterns or spec.gazetteer
         )
+        # entity_type -> its gazetteer file, for the SAME-TYPE, gazetteer-only merge
+        # in ``_merge_gazetteer_run``. Keyed off ``spec.gazetteer`` rather than off a
+        # name so a gazetteer entity added by config tomorrow is covered with no code
+        # change, and so a ``patterns:`` entity can never enter the merge.
+        self._gazetteer_files = {
+            name: spec.gazetteer
+            for name, spec in registry.entities.items()
+            if spec.gazetteer
+        }
         self._context_patterns: dict[str, re.Pattern[str] | None] = {
             name: (
                 re.compile(
@@ -861,7 +891,8 @@ class Detector:
             for result in results:
                 detection = self._to_detection(result, text, offset, doc_category)
                 if detection is not None:
-                    candidates.extend(self._split_composite_dates(text, detection))
+                    merged = self._merge_gazetteer_run(text, detection)
+                    candidates.extend(self._split_composite_dates(text, merged))
 
         kept = resolve_overlaps(text, candidates, self._policy_types, self._custom_names)
         _verify_offsets(text, kept)
@@ -1110,6 +1141,122 @@ class Detector:
             end=end,
             text=text[start:end],
             score=score,
+        )
+
+    def _merge_gazetteer_run(self, text: str, detection: Detection) -> Detection:
+        """``detection``, widened to cover every gazetteer term that OVERLAPS it.
+
+        The rule, exactly, because a merge rule that is loose is a rule that vaults
+        text which is not a value:
+
+        * **Same entity type only, and only a gazetteer-backed one.** The terms
+          consulted are the ones from *this* entity's own gazetteer file
+          (``self._gazetteer_files``), so a ``DIAGNOSIS`` can only ever absorb
+          diagnosis text. Nothing merges unrelated entities into a super-span --
+          that job belongs to :func:`resolve_overlaps`, which unions overlapping
+          spans of any type *after* they are all found, and which cannot help here
+          because the span this recovers is one Presidio never emitted.
+        * **Overlapping, not adjacent.** The absorbed term must share at least one
+          character with the span. See below.
+        * **Rightward only**, and see below for why that is complete rather than
+          half a rule.
+        * **Bounded** by :data:`GAZETTEER_MERGE_MAX_STEPS`.
+
+        Every character of the result therefore lies inside some curated clinical
+        term, so "merging swallowed a sentence" is not a bad outcome this rule can
+        reach: it would take a gazetteer whose terms chain across the sentence.
+
+        **Why the merge is needed at all.** Presidio compiles a deny-list into one
+        alternation and searches it, so matching is leftmost-first and
+        non-overlapping. ``diagnoses.txt`` ships ``type 2 diabetes`` and ``diabetes
+        mellitus`` but not the compound, and on
+
+            "Primary Diagnosis: Type 2 diabetes mellitus, stable."
+
+        the scan matches ``Type 2 diabetes`` at 19 and resumes at 34, so ``diabetes
+        mellitus`` -- which starts at 26, *inside* the first match -- is never tried.
+        The payload went out as ``Primary Diagnosis: [PHI_DIAGNOSIS_815d497e]
+        mellitus``. ``gazetteer_terms``' longest-first ordering does not reach this:
+        it resolves two terms starting at the SAME offset, and these start at
+        different ones. Neither does the egress gate, structurally -- pass 1 scans
+        for whole vaulted originals, the vaulted original is ``Type 2 diabetes``,
+        and that string does not contain ``mellitus``. The run reported
+        ``egress_rescan_warnings=0`` and outcome ``ok``.
+
+        **Why rightward extension alone is complete.** A term ``T`` that overlapped
+        the span on the LEFT would start before it, at a word start Presidio's scan
+        had already passed. Leftmost-first means the scan can only have passed that
+        offset by consuming a match that covers it -- i.e. ``T`` overlaps *that*
+        earlier hit, and rightward extension from the earlier hit reaches it. Worked
+        through: terms ``aa bb``, ``bb cc dd``, ``dd`` over ``"aa bb cc dd"`` give
+        Presidio ``[0,5)`` and ``[9,11)``; extending ``[0,5)`` rightward finds ``bb
+        cc dd`` at 3 and reaches 11, and :func:`resolve_overlaps` then absorbs the
+        second hit. Adding a leftward pass would find nothing and would cost a scan
+        per hit.
+
+        **Why overlap and not one-space adjacency.** Zero-gap adjacency cannot occur
+        at all -- both terms are word-boundary anchored, so the character between two
+        of them is a non-word character. That leaves "separated by a single space",
+        and taking it would join two spans that are *both already detected and both
+        already vaulted*: it closes no disclosure, and it replaces two true values in
+        the vault with one string that is not a value.
+
+        Measured over the four shipped fixtures plus 240 generated documents (60
+        seeds x 4 kinds; 244 documents, 610 gazetteer detections): same-type
+        detections separated by exactly one space occur **0** times, and all 61
+        consecutive same-type pairs within twelve characters of each other are
+        separated by ``" and "``. So the looser rule would have fired 0 times on the
+        whole corpus.
+
+        The honest companion number is that **this** rule also fires 0 times on that
+        corpus -- the compound shape is reachable, as the reproduction above shows,
+        but neither gazetteer's overlapping pairs appear in the shipped or generated
+        text, so no corpus count separates the two rules. What separates them is what
+        each can be wrong ABOUT: every character this rule adds lies inside a curated
+        term the span already overlaps, while the space rule would swallow a
+        separator and two independently-true values on the first document that writes
+        a problem list as ``hypertension hyperlipidemia``. Pairing all 208 diagnosis
+        terms and all 170 medication terms gives the whole reachable class: 4
+        overlapping pairs, all in ``diagnoses.txt``.
+
+        **Offsets.** ``start`` never moves and ``text`` is re-sliced from the
+        document, so the invariant ``text[start:end] == detection.text`` that
+        ``_verify_offsets`` enforces holds by construction rather than by arithmetic.
+        A term cannot match across a line break -- the terms are literals whose only
+        whitespace is a single space -- so the widened span stays on its own line.
+        """
+        filename = self._gazetteer_files.get(detection.entity_type)
+        if filename is None:
+            return detection
+
+        end = detection.end
+        for _step in range(GAZETTEER_MERGE_MAX_STEPS):
+            # Occurrences BEGINNING strictly inside the span: one starting at
+            # ``detection.start`` is the span's own term (or a shorter one it
+            # contains), and one starting at ``end`` is not an overlap.
+            reach = max(
+                (
+                    occurrence_end
+                    for _occurrence_start, occurrence_end in gazetteer_occurrences(
+                        filename, text, detection.start + 1, end
+                    )
+                ),
+                default=end,
+            )
+            if reach <= end:
+                break
+            end = reach
+
+        if end == detection.end:
+            return detection
+        logger.debug(
+            "gazetteer_run_merged entity_type=%s chars=%d added=%d",
+            detection.entity_type,
+            end - detection.start,
+            end - detection.end,
+        )
+        return detection.model_copy(
+            update={"end": end, "text": text[detection.start : end]}
         )
 
     def _split_composite_dates(self, text: str, detection: Detection) -> list[Detection]:

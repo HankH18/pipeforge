@@ -39,7 +39,11 @@ from secure_context_pipeline.audit.logger import (
     chain_payload,
     compute_entry_hash,
 )
-from secure_context_pipeline.errors import PipelineError
+from secure_context_pipeline.errors import (
+    UNREADABLE_AUDIT_REMEDY,
+    AuditUnavailableError,
+    PipelineError,
+)
 from secure_context_pipeline.models import (
     MAX_AUDIT_LABEL_LEN,
     MAX_DETAIL_VALUE_LEN,
@@ -1582,8 +1586,110 @@ async def test_verify_chain_reports_a_physically_corrupted_file_that_open_accept
         with pytest.raises(PipelineError) as length_err:
             await log.length()
         assert length_err.value.detail["reason"] == "audit_log_unreadable"
+
+        # Added with the writer's own refusal (below): both readers now carry the
+        # code the HTTP layer answers 503 with, and they name which call failed.
+        # `reason` above is unchanged and stays asserted -- it is what the API's
+        # own tests and the module docstrings have always keyed on.
+        for err, operation in ((query_err, "query"), (length_err, "length")):
+            assert isinstance(err.value, AuditUnavailableError), type(err.value)
+            assert err.value.code == "AUDIT_UNAVAILABLE"
+            assert err.value.detail["operation"] == operation
+            assert err.value.detail["audit_db"] == "corrupt.db", (
+                "the file NAME belongs in the body; the absolute path does not"
+            )
+            assert err.value.detail["remedy"] == UNREADABLE_AUDIT_REMEDY
     finally:
         await log.close()
+
+
+async def test_emit_refuses_a_corrupt_database_with_a_typed_error(tmp_path: Path) -> None:
+    """The writer's half of the rule the readers already followed.
+
+    Same input as the test above -- a real 120-row log with one 4 KiB page zeroed,
+    accepted by the real ``open`` -- driven at ``emit`` instead of at the readers.
+    What escaped was ``sqlite3.DatabaseError: database disk image is malformed``
+    from ``conn.execute(_LAST_ENTRY_SQL)``, i.e. from the chain-tail read, which is
+    the same class of failure ``verify_chain`` goes to trouble over and ``emit``
+    did nothing about. Through the ASGI app that was a bare
+    ``500 Internal Server Error``; ``tests/test_api.py`` pins the HTTP half.
+
+    Three assertions and each one is a separate claim:
+
+    * it **raises** -- "no release without a record" is the property, and a writer
+      that swallowed this would release runs with no record of them
+      (``integration/test_pipeline.py::test_no_release_survives_an_audit_write_that_failed_before_it``);
+    * it raises the **typed** error, with the operation named, so a client can tell
+      a corrupt data directory from a bug in the pipeline;
+    * the ``sqlite3`` exception is the ``__cause__`` and not the thing that escapes.
+      Asserting the cause is what keeps this test honest about *where* the failure
+      came from: a future implementation that raised the typed error for some
+      unrelated reason would satisfy the first two and fail here.
+
+    The corruption is a real file with real dead bytes rather than a monkeypatched
+    ``raise``: ``PRAGMA integrity_check`` on it reports ``database disk image is
+    malformed`` before this test ever calls ``emit``.
+    """
+    db = tmp_path / "audit.db"
+    await _build_log(db, rows=120)
+    _zero_one_page(db)
+
+    log = await AuditLogger.open(db)  # the premise: this does NOT raise
+    try:
+        with pytest.raises(AuditUnavailableError) as caught:
+            await log.emit(make_event(ts=9999.0))
+    finally:
+        await log.close()
+
+    error = caught.value
+    assert isinstance(error, PipelineError), "must stay inside the one hierarchy"
+    assert error.code == "AUDIT_UNAVAILABLE"
+    assert error.detail == {
+        "reason": "audit_log_unreadable",
+        "operation": "emit",
+        "audit_db": "audit.db",
+        "error": "DatabaseError",
+        "remedy": UNREADABLE_AUDIT_REMEDY,
+    }
+    assert isinstance(error.__cause__, sqlite3.DatabaseError), error.__cause__
+    assert "malformed" in str(error.__cause__)
+
+    # `api/errors.py` writes `dict(exc.detail)` into an HTTP body verbatim, so the
+    # server's directory layout must not be in it. The name is; the path is not.
+    assert str(tmp_path) not in str(error)
+
+
+async def test_the_unreadable_refusal_cannot_itself_raise_on_a_long_path(
+    tmp_path: Path,
+) -> None:
+    """The error path's own error path. Not hypothetical -- it is one ``str()`` away.
+
+    ``PipelineError.__init__`` *raises* ``ValueError`` when a detail value renders
+    longer than the 64-character ceiling, and this constructor runs while the
+    database is already on fire. Had ``_unreadable`` passed ``str(self._db_path)``
+    -- the obvious choice, and what the log line correctly does use -- then any
+    deployment whose data directory sits deeper than 64 characters would get a
+    ``ValueError`` out of the refusal and land back at the bare 500 the typed error
+    exists to remove. A pytest ``tmp_path`` alone is around 80.
+
+    So the ceiling is respected by construction, and this drives it with a 200-
+    character file name -- the longest this filesystem will accept, against a 64-
+    character ceiling -- to prove the clip is real rather than incidental.
+    """
+    deep = tmp_path / ("a" * 200 + ".db")
+    await _build_log(deep, rows=120)
+    _zero_one_page(deep)
+
+    log = await AuditLogger.open(deep)
+    try:
+        with pytest.raises(AuditUnavailableError) as caught:
+            await log.emit(make_event(ts=9999.0))
+    finally:
+        await log.close()
+
+    for key, value in caught.value.detail.items():
+        assert len(str(value)) <= MAX_DETAIL_VALUE_LEN, (key, value)
+    assert caught.value.detail["audit_db"] == "a" * MAX_DETAIL_VALUE_LEN
 
 
 async def test_a_truncated_file_either_verifies_honestly_or_refuses_to_open(
@@ -1942,6 +2048,26 @@ async def test_a_failed_write_does_not_wedge_every_later_write(
     Cancellation is included deliberately: it is a ``BaseException``, not an
     ``Exception``, and it is the *realistic* case -- an API request timing out
     mid-write -- rather than the exotic one.
+
+    **The two arms no longer surface the same way, and the difference is the
+    contract.** The sqlite fault is now the typed ``AuditUnavailableError`` -- 503
+    ``AUDIT_UNAVAILABLE`` at the HTTP boundary -- because a ``sqlite3.Error`` out of
+    the audit writer is *always* "this deployment's audit log cannot be used", and
+    the four realistic shapes on a bind-mounted file are one ``DatabaseError``
+    (a corrupt page: the reported defect) and three ``OperationalError``s (disk
+    full, a read-only mount, and ``database is locked`` from the several processes
+    sharing one file -- which is what actually happened to the demo). Narrowing the
+    refusal to ``DatabaseError`` would have fixed the one that was reported and
+    left the other three answering a bare ``500 Internal Server Error``.
+    Cancellation stays raw: it is a ``BaseException``, it means *this request* went
+    away rather than the log being unusable, and swallowing it into a domain error
+    would report a caller-side timeout as a server-side outage.
+
+    What this test is *about* is unchanged, and both arms still assert it: the
+    transaction is rolled back and the next write succeeds. The sqlite arm also
+    pins the identity of the original exception as ``__cause__``, which is stricter
+    than the bare ``type(injected)`` check it replaces -- the typed error must be
+    carrying the failure that actually happened, not merely be of the right class.
     """
     await audit.emit(make_event(ts=3000.0))
     conn = audit._connection()
@@ -1955,10 +2081,19 @@ async def test_a_failed_write_does_not_wedge_every_later_write(
 
         return failing
 
-    for injected in (sqlite3.OperationalError("disk I/O error"), asyncio.CancelledError()):
+    injections: tuple[tuple[BaseException, type[BaseException]], ...] = (
+        # (what fails inside the transaction, what the caller must see)
+        (sqlite3.OperationalError("disk I/O error"), AuditUnavailableError),
+        (asyncio.CancelledError(), asyncio.CancelledError),
+    )
+    for injected, surfaced in injections:
         monkeypatch.setattr(conn, "execute", make_failing(injected))
-        with pytest.raises(type(injected)):
+        with pytest.raises(surfaced) as caught:
             await audit.emit(make_event(ts=3001.0))
+        if surfaced is AuditUnavailableError:
+            assert caught.value.__cause__ is injected, (
+                "the typed refusal must carry the failure that actually happened"
+            )
         monkeypatch.undo()
 
         # The transaction was rolled back, so this is an ordinary write and not
@@ -2174,6 +2309,21 @@ def test_every_audit_reader_shares_one_unreadable_rule() -> None:
     ``test_an_unreadable_watermark_degrades_the_writer_and_still_fails_the_verifier``:
     a writer that fails closed silences the pipeline, and the verifier is the
     component whose job it is to report the tamper.
+
+    **And 5 -> 6 when ``emit``'s chain-tail read started refusing typed**, which is
+    the second time this counter has done its job. The number is a census of
+    implementation sites, so it goes stale whenever a site is legitimately added --
+    the contract it guards (one shared definition, no hand-written tuple, a count
+    nobody changed by accident) is untouched, and the sixth site is argued in the
+    same breath as the fifth because the two sit in the *same method* and resolve
+    in *opposite directions*. An unreadable watermark degrades: the log can still
+    be appended to, and a writer that fails closed on a lost high-water mark
+    silences the pipeline. An unreadable chain tail refuses: there is nothing to
+    chain onto, so the only alternative to raising is releasing a run with no
+    record of it. What it must NOT do is what it did -- let ``sqlite3.DatabaseError``
+    escape to the ASGI layer as a bare ``500 Internal Server Error``. Asserted
+    behaviourally by ``test_emit_refuses_a_corrupt_database_with_a_typed_error``
+    and, at the HTTP boundary, by ``test_api.py``'s corrupt-log test.
     """
     source = Path(logger_module.__file__).read_text(encoding="utf-8")
 
@@ -2185,10 +2335,21 @@ def test_every_audit_reader_shares_one_unreadable_rule() -> None:
         f"a reader is catching its own hand-written tuple {tuple_handlers} instead of "
         "_UNREADABLE; that is exactly how the last two versions of this rule drifted"
     )
-    assert source.count("except _UNREADABLE") == 5, (
-        "expected the shared rule at all five read sites (chain walk, the verifier's "
-        "watermark call, the writer's watermark call, query, length); a changed count "
-        "means a reader was added or removed without this test being considered"
+    # 5 -> 6: the writer's chain-tail read joined the list (see the docstring). The
+    # equality is deliberately still exact -- the point of the number is that it
+    # cannot move without somebody arguing for the site that moved it.
+    assert source.count("except _UNREADABLE") == 6, (
+        "expected the shared rule at all six sites (chain walk, the verifier's "
+        "watermark call, the writer's watermark call, the writer's chain-tail read, "
+        "query, length); a changed count means a reader was added or removed without "
+        "this test being considered"
+    )
+    # The three entry points must also *answer* alike, which a source census cannot
+    # see: one refusal, built in one place, so the two readers and the writer cannot
+    # drift on the code a client branches on.
+    assert source.count("self._unreadable(") == 3, (
+        "expected emit, query and length to share one refusal constructor; a fourth "
+        "call site or a hand-built AuditUnavailableError means they can drift again"
     )
 
 

@@ -23,7 +23,9 @@ from secure_context_pipeline.api.deps import ApiError
 from secure_context_pipeline.api.schemas import ErrorResponse
 from secure_context_pipeline.errors import (
     MAX_DETAIL_VALUE_LEN,
+    AuditUnavailableError,
     EgressBlockedError,
+    PayloadTooLargeError,
     PipelineError,
     SessionExpiredError,
     StoreAuthError,
@@ -180,6 +182,24 @@ def _register_handlers(app: FastAPI) -> None:
         EgressBlockedError,
         _pipeline_handler(HTTP_422_UNPROCESSABLE, log_level=logging.WARNING),
     )
+    # 422: the assembled payload is larger than one provider call can carry, refused
+    # before the gate runs and before any network call is constructed.
+    #
+    # Not 413. That status describes the *request entity*, and the request here is a
+    # small JSON body naming a document that was uploaded and accepted earlier -- the
+    # two codes that do mean "your request was too big", ``UPLOAD_TOO_LARGE`` and
+    # ``REQUEST_TOO_LARGE``, answer 413 and are counted by bytes on the wire. This one
+    # is a well-formed request the server cannot carry out, which is 422, and it is the
+    # same status as ``EGRESS_BLOCKED`` on purpose: both are the pipeline declining to
+    # make a provider call, and a client that already branches on 422 for "refused, no
+    # model call was made" gets this one right by reading ``code``.
+    #
+    # WARNING rather than INFO for the same reason the gate's block is: a refusal a
+    # caller cannot fix by retrying is worth a line in an operator's log.
+    app.add_exception_handler(
+        PayloadTooLargeError,
+        _pipeline_handler(HTTP_422_UNPROCESSABLE, log_level=logging.WARNING),
+    )
     # 404: wrong owner and absent document are byte-identical (build doc section 8).
     app.add_exception_handler(StoreAuthError, _pipeline_handler(http_status.HTTP_404_NOT_FOUND))
     # 404: the session's vault entries are gone -- indistinguishable from never
@@ -187,6 +207,37 @@ def _register_handlers(app: FastAPI) -> None:
     app.add_exception_handler(VaultMissError, _pipeline_handler(http_status.HTTP_404_NOT_FOUND))
     app.add_exception_handler(
         InvalidCategoryError, _pipeline_handler(http_status.HTTP_400_BAD_REQUEST)
+    )
+    # 503: the audit log is unreadable, so the operation was refused. The pipeline
+    # is healthy and a store it depends on is not, which is the same thing
+    # ``/health`` already answers 503 for when the audit connection is gone
+    # (``test_health_reports_degraded_when_the_audit_database_is_unreachable``) --
+    # so this is the existing vocabulary for the condition rather than a new one.
+    #
+    # Not 500. What this replaces *was* a 500 -- a bare ``text/plain`` "Internal
+    # Server Error" with no ``code``, no CSP and no ``nosniff``, because Starlette's
+    # ServerErrorMiddleware renders an unhandled exception outside the middleware
+    # that adds them -- and the point of the change is that a client can tell "this
+    # deployment's audit store is broken, and no request will succeed until an
+    # operator restores it" from "the pipeline has a bug". 500 is where the second
+    # lives, one registration below.
+    #
+    # No ``Retry-After``: the condition is not transient. Every retry re-reads the
+    # same dead page, and a header inviting one would be the same wrong advice the
+    # generic 500 gave. The ``remedy`` field carries what actually works.
+    #
+    # A NEW CODE IS A THREE-FILE CHANGE in this repo, and the third file is easy to
+    # miss: ``tests/test_ui_behaviour.py`` walks every ``PipelineError`` subclass and
+    # requires a sentence for its code in ``ui/app.js``'s SENTENCES table (plus a row
+    # in that file's ``_CODE_SENTENCES``). Until it has one the demo UI still renders
+    # this correctly -- the unknown-code path prints the code and the detail map, and
+    # ``test_an_unknown_error_code_still_renders_everything_the_body_carried`` pins
+    # that -- which is why ``remedy`` is a field in the body rather than prose the UI
+    # is trusted to supply.
+
+    app.add_exception_handler(
+        AuditUnavailableError,
+        _pipeline_handler(http_status.HTTP_503_SERVICE_UNAVAILABLE, log_level=logging.ERROR),
     )
     # 502: the provider failed. The pipeline is healthy; the upstream is not.
     app.add_exception_handler(

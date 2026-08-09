@@ -178,11 +178,34 @@ blind to it and the value rides through to the payload untouched. The gate must
 still block, the block must be audited, and the provider must never be called.
 That is the fail-closed property, proven independent of detection recall.
 
-Run it with ``pytest -m leakage``. **94-96 s** on this machine, measured rather than
-remembered -- three consecutive invocations of ``pytest tests/leakage/ -q -s`` took
-94.83 s, 95.49 s and 95.87 s, of which the 100 runs themselves were 89.6 s, 90.1 s and
-90.5 s. A range rather than a point because three earlier invocations of the same file
-took 93.10/93.49/93.81 s: the spread is other work on the machine, and quoting the
+**What a green run here is evidence of, and what it is not.** The summary line is the
+product claim README section 1 quotes, so the reliability of *this file* is part of the
+claim and is stated with it rather than left to be inferred. A clean execution is
+evidence that on 100 freshly generated documents, in that process, no original reached
+the outbound payload, the audit database or the process log, inside the boundaries
+listed above. It is **not** evidence that this module is deterministic, and N of them in
+a row is not either. The identifier limbs compare unbounded digit needles against
+digit-dense haystacks that are re-drawn on every process, so they collide by birthday at
+a rate that is measured rather than argued -- :data:`_FALSE_RED_PER_SUITE`, currently
+9.4e-03 spurious reds per suite, with the per-channel arithmetic and the narrowing
+decisions in :data:`_HARNESS_RUN_FLOOR`. The residual is **one-sided**: a collision adds
+a reported occurrence, so it can turn a clean run red and can never turn a leaking run
+green. ``0 leaks`` therefore means exactly what it says; what the streak of greens does
+not establish is that the next run will agree, and by the rule of three it takes about
+:data:`_CLEAN_SUITES_TO_BOUND` clean executions before a green streak bounds that rate
+at all. The bounded forms are a fifth channel that is bounded by observation rather than
+computed -- at most 1.5e-02 per suite, from a cross-run null over the 116 vaulted
+originals of six characters or fewer -- and it is declared beside that total rather than
+added to it, for the reason :data:`_HARNESS_RUN_FLOOR` gives. :meth:`Ledger.summary`
+prints all of that beside the tally, because a residual recorded only in a docstring is
+a residual the reader of the result never sees.
+
+Run it with ``pytest -m leakage``. **94-102 s** on this machine, measured rather than
+remembered -- six consecutive invocations of ``pytest tests/leakage/ -q -s`` took
+94.44, 95.46, 102.05, 101.98, 98.71 and 96.05 s, of which the 100 runs themselves were
+88.5, 88.9, 95.2, 95.2, 91.6 and 89.8 s. A range rather than a point because three
+earlier invocations of the same file took 93.10/93.49/93.81 s: the spread is other work
+on the machine, which these six were deliberately taken under, and quoting the
 fastest one as *the* number is how the last two figures went stale. The spaCy analyzer
 and the whole component graph are built once for the module and every run gets a fresh
 session. The number in this sentence had drifted to "40 s" while the suite actually took
@@ -599,6 +622,45 @@ class RunFailure:
         )
 
 
+#: What one clean execution of this module is worth, as a number rather than a mood.
+#:
+#: The expected count of **spurious** reds per 100-run suite, by channel, measured on
+#: the current tree; :data:`_HARNESS_RUN_FLOOR` carries the method, the raw window
+#: counts and the per-channel narrowing decisions. Two replays gave 9.43e-03 and
+#: 8.89e-03 in total and the larger is quoted here, because the conservative direction
+#: for a false-positive rate is up.
+#:
+#: **The residual is one-sided, and that is the half a reader must not lose.** Every
+#: entry is a needle colliding with a haystack, so each one can turn a run that leaked
+#: nothing red. None of them can turn a run that leaked green -- a collision only ever
+#: *adds* a reported occurrence. So the number below is not a discount on ``0 leaks``;
+#: it is the rate at which this module cries wolf, and the only thing it takes away is
+#: the inference "the harness went green four times, therefore it is deterministic".
+#:
+#: Spelled as a dict rather than a single float so the summary cannot quote a total
+#: whose parts nobody can check, and so a channel that gets narrowed later has a line
+#: to delete rather than a constant to edit.
+_FALSE_RED_PER_SUITE: dict[str, float] = {
+    # Fires as EgressBlockedError inside orchestrator.run -- the run dies before this
+    # module scans anything, and surfaces through Ledger.diagnosis as a missing run.
+    "payload (gate pass 1: regrouped + identifier limbs)": 6.53e-03,
+    "audit query view (find_in_digit_heavy_text)": 1.03e-03,
+    "DEBUG log haystack (find_in_digit_heavy_text)": 1.87e-03,
+}
+
+_FALSE_RED_TOTAL = sum(_FALSE_RED_PER_SUITE.values())
+
+#: How many consecutive clean executions it takes before a green streak says anything
+#: about :data:`_FALSE_RED_TOTAL` at all.
+#:
+#: The rule of three: seeing zero events in ``n`` trials bounds the rate at ``3/n`` with
+#: 95% confidence and at nothing tighter. So one clean suite bounds this rate at 3 --
+#: which is to say, at nothing -- and it takes ``3 / rate`` of them before "no false red
+#: yet" is even *consistent* with the measured rate being real. Printed beside the tally
+#: because the four-green-runs argument is the one this file has actually seen made.
+_CLEAN_SUITES_TO_BOUND = round(3 / _FALSE_RED_TOTAL)
+
+
 @dataclass(slots=True)
 class Ledger:
     """Accumulates the run tally so the module can print one summary line."""
@@ -657,10 +719,52 @@ class Ledger:
         self.round_trip_checked += restored
 
     def summary(self) -> str:
+        """The tally, and what the tally is and is not evidence of.
+
+        **The second half is not a disclaimer, it is the finding that a green run does
+        not carry.** This line is the product claim quoted in README section 1, and for
+        its whole history it said ``100/100 runs clean, 0 leaks`` and stopped -- which
+        reads as *this harness is deterministic and it agreed with itself again*. It is
+        not: :data:`_FALSE_RED_PER_SUITE` is a measured, seed-irreproducible channel that
+        turns a clean run red about once in 110 executions, so *"it went green four times
+        in a row"* is not evidence about this module's reliability. It takes
+        :data:`_CLEAN_SUITES_TO_BOUND` clean executions before it is evidence at all, and
+        that number belongs beside the tally rather than in a docstring nobody opens at
+        the moment they are reading the result.
+
+        The direction is stated as explicitly as the rate, because the honest caveat is
+        narrow and an over-broad one would be its own dishonesty: the residual is a
+        false-**red** channel. It can never explain a green, so ``0 leaks`` means what it
+        says; what it cannot do is promise the next run says the same.
+
+        Returned as one string of four lines rather than four calls, so that "the
+        summary" cannot be copied without the sentence that qualifies it. The first line
+        is byte-for-byte what it always was -- ``test_readme_claims`` parses it and the
+        README quotes it -- and the qualification is added rather than substituted.
+        """
+        width = max(len(name) for name in _FALSE_RED_PER_SUITE)
+        channels = "\n".join(
+            f"            {name.ljust(width)}  {rate:.1e}"
+            for name, rate in _FALSE_RED_PER_SUITE.items()
+        )
         return (
             f"[leakage] {self.runs}/{RUNS} runs clean, {self.leaks} leaks "
             f"({self.originals_vaulted} originals vaulted and scanned, "
-            f"{self.round_trip_checked} surrogates round-tripped)"
+            f"{self.round_trip_checked} surrogates round-tripped)\n"
+            "[leakage] evidence: for each run counted above -- a freshly generated "
+            "document, in\n          THIS process -- no original reached the outbound "
+            "payload, the audit DB or\n          the process log, inside the four "
+            "boundaries this module's docstring declares.\n"
+            "[leakage] NOT evidence: that this module is deterministic. Measured "
+            f"{_FALSE_RED_TOTAL:.1e} spurious\n          reds per suite from the "
+            "unbounded digit limbs -- one-sided (a collision\n          manufactures a "
+            "red; it never turns a leak green), reproducible by no seed:\n"
+            f"{channels}\n          the bounded limbs add an unquantified <=1.5e-02, "
+            "bounded by observation only.\n"
+            "[leakage] so N clean runs bound that rate at 3/N and no tighter (rule of "
+            f"three):\n          ~{_CLEAN_SUITES_TO_BOUND} consecutive clean suites "
+            "before a green streak is evidence about it.\n          Derivation: "
+            "_HARNESS_RUN_FLOOR."
         )
 
     def timing(self) -> str:
@@ -1351,7 +1455,10 @@ def _harness_mask_own_ids(haystack: str, issued: frozenset[str]) -> str:
     *worse*, because the assertion it fails says "original present in the outbound
     payload" -- the headline claim of this repository -- about a run in which nothing
     left. The gate measured its own rate at 1.3e-02 spurious blocks per 100-run suite,
-    seen twice in 27 executions.
+    seen twice in 27 executions. Re-measured from this side and after this exclusion, the
+    payload channel is 6.5e-03 per suite -- the same order, and still the largest of the
+    four channels in :data:`_FALSE_RED_PER_SUITE`, because what is left of it is the
+    *regrouped* limb rather than the id coincidence this function removes.
 
     **Two narrowings, and each one is a hole if it is dropped.**
 
@@ -1654,21 +1761,110 @@ def find_in_text(
 #: is the surface of the database *files*, which this function never reads --
 #: :func:`find_in_bytes` reads those, and it declines these needles outright. What
 #: :func:`find_in_digit_heavy_text` is actually handed is one much smaller haystack and
-#: one much larger one. Re-measured over a full 100-run replay by counting the distinct
-#: 7-digit windows each run's haystacks actually contain:
+#: one much larger one, and the two were once quoted as::
 #:
 #:     audit query view (one session's rows)         99 windows -> 2.1e-03 per suite
 #:     DEBUG log haystack (log_haystack(caplog))  7,574 windows -> 1.7e-01 per suite
 #:
-#: over the 203 pure-digit identifier needles the 100 runs produce. The audit figure is
-#: on the side of the line this floor was drawn for. The log figure is 170x the wrong
-#: side of it, and it had never been measured, because the arithmetic was only ever run
-#: against the database.
+#: **Those two figures are stale, and re-measuring them on the current tree is the only
+#: reason to trust any number here.** Several exemptions have landed since they were
+#: taken; one of them is 45x out and the other is 2x out in the conservative direction.
+#: The method, spelled out so the next reader can redo it rather than believe it: two
+#: full 100-run replays with both scan entry points wrapped, taking -- for each needle
+#: the limb *actually* used, in the haystack view it is *actually* compared against --
+#: the count of distinct windows of that needle's own shape, and summing
+#: ``windows / 10 ** digits`` over every needle of every run. That is the birthday
+#: estimate per suite. The 100 runs produce 266 pure-digit needles (100 of them exactly
+#: seven digits, one per run) and 1,130 separator-bearing ones::
 #:
-#: Both are live rather than theoretical. Run 099 (medical/pseudonymization, seed 90099)
-#: failed assertion 2a on a seven-digit MRN with ``identifier`` as the only limb that
-#: fired, once in 24 executions of the identical 100 runs and never again -- which is
-#: what a coincidence against per-process random hex looks like from the outside, and
+#:     channel                       distinct 7-digit windows/run   replay A   replay B
+#:     payload, regrouped limb       (digit-only projection)        6.43e-03   6.43e-03
+#:     payload, identifier limb        5                            1.02e-04   1.02e-04
+#:     audit query view               97 / 92                       1.03e-03   9.50e-04
+#:     DEBUG log haystack            169 / 129                      1.87e-03   1.41e-03
+#:                                                                  --------   --------
+#:     expected spurious reds per 100-run suite                     9.43e-03   8.89e-03
+#:
+#: One execution of this module therefore reds with nothing leaked about **once every
+#: 110 executions**. :data:`_FALSE_RED_PER_SUITE` carries that total into
+#: :meth:`Ledger.summary`, because a residual nobody prints is a residual nobody knows.
+#:
+#: **What moved, per channel, and what did not.** The audit view's *window count*
+#: reproduced (99 then, 92 and 97 now); its *rate* halved because the old arithmetic
+#: multiplied the 7-digit window count by all 203 pure-digit needles, including the 9-,
+#: 10-, 12- and 13-digit ones, which collide 100x to 1e6x less often -- an error in the
+#: safe direction, but an error. The log figure fell 45x and **the cause is not
+#: established**; what is established is what it is *not*. The natural guess is the
+#: own-id exclusion, which landed on this channel in the meantime, and that guess is
+#: measurably wrong: see :func:`find_in_digit_heavy_text` for the 12,905-vs-12,905
+#: count. The current figure rests on two independent replays that agree to within the
+#: run-to-run spread of the log itself, which is the only evidence offered for it.
+#:
+#: **The payload row is not this module's red to make.** The harness's payload scan is
+#: by construction at least as wide as pass 1, so a payload-side collision fires the
+#: *gate* first: the run dies inside ``orchestrator.run`` with ``EgressBlockedError``
+#: and surfaces through :meth:`Ledger.diagnosis` as a run that never recorded, never as
+#: "an original reached the outbound payload". Measured rather than assumed -- the extra
+#: digit stream this module has and the gate does not (:func:`_harness_strip_own_tokens`)
+#: contributed nothing at all to the estimate: 6.426e-03 with it and 6.426e-03 without.
+#: It is listed because it is a spurious red *of this suite*, which is what the summary
+#: line is about, and because it is the largest of the four and the one that cannot be
+#: narrowed here: :func:`find_in_text` must stay exactly as wide as the gate, and
+#: :func:`test_the_harness_is_never_weaker_than_the_gate_on_generated_input` fails if it
+#: does not.
+#:
+#: **The log haystack: measured and declared, not narrowed.** It is the largest channel
+#: this module owns, so the narrowing question was asked of it directly and answered
+#: three ways. (1) The narrowing the payload got is *already applied* here and buys
+#: nothing -- measured, zero windows removed. (2) Extending it to blank the bare
+#: ``token_id`` the package also logs is refused: a bare ``1234567a`` in the log is
+#: either one of our ids or a vaulted ``1234567`` with a letter glued to it, which is
+#: the exact shape this limb exists for, and nothing in the string separates them.
+#: (3) A digest exemption is the only other one available, and it is refused twice
+#: over. 8,132 of the log's 12,905 windows and 8,132 of the audit view's 9,231 sit
+#: inside a 64-character run of nothing but lowercase hex -- the audit chain hash, the
+#: same set on both channels -- so exempting it would take the audit view to ~1.1e-04
+#: and the log to ~8.6e-04. Keyed on *shape*, that is precisely the rule narrowing 1 of
+#: :func:`_harness_mask_own_ids` refuses, because an uploaded document can satisfy a
+#: shape. Keyed on *exact string* it is defensible on the audit view alone, and it is
+#: still not taken: it buys 9% of a 9e-03 total, on the channel that is already the
+#: smallest, at the price of a second exemption to defend on the two channels where
+#: this module is the only opinion there is.
+#:
+#: **The bounded limbs are a fourth channel, and it is the one this file cannot put a
+#: measured number on.** They carry no minimum length by design -- the gate skips an
+#: original shorter than ``MIN_ORIGINAL_LEN`` and this module deliberately does not --
+#: and the suite's shortest vaulted original is **four characters**, with 116 of 2,966
+#: at six or fewer. A four-character needle compared word-bounded against a 580 KB log
+#: haystack is not a safe bet on paper, and a green suite says nothing about it: the
+#: values that were vaulted are exactly the ones that did not collide.
+#:
+#: So it was measured against a **cross-run null** -- each run's short originals against
+#: every *other* run's two haystacks, which is realistic needles in realistic haystacks
+#: where a hit cannot possibly be a real disclosure. 116 x 99 x 2 = 22,968 trials, run
+#: twice: 18 hits and then 31 (the spread is the pseudonym draw, which is keyed per
+#: session). **Every hit in both replays was alphabetic, and every one landed inside one
+#: of the target run's own pseudonyms** -- a short surname of one document matching the
+#: fake Faker drew for another.
+#:
+#: That is emphatically *not* a false-positive rate for a suite, and reading it as one
+#: would be the same error in the other direction: **in-suite the identical event is a
+#: real finding**, because a fake that reproduces an original verbatim puts that value on
+#: the wire, and pseudonymization's collision guard forbids the pairing inside one
+#: document anyway. What the null does bound is the other half -- a short original
+#: matching ordinary log text, a lab value against a latency, a bare year against a
+#: timestamp. Of those there were **zero in 45,936 trials across the two replays**, which
+#: by the rule of three is 6.5e-05 per trial and 1.5e-02 per suite over the 232 (short
+#: original, channel) pairs a suite makes. That is an upper bound of the same order as
+#: the whole identifier total above, and it is a bound rather than a measurement, so this
+#: channel is declared here and deliberately **not** folded into
+#: :data:`_FALSE_RED_PER_SUITE`: adding a guess to a measured number is how ``1.7e-01``
+#: came to be quoted for three commits.
+#:
+#: All of it is live rather than theoretical. Run 099 (medical/pseudonymization, seed
+#: 90099) failed assertion 2a on a seven-digit MRN with ``identifier`` as the only limb
+#: that fired, once in 24 executions of the identical 100 runs and never again -- which
+#: is what a coincidence against per-process random hex looks like from the outside, and
 #: is not something a seed can reproduce.
 #:
 #: Narrowing either limb -- a higher floor, a boundary on the needle, dropping a
@@ -1748,6 +1944,23 @@ def find_in_digit_heavy_text(
     So the coincidence the gate stopped blocking lands here too, and at this
     function's own floor: :data:`_HARNESS_RUN_FLOOR` is seven digits and an 8-hex id
     holds two seven-character windows.
+
+    **On this channel the exclusion nonetheless removes no collision surface at all, and
+    that is measured rather than expected.** Distinct 7-digit windows in the skeleton
+    this limb reads, with the exclusion applied and with it disabled: 145/145, 117/117,
+    121/121 and 124/124 over the first four runs, and **12,905 against 12,905** summed
+    over a full 100-run replay. The cause is that our ids reach this haystack by two
+    routes and the exclusion only closes one: the vault binds ``token_id`` as a column
+    of its own and the audit logger puts it in ``extra=``, so each id that carries a
+    seven-digit window occurs **17 times in the log and only 4 of those inside the whole
+    surrogate** -- the exclusion blanks those 4, and the other 13 keep the same eight hex
+    characters in the haystack a few hundred bytes away. Blanking the bare id instead is
+    refused for the reason :data:`_HARNESS_RUN_FLOOR` gives: a bare ``1234567a`` in a log
+    line is either one of our ids or a vaulted ``1234567`` with a letter glued to it, and
+    that is the shape this limb exists for. The exclusion stays because it is right in
+    the payload sense -- the span inside a token *is* ours -- and because removing it
+    would widen a scan for no gain; it is simply not the reason this channel's rate is
+    1.4e-03 rather than 1.7e-01.
 
     That is why the run passes ``issued`` on the log limb and **not** on the two audit
     limbs. Where the channel measurably carries none of our tokens the exclusion is the
@@ -5128,6 +5341,97 @@ def test_the_summary_assertion_prints_the_per_run_diagnosis() -> None:
     assert diagnosis_at < count_at, (
         "the count comparison now fires before the diagnosis, so the message a "
         "reviewer sees for a vanished run is a bare integer mismatch again"
+    )
+
+
+def test_the_summary_says_what_a_full_clean_suite_does_and_does_not_establish() -> None:
+    """The tally may not be printed without the sentence that says what it is worth.
+
+    Built on a **full, clean** ledger on purpose: 100 of 100, zero leaks is the exact
+    state in which the caveat is least welcome and most needed, and a summary that
+    qualified only its failures would be worse than one that qualified nothing.
+
+    Four facts are pinned, and each one is a separate way the line has been read wrong:
+
+    * the tally line is **byte-for-byte** what it was. ``test_readme_claims`` parses this
+      text and README section 1 pastes it, so widening the claim is not licence to
+      reword the number -- the qualification is *added*, never substituted;
+    * the rate is **quoted, not gestured at**, and quoted per channel, so a reader can
+      check the parts against :data:`_HARNESS_RUN_FLOOR` instead of taking a total on
+      trust;
+    * the residual is named as **one-sided**. Without that sentence the caveat reads as
+      a discount on ``0 leaks``, which would be a different and false statement: a
+      collision adds a reported occurrence and can only manufacture a red;
+    * the rule-of-three number is present, because *"it went green four times"* is the
+      specific argument this whole finding was raised against, and the answer to it is
+      an integer.
+    """
+    book = Ledger()
+    for index in range(RUNS):
+        book.record(index=index, originals=30, restored=24)
+    lines = book.summary().splitlines()
+
+    assert lines[0] == (
+        "[leakage] 100/100 runs clean, 0 leaks (3000 originals vaulted and scanned, "
+        "2400 surrogates round-tripped)"
+    ), f"the README-quoted tally line has changed shape: {lines[0]!r}"
+
+    # Whitespace-flattened for the prose assertions: the line is wrapped for a reader,
+    # and a test that pinned the wrap points would fail on a re-flow rather than on a
+    # lost claim. The channel rows below keep the raw text, where the alignment lives.
+    caveat = " ".join("\n".join(lines[1:]).split())
+    assert caveat, (
+        "the summary prints the tally with nothing qualifying it, which is the state "
+        "that let four green runs be quoted as evidence that this harness is "
+        "deterministic -- it carries a measured false-red channel and must say so"
+    )
+    for fact in (
+        "NOT evidence",
+        "deterministic",
+        f"{_FALSE_RED_TOTAL:.1e}",
+        str(_CLEAN_SUITES_TO_BOUND),
+        "_HARNESS_RUN_FLOOR",
+        # The fifth channel, which is bounded by observation rather than computed and is
+        # deliberately outside the total above. Naming the total without it would read as
+        # a complete accounting of the residual, and it is not one.
+        "the bounded limbs add an unquantified",
+    ):
+        assert fact in caveat, f"the summary no longer states {fact!r}: {caveat!r}"
+
+    assert "never turns a leak green" in caveat, (
+        "the caveat no longer says the residual is one-sided, so it now reads as a "
+        "discount on `0 leaks` rather than a statement about reproducibility"
+    )
+    for name, rate in _FALSE_RED_PER_SUITE.items():
+        row = re.compile(rf"{re.escape(name)}\s+{re.escape(f'{rate:.1e}')}")
+        assert row.search(caveat), (
+            f"the {name!r} channel is in the measured total but is not printed beside "
+            "its own rate, so the total cannot be checked against its parts"
+        )
+
+
+def test_the_false_red_rate_the_prose_quotes_is_the_one_the_code_computes() -> None:
+    """The three places that number appears must not be able to drift apart.
+
+    It lives in :data:`_FALSE_RED_PER_SUITE` (the parts), in the module docstring (the
+    prose a reviewer reads first) and in :data:`_CLEAN_SUITES_TO_BOUND` (the consequence
+    a reader acts on). Two of the three were prose until this test existed, and prose
+    quoting a measurement is exactly how ``1.7e-01`` survived three commits after the
+    exemption that was supposed to explain it turned out to remove nothing.
+
+    The rule-of-three arithmetic is asserted rather than the literal, so lowering the
+    rate without recomputing the bound -- the flattering direction -- is red.
+    """
+    assert all(0.0 < rate < 1.0 for rate in _FALSE_RED_PER_SUITE.values()), (
+        f"a channel rate is not a probability: {_FALSE_RED_PER_SUITE}"
+    )
+    assert _CLEAN_SUITES_TO_BOUND == round(3 / _FALSE_RED_TOTAL), (
+        "the rule-of-three bound is no longer derived from the rate it bounds"
+    )
+    doc = __doc__ or ""
+    assert f"{_FALSE_RED_TOTAL:.1e}" in doc, (
+        f"the module docstring quotes a false-red rate other than the measured "
+        f"{_FALSE_RED_TOTAL:.1e} the summary prints, so one of the two is stale"
     )
 
 

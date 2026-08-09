@@ -51,3 +51,12 @@ wire_dump*.txt
 
 # os
 .DS_Store
+
+# Tooling state that is per-developer, not per-repo. Both were invisible here for
+# reasons that do not travel: `.claude/settings.local.json` was covered only by a
+# MACHINE-GLOBAL ignore (~/.config/git/ignore), which a CI checkout or a teammate's
+# clone does not have, and `.hypothesis/` only by a .gitignore Hypothesis writes into
+# itself. Neither is this repository's decision until it is written here -- and this
+# repo runs `git add -A`, so "untracked" is one careless commit away from "tracked".
+.claude/
+.hypothesis/

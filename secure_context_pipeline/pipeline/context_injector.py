@@ -25,15 +25,70 @@ of it exposes nothing. See README section 13.4 Q2.
 from __future__ import annotations
 
 import re
+from typing import Final
 
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
+    "MAX_PAYLOAD_CHARS",
     "PSEUDONYMIZATION_SYSTEM_PROMPT",
     "TOKENIZATION_SYSTEM_PROMPT",
     "ContextInjector",
     "InjectedPayload",
 ]
+
+#: Hard ceiling on :attr:`InjectedPayload.char_count`, checked by the orchestrator
+#: before the provider is called. **250,000 characters.**
+#:
+#: **Why a module-level ``Final`` and not a ``Settings`` field.** This is a protocol
+#: limit of the model the pipeline talks to, not a tuning knob: below it the call
+#: works and above it the call cannot be made at all, so there is no value an
+#: operator could usefully choose. A config field would invite one to be chosen, and
+#: the only choice that is *safe* is the one derived below. It lives here rather than
+#: anywhere else because this module is what assembles the string being measured --
+#: if ``build`` ever emits something longer than ``serialized`` returns, the constant
+#: and the measurement move together.
+#:
+#: **The derivation, stated so it can be checked rather than trusted.**
+#:
+#: * The configured model is ``Settings.llm_model``, whose default is
+#:   ``claude-opus-5``: a **1,000,000-token input context window**.
+#: * A byte-level BPE tokenizer never spends fewer than one UTF-8 byte on a token,
+#:   so ``tokens <= bytes``.
+#: * A Python ``str`` is counted in code points, and a code point is at most **four**
+#:   UTF-8 bytes, so ``bytes <= 4 * len(text)``.
+#: * Therefore ``tokens <= 4 * 250,000 = 1,000,000`` -- the window -- for *any* valid
+#:   Unicode payload. The 4x is the entire safety margin; there is no second fudge
+#:   factor stacked on top of it.
+#:
+#: **A character count is an approximation of a token count, and this is where the
+#: approximation shows.** The chain above is an upper bound only while "at least one
+#: byte per token" holds, which is a documented property of the tokenizer rather than
+#: something this process can verify offline -- the exact count is a network call
+#: (``/v1/messages/count_tokens``), and putting a network call on the path *before*
+#: the egress gate would create an outbound request the gate never saw. So the
+#: character count is the local, offline, deterministic stand-in, and it only has to
+#: be conservative.
+#:
+#: **It is conservative, and that costs refused runs rather than leaks.** The shipped
+#: fixtures measure about four characters per token, so 250,000 characters of ordinary
+#: English is roughly 62,500 tokens -- about 6% of the window. A document between the
+#: ceiling and what the model would actually have accepted is therefore refused,
+#: which is the direction this pipeline is allowed to be wrong in: the caller gets
+#: ``PAYLOAD_TOO_LARGE`` with both numbers and a remedy, and nothing is disclosed.
+#: Being wrong the other way costs a non-retryable HTTP 400 out of the provider, after
+#: paying for detection, obfuscation and a full detector re-scan.
+#:
+#: For scale rather than for reassurance: 250,000 characters is roughly 36,000 words,
+#: about 150 pages, and **2.8x** the largest document this repository ships
+#: (``fixtures/legal_brief_large.txt`` assembles to 87,922 characters, measured by
+#: ``test_the_largest_shipped_fixture_runs_with_room_under_the_ceiling``). The
+#: challenge's own benchmark document is 2,000 words. A deployment that needs more should
+#: raise this number against a measured chars-per-token ratio for its own corpus -- not
+#: guess at one -- and a deployment that points ``SCP_LLM_MODEL`` at a smaller-window
+#: model must bring it *down*: the smallest current Claude window is 200,000 tokens,
+#: for which the same derivation gives 50,000.
+MAX_PAYLOAD_CHARS: Final[int] = 250_000
 
 # Verbatim from build doc section 9.5.2 -- do not reword without re-running section 10.7.
 #

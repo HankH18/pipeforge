@@ -46,7 +46,9 @@ from secure_context_pipeline.detection.detector import (
 from secure_context_pipeline.detection.recognizers import (
     GAZETTEER_SCORE,
     PATTERN_SCORE,
+    build_gazetteer_recognizer,
     class_hint_for,
+    gazetteer_occurrences,
     gazetteer_terms,
     load_gazetteer,
 )
@@ -2749,7 +2751,10 @@ proposal is accepted.
 # lowering a floor here without moving the corresponding entry there is how a
 # regression would get through.
 HELD_OUT_COVERAGE_FLOORS: dict[str, float] = {
-    "ACCOUNT_NUMBER": 0.94,
+    # Raised from 0.94 when ACCOUNT_NUMBER's digit shape learned card-style grouping.
+    # The one shortfall the 0.94 admitted was ho_card_dispute's '4400 8829 1374', and
+    # it is the whole of the entity's held-out movement: 18/19 -> 19/19.
+    "ACCOUNT_NUMBER": 1.0,
     "ADDRESS": 1.0,
     "AMOUNT": 0.84,
     "CASE_ID": 1.0,
@@ -2845,7 +2850,8 @@ HELD_OUT_MISS_SHAPES: dict[str, tuple[int, str]] = {
         "both patterns need a literal 'settle...' inside the bounded gap. An award of "
         "'damages in the sum of $612,500' has none, and AMOUNT is out of scope in a "
         "legal document, so that figure goes to the provider in the clear -- a plain "
-        "gap rather than a known limit, as is ACCOUNT_NUMBER's below. The second "
+        "gap rather than a known limit. (This used to say 'as is ACCOUNT_NUMBER's "
+        "below'; that row is gone, because that gap was closed.) The second "
         "shortfall is not of that kind: 'A settlement of $75,000 was\\ndiscussed off "
         "the record' does match, but the span returned is 'settlement of $75,000', so "
         "the money is masked and only the surrounding words are uncovered.",
@@ -2862,12 +2868,16 @@ HELD_OUT_MISS_SHAPES: dict[str, tuple[int, str]] = {
         "spaCy PERSON again: only the surname of 'Margarethe Solheim' is returned, so "
         "the forename is left uncovered. The surname is still masked.",
     ),
-    "ACCOUNT_NUMBER": (
-        1,
-        "'4400 8829 1374' is space-grouped, and the pattern's specificity comes from "
-        "an unbroken 8-17 digit run. Card-style grouping is common; this is a real gap.",
-    ),
 }
+# An ACCOUNT_NUMBER row used to sit here: "'4400 8829 1374' is space-grouped, and the
+# pattern's specificity comes from an unbroken 8-17 digit run. Card-style grouping is
+# common; this is a real gap." It is GONE rather than reworded to 0, and that is the
+# stricter of the two: `test_held_out_residual_stays_inside_the_documented_shapes`
+# fails on any shortfall in an entity type absent from this table, so an
+# ACCOUNT_NUMBER regression is now an undocumented-cause failure rather than one
+# silently inside a ceiling. The gap was closed by adding a grouped branch to the
+# digit shape behind the account noun (entities.yaml); measured, 18/19 -> 19/19 and
+# the residual for the type is empty.
 
 # Every held-out value that IS masked, but by a detection carrying the wrong label:
 # (entity_type, doc_id, value, labels that cover it). These are the shortfalls that
@@ -4607,6 +4617,341 @@ def test_class_hint_for_unknown_term_and_non_gazetteer_entity(registry: EntityRe
     assert class_hint_for(registry, "MRN", "metformin") is None
 
 
+# ---------------------------------------------------------------------------
+# 9b. Overlapping gazetteer terms: the compound is vaulted whole
+# ---------------------------------------------------------------------------
+# Presidio compiles a deny-list into ONE alternation and searches it, so matching is
+# leftmost-first and non-overlapping. `diagnoses.txt` ships `type 2 diabetes` (line
+# 58) and `diabetes mellitus` (line 41) but not the compound, so on
+#
+#     "Primary Diagnosis: Type 2 diabetes mellitus, stable."
+#
+# the scan matched `Type 2 diabetes` at 19, resumed at 34, and never tried
+# `diabetes mellitus` at 26. The payload went out as
+# `Primary Diagnosis: [PHI_DIAGNOSIS_815d497e] mellitus` -- a PHI fragment on the
+# wire, against Success Criteria "zero instances of original PII/PHI values", with
+# `egress_rescan_warnings=0` and outcome `ok`.
+#
+# The gate cannot see it by construction: pass 1 scans for WHOLE vaulted originals
+# and the vaulted original is `Type 2 diabetes`, which does not contain `mellitus`.
+# `gazetteer_terms`' longest-first ordering does not reach it either -- that resolves
+# two terms starting at the SAME offset, and these start at different ones.
+#
+# The tests below are written against the CLASS, not the instance: the compound list
+# is derived from the shipped gazetteer files by word arithmetic here in the test, so
+# a gazetteer edit that introduces a new overlapping pair is covered the moment it
+# lands. Deriving it that way rather than by asking the detector's own matcher is
+# deliberate -- a checker that shares the regex it is checking cannot report a bug in
+# that regex.
+
+#: entity_type -> gazetteer file, pinned so a registry edit fails loudly here rather
+#: than silently shrinking the enumeration below to nothing.
+GAZETTEER_ENTITIES = {"DIAGNOSIS": "diagnoses.txt", "MEDICATION": "medications.txt"}
+
+
+def overlapping_term_pairs(filename: str) -> list[tuple[str, str, int]]:
+    """``(a, b, k)`` for every pair where a's last k words are b's first k words.
+
+    ``k`` is strictly less than either term's word count, so this is the *proper*
+    overlap -- a nested pair like ``anemia`` inside ``iron deficiency anemia`` is
+    not one, and it never strands a tail because the leftmost-longest match already
+    covers it. Plain list arithmetic, no regex, no project helper.
+    """
+    terms = sorted(load_gazetteer(filename))
+    words = {term: term.split() for term in terms}
+    pairs: list[tuple[str, str, int]] = []
+    for first in terms:
+        for second in terms:
+            if first == second:
+                continue
+            left, right = words[first], words[second]
+            for k in range(min(len(left), len(right)) - 1, 0, -1):
+                if left[-k:] == right[:k]:
+                    pairs.append((first, second, k))
+                    break
+    return pairs
+
+
+#: ``(entity_type, compound)`` for every phrase the shipped gazetteers can strand.
+#: Measured at 4, all in ``diagnoses.txt``: three diabetes compounds and
+#: ``overactive bladder cancer``. ``medications.txt`` admits none.
+GAZETTEER_COMPOUNDS = [
+    (entity_type, f"{first} {' '.join(second.split()[k:])}")
+    for entity_type, filename in sorted(GAZETTEER_ENTITIES.items())
+    for first, second, k in overlapping_term_pairs(filename)
+]
+
+
+def test_the_gazetteer_entity_table_matches_the_shipped_registry(
+    registry: EntityRegistry,
+) -> None:
+    """The enumeration above is only worth anything if it covers every gazetteer."""
+    shipped = {name: spec.gazetteer for name, spec in registry.gazetteer_backed().items()}
+    assert shipped == GAZETTEER_ENTITIES
+    assert len(GAZETTEER_COMPOUNDS) == 4, GAZETTEER_COMPOUNDS
+
+
+async def test_a_compound_diagnosis_leaves_no_tail_in_the_clear(detector: Detector) -> None:
+    """The reported instance, verbatim, asserted on coverage rather than on a label."""
+    text = "Primary Diagnosis: Type 2 diabetes mellitus, stable."
+    found = await detector.detect(text, "medical")
+
+    assert uncovered(text, found, "Type 2 diabetes mellitus") == ""
+    assert spans_of(found, "DIAGNOSIS") == [(19, 43)]
+    assert text[19:43] == "Type 2 diabetes mellitus"
+
+
+async def test_the_compound_diagnosis_tail_never_reaches_the_payload(
+    detector: Detector, registry: EntityRegistry, settings: Settings
+) -> None:
+    """The same property end to end, which is where the Success Criteria is stated.
+
+    The span assertion above is the mechanism; this is the consequence that was
+    observed on the wire -- ``Primary Diagnosis: [PHI_DIAGNOSIS_815d497e] mellitus``
+    -- and the egress gate reported ``egress_rescan_warnings=0`` for it, because
+    pass 1 scans for WHOLE vaulted originals and ``Type 2 diabetes`` does not
+    contain ``mellitus``. A detection-only assertion would not have caught the leak
+    and neither did the gate, so both halves are kept.
+
+    The Tier-3 class is asserted in the same breath, under the strategy that emits
+    it: closing a disclosure by deleting the clinical signal the token exists to
+    carry would be half a fix, and the merged span is not itself a gazetteer row, so
+    the exact lookup misses it. Run under ``pseudonymization`` because that is the
+    mode whose Tier-3 branch annotates the token -- ``tokenization`` keeps hints off
+    unless a caller asks for them, by design.
+    """
+    text = "Primary Diagnosis: Type 2 diabetes mellitus, stable."
+    settings = settings.model_copy(update={"strategy": "pseudonymization"})
+    sessions = SessionRegistry(settings)
+    vault = await SessionVault.open(settings.data_dir / "vault.db", sessions)
+    audit = await AuditLogger.open(settings.data_dir / "audit.db")
+    try:
+        session_id, _expires = await sessions.create("compound-diagnosis")
+        engine = ObfuscationEngine(
+            registry=registry,
+            vault=vault,
+            session_registry=sessions,
+            settings=settings,
+            audit=audit,
+        )
+        detections = await detector.detect(text, "medical")
+        result = await engine.obfuscate(session_id, text, detections)
+
+        assert "mellitus" not in result.obfuscated_text, result.obfuscated_text
+        assert "diabetes" not in result.obfuscated_text.casefold(), result.obfuscated_text
+        assert "endocrine-metabolic" in result.obfuscated_text, (
+            f"the merged span lost its Tier-3 class: {result.obfuscated_text}"
+        )
+    finally:
+        await vault.close()
+        await audit.close()
+
+
+@pytest.mark.parametrize(("entity_type", "compound"), GAZETTEER_COMPOUNDS)
+async def test_no_gazetteer_compound_strands_a_tail(
+    detector: Detector, entity_type: str, compound: str
+) -> None:
+    """Every compound the shipped term lists can build is covered end to end.
+
+    One frame for both gazetteers on purpose: a gazetteer hit scores
+    ``GAZETTEER_SCORE`` = 0.8 before any context boost, which already clears every
+    floor, so the frame is there to make the sentence a sentence and not to help
+    the match.
+    """
+    text = f"Assessment: {compound}, stable since the last visit."
+    found = await detector.detect(text, "medical")
+
+    assert uncovered(text, found, compound) == "", f"{compound!r} left text in the clear"
+    assert (12, 12 + len(compound)) in spans_of(found, entity_type)
+
+
+async def test_two_gazetteer_hits_separated_by_a_space_are_not_merged(
+    detector: Detector,
+) -> None:
+    """Adjacency is NOT the merge condition -- overlap is. The negative half.
+
+    Both spans here are already detected and already vaulted, so joining them
+    closes no disclosure; it only replaces two true values in the vault with one
+    string that is not a value. Measured over the four shipped fixtures and 240
+    generated documents -- 244 documents, 610 gazetteer detections -- same-type
+    detections separated by exactly one space occur 0 times, and all 61 consecutive
+    same-type pairs within twelve characters are separated by ``" and "``. So the
+    looser rule buys nothing measurable, and this sentence is the shape it would
+    get wrong.
+    """
+    text = "Assessment: hypertension hyperlipidemia, both stable."
+    found = await detector.detect(text, "medical")
+
+    assert spans_of(found, "DIAGNOSIS") == [(12, 24), (25, 39)]
+
+
+async def test_a_gazetteer_span_is_never_widened_across_a_line_break(
+    detector: Detector,
+) -> None:
+    """Terms are literals whose only whitespace is a single space.
+
+    Documents reaching the detector are hard-wrapped by ``extraction.py``, so a
+    merge rule that treated a newline as a space would join whatever happened to
+    start the next line. It cannot: the wrapped tail is left to be found on its own.
+    """
+    text = "Primary Diagnosis: Type 2 diabetes\nmellitus, stable."
+    found = await detector.detect(text, "medical")
+
+    assert spans_of(found, "DIAGNOSIS") == [(19, 34)]
+
+
+async def test_the_merge_consults_only_the_entitys_own_gazetteer(
+    detector: Detector,
+) -> None:
+    """Same entity type, and only a gazetteer-backed one -- no super-spans.
+
+    Fed a ``MEDICATION`` span whose text is a DIAGNOSIS term, the merge must not
+    reach into ``diagnoses.txt`` for a continuation. Asserted directly on the merge
+    rather than through ``detect`` because no analyzer run can produce this input;
+    that is the point -- the guard is the file lookup, not the analyzer.
+    """
+    text = "Primary Diagnosis: Type 2 diabetes mellitus, stable."
+    borrowed = Detection(
+        entity_type="MEDICATION",
+        category="PHI",
+        start=19,
+        end=34,
+        text=text[19:34],
+        score=GAZETTEER_SCORE,
+    )
+    pattern_backed = Detection(
+        entity_type="MRN", category="PHI", start=19, end=34, text=text[19:34], score=PATTERN_SCORE
+    )
+
+    assert detector._merge_gazetteer_run(text, borrowed).end == 34
+    assert detector._merge_gazetteer_run(text, pattern_backed).end == 34
+
+
+async def test_the_merge_step_cap_is_consulted(
+    detector: Detector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GAZETTEER_MERGE_MAX_STEPS`` bounds over-capture, and it is live.
+
+    Pinned by turning it off: at zero steps the pre-fix span comes back, tail in
+    the clear. A cap read once at import, or spelled as a number the loop ignores,
+    would leave this green while claiming a bound nothing enforces.
+    """
+    text = "Primary Diagnosis: Type 2 diabetes mellitus, stable."
+    monkeypatch.setattr(detector_module, "GAZETTEER_MERGE_MAX_STEPS", 0)
+    found = await detector.detect(text, "medical")
+
+    assert spans_of(found, "DIAGNOSIS") == [(19, 34)]
+    assert uncovered(text, found, "Type 2 diabetes mellitus") == " mellitus"
+
+
+@pytest.mark.parametrize(
+    ("text", "value", "residue"),
+    [
+        ("Primary Diagnosis: diabetes mellitus type 2, stable.", "diabetes mellitus", " type 2"),
+        (
+            "Primary Diagnosis: chronic kidney disease stage 3b, stable.",
+            "chronic kidney disease",
+            " stage 3b",
+        ),
+        ("Primary Diagnosis: stage 4 breast cancer, on therapy.", "breast cancer", "stage 4 "),
+    ],
+)
+async def test_a_non_term_qualifier_beside_a_diagnosis_is_a_declared_residual(
+    detector: Detector, text: str, value: str, residue: str
+) -> None:
+    """The boundary of the merge rule, pinned with live instances rather than prose.
+
+    The rule joins gazetteer hit to gazetteer hit. A *qualifier* -- ``type 2`` after
+    the diagnosis, ``stage 3b``, ``stage 4`` before it -- is not a row in
+    ``diagnoses.txt`` and is not part of any row, so there is no second occurrence to
+    merge with and no widening this rule can justify. Widening to "any clinical-
+    looking neighbour" is the over-capture the rule is written to avoid.
+
+    What that costs is bounded and is asserted here: the DIAGNOSIS **value** is
+    vaulted whole -- so the egress gate's needle is intact and the Success Criteria
+    holds for the original -- and what stays in the clear is a severity or stage
+    modifier. Measured over the four shipped fixtures and 240 generated documents,
+    610 gazetteer occurrences produce **0** instances of even this shape: no term in
+    either file abuts a word the gazetteers know only from some other term.
+
+    Written as a characterisation test on purpose. If a later change closes it, this
+    goes red and asks for the number to be re-measured rather than letting a
+    declared boundary drift silently.
+    """
+    found = await detector.detect(text, "medical")
+
+    assert uncovered(text, found, value) == "", "the diagnosis value itself must be covered"
+    assert [d.text for d in found if d.entity_type == "DIAGNOSIS"] == [value]
+    assert uncovered(text, found, residue.strip()) == residue.strip()
+
+
+def test_gazetteer_occurrences_finds_the_overlap_presidios_search_cannot(
+    registry: EntityRegistry,
+) -> None:
+    """The premise of the whole section, asserted against the real recognizer.
+
+    If Presidio ever started returning overlapping deny-list matches, the merge
+    would be dead weight and this test says so first.
+    """
+    text = "Primary Diagnosis: Type 2 diabetes mellitus, stable."
+    recognizer = build_gazetteer_recognizer(registry.spec("DIAGNOSIS"))
+    presidio = sorted((r.start, r.end) for r in recognizer.analyze(text, ["DIAGNOSIS"]))
+    assert presidio == [(19, 34)], "premise: the deny-list search is non-overlapping"
+
+    occurrences = gazetteer_occurrences("diagnoses.txt", text)
+    assert (19, 34) in occurrences
+    assert (26, 43) in occurrences
+
+
+def test_the_anchored_gazetteer_matcher_is_compiled_at_construction(
+    registry: EntityRegistry,
+) -> None:
+    """Same rule as the deny-list it mirrors: compiled once, before any request.
+
+    ``gazetteer_occurrences`` is reached from ``Detector.detect``, which runs while
+    four worker threads are inside the analyzer. A lazily-populated module cache
+    would be built for the first time under exactly that contention, and would still
+    produce the right answer every time -- so nothing else in the suite would notice.
+    """
+    from secure_context_pipeline.detection import recognizers as recognizers_module
+
+    recognizers_module._GAZETTEER_MATCHER_CACHE.clear()
+    build_gazetteer_recognizer(registry.spec("DIAGNOSIS"))
+
+    assert "diagnoses.txt" in recognizers_module._GAZETTEER_MATCHER_CACHE
+
+
+def test_gazetteer_occurrences_honours_word_boundaries() -> None:
+    """Same boundary rule as the deny-list, so it can never widen past a real hit."""
+    assert gazetteer_occurrences("medications.txt", "metforminol 500 mg daily") == []
+    assert gazetteer_occurrences("medications.txt", "metformin 500 mg daily") == [(0, 9)]
+
+
+def test_a_merged_span_keeps_the_class_its_terms_agree_on(registry: EntityRegistry) -> None:
+    """Closing a leak must not silently delete the Tier-3 clinical signal.
+
+    ``Type 2 diabetes mellitus`` is not a row in ``diagnoses.txt``, so the exact
+    lookup misses and the token would degrade to a bare ``[PHI_DIAGNOSIS_...]``.
+    Both constituent terms are ``endocrine-metabolic``, so the class survives as a
+    fact about the span rather than a guess.
+    """
+    assert class_hint_for(registry, "DIAGNOSIS", "Type 2 diabetes mellitus") == (
+        "endocrine-metabolic"
+    )
+    assert class_hint_for(registry, "DIAGNOSIS", "gestational diabetes mellitus") == (
+        "endocrine-metabolic"
+    )
+
+
+def test_a_merged_span_whose_terms_disagree_gets_no_class(registry: EntityRegistry) -> None:
+    """The one disagreeing pair the shipped files admit -- ``renal`` vs ``oncologic``.
+
+    Emitting either would tell the model something false about the patient, so the
+    fallback declines rather than picking the leftmost.
+    """
+    assert class_hint_for(registry, "DIAGNOSIS", "overactive bladder cancer") is None
+
+
 def test_every_recognizer_pattern_is_compiled_before_any_request(
     registry: EntityRegistry,
 ) -> None:
@@ -6009,3 +6354,200 @@ async def test_no_chunk_starts_after_the_detect_deadline(
         assert len(calls) == len(chunks), (
             f"premise: a generous deadline must run all {len(chunks)} chunks, ran {len(calls)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 21. The surface forms two spec-mandated identifier types were missing
+# ---------------------------------------------------------------------------
+# Section 4.1 of the challenge names nine entity types the system "must identify at
+# minimum", so ACCOUNT_NUMBER and CASE_ID are graded by name. Both missed ordinary
+# business spellings, and a nine-entity document written in plain formatting BEFORE
+# anyone read the patterns found them: "Bank Account Number: 4829-1057-3364" returned
+# zero ACCOUNT_NUMBER detections and "Legal Case Number: Case No. 2024-CV-88213"
+# returned zero CASE_ID detections.
+#
+# A miss here is the failure mode this pipeline cannot recover from, and it is worth
+# restating because it is what makes a recall gap a SECURITY defect rather than a
+# quality one: the engine vaults `detection.text`, the egress gate's first pass scans
+# the outbound payload for vaulted originals, and its second pass re-runs this same
+# detector. A value no pattern anchors on is therefore invisible to detection, to
+# pass 1 and to pass 2 alike, and travels to the provider byte for byte.
+#
+# The rows are an 18-case matrix of surface forms, not a list of the two reproducers,
+# so they record the boundary rather than the bug: which spellings the widened
+# patterns reach and -- in ACCOUNT_NUMBER_SURFACE_FORMS_STILL_MISSED and the negatives
+# below -- exactly which ones they still do not, and why that is a decision.
+
+# (entity_type, doc_category, document, the substring that must be covered)
+IDENTIFIER_SURFACE_FORMS: list[tuple[str, str | None, str, str]] = [
+    # -- ACCOUNT_NUMBER: contiguous (already worked) and grouped (did not) ----
+    (
+        "ACCOUNT_NUMBER",
+        "financial",
+        "Account Number: 482910573364 on the statement.",
+        "482910573364",
+    ),
+    ("ACCOUNT_NUMBER", "financial", "Wire to Acct #48291057 today.", "48291057"),
+    (
+        "ACCOUNT_NUMBER",
+        "financial",
+        "Bank Account Number: 4829-1057-3364",
+        "4829-1057-3364",
+    ),
+    (
+        "ACCOUNT_NUMBER",
+        "financial",
+        "Bank Account Number: 4829 1057 3364",
+        "4829 1057 3364",
+    ),
+    (
+        "ACCOUNT_NUMBER",
+        "financial",
+        "Account No. 4829-1057-3364-2201 was charged.",
+        "4829-1057-3364-2201",
+    ),
+    (
+        "ACCOUNT_NUMBER",
+        "financial",
+        "Chargeback filed against acct 4400 8829 1374 this morning.",
+        "4400 8829 1374",
+    ),
+    # -- CASE_ID: the case-sensitivity split, and four-digit years -----------
+    ("CASE_ID", "legal", "Case No. 1:24-cv-08821 is set for hearing.", "1:24-cv-08821"),
+    ("CASE_ID", "legal", "Docket 24-CV-88213 was reassigned.", "24-CV-88213"),
+    # The sharpest of the nine. Pattern 1 carried '(?i)' and pattern 2 did not, in
+    # the same entity, so the identical docket detected in upper case and vanished in
+    # lower -- and lower case is how a brief writes it in running prose.
+    ("CASE_ID", "legal", "Docket 24-cv-88213 was reassigned.", "24-cv-88213"),
+    (
+        "CASE_ID",
+        "legal",
+        "Legal Case Number: Case No. 2024-CV-88213",
+        "2024-CV-88213",
+    ),
+    (
+        "CASE_ID",
+        "legal",
+        "Legal Case Number: Case No. 2024-cv-88213",
+        "2024-cv-88213",
+    ),
+    ("CASE_ID", "legal", "Refiled as CV-2024-008821 in state court.", "CV-2024-008821"),
+    ("CASE_ID", "legal", "Refiled as cv-2024-008821 in state court.", "cv-2024-008821"),
+    # A docket carries no document category in a covering e-mail; CASE_ID is not
+    # scoped by only_in_doc_categories and must fire outside a legal document too.
+    ("CASE_ID", None, "Please reference 24-cv-88213 on the invoice.", "24-cv-88213"),
+]
+
+
+@pytest.mark.parametrize(
+    ("entity_type", "doc_category", "text", "value"),
+    IDENTIFIER_SURFACE_FORMS,
+    ids=[f"{row[0]}-{row[3]}" for row in IDENTIFIER_SURFACE_FORMS],
+)
+async def test_the_spec_mandated_identifier_surface_forms_are_all_detected(
+    detector: Detector,
+    entity_type: str,
+    doc_category: str | None,
+    text: str,
+    value: str,
+) -> None:
+    """Every spelling of the matrix, asserted on coverage rather than on the label.
+
+    ``uncovered`` rather than a span equality because the contract is "no detected
+    original leaves in the clear", and a partially covered identifier is the shape
+    that reads as a pass while half the digits travel: ``'4829-1057-3364'`` matched
+    as ``'4829'`` would satisfy an ``entity_type in types_of`` assertion on its own.
+    Both halves are kept -- the type, because the spec grades these two by name and a
+    value masked as something else is not evidence that the mandated type works.
+    """
+    hits = await detector.detect(text, doc_category)
+    assert entity_type in types_of(hits), f"{entity_type} missed in {text!r}"
+    assert uncovered(text, hits, value) == "", f"{value!r} partly left in the clear"
+
+
+# The surface forms the widening deliberately does NOT reach, asserted as misses.
+#
+# Recording them as passing tests is the honest half of a recall claim: a reader who
+# sees the matrix above should be able to find, in the same place, what it does not
+# cover. Both of these fail on the ANCHOR rather than on the digit shape, which is
+# the line the widening was held to -- 'account|acct|a/c' is what keeps
+# ACCOUNT_NUMBER's false-positive surface small, and reaching either of these means
+# widening the anchor or admitting a letter-bearing value, neither of which is a
+# digit-grouping change.
+#
+# Asserted rather than left to a comment for the reason HELD_OUT_MISS_SHAPES exists:
+# a prose caveat cannot go red. If a later change closes one of these, this test
+# fails and the caveat gets deleted in the same commit as the fix.
+ACCOUNT_NUMBER_SURFACE_FORMS_STILL_MISSED: list[tuple[str, str, str]] = [
+    (
+        "bare-card-no-account-noun",
+        "Card 4829105733642201 was declined.",
+        "sixteen contiguous digits, which the digit shape already accepts -- what is "
+        "absent is the account noun the '\\K' anchor requires. 'Card' is not one, and "
+        "adding it is a widening of the ANCHOR.",
+    ),
+    (
+        "iban",
+        "IBAN: GB29 NWBK 6016 1331 9268 19 at the correspondent bank.",
+        "fails on both halves: 'IBAN' is not an account noun, and the value is "
+        "alphanumeric where every branch of this pattern is digits. An IBAN needs its "
+        "own value shape, which is a different change from grouping digits.",
+    ),
+    (
+        "dot-grouped",
+        "Account: 4829.1057.3364 at Meridian.",
+        "the group separator is ' ' or '-' only. A dot is also a decimal point and a "
+        "date separator, so admitting it behind an account noun claims '1.234.567' "
+        "and every dotted date; the two reported grouped spellings use neither.",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "text", "why"),
+    ACCOUNT_NUMBER_SURFACE_FORMS_STILL_MISSED,
+    ids=[row[0] for row in ACCOUNT_NUMBER_SURFACE_FORMS_STILL_MISSED],
+)
+async def test_the_account_number_forms_outside_the_widening_are_still_missed(
+    detector: Detector, label: str, text: str, why: str
+) -> None:
+    """The boundary of the widening, stated as a test so it cannot go stale."""
+    found = types_of(await detector.detect(text, "financial"))
+    assert "ACCOUNT_NUMBER" not in found, (
+        f"{label} is now detected, which is good -- delete this row and its entry in "
+        f"the note above, because the recorded reason is no longer true: {why}"
+    )
+
+
+# What the widened patterns must still refuse. The first four are the price of
+# CASE_ID pattern 2 becoming case-insensitive: '\d{2,4}-[a-z]{1,4}-\d{3,6}' with no
+# guard is also the day-month-year date shape, and '21-Aug-1958' is a birth date in
+# ho_radiology while '17-Feb-1995' is a DOB row in SPELLING_VARIANTS. Claiming those
+# as case numbers masks them under a LEGAL type at identifier tier instead of PII at
+# date tier. The last is ACCOUNT_NUMBER's: two four-digit groups behind an account
+# noun is a year pair, which is why the grouped branch needs three.
+WIDENED_IDENTIFIER_NEGATIVES: list[tuple[str, str | None, str, set[str]]] = [
+    ("dob-hyphen-month", None, "Applicant three: birthdate 17-Feb-1995 recorded.", {"CASE_ID"}),
+    ("dob-four-letter-month", "medical", "Birth date 04-June-1958 on the chart.", {"CASE_ID"}),
+    ("dob-sept", "medical", "Birth date 17-Sept-1995 on the chart.", {"CASE_ID"}),
+    ("date-in-prose", "legal", "The order was signed 09-Dec-2024 by the clerk.", {"CASE_ID"}),
+    (
+        "adjacent-years",
+        "financial",
+        "The account 2023 2024 comparison shows steady growth.",
+        {"ACCOUNT_NUMBER"},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "doc_category", "text", "forbidden"),
+    WIDENED_IDENTIFIER_NEGATIVES,
+    ids=[row[0] for row in WIDENED_IDENTIFIER_NEGATIVES],
+)
+async def test_the_widened_identifier_patterns_refuse_dates_and_year_pairs(
+    detector: Detector, label: str, doc_category: str | None, text: str, forbidden: set[str]
+) -> None:
+    """The false positives the two widenings were bounded to avoid."""
+    found = types_of(await detector.detect(text, doc_category))
+    assert not found & forbidden, f"{label}: {found & forbidden} claimed {text!r}"

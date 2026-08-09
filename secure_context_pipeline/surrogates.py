@@ -12,8 +12,32 @@ Canonical emitted form (build doc section 9.3)::
 
 ``TOKEN_RE`` is deliberately *tolerant* (build doc section 9.7): an LLM will mangle
 tokens, and a token we fail to match is a token that reaches the user un-restored.
-It accepts wrong or missing brackets, stray whitespace, and a case-mangled hash.
+It accepts wrong or missing brackets, stray whitespace **anywhere inside the
+token**, and any casing of the category, the entity type and the hash.
 Restore keys on the 8-hex hash alone, so a dropped or corrupted hint still restores.
+
+**Tolerance is one-way: ``TOKEN_RE`` is tolerant, ``STRICT_TOKEN_RE`` is not.**
+The two were both once case-sensitive outside the hash, and the cost was measured
+directly::
+
+    [PHI_NAME_1a2b3c4d] -> match      [phi_name_1a2b3c4d] -> NO match
+    [PHI_NAME_1A2B3C4D] -> match      [Phi_Name_1a2b3c4d] -> NO match
+    [PHI_NAME_1a2b3c4d] -> match      [PHI_NAME_\n1a2b3c4d] -> NO match
+
+Lower-casing a token, title-casing it, or wrapping a line at one of its two
+separators are all "paraphrased or grammatically modified forms" in the sense of
+core requirement 6, and each of those three left the token in the answer the user
+reads -- the outcome the rubric names separately as "no tokens leak to the user".
+``TOKEN_RE`` now accepts all of them (:func:`_any_case`, :data:`_SEPARATOR`).
+
+``STRICT_TOKEN_RE`` stays exactly as narrow as :func:`format_surrogate`, and
+widening it in sympathy would be a *security* change rather than a tolerance one:
+the egress gate builds its detector skip-list from ``STRICT_TOKEN_RE`` spans
+(``egress_gate._own_token_mask``), so every shape added to it is a span of outbound
+payload the gate stops re-scanning. ``phi_name_1a2b3c4d`` is not a string this
+pipeline can emit, so it is document text, and document text must be scanned.
+The same asymmetry is why the hint group is *not* case-folded: an upper-case hint
+is not a shape :func:`format_surrogate` can write either.
 
 **Every quantifier here is bounded, and that is a security property, not style.**
 ``TOKEN_RE`` runs on fully untrusted text -- the raw LLM response, in
@@ -104,6 +128,44 @@ ENTITY_TYPE_RE = re.compile(rf"\A{_TYPE_BODY}\Z")
 #: and "a pipe in the model's prose" is whether one of these characters comes next.
 _CLOSER_CLASS = r"[\]\}\)]"
 
+
+def _any_case(literal: str) -> str:
+    """``PHI`` -> ``[Pp][Hh][Ii]``: a literal the *matcher* reads in any casing.
+
+    Written out per character rather than by compiling :data:`TOKEN_RE` with
+    ``re.IGNORECASE``, and the difference is not stylistic:
+
+    * ``re.IGNORECASE`` is pattern-wide, so it would also fold the hint group's
+      ``[a-z0-9-]`` -- and the module docstring's rule is that the matcher must
+      never out-run what :func:`format_surrogate` can emit. ``HINT_RE`` is
+      lowercase-only, so an upper-case hint is not a shape we can have written.
+    * Python's ``IGNORECASE`` is *Unicode* case folding, so ``[A-Z]`` would begin
+      matching U+212A KELVIN SIGN and U+017F LATIN SMALL LETTER LONG S. Those
+      characters would then travel into the entity-type label the restorer copies
+      into an audit row, which is a confusable-lookalike in a compliance column
+      for no tolerance gained -- a model that re-cases a token types ASCII.
+
+    A scoped ``(?i:...)`` group fixes the first problem and not the second.
+    """
+    return "".join(f"[{char.upper()}{char.lower()}]" for char in literal)
+
+
+#: The category and entity-type literals as the *matcher* accepts them: ASCII, in
+#: any casing. ``[phi_name_1a2b3c4d]`` and ``[Phi_Name_1a2b3c4d]`` did not match at
+#: all before this, so a model that lower-cased or title-cased a token -- an
+#: ordinary "grammatically modified form" (core requirement 6) -- left the token
+#: un-restored and visible to the user. Only the 8-hex hash was case-tolerant.
+_CATEGORY_ALT_ANY_CASE = "|".join(_any_case(category) for category in CATEGORIES)
+_TYPE_BODY_ANY_CASE = f"[A-Za-z][A-Za-z0-9_]{{0,{MAX_ENTITY_TYPE_LEN - 1}}}"
+
+#: ``_`` or ``-``, with the same bounded whitespace class allowed on either side.
+#: The class was already permitted after the opening bracket, around the pipe and
+#: before the closer, but not here -- so a token a model wrapped across a line at a
+#: separator (``[PHI_NAME_\n1a2b3c4d]``) did not match and reached the user whole.
+#: Bounded for the reason every quantifier in this module is bounded; see the
+#: module docstring.
+_SEPARATOR = f"{_WS}[_\\-]{_WS}"
+
 # Tolerant matcher -- see module docstring. Groups: (category, entity_type, hash, hint)
 #
 # The hint group ends in `(?={_CLOSER_CLASS})`: a lookahead, so the closer stays
@@ -112,8 +174,14 @@ _CLOSER_CLASS = r"[\]\}\)]"
 # the group from eating the model's prose (module docstring, third bullet) while
 # leaving match *existence* untouched -- the group is optional, so nothing that
 # matched before stops matching; only over-long matches get shorter.
+#
+# Groups 1 and 2 are case-*tolerant*, which makes them case-*unreliable*: a caller
+# that copies either into a label must upper-case it, or one entity produces two
+# spellings of the same audit row depending on how the model typed it. See
+# `restorer._restore_tokens`, the only caller that does.
 TOKEN_RE = re.compile(
-    rf"[\[\{{\(]?{_WS}({_CATEGORY_ALT})[_\-]({_TYPE_BODY})[_\-]([0-9a-fA-F]{{8}})"
+    rf"[\[\{{\(]?{_WS}({_CATEGORY_ALT_ANY_CASE}){_SEPARATOR}({_TYPE_BODY_ANY_CASE})"
+    rf"{_SEPARATOR}([0-9a-fA-F]{{8}})"
     rf"(?:{_WS}\|{_WS}([a-z0-9\-]{{1,{MAX_HINT_LEN}}}){_WS}(?={_CLOSER_CLASS}))?"
     rf"{_WS}{_CLOSER_CLASS}?"
 )

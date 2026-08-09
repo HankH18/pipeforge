@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from secure_context_pipeline.models import Detection
 from secure_context_pipeline.obfuscation.strategies.base import (
     ObfuscationStrategy,
+    RestoreMode,
     StrategyContext,
     register_strategy,
 )
@@ -55,6 +56,11 @@ class TokenizationStrategy(ObfuscationStrategy):
     """
 
     name = "tokenization"
+
+    #: Every surrogate this class emits comes from ``plain_token``, so the token ID
+    #: is inside the string and the restorer needs nothing else. The narrow claim of
+    #: the two, and true here for the same reason the class has no tier dispatch.
+    restores_via = RestoreMode.TOKEN_ID
 
     def __init__(self, ctx: StrategyContext) -> None:
         super().__init__(ctx)

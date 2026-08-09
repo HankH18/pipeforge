@@ -13,17 +13,40 @@ is attacked for backtracking blowup and for over-matching.
 
 from __future__ import annotations
 
+import base64
 import re
+import secrets
 import time
+from collections.abc import AsyncIterator, Callable, Coroutine
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import pytest
+import pytest_asyncio
 
-from secure_context_pipeline.errors import ConfigError
+from secure_context_pipeline.audit.logger import EGRESS_BLOCK, EGRESS_PASS, AuditLogger
+from secure_context_pipeline.config import Settings
+from secure_context_pipeline.deobfuscation.restorer import Restorer
+from secure_context_pipeline.detection.detector import Detector
+from secure_context_pipeline.detection.registry import EntityRegistry, load_registry
+from secure_context_pipeline.errors import (
+    OVERSIZED_PAYLOAD_REASON,
+    ConfigError,
+    PayloadTooLargeError,
+)
+from secure_context_pipeline.llm.base import LLMResponse
+from secure_context_pipeline.llm.mock_provider import MockProvider
+from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import (
+    MAX_PAYLOAD_CHARS,
     PSEUDONYMIZATION_SYSTEM_PROMPT,
     TOKENIZATION_SYSTEM_PROMPT,
     ContextInjector,
 )
+from secure_context_pipeline.pipeline.egress_gate import EgressGate
+from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
+from secure_context_pipeline.store.document_store import EncryptedDocumentStore
 from secure_context_pipeline.surrogates import (
     CATEGORIES,
     MAX_HINT_LEN,
@@ -33,6 +56,8 @@ from secure_context_pipeline.surrogates import (
     format_redaction,
     format_surrogate,
 )
+from secure_context_pipeline.vault.session_registry import SessionRegistry
+from secure_context_pipeline.vault.session_vault import SessionVault
 
 DOC = "Patient [PHI_NAME_1a2b3c4d] takes [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic]."
 
@@ -405,3 +430,276 @@ def test_format_surrogate_validates_category_and_token_id() -> None:
             format_surrogate("PII", "NAME", bad_id)
     for category in CATEGORIES:
         assert STRICT_TOKEN_RE.fullmatch(format_surrogate(category, "NAME", "deadbeef"))
+
+
+# ---------------------------------------------------------------------------
+# The single-call payload ceiling (MAX_PAYLOAD_CHARS)
+#
+# These drive the REAL orchestrator -- real encrypted store, real spaCy detection,
+# real engine, real vault, real gate, real hash-chained audit log -- with only the
+# provider replaced, because the claim under test is about ordering ("the provider
+# is not called", "the gate does not run") and ordering is a property of the graph,
+# not of the injector in isolation. A unit test that called `build()` and compared
+# a length would pass with the check deleted from `run()`.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+REGISTRY_PATH = REPO_ROOT / "entities.yaml"
+FIXTURES = REPO_ROOT / "fixtures"
+
+#: The largest document this repository ships -- the 12k-word brief README section 5
+#: Q1 measures the full pipeline against. It is the document that has to keep working.
+LARGEST_FIXTURE = FIXTURES / "legal_brief_large.txt"
+
+USER_ID = "ceiling-user"
+PROMPT = "Summarise this record and list the parties, dates and figures involved."
+
+
+class CountingProvider:
+    """The shipped mock, plus the only fact these tests ask of a provider: was it called."""
+
+    name = "mock"
+
+    def __init__(self) -> None:
+        self._inner = MockProvider()
+        self.calls = 0
+
+    async def complete(self, system: str, user: str, *, model: str, timeout_s: float = 60.0) -> str:
+        return (await self.complete_detailed(system, user, model=model, timeout_s=timeout_s)).text
+
+    async def complete_detailed(
+        self, system: str, user: str, *, model: str, timeout_s: float = 60.0
+    ) -> LLMResponse:
+        self.calls += 1
+        return await self._inner.complete_detailed(system, user, model=model, timeout_s=timeout_s)
+
+
+@dataclass(slots=True)
+class CeilingHarness:
+    store: EncryptedDocumentStore
+    sessions: SessionRegistry
+    vault: SessionVault
+    audit: AuditLogger
+    provider: CountingProvider
+    orchestrator: PipelineOrchestrator
+
+    async def upload(self, text: str, category: str) -> str:
+        return await self.store.put(USER_ID, "doc.txt", text.encode("utf-8"), category)
+
+    async def close(self) -> None:
+        await self.vault.close()
+        await self.store.close()
+        await self.audit.close()
+
+
+@pytest.fixture(scope="module")
+def ceiling_registry() -> EntityRegistry:
+    return load_registry(REGISTRY_PATH)
+
+
+@pytest.fixture(scope="module")
+def ceiling_detector(
+    ceiling_registry: EntityRegistry, tmp_path_factory: pytest.TempPathFactory
+) -> Detector:
+    """Built ONCE for the module: constructing a Detector loads spaCy, the slow part."""
+    settings = Settings(
+        master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        data_dir=tmp_path_factory.mktemp("ceiling-detector"),
+        registry_path=REGISTRY_PATH,
+        llm_provider="mock",
+    )
+    return Detector(ceiling_registry, settings)
+
+
+@pytest_asyncio.fixture
+async def make_ceiling_harness(
+    ceiling_registry: EntityRegistry, ceiling_detector: Detector, tmp_path: Path
+) -> AsyncIterator[Callable[[], Coroutine[Any, Any, CeilingHarness]]]:
+    built: list[CeilingHarness] = []
+
+    async def _make() -> CeilingHarness:
+        root = tmp_path / f"h{len(built)}"
+        root.mkdir(parents=True, exist_ok=True)
+        settings = Settings(
+            master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+            data_dir=root / "data",
+            registry_path=REGISTRY_PATH,
+            llm_provider="mock",
+        )
+        audit = await AuditLogger.open(root / "audit.db")
+        store = await EncryptedDocumentStore.open(settings)
+        sessions = SessionRegistry(settings)
+        vault = await SessionVault.open(root / "vault.db", sessions)
+        engine = ObfuscationEngine(
+            registry=ceiling_registry,
+            vault=vault,
+            session_registry=sessions,
+            settings=settings,
+            audit=audit,
+        )
+        provider = CountingProvider()
+        harness = CeilingHarness(
+            store=store,
+            sessions=sessions,
+            vault=vault,
+            audit=audit,
+            provider=provider,
+            orchestrator=PipelineOrchestrator(
+                store=store,
+                detector=ceiling_detector,
+                engine=engine,
+                injector=ContextInjector(),
+                gate=EgressGate(
+                    vault=vault, detector=ceiling_detector, settings=settings, audit=audit
+                ),
+                provider=provider,
+                restorer=Restorer(vault=vault, settings=settings, audit=audit),
+                vault=vault,
+                settings=settings,
+                audit=audit,
+            ),
+        )
+        built.append(harness)
+        return harness
+
+    try:
+        yield _make
+    finally:
+        for harness in reversed(built):
+            await harness.close()
+
+
+def _oversized_document() -> str:
+    """A genuinely oversized document: the medical fixture repeated past the ceiling.
+
+    Repeated rather than synthesised from filler, so the detector, the engine and the
+    vault all do real work on real entity shapes on the way to the refusal -- the point
+    is that the ceiling fires at the end of a normal run, not that it fires on a string.
+
+    Sized just past the ceiling on the *document*, which is a lower bound on the
+    payload: the payload adds the system prompt and the fence, and tokenization
+    lengthens the text it replaces. Deliberately only just past it -- every extra
+    character is another spaCy pass this test pays for.
+    """
+    unit = (FIXTURES / "medical_note.txt").read_text(encoding="utf-8") + "\n\n"
+    repeats = MAX_PAYLOAD_CHARS // len(unit) + 1
+    document = unit * repeats
+    assert len(document) > MAX_PAYLOAD_CHARS, "the fixture repeat did not clear the ceiling"
+    return document
+
+
+async def test_an_oversized_document_is_refused_before_the_provider_is_called(
+    make_ceiling_harness: Callable[[], Coroutine[Any, Any, CeilingHarness]],
+) -> None:
+    """The gap this closes: nothing bounded the outbound payload.
+
+    ``ContextInjector.build`` emits one payload holding the whole obfuscated document
+    and ``run()`` makes exactly one provider call with it, so past the model's input
+    window the request came back a **non-retryable HTTP 400** and surfaced as
+    ``LLM_TRANSPORT_ERROR`` -- "the upstream is broken" -- after the run had already
+    paid for detection, obfuscation, and a full detector re-scan inside the gate.
+
+    Three assertions, and the second and third are the ones that bind. A typed error
+    alone would be satisfied by raising it anywhere, including from a wrapper around
+    the provider call that had already sent the bytes.
+
+    * the refusal is typed, carries a code the UI renders, and states BOTH numbers;
+    * the provider was never called;
+    * the audit log records the refusal -- and records it as a block, so a compliance
+      query over the log alone can tell this run from one that simply never happened.
+
+    The fourth assertion is the ordering decision: no ``EGRESS_PASS`` row, because the
+    check runs *before* the gate. See ``_refuse_oversized_payload`` for why -- briefly,
+    pass 2 of the gate is a full spaCy pass over the payload, which on a document the
+    API will accept (16 MiB) is minutes of caller-controlled CPU spent on a run that
+    was always going to be refused.
+    """
+    harness = await make_ceiling_harness()
+    document = _oversized_document()
+    doc_id = await harness.upload(document, "medical")
+    session_id, _ = await harness.sessions.create(USER_ID)
+
+    with pytest.raises(PayloadTooLargeError) as raised:
+        await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+
+    error = raised.value
+    assert error.code == "PAYLOAD_TOO_LARGE"
+    assert error.detail["reason"] == OVERSIZED_PAYLOAD_REASON
+    assert error.detail["limit_chars"] == MAX_PAYLOAD_CHARS
+    measured = error.detail["payload_chars"]
+    assert isinstance(measured, int) and measured > MAX_PAYLOAD_CHARS
+    # The message has to tell the reviewer what to do, not only that something failed.
+    assert error.detail["remedy"] == "split the document and run each part as its own request"
+    # Content-free, like every other error in this hierarchy: counts and codes only.
+    rendered = str(error)
+    assert "Marcus" not in rendered and "@" not in rendered
+
+    assert harness.provider.calls == 0, "an oversized payload must not reach the provider"
+
+    events = await harness.audit.query(session_id=session_id, limit=100_000)
+    blocks = [e for e in events if e.event_type == EGRESS_BLOCK]
+    seen_types = [e.event_type for e in events]
+    assert len(blocks) == 1, f"the refusal is not in the audit trail: {seen_types}"
+    assert blocks[0].detail["reason"] == OVERSIZED_PAYLOAD_REASON
+    assert blocks[0].detail["payload_chars"] == measured
+    assert blocks[0].detail["limit_chars"] == MAX_PAYLOAD_CHARS
+    assert not [e for e in events if e.event_type == EGRESS_PASS], (
+        "the ceiling is supposed to run BEFORE the gate; an EGRESS_PASS row means it did not"
+    )
+    # The refusal did not swallow the rest of the trail: what the run did to the
+    # document up to that point is still recorded.
+    assert {"DETECT", "OBFUSCATE"} <= {e.event_type for e in events}
+
+
+async def test_the_largest_shipped_fixture_runs_with_room_under_the_ceiling(
+    make_ceiling_harness: Callable[[], Coroutine[Any, Any, CeilingHarness]],
+) -> None:
+    """A ceiling nobody measured against a real document is a ceiling that refuses one.
+
+    The number that matters is not the fixture's size on disk but the size of the
+    payload it *assembles into*: obfuscation lengthens the text (a nine-character name
+    becomes a twenty-odd-character token), and the payload adds the system prompt and
+    the fence on top. So the margin is measured on ``stats["payload_chars"]``, which is
+    the same integer the ceiling compares.
+
+    The bound asserted here is deliberately loose -- 2x, not the measured value -- so
+    that ordinary drift in the fixture or the token grammar does not redden it, while a
+    change that put the shipped corpus anywhere near the ceiling still would.
+    """
+    harness = await make_ceiling_harness()
+    document = LARGEST_FIXTURE.read_text(encoding="utf-8")
+    doc_id = await harness.upload(document, "legal")
+    session_id, _ = await harness.sessions.create(USER_ID)
+
+    result = await harness.orchestrator.run(session_id, USER_ID, doc_id, PROMPT, "tokenization")
+
+    payload_chars = int(result.stats["payload_chars"])
+    assert payload_chars == len(result.obfuscated_payload)
+    margin = MAX_PAYLOAD_CHARS / payload_chars
+    assert margin >= 2.0, (
+        f"the largest shipped fixture assembles to {payload_chars} characters against a "
+        f"{MAX_PAYLOAD_CHARS} ceiling -- {margin:.1f}x, which is no longer comfortable"
+    )
+    assert harness.provider.calls == 1
+    print(
+        f"\nlargest shipped fixture: document {len(document)} chars -> payload "
+        f"{payload_chars} chars, ceiling {MAX_PAYLOAD_CHARS}, margin {margin:.1f}x"
+    )
+
+
+def test_the_ceiling_measures_the_string_the_provider_is_actually_handed() -> None:
+    """The constant is worthless if it bounds something other than what is sent.
+
+    ``char_count`` is the length of ``serialized``, which is the concatenation the gate
+    scans and the orchestrator re-derives in ``_verify_release``. Asserting the identity
+    here is what stops the ceiling drifting onto, say, the document alone -- which would
+    silently under-count the payload by the system prompt and the fence on every run.
+    """
+    payload = ContextInjector().build(
+        strategy="tokenization",
+        obfuscated_prompt="Summarise.",
+        obfuscated_document=DOC,
+    )
+    assert payload.char_count == len(payload.serialized)
+    assert payload.serialized == f"{payload.system}\n\n{payload.user}"
+    assert payload.char_count > len(DOC), "the ceiling must count the prompt and fence too"

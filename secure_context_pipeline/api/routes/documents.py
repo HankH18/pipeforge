@@ -1,4 +1,4 @@
-"""``POST /documents`` and ``GET /documents/{doc_id}/text``.
+"""``POST /documents``, ``GET /documents/{doc_id}/text`` and ``GET /fixtures/{name}``.
 
 The upload leaves plaintext nowhere: the original bytes and the extracted text
 are both stored as AES-256-GCM ciphertext under a key derived from the caller's
@@ -9,15 +9,28 @@ to return an original value, and access control *is* the decrypt.
 megabytes rather than in rows, so it carries a second meter of its own --
 :class:`_ByteMeter`, charged in *durable bytes* -- for the reason set out at
 :data:`UPLOAD_BYTES_BURST`.
+
+``GET /fixtures/{name}`` is the third route here and the only one that reads
+anything off the server's own disk. It hands the browser the four **synthetic**
+demo documents this repo ships so the demo UI's preset dropdown can load one in
+a single click instead of naming a path and asking the reviewer to go find it.
+It is a *read-only allow-list*, not a file server, and the whole of its security
+argument is at :data:`DEMO_FIXTURES` and :func:`_load_shipped_fixtures`.
 """
 
 from __future__ import annotations
 
+import logging
 import time
+from collections.abc import Mapping
+from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, Response, UploadFile
+from fastapi import Path as PathParam
 from fastapi import status as http_status
+from fastapi.responses import PlainTextResponse
 
 from secure_context_pipeline.api.constants import (
     HTTP_413_TOO_LARGE,
@@ -38,8 +51,11 @@ from secure_context_pipeline.api.schemas import (
     DocumentTextResponse,
     DocumentUploadResponse,
 )
+from secure_context_pipeline.config import PACKAGE_ROOT
 from secure_context_pipeline.errors import PipelineError
 from secure_context_pipeline.store.document_store import DOC_CATEGORIES, InvalidCategoryError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -297,3 +313,250 @@ async def get_document_text(
     return DocumentTextResponse(
         doc_id=doc_id, doc_category=category, text=text, chars=len(text)
     )
+
+
+# ---------------------------------------------------------------------------
+# The four shipped demo fixtures, over HTTP
+# ---------------------------------------------------------------------------
+#: Where the shipped fixtures live, resolved the same way
+#: :data:`~secure_context_pipeline.config.DEFAULT_REGISTRY_PATH` resolves
+#: ``entities.yaml`` -- the package's parent -- so a deployment that can find the
+#: registry can find these. The Dockerfile's ``COPY fixtures/ fixtures/`` puts
+#: them at ``/app/fixtures`` beside ``/app/entities.yaml``, and both are in the
+#: image's explicit allow-list rather than in a ``COPY . .``.
+FIXTURES_DIR = PACKAGE_ROOT.parent / "fixtures"
+
+#: **The allow-list.** Exact filename -> the ``doc_category`` that document must
+#: be scanned under. There is no other way into :data:`FIXTURE_BYTES`, and there
+#: is no code path anywhere in this module that turns a caller's string into a
+#: filesystem path.
+#:
+#: A literal table rather than ``FIXTURES_DIR.glob("*.txt")``, and the difference
+#: is the whole control. A glob makes the served set a property of the filesystem
+#: *at the moment of the request*: a developer's scratch file, a document a
+#: reviewer dropped in the directory to try it, a symlink planted by anything that
+#: can write there -- each would become world-readable on an anonymous GET the
+#: instant it appeared, with no code change and no review. With a table, adding a
+#: name is a diff. That these four names are the ones that actually ship is not
+#: asserted here, it is measured against ``git ls-files`` by
+#: ``tests/test_api_documents.py::test_the_fixture_allow_list_is_exactly_what_the_repo_ships``,
+#: so deleting or renaming a fixture fails a test rather than leaving a dead entry.
+#:
+#: The categories are the same strings the demo UI's ``<option data-cat>`` carries;
+#: ``test_the_ui_dropdown_and_the_server_allow_list_are_the_same_four_documents``
+#: pins the two together so the dropdown cannot drift into arming a document under
+#: a category this server would not have chosen for it.
+DEMO_FIXTURES: Mapping[str, str] = MappingProxyType(
+    {
+        "medical_note.txt": "medical",
+        "legal_memo.txt": "legal",
+        "financial_disclosure.txt": "financial",
+        "legal_brief_large.txt": "legal",
+    }
+)
+
+#: Longest shipped name is ``financial_disclosure.txt`` at 24 characters, so this
+#: is 5.3x the longest thing that can legitimately arrive. It is a ceiling on the
+#: *request*, not the control -- a 128-character name is refused by the allow-list
+#: exactly as a 4-character one is -- and it is set this loose on purpose: every
+#: adversarial name the tests send (``../../etc/passwd``, ``/etc/passwd``,
+#: ``....//....//etc/passwd``, a NUL-terminated name, a URL-encoded traversal) is
+#: under it and therefore reaches the allow-list, so what refuses them is
+#: demonstrably the allow-list and not a length check that fired first.
+MAX_FIXTURE_NAME_LEN = 128
+
+#: A file bigger than this is not loaded, and the endpoint answers 404 for it.
+#: Largest shipped fixture is ``legal_brief_large.txt`` at 83 029 bytes, so this is
+#: 12.6x headroom. It bounds the resident cost of :data:`FIXTURE_BYTES` (the four
+#: shipped files total 91 935 bytes) against the one way that number could grow
+#: without anyone noticing: an allow-listed *name* whose file someone later made
+#: enormous. It is not an upload ceiling; :data:`MAX_UPLOAD_BYTES` still owns what
+#: ``POST /documents`` will accept, and these bytes go back through that route.
+MAX_FIXTURE_BYTES = 1024 * 1024
+
+
+def _load_shipped_fixtures(directory: Path) -> dict[str, bytes]:
+    """Read the allow-listed files into memory, once, at import.
+
+    **This is the function that makes the endpoint structurally incapable of
+    becoming a general file reader.** Holding the bytes rather than reading them
+    per request means the request path never touches the filesystem at all: a
+    caller's string reaches exactly one operation, ``FIXTURE_BYTES.get(name)``, a
+    dict lookup on a table whose keys are literals in this file. There is no
+    ``open``, no ``read_bytes`` and no ``/`` operator downstream of the handler
+    for a later edit to point somewhere else -- widening this route would take
+    *adding* filesystem access to a handler that has none, which is a diff a
+    reviewer sees, rather than changing which path an existing read is handed,
+    which is a diff that looks like a rename.
+
+    The only string that ever reaches the ``/`` operator is ``allowed``, the
+    table's own key. That is why the loop is written over
+    ``DEMO_FIXTURES`` and the caller's name never appears here.
+
+    Five refusals, none of which a *request* can reach -- they guard the
+    directory, not the caller, and they exist because "the allow-list names it"
+    and "the thing on disk under that name is the document we shipped" are
+    different claims:
+
+    * a **symlink** is refused outright, so a link planted in ``fixtures/`` under
+      an allow-listed name cannot make this route read its target;
+    * a path whose real parent is not the real ``directory`` is refused. The
+      overlap between these two is measured rather than asserted: deleting either
+      one alone still refuses a link pointing *out* of the directory (each catches
+      it), and only deleting both lets ``/etc/passwd`` through under the name
+      ``medical_note.txt``; the link-to-a-sibling case is caught by the first
+      check alone. So the second is redundant today and is kept as the layer that
+      survives the first being deleted, which is exactly the mutation that
+      demonstrated it;
+    * anything that is not a regular file (a FIFO would block the process on
+      ``read_bytes``) is refused;
+    * a file over :data:`MAX_FIXTURE_BYTES` is refused, so the resident table
+      cannot silently grow;
+    * bytes that are not valid UTF-8 are refused, and that one is a *correctness*
+      guard for the caller rather than a security one: the browser receives this
+      body as text and re-encodes it to UTF-8 before posting it back to
+      ``POST /documents``, which is lossless for valid UTF-8 and silently
+      mangling for anything else -- so a preset run would stop being the same
+      document as a hand-picked run, which is the property this whole route is
+      written to preserve. All four shipped fixtures are pure ASCII.
+
+    A missing or refused fixture is a warning and an absent key, never an
+    exception: this module is imported while the ASGI app is built, and a
+    deployment that forgot ``fixtures/`` must still serve the pipeline. The demo
+    preset then reports itself unavailable, which is the honest failure.
+
+    Measured on this build: the four shipped files are 91 935 bytes and load in a
+    median 0.21 ms over 50 repeats, once, at import.
+    """
+    loaded: dict[str, bytes] = {}
+    try:
+        real_dir = directory.resolve(strict=True)
+    except OSError:
+        logger.warning("demo fixtures not served; directory absent (path=%s)", directory)
+        return loaded
+    for allowed in DEMO_FIXTURES:
+        # `allowed` -- a literal key of the table above -- is the ONLY thing this
+        # module ever joins onto a directory. Never a path component that came in
+        # over the wire.
+        path = directory / allowed
+        if path.is_symlink():
+            logger.warning("demo fixture refused: symlink (name=%s)", allowed)
+            continue
+        if not path.is_file():
+            logger.warning("demo fixture missing or not a regular file (name=%s)", allowed)
+            continue
+        try:
+            real = path.resolve(strict=True)
+        except OSError:
+            logger.warning("demo fixture refused: unresolvable (name=%s)", allowed)
+            continue
+        if real.parent != real_dir:
+            logger.warning("demo fixture refused: resolves outside its own directory (%s)", allowed)
+            continue
+        size = real.stat().st_size
+        if size > MAX_FIXTURE_BYTES:
+            logger.warning(
+                "demo fixture refused: %d bytes exceeds %d (name=%s)",
+                size,
+                MAX_FIXTURE_BYTES,
+                allowed,
+            )
+            continue
+        data = real.read_bytes()
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("demo fixture refused: not valid UTF-8 (name=%s)", allowed)
+            continue
+        loaded[allowed] = data
+    return loaded
+
+
+#: The served bytes, keyed by allow-listed name. Built once, at import; ~92 KB
+#: resident for the life of the process, which is 0.006% of the ~1.5 GB an
+#: ``en_core_web_lg`` worker already holds.
+FIXTURE_BYTES: Mapping[str, bytes] = MappingProxyType(_load_shipped_fixtures(FIXTURES_DIR))
+
+
+@router.get(
+    "/fixtures/{name:path}",
+    response_class=PlainTextResponse,
+    responses=_ERRORS,
+    tags=["documents"],
+    summary="One of the four shipped demo documents, by exact name (read-only)",
+)
+async def get_demo_fixture(
+    name: Annotated[
+        str,
+        PathParam(
+            max_length=MAX_FIXTURE_NAME_LEN,
+            description=f"Exactly one of {sorted(DEMO_FIXTURES)}. Nothing else is served.",
+        ),
+    ],
+) -> Response:
+    """Serve one shipped demo fixture so the UI preset can load it in one click.
+
+    **What this discloses: nothing new.** The four documents are *synthetic* --
+    generated by ``fixtures/generator.py``, containing no real person, no real
+    account and no real record -- and they already ship in the git repository and
+    in the container image (``COPY fixtures/ fixtures/``). Anyone who can reach
+    this port can already read them out of the clone or the image; serving them
+    over HTTP moves no boundary. Nothing here touches the encrypted store, the
+    vault or the audit log, and no response from this route can contain a value
+    from any of them: it returns bytes from a table built at import, and that
+    table's keys are the four literals at :data:`DEMO_FIXTURES`.
+
+    **No session, deliberately, and the reasoning is the point.** A session would
+    be pure friction with no security to show for it, for three reasons that all
+    have to hold:
+
+    1. It would gate content the same origin already publishes anonymously.
+       ``_mount_ui`` serves ``index.html``, ``app.js`` and ``style.css`` to
+       anybody, and a synthetic fixture is the same class of shipped asset.
+    2. A session is not a credential here. ``POST /sessions`` mints one for any
+       ``user_id`` an anonymous caller asks for -- ``api/app.py``'s docstring
+       states this and the audit-proof meter exists because of it -- so
+       "authenticated" would mean "made one extra anonymous request first".
+    3. It would break the thing this endpoint was added to fix. The preset is the
+       *first* control a reviewer touches; requiring a session to load a document
+       reintroduces an ordering trap in the exact place the friction was.
+
+    The honest counterweight, recorded rather than argued away: this is an
+    unauthenticated read that returns bytes the server holds. That is precisely
+    why the control is a closed allow-list of four names and not authentication --
+    authentication would decide *who* may read, and the property that matters here
+    is that there is nothing else to read.
+
+    **It does not bypass the upload path.** This route stores nothing and issues
+    no ``doc_id``. The browser takes these bytes straight back to
+    ``POST /documents`` as an ordinary multipart file with the same ``user_id``
+    and the same ``doc_category``, so a preset run and a hand-picked run of the
+    same fixture produce the same stored document and the same detections --
+    proved end to end by
+    ``test_a_preset_run_and_a_hand_picked_run_of_one_fixture_detect_identically``.
+
+    Anything not in the table is ``404 NOT_FOUND``, and the two 404 reasons are
+    deliberately distinguishable (``not_a_shipped_fixture`` against
+    ``fixture_not_installed``) because both facts are already public: the
+    allow-list is printed in this route's own OpenAPI description. The caller's
+    string is never echoed back into the detail.
+    """
+    data = FIXTURE_BYTES.get(name)
+    if data is None:
+        raise ApiError(
+            http_status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            {
+                "reason": (
+                    "fixture_not_installed" if name in DEMO_FIXTURES else "not_a_shipped_fixture"
+                ),
+                "shipped": len(DEMO_FIXTURES),
+            },
+        )
+    # `text/plain` with an explicit charset, and `X-Content-Type-Options: nosniff`
+    # from `_SecurityHeaders` on top of it, so a browser that navigates here
+    # directly renders inert text rather than sniffing the body into markup. No
+    # `Content-Disposition: attachment`: these are the demo's documents and a
+    # reviewer looking at one in a tab is a feature, and the response-wide CSP
+    # (`default-src 'none'`) already makes the page inert if one ever were markup.
+    return Response(content=data, media_type="text/plain; charset=utf-8")

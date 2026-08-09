@@ -10,6 +10,19 @@
   const S = {
     sessionId: null, lastSessionId: null, userId: null,
     docId: null, uploadKey: null, busy: false, verifying: false,
+    // Whether "Destroy session" has been armed and is waiting for its confirm. State
+    // rather than a read of the DOM for the same reason `armed` below is: two buttons
+    // and a live region have to agree, and inferring the answer from one of them is how
+    // they stop agreeing. See `setDestroyArmed`.
+    destroyArmed: false,
+    // WHICH of the two document controls Run will upload, and the single source of
+    // truth for it: `null`, `{ kind: 'preset', name }`, or `{ kind: 'file' }`. The
+    // state is explicit rather than inferred from "is there a file in the picker",
+    // because with two controls that infers wrong in both directions -- a preset
+    // armed after a file was chosen would silently lose to the leftover file, and a
+    // file chosen after a preset would fight it. Arming either one disarms the other
+    // here, in one place, and `paintArmed` prints whatever this says.
+    armed: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -110,16 +123,36 @@
   const STAT_META = {
     // `entities_detected` and panel 1's header count two DIFFERENT sets, and the
     // sets are not nested. See the `c1` assignment in `run` for the measurement.
-    entities_detected: { why: 'SAFETY. Spans the detector returned over the document ' +
-      'text, before any policy ran. The header of panel 1 counts a different set -- ' +
-      'the spans this run actually masked -- and neither is a subset of the other. ' +
-      'Hover that header for the arithmetic.' },
+    //
+    // `tag` is the ON-SCREEN half of that, and it is here because the hover was the
+    // whole of it: measured on fixtures/medical_note.txt as `medical`, this chip read
+    // `entities_detected 54` three lines above a header reading "52 spans masked" on
+    // EVERY run, and the only thing on the page reconciling them was a `title` on the
+    // other number. A reviewer who reads the strip first sees two disagreeing counts
+    // and no reason, and hover is not a thing a reviewer does to a number that looks
+    // fine. Four words beside the value say which set it is; the header now prints
+    // this number too and says the sets are not nested (`C1_DETECTED`), so whichever
+    // one is read first carries the reconciliation without a pointer.
+    entities_detected: { tag: 'before policy', why: 'SAFETY. Spans the detector ' +
+      'returned over the document text, before any policy ran. The header of panel 1 ' +
+      'counts a different set -- the spans this run actually masked -- and neither is ' +
+      'a subset of the other. Hover that header for the arithmetic.' },
     prompt_entities_detected: { why: 'SAFETY. Spans the detector returned over the ' +
       'prompt you typed. The prompt is obfuscated on the same path the document is; ' +
       'its spans are absent from panel 1 because their offsets are prompt-space.' },
-    tokens_issued: { why: 'SAFETY. Vault rows this run minted -- one per distinct ' +
-      '(entity type, value), document and prompt together. Lower than ' +
-      'entities_detected whenever a value occurs more than once.' },
+    // "minted" was wrong on exactly the run the next chip exists to expose. The vault
+    // keys a record by (entity type, value) for the LIFE OF THE SESSION and has no
+    // strategy dimension, so a second run over the same document can mint nothing and
+    // still report the same count -- measured on fixtures/medical_note.txt, two runs
+    // in one session: tokens_issued 32 both times, and the second run's payload
+    // carries the FIRST run's surrogates (that is the drift `strategyClause` reports).
+    // "Draws on" is true either way; the response carries no per-record minted/reused
+    // flag, so neither this chip nor the banner may claim one.
+    tokens_issued: { why: 'SAFETY. Vault records this run\'s payload draws on -- one ' +
+      'per distinct (entity type, value), document and prompt together. Minted by ' +
+      'this run, or reused from an earlier call in this session; the response does ' +
+      'not say which. Lower than entities_detected whenever a value occurs more than ' +
+      'once.' },
     prompt_tokens_issued: { why: 'SAFETY. How many of tokens_issued came from the ' +
       'prompt rather than from the document.' },
     pseudonyms_issued: { why: 'SAFETY. How many of tokens_issued the payload carries ' +
@@ -148,6 +181,13 @@
     unresolved_lost: { why: 'SAFETY, and 0 is the clean reading. Distinct token IDs ' +
       'this run DID issue that the vault no longer holds. The one counter here that ' +
       'means a value the user was entitled to could not be given back.', zero: true },
+    // Not a timing, and deliberately next to the one that is: this is the number the
+    // PAYLOAD_TOO_LARGE ceiling compares against, so a run that came close says so on
+    // the strip rather than only in the refusal it did not quite trigger.
+    payload_chars: { why: 'SAFETY. Characters in the assembled outbound payload -- ' +
+      'system prompt, obfuscated prompt and obfuscated document together, exactly ' +
+      'the string the egress gate scanned. Past 250,000 the run is refused with ' +
+      'PAYLOAD_TOO_LARGE before any model call, because one payload is one call.' },
     fetch_ms: { why: 'TIMING. Reading and decrypting the stored document.' },
     detect_ms: { why: 'TIMING. Detection over the document.' },
     prompt_detect_ms: { why: 'TIMING. Detection over the prompt.' },
@@ -199,6 +239,19 @@
     'is a subset of the other -- spans under 3 characters are dropped, and the vault\'s ' +
     'cross-call sweep adds occurrences the detector missed here. Measured on ' +
     'fixtures/medical_note.txt as medical: 54 detected, 3 dropped, 1 swept in, 52 masked.';
+  // The half of that reconciliation that is not hover, and the reason it exists: the
+  // paragraph above was written, both numbers were labelled, and the sentence joining
+  // them was still only reachable by hovering one of them. Two counts that disagree on
+  // 100% of runs, three lines apart, with the explanation hidden, is a page inviting
+  // the reviewer to decide for themselves which one is the real number.
+  //
+  // "N of M" stays refused -- 52 excludes 3 of the 54 and includes 1 that is not among
+  // them -- so the on-screen wording states the relationship that IS true of the two
+  // sets and nothing more. Both operands come out of the same response: `masked` is
+  // `result.detections.length`, `detected` is `stats.entities_detected`. Absent from
+  // `stats`, nothing is printed: there is no second number to reconcile against, and
+  // inventing one is the defect this whole block is about.
+  const C1_DETECTED = (n) => ' · detector returned ' + n + ', neither set contains the other';
 
   //: restorer.py's sentinel, verbatim. See the gap handling in `renderRestored`.
   const UNRESOLVED = '[UNRESOLVED_ENTITY]';
@@ -232,7 +285,19 @@
     'below describe an empty document.';
   const CLEARED = 'cleared — the session key and the vault rows for this run are gone. The ' +
     'audit tail below is what remains, and it is not reversible.';
-  const NEXT_STEP = 'Session created. Choose a file and press Run.';
+  //: Panel 1's body on a run this page knows is scoped by a destroyed session. See the
+  //: `destroyed` branch in `run` for why the text is not fetched at all. The second
+  //: sentence is the honest half: the erasure is of the session key and the token->value
+  //: mapping, which is exactly what CLEARED and the VAULT_DESTROYED banner claim and
+  //: never more, and a reviewer who notices that the document itself survives should
+  //: read that here rather than infer that the page was overstating.
+  const ERASED = 'not fetched — this run is scoped by the session you destroyed, so the ' +
+    'API refuses it at the session check and this page did not ask for the document text. ' +
+    'What the destroy erased is the session key and the vault rows that map a token back ' +
+    'to an original value; the encrypted document store is a different store and still ' +
+    'holds the file you uploaded, which is why a NEW session can read it again. Press ' +
+    '"Create session", then Run.';
+  const NEXT_STEP = 'Session created. Choose a demo document or your own file, then press Run.';
 
   //: `only_in_doc_categories`, mirrored out of entities.yaml, so a run can name the
   //: rule sets it did NOT use. It is a mirror rather than a fetch because nothing
@@ -489,9 +554,38 @@
       : 'FAIL-CLOSED: the egress gate refused to release the payload. ' +
         'No provider call was made. ') + detail,
 
+    // The other refusal on the run path, and the one that is NOT about a leak. It is
+    // kept off the EGRESS_BLOCKED code deliberately: that code's sentence, and the
+    // weight the README puts on it, is "the control caught something", and a document
+    // that is merely long has been caught at nothing. Both numbers are stated rather
+    // than left in the map because "too large" without them is unactionable and
+    // "812004 against 250000" tells the reviewer to split the file in four.
+    PAYLOAD_TOO_LARGE: (d) => 'That document assembles into an outbound payload larger than ' +
+      'one model call can carry' +
+      (typeof d.payload_chars === 'number' && typeof d.limit_chars === 'number'
+        ? ' (' + d.payload_chars + ' characters against a ceiling of ' + d.limit_chars + ')'
+        : '') +
+      '. Nothing was sent, and the egress gate did not run: the payload was refused ' +
+      'before either. Split the document and upload each part with the file picker, ' +
+      'then run them one at a time in the same session.',
+
+    // The middle sentence exists because this one and the cold-start badge read as
+    // opposites. The badge says a session is created for you; this says go and press a
+    // button. Both describe the same rule and neither stated it: `run` mints only when
+    // `!S.sessionId && !S.lastSessionId`, i.e. only when this page has never held a
+    // session. Every state that can produce a SESSION_EXPIRED is outside that -- after a
+    // proved destroy `lastSessionId` is kept ON PURPOSE so the run goes to the API and
+    // the 401 is the API's (that is the whole live-review sequence), and after a TTL
+    // lapse `S.sessionId` is still set, so Run re-sends the id that just expired. In
+    // both, pressing Run again gets this same banner and nothing else, which is what
+    // made "then re-run" read as advice that does not work. Verified against the live
+    // API at 127.0.0.1:8073: destroy, then two further presses of Run, and both answered
+    // 401 SESSION_EXPIRED with no POST /sessions in between.
     SESSION_EXPIRED: () =>
       'Session key is gone — the vault cannot be read, so nothing can be obfuscated or restored. ' +
-      'Press "Create session" for a new one, then re-run.',
+      'Run will not mint a replacement from here: it creates a session only when this page has ' +
+      'never had one, so that a refusal like this one comes from the API rather than from the ' +
+      'page. Press "Create session" for a new one, then re-run.',
 
     // Every route here is anonymous, so the meters are per source address:
     // a shared address can spend a budget this browser never touched.
@@ -582,6 +676,81 @@
 
     AUDIT_SCOPE_REQUIRED: () => 'The audit log can only be read for a session or a run, and ' +
       'this page scopes it to the live session. Press "Create session" first.',
+
+    // 503, raised by every AuditLogger entry point that touches a database it cannot
+    // read (errors.py::AuditUnavailableError). It arrived with no sentence, so the
+    // one code written specifically to replace an unactionable 500 rendered on this
+    // page as the bare word AUDIT_UNAVAILABLE followed by its detail map -- which is
+    // the shape it exists to remove.
+    //
+    // The two halves are told apart because they are not the same news, and
+    // `operation` is what separates them. Measured against the real API on an
+    // audit.db with one 4 KiB page overwritten: POST /sessions and POST /pipeline/run
+    // answer `"operation":"emit"` (a WRITE the log refused, which under "no release
+    // without a record" refuses the run with it), GET /audit answers `"query"` and
+    // GET /audit/verify answers `"length"` (READS, which cost this page its audit
+    // tail and its chain badge and no run at all). A reviewer's first question is
+    // whether the run happened, and one sentence for both leaves it unanswered.
+    //
+    // `audit_db` is the file NAME and never the server's path -- audit/logger.py
+    // clips it to `.name` on purpose, so the body says "audit.db" and cannot say
+    // where -- which is why the "where" is named here as the setting an operator
+    // actually turns. `remedy` ("restore it from backup or start a fresh data
+    // directory") is folded into the sentence rather than printed after it: a
+    // sentence followed by the map it paraphrases is still a blob.
+    AUDIT_UNAVAILABLE: (d) => (d.operation === 'emit'
+      ? 'The audit log could not be WRITTEN, so the run was refused before anything was ' +
+        'released -- no release without a record. '
+      : 'The audit log could not be READ, so there is no audit tail to show and the hash ' +
+        'chain cannot be walked. No run was affected by this. ') +
+      'The database is unreadable' +
+      (typeof d.error === 'string' && d.error ? ' (' + d.error + ')' : '') +
+      ' and no control on this page can fix it: restore ' +
+      (typeof d.audit_db === 'string' && d.audit_db ? d.audit_db : 'audit.db') +
+      ' in the API\'s SCP_DATA_DIR from backup, or point SCP_DATA_DIR at a fresh ' +
+      'directory, then restart the API.',
+
+    // The audit log's two siblings, and they arrived the same way -- as new
+    // `PipelineError` subclasses with no entry here, found by the derived-code test
+    // rather than by being remembered. Neither has a handler of its own in
+    // api/errors.py, so both fall through to the base `PipelineError` registration
+    // and answer 500 CARRYING THEIR OWN CODE, which is what reaches this table.
+    //
+    // The three remedies are NOT interchangeable and that is the whole reason these
+    // are three sentences rather than one shared "a store is unreadable":
+    //
+    //   audit.db      restore from backup -- the log is append-only and self-checking.
+    //   vault.db      do NOT restore. Its rows are bound to session keys that live in
+    //                 the API process's SessionRegistry and die with it, so a restored
+    //                 file decrypts to nothing (session_vault.py says so at
+    //                 UNREADABLE_VAULT_REMEDY). Fresh directory, new session.
+    //   documents.db  restore, OR just upload the document again from this page: the
+    //                 ciphertext blobs are separate files that a corrupt metadata
+    //                 database does not touch.
+    //
+    // Only the third has an answer a reviewer can act on without leaving the page, so
+    // only the third names a control -- the rest say plainly that no control here can
+    // fix it, which is the honest form of "what to do next".
+    VAULT_UNAVAILABLE: (d) => 'The vault database is unreadable' +
+      (typeof d.error === 'string' && d.error ? ' (' + d.error + ')' : '') +
+      ', so nothing can be tokenised or restored and the ' +
+      (d.operation === 'get_by_token' || d.operation === 'get_by_surrogate'
+        ? 'restore was refused' : 'run was refused') +
+      '. Restoring ' +
+      (typeof d.vault_db === 'string' && d.vault_db ? d.vault_db : 'vault.db') +
+      ' from backup will NOT work: its rows are encrypted under session keys that ' +
+      'live only in the API process and die with it. Point SCP_DATA_DIR at a fresh ' +
+      'directory, restart the API, then press "Create session" and run again.',
+
+    DOCUMENT_STORE_UNAVAILABLE: (d) => 'The document store is unreadable' +
+      (typeof d.error === 'string' && d.error ? ' (' + d.error + ')' : '') +
+      ', so the document could not be ' +
+      (d.operation === 'put' ? 'stored' : 'read') +
+      ' and the run was refused. Only the metadata database is affected -- the ' +
+      'encrypted document blobs beside it are separate files -- so choose the file ' +
+      'again with the file picker to upload it afresh. If that fails too, restore ' +
+      (typeof d.store_db === 'string' && d.store_db ? d.store_db : 'documents.db') +
+      ' in the API\'s SCP_DATA_DIR from backup.',
 
     // ---- restore path ----
     VAULT_MISS: () => 'A placeholder in the answer has no vault entry to restore it from, so ' +
@@ -679,10 +848,10 @@
   // of highlight apart was a colour, and the legend beside it names a CATEGORY, not a
   // kind. Under pseudonymization that is the dangerous direction and panel 3 is where
   // it bites: measured on fixtures/medical_note.txt, "Jamie Cain, MD" is painted PHI
-  // green in the provider's-eye view with nothing on the page saying it is a fake
-  // this run minted rather than a clinician named in the document. A reviewer's only
-  // recourse was diffing panel 3 against panel 1 by eye, which is the manual check
-  // the highlighting exists to replace.
+  // green in the provider's-eye view with nothing on the page saying it is an invented
+  // value rather than a clinician named in the document. A reviewer's only recourse
+  // was diffing panel 3 against panel 1 by eye, which is the manual check the
+  // highlighting exists to replace.
   //
   // None of the three names an original value: the whole point is that panels 2 and 3
   // do not hold one. The pseudonym tip names the entity TYPE, which the payload's
@@ -691,8 +860,18 @@
     'session and is not anywhere in this payload; panel 4 puts it back.';
   const RED_TIP = 'A redaction marker. The value was removed rather than tokenised -- ' +
     'irreversible by design, so it does not come back in panel 4.';
-  const psTip = (t) => 'A PSEUDONYM this run minted for a ' + (t || 'detected value') +
-    '. It reads like a real value and is not one: the original never left the vault.';
+  // "this run minted" is what this said, and it was false on exactly the run where
+  // the tooltip matters most. The vault keys a record by (entity type, value) for the
+  // life of the session, so a fake can be re-emitted by a later run that did not mint
+  // it and could not have -- measured on fixtures/medical_note.txt, a `tokenization`
+  // run following a `pseudonymization` one in the same session re-emitted 18 of them.
+  // The response carries no per-record minted/reused flag, so the tip says what IS
+  // derivable from the mark itself: it is a fake, and it belongs to this session.
+  // Same rule as `strategyClause` and the `tokens_issued` chip.
+  const psTip = (t) => 'A PSEUDONYM standing in for a ' + (t || 'detected value') +
+    '. It reads like a real value and is not one -- it was invented in this session ' +
+    '(not necessarily by this run: the vault reuses a record for the life of the ' +
+    'session) and the original never left the vault.';
 
   // Panels 2 and 3: highlight surrogates (coloured per category) and [REDACTED_*]
   // markers. `from` is where the scan starts; everything before it is plain text.
@@ -808,7 +987,12 @@
     $('stats').innerHTML = keys.map((k) => {
       const meta = STAT_META[k];
       const v = Number(stats[k]);
-      const shown = isTiming(k) ? v.toFixed(1) + ' ms' : String(Math.round(v));
+      // `tag` rides with the VALUE and not inside the `<i>`, so the raw API field
+      // name stays the whole of the key -- it is what a reviewer greps for and what
+      // the strip's key section in index.html indexes by. Only a counter whose bare
+      // name misleads about WHICH set it counted carries one; see `entities_detected`.
+      const tag = meta && meta.tag ? ' · ' + meta.tag : '';
+      const shown = (isTiming(k) ? v.toFixed(1) + ' ms' : String(Math.round(v))) + tag;
       // Timings recede, safety counts stay at full brightness, and the three whose
       // clean reading is 0 carry the verdict colour of the number they are showing.
       // `stat badge ok`/`err` reuse the badge rules `style.css` already ships. The
@@ -829,6 +1013,130 @@
       return '<span class="' + cls + '"' + tip + '><i>' + esc(k) + '</i>' + esc(shown) +
         '</span>';
     }).join('');
+  }
+
+  // ---------- the banner's strategy clause: the REQUEST vs what was emitted ----------
+  //
+  // The banner printed `result.strategy`, which is what the caller ASKED FOR --
+  // `orchestrator.run`'s `chosen`, i.e. the dropdown's value or the server default --
+  // and the page presented it, unqualified, as a description of the run. It is not
+  // one, and the gap is not theoretical:
+  //
+  //   The vault keys a record by (entity type, value) for the LIFE OF THE SESSION and
+  //   has no strategy dimension. Whichever strategy ran FIRST therefore owns every
+  //   surrogate that value gets afterwards. That reuse is deliberate and must not be
+  //   "fixed" -- it is what makes a pseudonym minted on run 1 still RESTORE correctly
+  //   on run 4 (orchestrator.py `_surrogate_map` and `_pseudonyms_issued`).
+  //
+  // Measured through the real API on fixtures/medical_note.txt as `medical`, one
+  // session, both orders, tokens_issued 32 on all four runs:
+  //
+  //   A. tokenization first, then pseudonymization selected: banner said
+  //      "strategy pseudonymization", pseudonyms_issued 0, panel 2 100% hash tokens
+  //      ("Patient name: [PII_NAME_09453c04]"). Understates: harmless, still a lie.
+  //   B. pseudonymization first, then TOKENIZATION selected: banner said
+  //      "strategy tokenization", pseudonyms_issued 18, and panel 2 read
+  //      "Patient name: Steven Lee", "Phone: 468-376-2490",
+  //      "romerochristina@example.org", "Note filed 06/07/2024 by physician
+  //      Benjamin Hansen, MD".
+  //
+  // B is the dangerous one and it is dangerous BECAUSE the label is reassuring: a
+  // reviewer inspecting panel 2 under the word "tokenization" reads eighteen invented
+  // values as this patient's real ones, and the only contradicting signal on the page
+  // was a `pseudonyms_issued` chip whose meaning was hover-only.
+  //
+  // So the clause prints the EFFECTIVE COMPOSITION, derived from the two counters the
+  // response already carries -- `tokens_issued` and `pseudonyms_issued`, the second
+  // read off the emitted surrogate SHAPE (`orchestrator._is_pseudonym`) rather than
+  // off the strategy -- and the requested name is labelled "requested" rather than
+  // stated. No new endpoint, no new response field, nothing about what the pipeline
+  // emits changes; only what the page says about it.
+  //
+  // What it deliberately does NOT say: which individual records were minted here and
+  // which were reused. The response has no per-record flag, so "14 reused from this
+  // session's vault" would be the same class of over-claim one layer down -- a hash
+  // token under pseudonymization is also what the CONTENT tier legitimately emits
+  // (`PseudonymizationStrategy.make_surrogate`). "Bracketed tokens" is true of both.
+
+  //: What each strategy NAME promises about the shape of the surrogates it emits:
+  //: `false` = never a realistic fake (TokenizationStrategy has no tier dispatch and
+  //: returns `plain_token` for every entity), `true` = a fake wherever the tier calls
+  //: for one. A name that is not in this table gets its composition printed and NO
+  //: verdict: `config._BUILTIN_STRATEGIES` is a floor rather than a closed set, a
+  //: deployment may register its own, and this page cannot know what that one
+  //: promised. Silence there is the honest answer; guessing is the defect.
+  const STRATEGY_FAKES = { tokenization: false, pseudonymization: true };
+
+  // Returns `{ text, drift }`. `drift` is the WARN condition -- the request and the
+  // emitted composition contradicting each other -- and is asserted only where the
+  // contradiction is a fact rather than a suspicion:
+  //
+  //   tokenization + any fake      contradiction. That strategy cannot mint one, so
+  //                                every fake on the wire came from an earlier call.
+  //   pseudonymization + no fake   contradiction, with two readings the response
+  //                                cannot separate; both are named rather than one
+  //                                being chosen.
+  //   pseudonymization + a mix     NOT flagged. Mixed is the correct output of an
+  //                                ordinary run: the content tier emits a token by
+  //                                design, so warning here would fire on runs that
+  //                                are working and train the reviewer to skip it --
+  //                                the mistake `renderScope` already had to undo.
+  //                                The composition is printed either way, which is
+  //                                the signal; the colour is reserved for the lie.
+  function strategyClause(strategy, stats) {
+    const asked = String(strategy || '(unset)');
+    const clause = { text: asked + ' requested', drift: false };
+    const s = stats || {};
+    // Derived from the response or not said at all. A response with neither counter
+    // supports no statement about composition, and the bare "X requested" is still
+    // true -- it is the unqualified "strategy X" that was not.
+    const total = Math.round('tokens_issued' in s ? Number(s.tokens_issued) : NaN);
+    const fakes = Math.round('pseudonyms_issued' in s ? Number(s.pseudonyms_issued) : NaN);
+    // `fakes > total` cannot happen -- both are counted over the one merged token
+    // list -- so a response saying it is one this page cannot describe, not one to
+    // paper over with a subtraction that would print a negative count of tokens.
+    if (!Number.isFinite(total) || !Number.isFinite(fakes) || total < 0 || fakes < 0 ||
+        fakes > total) {
+      return clause;
+    }
+    if (total === 0) {
+      clause.text = asked + ' requested · this run vaulted nothing, so the payload ' +
+        'carries no surrogates of either kind';
+      return clause;
+    }
+    const tokens = total - fakes;
+    const shape = fakes === 0
+      ? 'all ' + total + ' surrogates in the payload are bracketed tokens'
+      : tokens === 0
+        ? 'all ' + total + ' surrogates in the payload are realistic fake values'
+        : fakes + ' of the ' + total + ' surrogates in the payload are realistic fake ' +
+          'values, ' + tokens + ' are bracketed tokens';
+    // Own property only. `result.strategy` is a server-supplied string, and a plain
+    // index would resolve "constructor" or "__proto__" to something off
+    // `Object.prototype` -- not a verdict either way here, because both branches
+    // compare against a literal boolean, but a lookup on untrusted input that can
+    // reach the prototype chain at all is the wrong shape to leave in a demo whose
+    // subject is untrusted input.
+    const promises = Object.prototype.hasOwnProperty.call(STRATEGY_FAKES, asked)
+      ? STRATEGY_FAKES[asked] : undefined;
+    let why = '';
+    if (promises === false && fakes > 0) {
+      clause.drift = true;
+      why = ' · ' + asked + ' mints no fake values at all, so those ' + fakes + ' came ' +
+        'from records an earlier call in THIS session created: the vault keys a record ' +
+        'by (entity type, value) for the life of the session and has no strategy ' +
+        'dimension. The fakes in panel 2 are invented values, not values taken from ' +
+        'this document, and the label above them says ' + asked + '.';
+    } else if (promises === true && fakes === 0) {
+      clause.drift = true;
+      why = ' · not one of them is a fake, which ' + asked + ' alone would not produce. ' +
+        'Either an earlier call in THIS session already tokenised every value (the ' +
+        'vault keys a record by (entity type, value) for the life of the session and ' +
+        'has no strategy dimension), or no detected value falls in a tier this ' +
+        'strategy pseudonymises. The response cannot tell those two apart.';
+    }
+    clause.text = asked + ' requested · ' + shape + why;
+    return clause;
   }
 
   // `note` is a footer row when there are events and the empty-state row when there
@@ -868,19 +1176,64 @@
       .sort();
   }
 
-  function renderScope(cat) {
+  // ---------- the scope note, and when it is a WARNING rather than a fact ----------
+  //
+  // This fired yellow on every run without exception, and could not do otherwise: every
+  // doc_category in entities.yaml leaves at least one `only_in_doc_categories` rule set
+  // out, so `scopedOut` is never empty. Measured on the correct pairing --
+  // fixtures/medical_note.txt run as `medical`, the demo's own first click -- a yellow
+  // caution sat directly under a green RUN_OK saying AMOUNT, CASE_STRATEGY and
+  // CLIENT_IDENTITY did not run, which is true and is also the design working. A caution
+  // that fires on 100% of passes trains a reviewer to skip it, and it is then unavailable
+  // on the run it was written for.
+  //
+  // What it was written for is the WRONG category, which is a different fact from a
+  // scoped one: legal_memo.txt submitted as `medical` walks all five CASE_STRATEGY
+  // sentences to the provider while reporting entities_detected 38, the identical number
+  // the correct `legal` run reports. So the note keeps both halves and separates them by
+  // what the page can actually PROVE:
+  //
+  //   warn    The document declares its own category and the run used a different one,
+  //           and at least one rule set that the declared category WOULD have run did
+  //           not. That is a rule set actually suppressed, and it is the leak above.
+  //   note    Everything else the reviewer should still be able to read: which rule sets
+  //           this category leaves out. Same words, no alarm colour (`.banner.note`).
+  //   hidden  The document declares a category, the run used it, and nothing the
+  //           document's own category would have run was left out.
+  //
+  // `declared` is the demo dropdown's `data-cat` -- the category the bundled document IS
+  // -- and it is the only ground truth this page has. A file the reviewer picked
+  // themselves has none, so those runs get the neutral note rather than silence: deleting
+  // it there would put the measured legal_memo defect back out of sight for exactly the
+  // documents the page knows least about.
+  function renderScope(cat, declared) {
     const el = $('scope-note');
     const skipped = scopedOut(cat);
     // Empty is unreachable with today's registry -- every category leaves at least one
     // rule set out -- but a registry that scoped nothing must not leave a stale note up.
     if (!skipped.length) { el.hidden = true; return; }
-    // textContent, not innerHTML: nothing here is markup, and the one interpolated
-    // value (`cat`) comes off a <select> this page wrote the options for.
-    el.textContent = 'doc_category=' + cat + ': ' + skipped.join(', ') +
-      ' rules did not run for this document. entities.yaml scopes those entity types ' +
-      'to other categories, so any such value in this document was not detected, not ' +
-      'tokenised and not vaulted. The stats row cannot show this -- a run under the ' +
-      'wrong category can report the same entities_detected as the right one.';
+    // The rule sets the document's OWN category would have run and this one did not.
+    // Empty when the categories agree, and also when they differ in the harmless
+    // direction (a `general` document run as `medical` runs MORE rules, not fewer).
+    const suppressed = declared && declared !== cat
+      ? skipped.filter((t) => SCOPED_RULES[t].indexOf(declared) >= 0)
+      : [];
+    if (declared && !suppressed.length) { el.hidden = true; return; }
+    // textContent, not innerHTML: nothing here is markup, and the interpolated values
+    // (`cat`, `declared`) both come off <select> options this page wrote itself.
+    el.className = suppressed.length ? 'banner warn' : 'banner note';
+    el.textContent = suppressed.length
+      ? 'MIS-CATEGORISED: this document is bundled as doc_category=' + declared +
+        ' and you ran it as ' + cat + '. ' + suppressed.join(', ') + ' rules did not run ' +
+        'for this document. entities.yaml scopes those entity types to other categories, ' +
+        'so any such value in this document was not detected, not tokenised and not ' +
+        'vaulted. The stats row cannot show this -- a run under the wrong category can ' +
+        'report the same entities_detected as the right one.'
+      : 'doc_category=' + cat + ': ' + skipped.join(', ') +
+        ' rules did not run for this document. entities.yaml scopes those entity types ' +
+        'to other categories, so any such value in this document was not detected, not ' +
+        'tokenised and not vaulted. The stats row cannot show this -- a run under the ' +
+        'wrong category can report the same entities_detected as the right one.';
     el.hidden = false;
   }
 
@@ -913,6 +1266,12 @@
     S.busy = on;
     $('btn-run').disabled = on;
     $('btn-destroy').disabled = on;
+    // The two halves of the destroy gate freeze with the button they replace. Only one
+    // of the three is visible at a time, so this is belt and braces -- but the armed
+    // pair is the one that erases, and a control that erases must not be live while a
+    // request this page has already started is still in flight.
+    $('btn-destroy-confirm').disabled = on;
+    $('btn-destroy-cancel').disabled = on;
     $('btn-session').disabled = on;
     // The three inputs a run reads AFTER it has started. Only the buttons were
     // disabled, so the file picker stayed live while a request was in flight; its
@@ -921,13 +1280,40 @@
     // the banner becomes VALIDATION_ERROR {"errors":1,"fields":"body.doc_id"},
     // naming a field the reviewer never saw.
     $('file').disabled = on;
+    // The preset dropdown joined this list when it stopped being a label and started
+    // deciding which bytes get uploaded: `ensureDoc` reads `S.armed` across an await
+    // (the GET that fetches the fixture), so a preset changed mid-flight would post
+    // one document's bytes under the next one's name and category.
+    $('fixture').disabled = on;
     $('category').disabled = on;
     $('strategy').disabled = on;
     $('spin').hidden = !on;
   }
 
   // ---------- actions ----------
-  async function createSession() {
+  //
+  //: How `createSession` was reached. It changes the WORDS on the badge and in the
+  //: banner and nothing else: both spellings run one mint -- the same owner capture,
+  //: the same POST /sessions, the same replace-and-prove of the session it
+  //: supersedes, the same audit read -- because a second minting path would be a
+  //: second set of audit events to keep in step, and the audit story is the product.
+  //:
+  //: A string sentinel rather than a boolean, because `btn-session`'s listener IS
+  //: `createSession`, so the first argument an explicit press calls it with is a
+  //: click Event. `auto = !!arg` would therefore label every press on the button as
+  //: automatic -- and the node harness, which fires with `{}`, would agree with it.
+  //: Comparing against a literal makes the Event, the `{}` and a bare
+  //: `createSession()` all read as the press they are.
+  const MINT_BY_RUN = 'run';
+
+  async function createSession(origin) {
+    // Whether Run minted this session because there was none. See `run`: the mint is
+    // reached through this function precisely so that it is not a second path.
+    const auto = origin === MINT_BY_RUN;
+    // An armed destroy names the session on screen NOW. Minting replaces that session,
+    // so a confirm left standing across the mint would be a live erase button pointing
+    // at something the reviewer no longer has.
+    setDestroyArmed(false);
     clearBanner();
     setBusy(true);
     try {
@@ -969,13 +1355,26 @@
       S.lastSessionId = null;
       // With the note, because this is the one reset that happens while the user
       // still has a step to take: index.html's own panel-1 placeholder is an
-      // instruction ("Create a session, choose a file, press Run"), and blanking it
-      // to a dash on the click that completes its first clause is a worse page.
-      resetRun(NEXT_STEP);
+      // instruction ("choose a document, press Run"), and blanking it to a dash on
+      // the click that completes its first clause is a worse page. Not on the
+      // automatic mint: there the reviewer has already pressed Run and the run is
+      // about to paint the panel, so telling them to press it would be the page
+      // narrating a step it is mid-way through.
+      resetRun(auto ? null : NEXT_STEP);
       const when = new Date(r.expires_at * 1000).toLocaleTimeString();
       $('session-badge').className = 'badge ok';
-      $('session-badge').textContent = 'session ' + r.session_id.slice(0, 12) + '… · expires ' + when;
-      banner(replaced.warn ? 'warn' : 'ok', 'SESSION_CREATED',
+      // The durable half of "where did this session come from". The banner below says
+      // it too, but a banner is transient -- the run that minted this session
+      // overwrites it with RUN_OK, or with its own refusal, seconds later -- and the
+      // badge is this page's standing answer to "is there a session and whose is it".
+      // A reviewer looking at a scoped run must never have to wonder whether they
+      // created the scope or the page did.
+      $('session-badge').textContent = 'session ' + r.session_id.slice(0, 12) + '… · ' +
+        (auto ? 'auto-created by Run' : 'created') + ' · expires ' + when;
+      banner(replaced.warn ? 'warn' : 'ok', auto ? 'SESSION_AUTOCREATED' : 'SESSION_CREATED',
+        (auto ? 'No session was live, so Run created one before starting — same mint as the ' +
+          '"Create session" button, same owner, same SESSION_CREATE row in the audit tail ' +
+          'below. ' : '') +
         'Session key lives in process memory only.' + replaced.text);
       // Shows the new session's own SESSION_CREATE row, which is both the honest
       // replacement for the rows just cleared and the first evidence of this session.
@@ -1044,6 +1443,49 @@
       ', and a 204 proves nothing here. Treat that session as STILL LIVE.' };
   }
 
+  // ---------- the destroy gate: two deliberate steps, no modal ----------
+  //
+  // `btn-destroy` used to BE the destroy: one click, no confirmation, sitting under copy
+  // that calls the erasure irreversible and beside the page's primary action. A reviewer
+  // exploring the controls -- which is what a 45-minute live review is -- ended their own
+  // session, and the recovery is a new session plus a re-run of everything that had been
+  // set up. `window.confirm` is the reflex and is refused twice over: it is a modal this
+  // page cannot word, style or explain, and the whole of `tests/test_ui_behaviour.py`
+  // drives this file under node against a DOM stub with no `confirm`, so the gate would
+  // be the one control on the page the suite could not exercise.
+  //
+  // The arm swaps `btn-destroy` OUT for two buttons that were not under the pointer a
+  // moment earlier, so the second click cannot be the first click's momentum. Nothing
+  // else changes: `destroySession` below is untouched by the gate and is still what the
+  // confirm button calls, so every existing assertion about what a destroy DOES is about
+  // the same function.
+  const DESTROY_ARMED = 'ARMED. Confirm erases the session key and every vault row that maps ' +
+    'a token back to an original value, for this session, with no undo. Cancel leaves it alone.';
+
+  function setDestroyArmed(on) {
+    S.destroyArmed = on;
+    $('btn-destroy').hidden = on;
+    $('btn-destroy-confirm').hidden = !on;
+    $('btn-destroy-cancel').hidden = !on;
+    $('destroy-state').textContent = on ? DESTROY_ARMED : '';
+  }
+
+  //: Step 1. Refuses before arming when there is nothing to destroy, so the two-step
+  //: gate cannot ask a reviewer to confirm a no-op.
+  function armDestroy() {
+    if (S.busy) return;
+    if (!S.sessionId) { banner('warn', 'NO_SESSION', 'Nothing to destroy.'); return; }
+    setDestroyArmed(true);
+  }
+
+  //: Step 2. Disarms FIRST: `destroySession` awaits, and leaving the confirm button up
+  //: across those awaits is a second erasure one click away from the first.
+  function confirmDestroy() {
+    if (S.busy) return;
+    setDestroyArmed(false);
+    return destroySession();
+  }
+
   async function destroySession() {
     if (!S.sessionId) { banner('warn', 'NO_SESSION', 'Nothing to destroy.'); return; }
     setBusy(true);
@@ -1107,6 +1549,13 @@
       // Still stated at full strength, and now earned: the sentence is printed only
       // on the branch where the log itself says a live, owned session key was popped
       // and its vault rows dropped.
+      //
+      // "Press Run again: ... SESSION_EXPIRED" is now something the page delivers
+      // rather than something it promises. It was written when Run answered a missing
+      // session with its own local NO_SESSION banner and no request at all, so this
+      // sentence and the LIVE REVIEW strip both named a 401 that never arrived. `run`
+      // keeps `lastSessionId` as the scope for exactly this next press -- see the
+      // three-state comment there -- so the refusal the reviewer reads is the API's.
       banner('warn', 'VAULT_DESTROYED',
         'Session key and vault rows are gone — irreversibly, and confirmed: the audit ' +
         'log records this destroy as existed=1. Press Run again: the second run is ' +
@@ -1123,11 +1572,60 @@
     } catch (e) { showError(e); } finally { setBusy(false); }
   }
 
+  // The bytes of one shipped demo document, as something FormData can post.
+  //
+  // `api` rather than a bare `fetch` so this call gets the same deadline, the same
+  // NETWORK_UNREACHABLE reporting and the same abort handling as every other request
+  // on the page; the route answers `text/plain`, so `api` hands back a string.
+  //
+  // String -> Blob is a byte-exact round trip here and that is checked rather than
+  // assumed: the response declares `charset=utf-8`, `res.text()` decodes UTF-8 and
+  // `new Blob([s])` re-encodes UTF-8, which is lossless for any valid UTF-8 -- and
+  // the server refuses to serve a fixture that is not valid UTF-8 for exactly this
+  // reason (see `_load_shipped_fixtures`). All four shipped documents are pure
+  // ASCII, measured; `test_the_endpoint_hands_back_the_shipped_file_byte_for_byte`
+  // pins the wire half and
+  // `test_a_preset_run_and_a_hand_picked_run_of_one_fixture_detect_identically` pins
+  // the stored half.
+  //
+  // A 404 here means this deployment did not ship `fixtures/`, which is a different
+  // failure from "no such document for this user" -- so it gets its own code rather
+  // than inheriting NOT_FOUND's sentence, which talks about ownership.
+  async function presetBlob(name) {
+    let text;
+    try {
+      text = await api('GET', '/fixtures/' + encodeURIComponent(name));
+    } catch (e) {
+      if (e && e.status === 404) {
+        throw { code: 'PRESET_UNAVAILABLE', detail: 'This server is not serving the bundled ' +
+          'demo document "' + name + '". Its fixtures/ directory is missing, so use the file ' +
+          'picker with a document of your own.' };
+      }
+      throw e;
+    }
+    return new Blob([text], { type: 'text/plain' });
+  }
+
   // Returns the document id rather than only writing it to `S`, so a run can hold
   // its own copy across the awaits that follow.
   async function ensureDoc(uid, cat) {
-    const f = $('file').files[0];
-    if (!f) throw { code: 'NO_FILE', detail: 'Choose a document first (fixtures/ or any file).' };
+    // ONE upload path for both controls. The preset does not get a shortcut into the
+    // store: it fetches the bytes the server ships and hands them to the same
+    // multipart POST /documents the picker feeds, with the same `user_id` and the
+    // same `doc_category`, so "chose the preset" and "found the same file on disk"
+    // are indistinguishable to everything downstream -- extraction, the category
+    // gating in entities.yaml, detection, the gate. A preset that called some
+    // server-side "load fixture and store it" route would be a second ingestion path
+    // to keep in step, and the demo's whole claim is about what the ONE path does.
+    // Pinned end to end by
+    // test_a_preset_run_and_a_hand_picked_run_of_one_fixture_detect_identically.
+    const armed = S.armed;
+    const f = armed && armed.kind === 'file' ? $('file').files[0] : null;
+    if (!armed || (armed.kind === 'file' && !f)) {
+      throw { code: 'NO_FILE', detail: 'Nothing is armed. Pick a demo document from the ' +
+        'dropdown (one click -- it loads the document and sets its doc_category), or ' +
+        'choose your own file with the picker beside it.' };
+    }
     // doc_category was optional here and defaulted to unset, and unset is not a
     // neutral choice: entities.yaml gates entities behind `only_in_doc_categories`,
     // so it switches whole rule sets off. Measured on fixtures/financial_disclosure.txt
@@ -1143,10 +1641,23 @@
         'financial or general) -- it decides which rule sets run, and an uncategorised ' +
         'document is scanned without the category-scoped ones.' };
     }
-    const key = f.name + ':' + f.size + ':' + f.lastModified + ':' + cat;
+    // The cache key names the SOURCE as well as the document, so arming the preset for
+    // medical_note.txt and then picking a file of your own that happens to be called
+    // medical_note.txt cannot be served the previous upload -- a preset has no size and
+    // no mtime, so name alone would collide. `arm` nulling `S.docId` covers the same
+    // case and this is the second layer, deliberately: measured by deleting each,
+    // either one alone still forces the re-upload and only deleting both serves the
+    // bundled document under the reviewer's file name. Both are pinned, separately.
+    const key = f
+      ? 'file:' + f.name + ':' + f.size + ':' + f.lastModified + ':' + cat
+      : 'preset:' + armed.name + ':' + cat;
     if (S.docId && S.uploadKey === key) return S.docId;
     const form = new FormData();
-    form.append('file', f, f.name);
+    if (f) {
+      form.append('file', f, f.name);
+    } else {
+      form.append('file', await presetBlob(armed.name), armed.name);
+    }
     form.append('user_id', uid);
     form.append('doc_category', cat);
     // `slow`: the PDF parse and the .docx expansion happen inside this request, so it
@@ -1159,43 +1670,111 @@
 
   async function run() {
     if (S.busy) return;
+    // Same reason as in `createSession`: a confirm button left armed while the reviewer
+    // has moved on to a run is an erasure one stray click away, and Run is the control
+    // right next to it.
+    setDestroyArmed(false);
     clearBanner();
     const prompt = $('prompt').value.trim();
     if (!prompt) { banner('err', 'NO_PROMPT', 'Enter a prompt.'); return; }
-    // The missing input the page did not preflight, and the one the whole demo is
-    // scoped by. Run is the biggest button on the page, inside the red LIVE REVIEW
-    // strip; Create session is a small one ten controls above it. Without this the
-    // first click uploads the document, fills panel 1 with the original text, posts
-    // `session_id: null`, and the API's 401 becomes the banner "Session key is gone"
-    // -- about a key that was never minted. The empty `session_id` in that detail is
-    // the only thing that gives it away.
-    if (!S.sessionId) {
-      banner('err', 'NO_SESSION', 'Press "Create session" first — that is where the vault key ' +
-        'is minted, and every step below is scoped by it.');
-      return;
+    // ---- the session this run is scoped by, and the three states it can be in ----
+    //
+    // Every step below is scoped by a session, and this page used to make the
+    // reviewer go and mint one: no session meant a red NO_SESSION banner saying
+    // "Press Create session first". Run is the biggest button on the page and sits
+    // inside the red LIVE REVIEW strip; Create session is a small one ten controls
+    // above it, so the very first thing a reviewer does -- choose a document, press
+    // Run -- was answered by being sent to a different button. (The refusal itself
+    // replaced something worse: with no preflight at all the click uploaded the
+    // document, painted panel 1, posted `session_id: null`, and the API's 401 became
+    // "Session key is gone" -- about a key that was never minted. That failure is
+    // still fixed; what changed is that the answer is now to mint one.)
+    //
+    // NEVER HAD ONE -> mint it here and carry on. Through `createSession`, with no
+    // second path: same owner capture, same POST /sessions, same SESSION_CREATE row,
+    // same audit read. `MINT_BY_RUN` changes only what the badge and the banner say,
+    // and they do say it -- the badge reads "auto-created by Run" for as long as the
+    // session lives, and the RUN_OK banner below names it again.
+    //
+    // DESTROYED ON PURPOSE -> do NOT mint, and do not refuse locally either: run
+    // against the dead id and let the SERVER refuse it. This is the scripted LIVE
+    // REVIEW sequence (Run, Destroy session, Run), and the strip above the buttons
+    // and the destroy banner both promise the same thing -- "the second run is
+    // refused with SESSION_EXPIRED before the vault is consulted". Auto-minting here
+    // would erase the demonstration; the old local NO_SESSION banner did not erase it
+    // but did not show it either, so both notices were promising a 401 the page
+    // answered itself, in a different code, without asking the server. Verified
+    // against the live API: POST /pipeline/run with a destroyed session_id answers
+    // 401 `{"code":"SESSION_EXPIRED"}`, and GET /documents/{id}/text still answers
+    // 200 -- the document store is not the vault -- so panel 1 legitimately comes
+    // back while panels 2-4 stay empty, which is the erasure, shown.
+    //
+    // `lastSessionId` is that signal and it is not a new one: `destroySession` sets
+    // it ONLY on the branch where the audit log proved the erasure (existed=1), and
+    // `createSession` clears it. A separate boolean would be a second field saying
+    // the same thing, which is the drift this file keeps being bitten by. Sticky by
+    // choice: it stays refusing until the reviewer presses "Create session", which
+    // is exactly what the SESSION_EXPIRED sentence tells them to do, and a button
+    // that quietly changes behaviour on the second press is worse than one that does
+    // not.
+    const minted = !S.sessionId && !S.lastSessionId;
+    if (minted) {
+      await createSession(MINT_BY_RUN);
+      // The mint failed -- `createSession` has already banner'd why, and there is no
+      // scope to run under. Stop here rather than falling through to a `sid` of null.
+      if (!S.sessionId) return;
     }
     setBusy(true);
     // Captured ONCE, for the whole run. These were re-read from `S` and from the DOM
     // after each await, so a control touched mid-request was read by the next step.
     const uid = userId();
-    const sid = S.sessionId;
+    const sid = S.sessionId || S.lastSessionId;
     const strategy = $('strategy').value;
     // Captured here for the same reason `strategy` is, and read twice: once to scope
     // the upload, once to name the rule sets the run did not use.
     const cat = $('category').value;
+    // The category the DOCUMENT declares, as opposed to the one the run was given. Only
+    // the bundled presets have one; see `renderScope`.
+    const declared = S.armed && S.armed.kind === 'preset' ? (S.armed.cat || null) : null;
+    // ---- the destroyed-session run does NOT go and fetch the plaintext ----
+    //
+    // `destroySession` has just printed "Session key and vault rows are gone --
+    // irreversibly" and wiped the four panels to say so. Pressing Run again -- step 3 of
+    // the LIVE REVIEW sequence printed in red above the button -- then re-fetched
+    // `GET /documents/{id}/text`, which still answers 200 because the document store is
+    // not the vault, and painted the whole original back into panel 1 BEFORE the API
+    // refused the run. Measured on fixtures/medical_note.txt at 127.0.0.1:8073: 2,826
+    // characters of cleartext PHI -- "Patient name: David Ochoa", MRN 9224297, the phone
+    // number and the e-mail -- sitting under a red SESSION_EXPIRED banner and a badge
+    // reading "session destroyed". Nothing there was false; the screen simply said the
+    // opposite of the sentence above it, at the one moment the demo is making its
+    // strongest claim.
+    //
+    // So the fetch is skipped rather than the panel blanked after the fact. Blanking
+    // would leave the plaintext in the network tab of the devtools a reviewer of a
+    // security demo has open, which is the same contradiction one pane further out. The
+    // POST to /pipeline/run still happens against the dead id, so the refusal is still
+    // the API's -- that is the demonstration and it is untouched.
+    const destroyed = !S.sessionId && !!S.lastSessionId;
     try {
       resetRun();
       const docId = await ensureDoc(uid, cat);
-      const doc = await api('GET', '/documents/' + encodeURIComponent(docId) +
-        '/text?user_id=' + encodeURIComponent(uid));
+      const doc = destroyed
+        ? null
+        : await api('GET', '/documents/' + encodeURIComponent(docId) +
+          '/text?user_id=' + encodeURIComponent(uid));
       // Panel 1 is filled before the pipeline call so a reviewer can see which
       // document is in flight during a run that takes seconds. `resetRun` above has
       // already dropped panels 2-4, so a failure from here on leaves ONE document on
       // screen rather than a mixture of two. The counter says "not yet scanned"
       // because the spans only arrive with the response, and a bare "2826 chars"
       // beside an unhighlighted document reads as "the detector found nothing".
-      $('p1').innerHTML = doc.chars ? esc(doc.text) : esc(NO_TEXT);
-      $('c1').textContent = doc.chars + ' chars · not yet scanned';
+      if (doc) {
+        $('p1').innerHTML = doc.chars ? esc(doc.text) : esc(NO_TEXT);
+        $('c1').textContent = doc.chars + ' chars · not yet scanned';
+      } else {
+        $('p1').innerHTML = esc(ERASED);
+      }
 
       const result = await api('POST', '/pipeline/run', {
         // `slow`: the provider call alone is allowed 3 x 60 s plus backoff.
@@ -1213,12 +1792,27 @@
       // panel then went blank -- placeholder wiped, nothing in its place -- under a
       // green RUN_OK banner and beside a confident summary of a document that
       // contained nothing.
-      $('p1').innerHTML = doc.chars ? renderOriginal(doc.text, result.detections) : esc(NO_TEXT);
-      // "spans" alone did not say WHICH spans, and it is the number a reviewer
-      // compares against `entities_detected` in the strip above. See `C1_TITLE`.
-      $('c1').textContent = doc.chars + ' chars · ' + (result.detections || []).length +
-        C1_MASKED;
-      $('c1').title = C1_TITLE;
+      //
+      // Guarded on `doc` for the branch above: with a destroyed session this page never
+      // asked for the text, and a 200 here would mean the session was NOT destroyed
+      // after all -- the API refuses that request at `_require_session`. Panel 1 then
+      // keeps the erasure statement rather than throwing on a null, and the run's other
+      // three panels still render, so a page that was wrong about the session says less
+      // rather than crashing.
+      if (doc) {
+        $('p1').innerHTML = doc.chars ? renderOriginal(doc.text, result.detections) : esc(NO_TEXT);
+        // "spans" alone did not say WHICH spans, and it is the number a reviewer
+        // compares against `entities_detected` in the strip above. See `C1_TITLE`.
+        // The comparison itself is printed here too, rather than left in the tooltip:
+        // the two counts disagree on every run, and a reconciliation nobody hovers is
+        // not on the page. See `C1_DETECTED` -- and it is omitted, not faked, when the
+        // response did not carry the other number.
+        const st = result.stats || {};
+        const detected = Math.round('entities_detected' in st ? Number(st.entities_detected) : NaN);
+        $('c1').textContent = doc.chars + ' chars · ' + (result.detections || []).length +
+          C1_MASKED + (Number.isFinite(detected) && detected >= 0 ? C1_DETECTED(detected) : '');
+        $('c1').title = C1_TITLE;
+      }
       const fence = result.obfuscated_payload.indexOf(DOC_OPEN);
       $('p2').innerHTML = renderMarks(result.obfuscated_payload, result.detections, fence);
       $('c2').textContent = result.obfuscated_payload.length + ' chars';
@@ -1234,8 +1828,22 @@
       $('p4').innerHTML = renderRestored(result.raw_llm_response, result.restored_text, result.detections);
       $('c4').textContent = result.restored_text.length + ' chars';
       renderStats(result.stats || {});
-      renderScope(cat);
-      banner('ok', 'RUN_OK', 'run_id ' + result.run_id + ' · strategy ' + result.strategy);
+      renderScope(cat, declared);
+      // The strategy half is `strategyClause`: the composition the run EMITTED, not
+      // the literal it was asked for. The code keeps its `RUN_OK` prefix on both
+      // branches because the run did succeed either way -- what the drift branch
+      // reports is the page's own label, not a pipeline failure -- and a reviewer
+      // greps `RUN_OK`. The colour is the difference a reviewer sees first.
+      //
+      // The other half is "where did this session come from". `createSession`'s own
+      // SESSION_AUTOCREATED banner is written and then overwritten by this one within
+      // the same click, so without this clause the green verdict a reviewer actually
+      // reads would say nothing about the scope having been minted for it.
+      const strat = strategyClause(result.strategy, result.stats);
+      banner(strat.drift ? 'warn' : 'ok', strat.drift ? 'RUN_OK_STRATEGY_DRIFT' : 'RUN_OK',
+        'run_id ' + result.run_id + ' · ' + strat.text +
+        (minted ? ' · session ' + sid.slice(0, 12) + '… was auto-created by this Run: there ' +
+          'was none, and every step above is scoped by it.' : ''));
       $('audit-run').textContent = 'run_id ' + result.run_id;
       await loadAudit(result.run_id);
     } catch (e) {
@@ -1262,6 +1870,14 @@
       // NO_CATEGORY are refusals of the CLICK, not of a run: nothing was uploaded, no
       // run id exists, and the tail cannot have changed -- so an audit read here would
       // be the only request issued by a path whose whole point is that it issues none.
+      //
+      // PRESET_UNAVAILABLE is on the reloading side of that line and belongs there,
+      // though the distinction is finer: it DID reach the server (the GET for the
+      // bundled document), so this path is not one that issues no requests. The
+      // fixtures route writes no audit row, so the reload re-renders the same tail
+      // rather than showing something new -- which is the correct answer, not a
+      // wasted call: it keeps the rows under the emptied label agreeing with the
+      // panels beside them, which is what this reload is for.
       if (e.code !== 'NO_FILE' && e.code !== 'NO_CATEGORY') await loadAudit(refused);
     } finally { setBusy(false); }
   }
@@ -1357,34 +1973,121 @@
     } catch (e) { markUnreachable(); }
   }
 
-  // ---------- the fixture preset ----------
-  // Build doc section 9.10 asks for an "upload fixture dropdown". This control
-  // cannot upload: a browser cannot read a path off disk, and nothing serves
-  // `fixtures/` over HTTP -- `_mount_ui` mounts `secure_context_pipeline/ui/`
-  // alone, so `GET /fixtures/medical_note.txt` answers 404. Labelled "fixture"
-  // and wired to set `doc_category` and nothing else, it promised the upload and
-  // withheld it silently: picking `medical_note.txt` and pressing Run issued zero
-  // requests and answered `NO_FILE`. The hint carries the half a dropdown can
-  // still do -- naming the path to hand the file picker -- and both strings live
-  // here rather than in the markup so the idle text and the reset are one value.
-  // See README section 8's deviation ledger for the row against section 9.10.
-  const HINT_IDLE = 'a preset, not an upload: it sets doc_category; the picker takes the file';
-  const hintFor = (name) => (name
-    ? 'now pick fixtures/' + name + ' with the file button'
-    : HINT_IDLE);
+  // ---------- the demo-document preset ----------
+  // Build doc section 9.10 asks for an "upload fixture dropdown", and this is now
+  // one. It could not be: a browser cannot read a path off disk and nothing served
+  // `fixtures/` over HTTP, so the control listed four filenames, set `doc_category`,
+  // and left the reviewer to find the same file on disk with the picker -- the hint
+  // literally read "now pick fixtures/medical_note.txt with the file button". Naming
+  // a document and then making you go and get it is friction on the first control a
+  // reviewer touches; before the hint existed it was silent failure (zero requests,
+  // `NO_FILE`). `api/routes/documents.py` now serves exactly these four names, so
+  // one click arms the document AND its category, and Run uploads it through the
+  // same `POST /documents` the picker uses.
+  //
+  // Two controls, one armed at a time, and the arming is state rather than a guess:
+  // see `S.armed`. Every string is here rather than in the markup so the idle text
+  // and the reset are one value. See README section 8's deviation ledger.
+  const HINT_IDLE = 'nothing armed yet: choose a demo document (loads it and sets its ' +
+    'doc_category), or pick a file of your own';
+  const armedPreset = (name, cat) => 'ARMED: bundled fixtures/' + name +
+    (cat ? ' as doc_category=' + cat : '') + '. Press Run.';
+  const armedFile = (name, cat) => 'ARMED: your own file "' + name + '"' +
+    (cat ? ' as doc_category=' + cat : ' (choose a doc_category)') +
+    '. The demo-document dropdown is cleared.';
+
+  // The page's answer to "which document does Run upload". `textContent`, never
+  // `innerHTML`: a file name is a string off the reviewer's disk and this is the one
+  // place the page prints one.
+  function paintArmed() {
+    const cat = $('category').value;
+    const a = S.armed;
+    $('fixture-hint').textContent = !a
+      ? HINT_IDLE
+      : (a.kind === 'preset' ? armedPreset(a.name, cat) : armedFile(a.name, cat));
+  }
+
+  // Arming either control disarms the other, in one function, so there is no order
+  // of clicks that leaves both live or leaves the page saying one thing and
+  // uploading another. The DOM side of the disarm is cosmetic but not optional: a
+  // picker still showing "report.pdf" beside a hint that says a bundled document is
+  // armed is exactly the ambiguity this replaced. `$('file').value = ''` is the
+  // portable way to clear a file input -- assigning to `.files` throws in Chrome
+  // unless the value is a real `FileList` -- and it is only the DISPLAY: `S.armed`
+  // is what `ensureDoc` reads.
+  function arm(next) {
+    S.armed = next;
+    // Any change of source invalidates the cached upload, or Run would re-serve the
+    // previously uploaded document under the newly armed one's name.
+    S.docId = null;
+    S.uploadKey = null;
+    if (!next || next.kind === 'preset') $('file').value = '';
+    if (!next || next.kind === 'file') $('fixture').value = '';
+    paintArmed();
+  }
 
   // ---------- wiring ----------
   $('btn-session').addEventListener('click', createSession);
-  $('btn-destroy').addEventListener('click', destroySession);
+  // Three listeners for one action, which is the gate: `btn-destroy` only ARMS.
+  $('btn-destroy').addEventListener('click', armDestroy);
+  $('btn-destroy-confirm').addEventListener('click', confirmDestroy);
+  $('btn-destroy-cancel').addEventListener('click', () => setDestroyArmed(false));
   $('btn-run').addEventListener('click', run);
   $('btn-verify').addEventListener('click', verifyChain);
   $('fixture').addEventListener('change', (ev) => {
     const opt = ev.target.selectedOptions[0];
+    // The category travels with the document, so choosing a preset satisfies the
+    // required `doc_category` too -- the reviewer does not set it twice. Applied
+    // before `arm` so the armed line prints the category it just chose. An option
+    // with no `data-cat` (the placeholder) leaves the field alone rather than
+    // blanking it: the reviewer may have set it for a file of their own.
     if (opt && opt.dataset.cat) $('category').value = opt.dataset.cat;
-    $('fixture-hint').textContent = hintFor(opt && opt.value);
+    // `cat` is carried on the armed state, not just applied to the field, because it is
+    // the one piece of ground truth this page has about what a document IS: the field
+    // can be changed afterwards and the bundled document's own category cannot.
+    // `renderScope` is what reads it -- see the three states there.
+    arm(opt && opt.value
+      ? { kind: 'preset', name: opt.value, cat: opt.dataset.cat || null }
+      : null);
   });
-  $('file').addEventListener('change', () => { S.docId = null; S.uploadKey = null; });
+  $('file').addEventListener('change', () => {
+    const f = $('file').files[0];
+    arm(f ? { kind: 'file', name: f.name } : null);
+  });
+  // The armed line names the category, so it has to be repainted when the category
+  // moves under it -- otherwise arming medical_note.txt and then switching to
+  // `legal` leaves the page claiming a `medical` run it is not about to make.
+  $('category').addEventListener('change', paintArmed);
   $('prompt').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') run(); });
-  $('fixture-hint').textContent = HINT_IDLE;
+  // Browsers restore form controls across a reload and out of the bfcache WITHOUT
+  // firing `change`, so this page can come back with a document already sitting in
+  // the picker or an option already selected in the dropdown. Reading the DOM once
+  // here is what keeps the armed line honest in that case: painting a bare
+  // "nothing armed" over a picker visibly holding a file is the same
+  // says-one-thing-does-another the armed state exists to remove. The picker wins if
+  // the browser somehow restored both, and `arm` then clears the other, so there is
+  // exactly one armed control after start-up whatever was restored.
+  const restored = $('file').files[0];
+  const restoredPreset = $('fixture').value;
+  // The restored preset's category is read off the <option> the browser re-selected,
+  // exactly as the `change` listener would have -- `dataset` is not available on a
+  // <select> value, and a restored preset with no `cat` would make `renderScope` treat a
+  // bundled document as one the page knows nothing about.
+  const restoredOpt = restoredPreset
+    ? Array.prototype.find.call($('fixture').options || [],
+      (o) => o.value === restoredPreset)
+    : null;
+  arm(restored
+    ? { kind: 'file', name: restored.name }
+    : (restoredPreset
+      ? { kind: 'preset', name: restoredPreset,
+        cat: (restoredOpt && restoredOpt.dataset && restoredOpt.dataset.cat) || null }
+      : null));
+  // The markup ships the confirm pair `hidden`, so this changes nothing on a first load.
+  // It is here so that the DOM, `S.destroyArmed` and the live region have exactly one
+  // writer: a page restored out of the bfcache can come back with the arm mid-flight,
+  // and a disarmed pair beside a live region still reading "ARMED" is the disagreement
+  // this state exists to prevent.
+  setDestroyArmed(false);
   health();
 })();

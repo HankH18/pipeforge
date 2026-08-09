@@ -787,3 +787,214 @@ def test_the_shipped_lab_result_pattern_is_linear_on_dot_runs(
         f"{large_ms:.3f} ms at {DOT_RUN_LARGE_CHARS} "
         f"({large_ms / max(small_ms, 1e-9):.1f}x for 4x the length; linear is 4x)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. the two spec-mandated identifier patterns, at the pattern layer
+# ---------------------------------------------------------------------------
+# Section 4.1 of the challenge names ACCOUNT_NUMBER and CASE_ID among the nine types
+# the system must identify, so both are graded by name and a missed spelling is a
+# graded miss. `test_detection.py` asserts the end-to-end consequence; these assert
+# the property AT THE PATTERN, where the defect lived, because the two layers can
+# disagree in the direction that matters: a detector-level assertion is satisfied by
+# ANY recognizer covering the span, so CASE_ID's lowercase docket would read as
+# "detected" the day something else -- PHONE, on a bare hyphenated digit run -- began
+# claiming it. `_shipped_spans` runs one entity's own patterns and nothing else.
+
+
+def test_the_shipped_case_id_patterns_agree_about_case(registry: EntityRegistry) -> None:
+    """One CASE_ID pattern carried `(?i)` and its sibling did not. That was a bug.
+
+    Not a trade and not a scoping decision -- a one-token inconsistency inside a
+    single entity, and its symptom is the sharpest thing in the audit: the SAME
+    docket number detected in upper case and returned NOTHING in lower.
+    `\\b\\d{2}-[A-Z]{1,4}-\\d{3,6}\\b` claimed 'Docket 24-CV-88213' and skipped
+    'Docket 24-cv-88213', which is the spelling a brief actually uses in running
+    prose after the caption. A missed docket is never vaulted, so the egress gate's
+    first pass has no needle for it and its second re-runs this same pattern.
+
+    Asserted as an EQUALITY between the two case foldings rather than as "the
+    lowercase one is found", so it cannot be satisfied by a pattern that reaches
+    lowercase while dropping the upper-case form the generator's `_case_pair` emits.
+    """
+    for lowered, uppered in (
+        ("Docket 24-cv-88213 was reassigned.", "Docket 24-CV-88213 was reassigned."),
+        ("Case No. 2024-cv-88213 refiled.", "Case No. 2024-CV-88213 refiled."),
+        ("Refiled as cv-2024-008821 today.", "Refiled as CV-2024-008821 today."),
+        ("Filed in 1:23-cv-04567 last term.", "Filed in 1:23-CV-04567 last term."),
+    ):
+        low = _shipped_spans(registry, "CASE_ID", lowered)
+        upp = _shipped_spans(registry, "CASE_ID", uppered)
+        assert low != [], f"no CASE_ID span in the lowercase spelling {lowered!r}"
+        assert [span.casefold() for span in low] == [span.casefold() for span in upp], (
+            f"CASE_ID disagrees about case: {lowered!r} -> {low}, {uppered!r} -> {upp}"
+        )
+
+
+# Every day-month-year spelling a `(?i)` on `\d{2,4}-[a-z]{1,4}-\d{3,6}` would claim.
+# Two of these are live rows elsewhere in the suite -- '21-Aug-1958' is a DOB in
+# HELD_OUT_CORPUS's ho_radiology and '17-Feb-1995' is a SPELLING_VARIANTS DOB -- so
+# the blanket case fold really would have mislabelled a birth date as a case number.
+# The list is every month token that fits `[a-z]{1,4}`, which is what the guard's
+# `[a-z]?` tail is sized for: 'sept', 'june' and 'july' are the four-letter ones, and
+# 'March'/'April' cannot reach the pattern's second '-' at all.
+DATES_A_BLANKET_CASE_FOLD_WOULD_CLAIM = [
+    "21-Aug-1958", "17-Feb-1995", "04-Jan-2001", "28-Mar-1977", "01-Apr-2019",
+    "15-May-1963", "30-Jun-2004", "09-Jul-1988", "12-Sep-1999", "31-Oct-1955",
+    "22-Nov-2011", "09-Dec-2024", "04-June-1958", "17-Sept-1995", "02-July-1970",
+]
+
+
+@pytest.mark.parametrize("value", DATES_A_BLANKET_CASE_FOLD_WOULD_CLAIM)
+def test_the_shipped_case_id_pattern_never_claims_a_day_month_year_date(
+    registry: EntityRegistry, value: str
+) -> None:
+    """The price of the case fold, refused rather than paid.
+
+    A date claimed as CASE_ID is not a leak -- the span is masked either way -- but
+    it is audited LEGAL instead of PII and pseudonymized at identifier tier instead
+    of date tier, and `daterules.py` never sees it, so a composite date is never
+    split. The guard is a negative lookahead naming the twelve months, which is a
+    closed list on purpose: months are twelve forever, where the label spellings and
+    payer codes this file refuses to enumerate elsewhere are open sets.
+    """
+    assert _shipped_spans(registry, "CASE_ID", f"Recorded {value} in the file.") == []
+
+
+def test_the_shipped_case_id_pattern_reaches_the_four_digit_year_spellings(
+    registry: EntityRegistry,
+) -> None:
+    """A docket written with a full year is the same identifier, and it was missed.
+
+    Measured on the audit's matrix before the change: '1:24-cv-08821' and
+    '24-CV-88213' detected, while '2024-CV-88213' -- the form a plainly formatted
+    "Legal Case Number: Case No. 2024-CV-88213" uses -- and the state-court ordering
+    'CV-2024-008821' returned nothing at all.
+
+    The span assertions are exact, and that is the half that is not about recall: an
+    identifier detected as a PREFIX of itself is worse than one missed outright,
+    because the vaulted original is then a string the second mention does not
+    contain. That is the defect the '\\K' note above MRN in entities.yaml records
+    measuring, and `\\d{2,4}` re-opens exactly that door -- '2024-CV-88213' matched
+    as '24-CV-88213' would leave '20' on the wire and vault the wrong needle.
+    """
+    assert _shipped_spans(registry, "CASE_ID", "Case No. 2024-CV-88213 refiled.") == [
+        "2024-CV-88213"
+    ]
+    assert _shipped_spans(registry, "CASE_ID", "Refiled as CV-2024-008821 today.") == [
+        "CV-2024-008821"
+    ]
+    # The two-digit form must survive the widening; it is what `_case_pair` plants.
+    assert _shipped_spans(registry, "CASE_ID", "Docket 24-CV-88213 reassigned.") == [
+        "24-CV-88213"
+    ]
+
+
+def test_the_shipped_account_number_pattern_reads_a_grouped_digit_run(
+    registry: EntityRegistry,
+) -> None:
+    """Card-style grouping is how a statement prints an account number.
+
+    An unbroken `\\d{8,17}` misses every one of them. Measured on the audit's matrix:
+    'Account Number: 482910573364' and 'Acct #48291057' detected; 'Bank Account
+    Number: 4829-1057-3364' and the space-grouped spelling returned NOTHING. The
+    held-out corpus carried one already -- ho_card_dispute's '4400 8829 1374' -- and
+    HELD_OUT_MISS_SHAPES called it "a real gap" rather than a known limit.
+
+    The spans are asserted exactly, for the same reason as CASE_ID's above: the
+    engine vaults `detection.text`, so a grouped account matched as its first group
+    would put '4829' in the vault and send the other eight digits to the provider
+    with no pass-1 needle for them.
+    """
+    for text, expected in (
+        ("Bank Account Number: 4829-1057-3364", "4829-1057-3364"),
+        ("Bank Account Number: 4829 1057 3364", "4829 1057 3364"),
+        ("Account No. 4829-1057-3364-2201 was charged.", "4829-1057-3364-2201"),
+        ("Chargeback against acct 4400 8829 1374 today.", "4400 8829 1374"),
+        # The contiguous branch must survive the alternation.
+        ("Account Number: 482910573364 on file.", "482910573364"),
+        ("Wire to Acct #48291057 today.", "48291057"),
+    ):
+        assert _shipped_spans(registry, "ACCOUNT_NUMBER", text) == [expected]
+
+
+def test_the_grouped_branch_needs_three_groups_and_keeps_the_account_anchor(
+    registry: EntityRegistry,
+) -> None:
+    """The two bounds that keep the widening from being a licence.
+
+    THE GROUP COUNT. Allowing two four-digit groups admits eight digits split 4+4,
+    and the shortest thing of that shape in financial prose is a pair of adjacent
+    years: 'the account 2023 2024 comparison' matched '2023 2024' when the repeat
+    was `{1,3}`. Three groups is twelve digits, and three adjacent four-digit runs
+    immediately behind an account noun is not a year pair.
+
+    THE ANCHOR. 'account|acct|a/c' is untouched and is what keeps the false-positive
+    surface small, so a grouped run with no account noun in front of it is still not
+    a match -- which is asserted here rather than left to a corpus count, because a
+    corpus that happens to contain no bare grouped digits would pass either way.
+    """
+    assert _shipped_spans(registry, "ACCOUNT_NUMBER", "the account 2023 2024 comparison") == []
+    assert _shipped_spans(registry, "ACCOUNT_NUMBER", "Card 4829 1057 3364 was declined.") == []
+    assert _shipped_spans(registry, "ACCOUNT_NUMBER", "Reference 4829-1057-3364 follows.") == []
+    # Still refuses a digit run introduced by a verb rather than a noun phrase.
+    assert (
+        _shipped_spans(registry, "ACCOUNT_NUMBER", "Accounts payable processed 1002 0030 0400.")
+        == []
+    )
+
+
+# The grouped branch is the only unbounded-looking thing added to two patterns this
+# repo has already paid to make linear, so it gets its own attack rows next to the
+# LAB_RESULT ones above. `test_detection.py`'s shipped ReDoS harness carries an
+# 'a/c-blanks' row, which attacks the LABEL separators; none of its rows is a run of
+# DIGIT GROUPS, which is what the new branch alternates over. Same omission the dot
+# runs had, same fix: the guard lives beside the branch it guards.
+GROUPED_IDENTIFIER_ATTACKS = [
+    ("acct-digit-groups", lambda n: "account " + "1234 " * (n // 5)),
+    ("acct-hyphen-groups", lambda n: "account " + "1234-" * (n // 5)),
+    # A run that can never complete the third group, so every start position must
+    # FAIL after walking it -- failure is where a backtracking pattern spends time.
+    ("acct-short-groups", lambda n: "account " + "12 " * (n // 3)),
+    ("case-year-hyphens", lambda n: "case " + "2024-cv-" * (n // 8)),
+]
+
+GROUPED_SMALL_CHARS = 4_000
+GROUPED_LARGE_CHARS = 16_000
+# 4x the length, so linear is 4x; the same 12x headroom the dot-run guard uses, and
+# the same 250 ms absolute budget as the shipped harness.
+GROUPED_GROWTH_CAP = 12.0
+GROUPED_FLOOR_MS = 0.5
+GROUPED_BUDGET_MS = 250.0
+
+
+@pytest.mark.parametrize(
+    ("label", "build"),
+    GROUPED_IDENTIFIER_ATTACKS,
+    ids=[case[0] for case in GROUPED_IDENTIFIER_ATTACKS],
+)
+def test_the_grouped_identifier_branches_are_linear_on_group_runs(
+    registry: EntityRegistry, label: str, build: Callable[[int], str]
+) -> None:
+    """Every ACCOUNT_NUMBER and CASE_ID pattern, on runs of the groups they alternate over.
+
+    Compiled with `regex` and `PATTERN_FLAGS` -- the engine
+    `presidio_analyzer.pattern_recognizer` actually hands these to, and the only one
+    that can compile the `\\K` the account anchor uses.
+    """
+    small_text, large_text = build(GROUPED_SMALL_CHARS), build(GROUPED_LARGE_CHARS)
+    for entity_type in ("ACCOUNT_NUMBER", "CASE_ID"):
+        for index, pattern in enumerate(registry.spec(entity_type).patterns):
+            compiled = regex.compile(pattern, PATTERN_FLAGS)
+            small_ms = _best_search_ms(compiled, small_text)
+            large_ms = _best_search_ms(compiled, large_text)
+            assert large_ms < GROUPED_BUDGET_MS, (
+                f"{entity_type}[{index}] on {label} took {large_ms:.0f} ms "
+                f"at {GROUPED_LARGE_CHARS} chars"
+            )
+            assert large_ms <= GROUPED_GROWTH_CAP * small_ms + GROUPED_FLOOR_MS, (
+                f"{entity_type}[{index}] on {label}: {small_ms:.3f} ms at "
+                f"{GROUPED_SMALL_CHARS} chars -> {large_ms:.3f} ms at "
+                f"{GROUPED_LARGE_CHARS} ({large_ms / max(small_ms, 1e-9):.1f}x for 4x "
+                "the length; linear is 4x)"
+            )

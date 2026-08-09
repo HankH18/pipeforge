@@ -152,6 +152,15 @@ class Settings(BaseSettings):
     # startup refusal into an HTTP 500 on every run that touches an entity -- the
     # same defect shape the per-entity `strategy:` override has. Fail-closed and
     # fail-early are both preserved.
+    #
+    # Widening this field alone was necessary and not sufficient, and the residual is
+    # now closed too: `api/schemas.py::StrategyName` was still a `Literal` of the same
+    # two names, so a plug-in strategy was selectable by `SCP_STRATEGY` and not by a
+    # request, and `deobfuscation/restorer.py` matched the strategy name against a
+    # hardcoded pair, so a run under a third name reached the restorer and died with
+    # `unknown_strategy` after the payload had already gone to the provider. Both ask
+    # `obfuscation.strategies.base` now -- the schema via `available_strategies`, the
+    # restorer via `restore_mode` -- so the three checks share one source of truth.
     strategy: str = "tokenization"
     threshold_obfuscate: float = Field(default=0.5, ge=0.0, le=1.0)
     threshold_redact: float = Field(default=0.3, ge=0.0, le=1.0)

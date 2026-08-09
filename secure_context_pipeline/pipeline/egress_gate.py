@@ -1093,7 +1093,8 @@ class EgressGate:
         is :data:`~secure_context_pipeline.surrogates.STRICT_TOKEN_RE` -- the exact
         shape :func:`~secure_context_pipeline.surrogates.format_surrogate` produces --
         and *not* the tolerant ``TOKEN_RE``. ``TOKEN_RE`` accepts wrong brackets, stray
-        whitespace, uppercase hex and ``-`` where we write ``_``, and it accepts them
+        whitespace (including at both separators), any casing of the category, the
+        entity type and the hash, and ``-`` where we write ``_``, and it accepts them
         for one reason: the restorer reads text an LLM mangled. Nothing on this path
         has been near an LLM. Every token in the payload was written by
         ``format_surrogate`` milliseconds earlier, so here the tolerance buys nothing

@@ -352,6 +352,150 @@ def test_narrowing_the_hint_group_did_not_narrow_what_matches_at_all() -> None:
 
 
 # --------------------------------------------------------------------------
+# Case and separator tolerance -- core requirement 6's "grammatically modified
+# forms". Tolerance belongs to TOKEN_RE ONLY: every case below is also asserted
+# against STRICT_TOKEN_RE, because that is the pattern the egress gate builds its
+# skip-list from and anything it starts matching is outbound payload the gate
+# stops re-scanning.
+# --------------------------------------------------------------------------
+
+#: Re-casings and separator whitespace a model produces, with the reason each one
+#: is not exotic. Every one of these was a NO MATCH before, i.e. a token left in
+#: the answer the user reads.
+CASE_AND_SPACING_FORMS = [
+    (f"[phi_name_{TOKEN_ID}]", "the model lower-cased the whole token"),
+    (f"[Phi_Name_{TOKEN_ID}]", "title case, as in a heading"),
+    (f"[PHI_NAME_{TOKEN_ID.upper()}]", "upper-cased hash -- the one case already tolerated"),
+    (f"[phi_name_{TOKEN_ID.upper()}]", "both halves re-cased"),
+    (f"[pHi-NaMe-{TOKEN_ID}]", "re-cased and hyphen-separated at once"),
+    (f"[PHI_NAME_\n{TOKEN_ID}]", "line wrapped after the second separator"),
+    (f"[PHI_NAME\n_{TOKEN_ID}]", "line wrapped before the second separator"),
+    (f"[PHI\n_NAME_{TOKEN_ID}]", "line wrapped at the first separator"),
+    (f"[PHI_ NAME_{TOKEN_ID}]", "a space after the first separator"),
+    (f"[PHI _NAME_ {TOKEN_ID}]", "spaces on both sides of both separators"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "why"), CASE_AND_SPACING_FORMS, ids=[case[1] for case in CASE_AND_SPACING_FORMS]
+)
+def test_a_recased_or_rewrapped_token_is_matchable_and_keys_the_same_vault_row(
+    text: str, why: str
+) -> None:
+    """A token we cannot match is a token that reaches the user (requirement 6).
+
+    Measured before the fix, with everything else about the token intact::
+
+        [PHI_NAME_1a2b3c4d]   -> match      [phi_name_1a2b3c4d]   -> NO match
+        [PHI_NAME_1A2B3C4D]   -> match      [Phi_Name_1a2b3c4d]   -> NO match
+                                            [PHI_NAME_\\n1a2b3c4d] -> NO match
+
+    The hash was the only case-tolerant field and the two ``[_-]`` separators were
+    the only places the bounded whitespace class was not allowed.
+
+    The vault key is asserted too, not just the match: tolerating a shape whose
+    group 3 came out differently would substitute the wrong entity, which is worse
+    than not matching at all.
+    """
+    match = TOKEN_RE.search(text)
+    assert match is not None, f"{why}: {text!r} does not match"
+    assert match.group(0) == text, "the whole token must be claimed, not a prefix"
+    assert match.group(3).lower() == TOKEN_ID
+    assert extract_token_ids(text) == {TOKEN_ID}
+
+
+@pytest.mark.parametrize(
+    ("text", "why"), CASE_AND_SPACING_FORMS, ids=[case[1] for case in CASE_AND_SPACING_FORMS]
+)
+def test_the_strict_grammar_refuses_every_shape_the_tolerant_one_gained(
+    text: str, why: str
+) -> None:
+    """STRICT_TOKEN_RE must stay exactly as narrow as ``format_surrogate``.
+
+    ``egress_gate._own_token_mask`` builds the detector skip-list from
+    ``STRICT_TOKEN_RE`` spans, so a shape added there is a span of *outbound
+    payload* the gate stops re-scanning. None of the strings above is one this
+    pipeline can emit -- so on that path they are uploaded-document text, and
+    document text must be scanned. The emitter is asserted alongside the matcher
+    because "we never emit this" is the whole justification.
+    """
+    assert STRICT_TOKEN_RE.fullmatch(text) is None, why
+    assert STRICT_TOKEN_RE.search(text) is None, why
+    assert format_surrogate("PHI", "NAME", TOKEN_ID) != text
+
+
+def test_case_tolerance_stops_at_the_hint_because_the_emitter_stops_there() -> None:
+    """An upper-case hint is not a shape ``format_surrogate`` can write.
+
+    This is why the pattern is not simply compiled with ``re.IGNORECASE``: that
+    flag is pattern-wide and would fold the hint group's ``[a-z0-9-]`` too. The
+    module's rule is that the matcher must never out-run the emitter, and a hint
+    the matcher absorbs is a hint the restorer *deletes* from the answer.
+    ``[PHI_MEDICATION_2f4a1b3c|MANGLED-HINT]`` is still cleaned up, but downstream
+    in ``restorer._consume_unclosed_tail`` under its five bounds -- not here.
+    """
+    assert HINT_RE.fullmatch("ORAL-ANTIDIABETIC") is None
+    match = TOKEN_RE.search(f"[PHI_MEDICATION_{TOKEN_ID}|ORAL-ANTIDIABETIC]")
+    assert match is not None
+    assert match.group(4) is None, "an upper-case hint must not be absorbed"
+    assert match.group(0) == f"[PHI_MEDICATION_{TOKEN_ID}"
+    # The lower-case one still is -- otherwise this test would pass on a matcher
+    # that had simply stopped reading hints.
+    annotated = TOKEN_RE.search(f"[PHI_MEDICATION_{TOKEN_ID}|oral-antidiabetic]")
+    assert annotated is not None
+    assert annotated.group(4) == "oral-antidiabetic"
+
+
+#: Codepoints Python's ``re.IGNORECASE`` folds onto ASCII letters. Both are legal
+#: in an identifier-shaped run and both are confusable with the ASCII letter they
+#: fold to, which is what makes them a bad thing to widen an audit label with.
+#:
+#: Built with ``chr`` rather than written literally, the same convention
+#: ``restorer._RSQUO`` follows: a character confusable with ASCII must not appear
+#: as itself in this source file (RUF001), least of all in the test that exists
+#: because it is confusable.
+UNICODE_CASE_CONFUSABLES = [chr(0x212A), chr(0x017F)]  # KELVIN SIGN, LATIN SMALL LONG S
+
+
+@pytest.mark.parametrize("char", UNICODE_CASE_CONFUSABLES)
+def test_case_tolerance_is_ascii_only_and_admits_no_unicode_lookalike(char: str) -> None:
+    """``(?i)`` would have let U+212A into the entity type; the explicit classes do not.
+
+    Python's ``IGNORECASE`` is Unicode case folding, so ``[A-Z]`` under it matches
+    KELVIN SIGN and LATIN SMALL LETTER LONG S. The restorer copies group 2 into an
+    audit row's ``entity_type``, so folding would have put a character that reads
+    as ``K`` -- and is not ``K`` -- into a compliance column, for a tolerance no
+    re-casing model needs. Asserted against the real folding behaviour rather than
+    assumed, so the premise cannot rot.
+    """
+    assert re.fullmatch("[A-Z]", char, re.IGNORECASE), "premise: this really is folded by (?i)"
+    assert TOKEN_RE.search(f"[PHI_NAM{char}_{TOKEN_ID}]") is None
+    assert TOKEN_RE.search(f"[P{char}I_NAME_{TOKEN_ID}]") is None
+    # ...and an entity type carrying one is refused at the door, as it always was.
+    with pytest.raises(ConfigError):
+        validate_entity_type(f"NAM{char}")
+
+
+def test_widening_the_grammar_did_not_widen_the_match_extent() -> None:
+    """The restorer deletes the whole match, so extent is the blast radius.
+
+    Case tolerance and separator whitespace both live strictly *inside* the token,
+    between the opening bracket and the hash, so neither can reach further into the
+    model's prose than the old pattern did. Pinned on the two shapes where an
+    over-reach would be invisible: a markdown table row and a sentence.
+    """
+    row = f"| pii_name_{TOKEN_ID} | active | reviewed |"
+    match = TOKEN_RE.search(row)
+    assert match is not None
+    assert match.group(0) == f" pii_name_{TOKEN_ID} ", match.group(0)
+
+    prose = f"phi-name-{TOKEN_ID} was reviewed by Dr. Lee."
+    match = TOKEN_RE.search(prose)
+    assert match is not None
+    assert match.group(0) == f"phi-name-{TOKEN_ID} ", match.group(0)
+
+
+# --------------------------------------------------------------------------
 # Bounds -- every quantifier here is a security property (module docstring).
 # --------------------------------------------------------------------------
 
@@ -385,6 +529,31 @@ def test_the_matcher_does_not_blow_up_on_a_long_whitespace_run(size: int) -> Non
     assert TOKEN_RE.search(haystack) is not None
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     assert elapsed_ms < 200.0, f"{elapsed_ms:.0f} ms over {size:,} spaces"
+
+
+@pytest.mark.parametrize("size", [1_000, 32_000, 128_000])
+def test_the_new_separator_whitespace_is_bounded_like_every_other_run(size: int) -> None:
+    """The separators gained a ``\\s{0,4}`` on each side; that is two more entry points.
+
+    Same denial of service, one field to the right: the run that cost 94 seconds
+    sat in front of the category, and whitespace was not permitted at the
+    separators at all until re-wrapped tokens had to restore. Timed at the size
+    that produced the original 94 s, which the structural bounds test cannot
+    observe -- it reads the pattern, not the clock. Measured after the change:
+    23 ms for a 128 000-character run inside the token, 23 ms in front of it.
+    """
+    import time
+
+    inside = f"[PHI_{' ' * size}NAME_{TOKEN_ID}]"
+    started = time.perf_counter()
+    TOKEN_RE.search(inside)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    assert elapsed_ms < 200.0, f"{elapsed_ms:.0f} ms over {size:,} spaces at a separator"
+
+    # The run is past the four-character bound, so the token does NOT match -- the
+    # cost of the bound, stated exactly, the same way the restorer's tests state it.
+    if size > 4:
+        assert TOKEN_RE.search(inside) is None
 
 
 def test_the_hint_bound_matches_what_the_emitter_can_produce() -> None:

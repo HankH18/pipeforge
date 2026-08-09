@@ -342,6 +342,49 @@ async def test_mock_provider_emits_exactly_one_coreference_sentence() -> None:
     assert output.count(COREFERENCE_SENTENCE) == 1
 
 
+def test_bracket_dropped_on_an_annotated_token_strands_the_hint_byte_for_byte() -> None:
+    """The seam behind panel 4's ``chest pain|cardiovascular``, stated from this side.
+
+    ``bracket_dropped`` is the one mutation that can leave pipeline metadata in
+    the user's answer, and it does so only on an *annotated* token: ``TOKEN_RE``
+    reads a ``|hint`` only when a closer follows it, so with both brackets gone
+    the match stops at the hash and the hint is not part of what the restorer
+    replaces. Measured on ``fixtures/medical_note.txt`` under pseudonymization
+    before the fix, panel 3's ``PHI_DIAGNOSIS_7f029e2e|cardiovascular.`` came
+    back as ``chest pain|cardiovascular.``
+
+    ``restorer._consume_emitted_hint`` removes that remnant by comparing the
+    stranded bytes against the hint this run emitted -- an *equality* test, which
+    is what lets it delete without a delimiter to stop at. So the mock owes it a
+    precise promise, and this is that promise: what ``bracket_dropped`` strands is
+    exactly ``|`` plus the emitted hint, unmangled. If a future mutation
+    upper-cased it, spaced the pipe, or truncated the run, the equality would stop
+    holding and the remnant would silently return to the answer -- with the
+    restorer's own tests still green, because they supply the hint by hand.
+
+    The other five classes are checked here too, and none of them strands
+    anything: possessive, bold, upper_hash and verbatim all keep both brackets, so
+    ``TOKEN_RE`` absorbs the hint, and hint_stripped removes it outright.
+    """
+    annotated = "[PHI_MEDICATION_2f4a1b3c|oral-antidiabetic]"
+    hint = "oral-antidiabetic"
+
+    dropped = render_mutation(annotated, "bracket_dropped")
+    assert dropped == f"PHI_MEDICATION_2f4a1b3c|{hint}"
+    match = TOKEN_RE.search(dropped)
+    assert match is not None
+    # The hint group is unset and the match stops short of the pipe: everything
+    # from `match.end()` on is what would survive into the restored answer.
+    assert match.group(4) is None
+    assert dropped[match.end() :] == f"|{hint}"
+
+    for mutation in ("possessive", "bold", "upper_hash", "verbatim", "hint_stripped"):
+        rendered = render_mutation(annotated, mutation)
+        residue = TOKEN_RE.search(rendered)
+        assert residue is not None, mutation
+        assert "|" not in rendered[residue.end() :], (mutation, rendered)
+
+
 #: Vocabulary that ties a sentence to one document class. Three domains, because
 #: the property is "neutral", not "not medical": a template rewritten into legal
 #: or financial prose would be exactly as wrong for the other three fixtures.

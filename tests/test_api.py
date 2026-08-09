@@ -83,6 +83,7 @@ from secure_context_pipeline.audit.logger import (
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.errors import (
     MAX_DETAIL_VALUE_LEN,
+    UNREADABLE_AUDIT_REMEDY,
     PipelineError,
     SessionExpiredError,
 )
@@ -373,6 +374,157 @@ async def test_egress_block_surfaces_as_422(
     assert "EGRESS_BLOCK" in event_types
     assert LLM_CALL not in event_types, "the provider must never have been called"
     assert planted not in audit.text
+
+
+# ---------------------------------------------------------------------------
+# 3b. A corrupt audit log surfaces as 503, not as a bare 500
+# ---------------------------------------------------------------------------
+def _wreck_every_page_but_the_header(path: Path) -> None:
+    """Garbage every page of a real SQLite file except page 1, keeping its length.
+
+    The length is the trick that gets past ``open``: the header records the
+    database size in pages, so a *short* file is rejected outright while a
+    full-length file whose data pages are dead is opened happily and fails only
+    when something reads one. Page 1 survives because that is where the schema
+    lives -- ``open`` runs ``CREATE TABLE IF NOT EXISTS`` and has to parse it.
+    ``PRAGMA integrity_check`` on the result raises ``database disk image is
+    malformed``, which is what the demo's own ``data/audit.db`` reported.
+
+    ``tests/test_audit.py`` zeroes a *single* page, which is the lighter and more
+    interesting corruption there. It is not deterministic enough here: this log
+    holds nine rows, so its table is one b-tree leaf, and a run that appends to
+    that leaf can fail while a filtered ``SELECT`` served from an index still
+    succeeds -- measured, and it is why the ``GET /audit`` half of this test read
+    ``200`` against a database the same request's writer could not use.
+    """
+    data = bytearray(path.read_bytes())
+    page = 4096
+    assert len(data) >= 2 * page, "database is too small for this corruption to be meaningful"
+    for start in range(page, len(data), page):
+        data[start : start + page] = (b"\xde\xad\xbe\xef" * (page // 4))[: len(data) - start]
+    path.write_bytes(bytes(data))
+
+
+async def test_a_corrupt_audit_log_refuses_the_run_as_a_typed_503(tmp_path: Path) -> None:
+    """The reported defect, at the boundary a reviewer actually sees.
+
+    Reproduced against the running demo first: with ``data/audit.db`` corrupt (its
+    ``PRAGMA integrity_check`` reporting ``Tree 2 page 2 cell 0: invalid page``),
+    ``AuditLogger.emit`` let ``sqlite3.DatabaseError`` escape to the ASGI layer and
+    ``POST /pipeline/run`` answered **``500``, ``content-type: text/plain``, body
+    ``Internal Server Error``, and no security headers at all** -- no CSP, no
+    ``nosniff`` -- because Starlette renders an unhandled exception outside the
+    middleware that adds them. Three defects in one response: no ``code`` to branch
+    on, an admission that an exception reached the framework, and a shape
+    indistinguishable from a bug in the pipeline.
+
+    This drives the whole thing for real: a fresh app on its own data directory, a
+    healthy run first, then the live ``audit.db`` physically wrecked on disk and the
+    same request repeated. Nothing is monkeypatched -- no patched ``emit``,
+    no injected raise -- so what is asserted is the behaviour of the shipped code on
+    a file SQLite genuinely cannot read.
+
+    ``raise_app_exceptions`` is left at its default ``True``, which is load-bearing:
+    if anything still escapes unhandled, this test *errors* with that exception
+    instead of reading a status code off a Starlette-generated 500. The old
+    behaviour cannot pass this test by accident.
+
+    The run must still be **refused** -- "no release without a record", pinned by
+    ``integration/test_pipeline.py::test_no_release_survives_an_audit_write_that_failed_before_it``
+    -- so the provider call count is asserted unchanged across the refused run.
+    Only the shape of the refusal changed.
+    """
+    settings = Settings(
+        master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        # Its own directory. The module-scoped app's audit.db is shared by every
+        # other test in this file, and this test destroys the one it points at.
+        data_dir=tmp_path / "corrupt-audit-data",
+        registry_path=REGISTRY_PATH,
+        llm_provider="mock",
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        services = app.state.services
+        assert isinstance(services, Services)
+
+        provider_calls = 0
+        real_complete = services.orchestrator._provider.complete_detailed
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal provider_calls
+            provider_calls += 1
+            return await real_complete(*args, **kwargs)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://scp.test") as http:
+            with mock.patch.object(
+                services.orchestrator._provider, "complete_detailed", counting
+            ):
+                session_id = await _create_session(http)
+                doc_id = await _upload(http)
+
+                # Control: the identical request succeeds on a healthy log. Without
+                # it the 503 below could come from a broken fixture.
+                healthy = await _run(http, session_id, doc_id)
+                assert healthy.status_code == 200, healthy.text
+                assert provider_calls == 1, "premise: a healthy run reaches the provider"
+
+                # Corrupt the log under the live app. Closed and reopened rather
+                # than written behind SQLite's back, so the page cache cannot mask
+                # it and the test is deterministic: that is the same file the next
+                # request opens, and the demo's own restart-after-corruption case.
+                await services.audit.close()
+                _wreck_every_page_but_the_header(settings.data_dir / "audit.db")
+                async with services.audit:
+                    refused = await _run(http, session_id, doc_id)
+                    reader = await http.get(
+                        "/audit", params={"session_id": session_id, "user_id": OWNER}
+                    )
+
+    # FIRST, before anything about the shape of the answer: the run was refused
+    # before the payload was sent. Measured to bite -- replacing the writer's raise
+    # with "log it and carry on", which is what a resilient-looking audit sink
+    # invites, still answers 503 (the run dies later, reading its own seq list back)
+    # but the provider has been called by then: 2, not 1, with no record of it.
+    assert provider_calls == 1, "the refused run must not have reached the provider"
+
+    assert refused.status_code == 503, refused.text
+    assert refused.headers["content-type"].startswith("application/json")
+    body = refused.json()
+    assert body["code"] == "AUDIT_UNAVAILABLE"
+    assert body["detail"]["reason"] == "audit_log_unreadable"
+    # ``emit``, not ``query``: the refusal has to come from the WRITE, which is the
+    # one that happens before the provider call. See the measurement above.
+    assert body["detail"]["operation"] == "emit", "the write path is what refused the run"
+    assert body["detail"]["audit_db"] == "audit.db"
+    assert body["detail"]["error"] == "DatabaseError"
+    assert body["detail"]["remedy"] == UNREADABLE_AUDIT_REMEDY
+    # ...and, independently of that constant, the remedy has to be something a
+    # reviewer can DO. Comparing an imported constant to itself would pass against
+    # `remedy: ""`; these words are typed out here on purpose so that the check does
+    # not share its answer with the code it is checking.
+    remedy = str(body["detail"]["remedy"])
+    assert "restore" in remedy and "data directory" in remedy, remedy
+
+    # The old answer, gone: no free-text 500 body, and no unhandled-exception smell.
+    assert "Internal Server Error" not in refused.text
+    # An error body is not a place to describe the server's filesystem. The file
+    # NAME is what an operator acts on; the path is theirs to know already.
+    assert str(settings.data_dir) not in refused.text
+
+    # The bare 500 carried none of these, because ServerErrorMiddleware sits
+    # outside the middleware that adds them. A typed refusal is a normal response
+    # and gets the same hardening as every other one.
+    assert refused.headers["x-content-type-options"] == "nosniff"
+    csp = refused.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in csp
+    assert "default-src 'none'" in csp
+
+    # The reader half of the same file, at the same boundary: ``GET /audit`` answers
+    # the same code rather than a generic 500, and names the call that failed.
+    assert reader.status_code == 503, reader.text
+    assert reader.json()["code"] == "AUDIT_UNAVAILABLE"
+    assert reader.json()["detail"]["operation"] == "query"
 
 
 # ---------------------------------------------------------------------------

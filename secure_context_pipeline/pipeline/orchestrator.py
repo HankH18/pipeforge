@@ -1,6 +1,12 @@
 """PipelineOrchestrator -- the end-to-end round trip (build doc sections 9.5.1 and 4).
 
-    fetch+decrypt -> detect -> obfuscate -> inject -> EGRESS GATE -> provider -> restore
+    fetch+decrypt -> detect -> obfuscate -> inject -> CEILING -> EGRESS GATE
+        -> provider -> restore
+
+``CEILING`` is a bound on the assembled payload, added because there was none: one
+payload, one provider call, and past the model's input window a **non-retryable** 400.
+See :meth:`PipelineOrchestrator._refuse_oversized_payload` for the size, the ordering
+argument, and why the answer is an explicit refusal rather than chunking the call.
 
 **Two inputs go through detect -> obfuscate, not one.** The outbound payload is
 ``{system prompt} + {user prompt} + {obfuscated document}``, so the user prompt is
@@ -71,7 +77,9 @@ from secure_context_pipeline.deobfuscation.restorer import Restorer
 from secure_context_pipeline.detection.detector import Detector
 from secure_context_pipeline.errors import (
     MAX_DETAIL_VALUE_LEN,
+    OVERSIZED_PAYLOAD_REASON,
     EgressBlockedError,
+    PayloadTooLargeError,
     PipelineError,
 )
 from secure_context_pipeline.llm.base import DetailedLLMProvider
@@ -83,7 +91,10 @@ from secure_context_pipeline.models import (
     TokenRecord,
 )
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
-from secure_context_pipeline.pipeline.context_injector import ContextInjector
+from secure_context_pipeline.pipeline.context_injector import (
+    MAX_PAYLOAD_CHARS,
+    ContextInjector,
+)
 from secure_context_pipeline.pipeline.egress_gate import EgressGate
 from secure_context_pipeline.store.document_store import EncryptedDocumentStore
 from secure_context_pipeline.surrogates import STRICT_TOKEN_RE
@@ -272,6 +283,12 @@ class PipelineOrchestrator:
         # ``test_the_gate_is_handed_the_surrogates_this_run_actually_emitted``.
         surrogates = frozenset(t.surrogate for t in tokens)
         stats["inject_ms"] = _ms(mark)
+        stats["payload_chars"] = float(payload.char_count)
+
+        # 5b. CEILING. One payload, one provider call, and a model window that does
+        #     not stretch. Refused here -- BEFORE the gate, and the ordering is
+        #     argued at :meth:`_refuse_oversized_payload`.
+        await self._refuse_oversized_payload(session_id, run_id, payload.char_count)
 
         # The two strings the provider will be handed, bound to locals here and not
         # re-read from ``payload`` afterwards. Everything from this line to the
@@ -479,6 +496,114 @@ class PipelineOrchestrator:
             detections,
             strategy=strategy,
             doc_category=doc_category,
+            run_id=run_id,
+        )
+
+    async def _refuse_oversized_payload(
+        self, session_id: str, run_id: str, payload_chars: int
+    ) -> None:
+        """Refuse a payload larger than one provider call can carry.
+
+        The bound this closes is the one nothing else in the pipeline had:
+        :meth:`ContextInjector.build` emits **one**
+        :class:`~secure_context_pipeline.pipeline.context_injector.InjectedPayload`
+        holding the whole obfuscated document, and step 7 makes **one** provider call
+        with it. Past the model's input window that call comes back a non-retryable
+        HTTP 400 -- the shape ``llm/anthropic_provider.py`` documents -- so an
+        oversized document failed as ``LLM_TRANSPORT_ERROR``, i.e. as an upstream
+        fault, when nothing upstream was faulty and the caller's actual remedy (send
+        less document) appeared nowhere in the answer. It is reachable through the
+        shipped API rather than hypothetical: ``MAX_UPLOAD_BYTES`` is 16 MiB, which is
+        about **67x** :data:`MAX_PAYLOAD_CHARS`.
+
+        **This is not chunking, and the limit is not a bug being worked around.** One
+        payload is the spec: challenge requirement 5 says "assemble the obfuscated
+        document chunks into *a context payload*", singular. Per-chunk calls would buy
+        larger documents at the cost of cross-document reasoning plus a merge step the
+        spec never contemplates, for a case its 2,000-word benchmark is three orders of
+        magnitude away from. So the limit stays and becomes *legible*: a typed refusal
+        carrying both numbers and a remedy.
+
+        **Ordering: this runs BEFORE the egress gate, and that is a decision.** The
+        argument for putting it after is that the gate is what proves no original
+        leaves, so nothing should skip it. That argument does not survive contact with
+        what "skip" means here: the gate proves a property of *released* bytes, and
+        these bytes are never released -- the refusal is unconditional, raises out of
+        ``run()``, and cannot be caught into a call. A check that can only *remove*
+        reachability of step 7 cannot weaken a guarantee about step 7.
+
+        Three things favour going first:
+
+        * **Cost, and cost is the security argument.** Pass 2 of the gate runs the full
+          detector over the whole payload, and README section 5 Q1 measures the gate at
+          about as much wall time as detection itself -- 2,911 ms of a 6.4 s run on the
+          12k-word brief, 87% of it spaCy. On a payload we have already decided to
+          refuse, that is a caller-controlled amplification: upload the 16 MiB the API
+          accepts and every request buys minutes of CPU on a process-wide event loop
+          before the refusal it was always going to get. Going first turns that into an
+          integer comparison.
+        * **The reason survives.** Refusing after the gate means whichever the gate says
+          first wins, and on an oversized document that is usually a ``vault_original``
+          or a rescan hit -- a leak-shaped code for a size problem, which is precisely
+          the misdiagnosis this method exists to remove.
+        * **"No release without a record" is untouched.** That property is about the
+          path that reaches the provider; this path never does. It is still pinned by
+          ``test_no_release_survives_an_audit_write_that_failed_before_it``, whose
+          documents are kilobytes and which therefore never reaches this branch.
+
+        What going first *costs* is the ``EGRESS_PASS`` row: a refused oversized run
+        leaves no gate verdict in the audit log. It leaves an ``EGRESS_BLOCK`` instead,
+        which is the honest record -- the payload was not released -- and the run's
+        ``DETECT`` and ``OBFUSCATE`` events are already written, so the trail still says
+        what the run did with the document.
+
+        The audit write is best-effort for the same reason it is in
+        :meth:`_verify_release`: the refusal below is already guaranteed, and an
+        audit-layer failure here must not replace a typed ``PAYLOAD_TOO_LARGE`` with
+        whatever the log threw. ``EGRESS_BLOCK`` is the event type rather than a new one
+        because build doc section 7 fixes the vocabulary and ``reason`` is what tells the
+        three orchestrator-side blocks apart.
+        """
+        if payload_chars <= MAX_PAYLOAD_CHARS:
+            return
+        logger.error(
+            "assembled payload exceeds the single-call ceiling; refusing before the gate",
+            extra={
+                "session_id": session_id,
+                "run_id": run_id,
+                "payload_chars": payload_chars,
+                "limit_chars": MAX_PAYLOAD_CHARS,
+            },
+        )
+        try:
+            await self._emit(
+                AuditEvent(
+                    ts=time.time(),
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type=EGRESS_BLOCK,
+                    detail={
+                        "reason": OVERSIZED_PAYLOAD_REASON,
+                        "hit_count": 0,
+                        "entity_types": "",
+                        "payload_chars": payload_chars,
+                        "limit_chars": MAX_PAYLOAD_CHARS,
+                    },
+                )
+            )
+        except Exception as exc:
+            logger.error(
+                "oversized-payload block could not be audited; the block itself still stands",
+                extra={
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "error": type(exc).__name__,
+                },
+            )
+        raise PayloadTooLargeError(
+            session_id=session_id,
+            payload_chars=payload_chars,
+            limit_chars=MAX_PAYLOAD_CHARS,
             run_id=run_id,
         )
 

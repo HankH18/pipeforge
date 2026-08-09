@@ -38,6 +38,50 @@ button.big { padding: 6px 16px; font-weight: bold; }
 button.danger-btn { background: #5c1d1a; border-color: var(--err); color: #ffd7d3; }
 .controls.danger { border-color: var(--err); background: #1c1315; }
 .tag { color: var(--err); letter-spacing: .04em; font-size: 11px; flex: 1 1 auto; }
+
+/* The create-session gate, done in markup. "Create session" was a one-click
+   `class="go"` primary that erases the live session's key and every vault row before it
+   mints -- the same irreversible loss the red bar two sections down puts behind an
+   arm/confirm pair -- so it is now a <details> whose summary arms and whose button
+   commits. See the ordering note in index.html for why it is <details> and not a second
+   button pair.
+
+   The summary has to LOOK like the button it replaced or the gate reads as a broken
+   layout, so it borrows `input, select, button`'s box; `--control-line` is the same
+   border those get, which is what keeps it inside WCAG 2.1 1.4.11's 3:1 against both
+   #0b0f14 and the #151b23 bar behind it (3.58 and 3.23 -- measured in
+   test_api_ui_escaping.py, which now reads this rule too). `list-style: none` plus the
+   ::-webkit-details-marker rule drops the disclosure triangle in both engines: the
+   triangle is the only thing that would make this read as an expander rather than a
+   control, and "Create session..." already spells the arm.
+
+   The open panel introduces no NEW colour: it reuses `--panel` (#151b23), which is
+   already `.controls`' own fill and already one of the surfaces the bordered-control
+   contrast check measures against, so nothing on this page ends up sitting on a pairing
+   nobody computed. A background is not optional here, because `position: absolute` is
+   not: `.controls` is a flex row, and letting the disclosure grow inline shoved the
+   user_id field, the document dropdown and the category select sideways the moment the
+   guard opened -- a gate that moves the controls around it is a gate a reviewer
+   mis-clicks past. The red edge is what marks the box as destructive; the button inside
+   carries `.danger-btn`'s own border colour. */
+details.guard { position: relative; }
+details.guard > summary {
+  cursor: pointer; list-style: none; padding: 4px 6px; border-radius: 4px;
+  background: #0b0f14; border: 1px solid var(--control-line); color: var(--fg);
+}
+details.guard > summary::-webkit-details-marker { display: none; }
+details.guard[open] > summary { border-color: var(--err); color: #ffd7d3; }
+.guard-body {
+  position: absolute; z-index: 2; top: calc(100% + 4px); left: 0; width: 330px;
+  display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  background: var(--panel); border: 1px solid var(--err); border-radius: 6px;
+}
+/* The spacer that keeps the destroy confirm away from the pixels its own arm button
+   occupied a moment earlier. Measured at 1550px before this rule: "Destroy session..."
+   spans x=24-186 and the confirm rendered at x=24-250, so one double-click did the whole
+   erasure. Growing the live region pushes the confirm to the far end of the bar; Cancel
+   is what now sits under a second click. See the ordering note in index.html. */
+#destroy-state { flex: 1 1 auto; }
 .spin { display: inline-block; width: 9px; height: 9px; margin-left: 6px; border: 2px solid #fff;
   border-right-color: transparent; border-radius: 50%; animation: sp .7s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg); } }
@@ -52,6 +96,14 @@ button.danger-btn { background: #5c1d1a; border-color: var(--err); color: #ffd7d
 .banner.ok { border-color: var(--ok); background: #0e2a15; color: #b6f0c2; }
 .banner.warn { border-color: var(--warn); background: #2a2110; color: #f5dc9a; }
 .banner.err { border-color: var(--err); background: #3a1315; color: #ffc9c4; font-size: 14px; }
+/* The scope note's OTHER voice. It used to be `banner warn` unconditionally, so a yellow
+   caution sat under a green RUN_OK on every single run -- every doc_category leaves at
+   least one rule set out, by design, so the note could never NOT fire. A caution that
+   fires on 100% of passes is a caution a reviewer learns to skip, which costs the one
+   run where it means something. `renderScope` now keeps `warn` for the case it can
+   actually prove (the document declares a category and the run used a different one) and
+   uses this quieter voice for the standing fact. Same words, no alarm. */
+.banner.note { color: var(--dim); }
 
 .stats { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 3px 8px; font-size: 11px; }
@@ -64,6 +116,15 @@ button.danger-btn { background: #5c1d1a; border-color: var(--err); color: #ffd7d
 @media (max-width: 900px) { .panels { grid-template-columns: minmax(0, 1fr); } }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
 .count { float: right; color: var(--dim); font-weight: normal; }
+/* "Which provider", said in panels 2 and 3 rather than only in the health badge three
+   quarters of a 1550px page away. Not `.count` and not floated: `#c2`/`#c3` float right
+   and are rewritten every run, and a provider label that shares their box would be
+   pushed off the end of the heading by a long counter. Normal weight and `--dim` so the
+   heading's own words still lead; `<b>mock</b>` inside it is the one word that has to be
+   read, and `b` is bolder than the surrounding text without spending a colour that means
+   something else on this page (green is a clean safety counter, red is a non-zero one). */
+.prov { color: var(--dim); font-weight: normal; }
+.prov code { color: var(--dim); }
 .body { margin: 0; padding: 8px; height: 300px; overflow: auto; white-space: pre-wrap;
   word-break: break-word; font-size: 12px; }
 
@@ -92,6 +153,32 @@ mark.tok { font-weight: bold; }
    WORKED, the other is the single value the run failed to give back. The hatch is
    the wavy line's job done with the only channel an empty box has. */
 i.unres { background: repeating-linear-gradient(135deg, #3a1418 0 3px, var(--err) 3px 4px); }
+
+/* REAL vs SUBSTITUTE, on the channel the eye actually reads.
+   Every rule above assigns a hue to a CATEGORY, and none of them said whether the
+   highlighted string is a value out of the document or something the run invented to
+   stand in for one. Under pseudonymization those two look alike on purpose -- that is
+   what a realistic fake is -- so panel 1 and panel 2 were painting opposites identically:
+   measured on fixtures/medical_note.txt as `medical`, strategy=pseudonymization, the real
+   "David Ochoa" (panel 1) and the invented "Andrew Stanley" (panel 2) are both #58a6ff on
+   #12365e, pixel for pixel. The per-mark `title` added for this is a real improvement and
+   a poor answer on its own: 52 marks, and colour is read before a hover ever happens.
+   Filled = a real value; outlined = a substitute. One rule, held across all four panels,
+   and it spends no hue -- the category colour still means the category on both sides.
+
+   `mark.tok` is precisely the panel-2/3 highlight (`renderMarks` sets it on all three
+   kinds it emits: the bracketed token, the [REDACTED_*] marker and the pseudonym), so
+   this needs nothing from app.js and cannot drift from what that function emits.
+   `:not(.unres)` holds panel 4's vault-miss sentinel out: that mark is a FAILURE, not a
+   substitute, and it keeps the error fill and wavy underline the rule above gives it.
+   `outline` rather than `border` because an outline is drawn outside the box model --
+   inside a 300px `white-space: pre-wrap` monospace panel a 1px border on 52 inline marks
+   reflows the payload a reviewer is comparing line-by-line against panel 1, and an
+   outline moves nothing. `i.tok` is the legend swatch, which needs the same treatment on
+   an empty 10x10 box for the key to be showing the thing it names. */
+mark.tok:not(.unres), i.tok {
+  background: none; outline: 1px dashed currentColor; outline-offset: -1px;
+}
 
 .audit { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
 .audit h2 { display: flex; align-items: center; gap: 10px; }

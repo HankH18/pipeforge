@@ -40,6 +40,14 @@ trade (README threat model). Encryption is application-layer AES-GCM only --
 SQLCipher is a locked-out decision (build doc section 3), and per-record AAD
 binding is strictly stronger than whole-file encryption here.
 
+**A documents.db this process cannot read refuses the request.** The metadata
+database is not on the blob read path -- ``get_text`` and ``get_raw`` open a file
+and decrypt it, and answer correctly while the database is rubble -- so the
+refusal has to come from the four methods that do query it: ``put``,
+``get_category``, ``list_docs`` and ``sweep_orphans``. See
+:data:`_UNREADABLE` and :class:`DocumentStoreUnavailableError` for the rule, the
+measured cost of the fail-open, and why ``sweep_orphans`` is the dangerous one.
+
 **Crash recovery.** ``put`` unwinds its own partial writes on any exception,
 including cancellation, but a ``SIGKILL`` or a power cut between the blob writes
 and the metadata commit leaves blobs with no row pointing at them. Metadata is
@@ -53,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
@@ -80,8 +89,11 @@ __all__ = [
     "DOC_CATEGORIES",
     "RAW_SUFFIX",
     "TEXT_SUFFIX",
+    "UNREADABLE_STORE_REASON",
+    "UNREADABLE_STORE_REMEDY",
     "DocumentMeta",
     "DocumentStore",
+    "DocumentStoreUnavailableError",
     "EncryptedDocumentStore",
     "InvalidCategoryError",
 ]
@@ -115,6 +127,91 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 """
 _INDEX = "CREATE INDEX IF NOT EXISTS documents_user_idx ON documents (user_id, created_at);"
+
+
+#: What "this database is not readable" means, in one place, for every call site
+#: here that queries it. Copied deliberately from ``audit/logger.py::_UNREADABLE``
+#: rather than re-decided: ``audit.db``, ``vault.db`` and ``documents.db`` are three
+#: files of one shape, they failed the same way, and the audit half of the fix has
+#: already argued the membership.
+#:
+#: ``sqlite3.Error`` is the corrupt-file case measured below. ``ValueError`` is
+#: aiosqlite's ``no active connection``, which this module has already been bitten
+#: by once -- see the ordering argument in :meth:`EncryptedDocumentStore.close`.
+#: ``TypeError`` is inherited from the shared rule and nothing here is known to
+#: raise it; it is kept so the three files cannot drift apart, and
+#: ``tests/test_document_store.py::
+#: test_the_document_store_and_the_audit_log_share_one_unreadable_rule`` fails if
+#: they do.
+_UNREADABLE = (sqlite3.Error, ValueError, TypeError)
+
+#: The machine half of the refusal, and the word that goes in the HTTP body.
+UNREADABLE_STORE_REASON = "document_store_unreadable"
+
+#: What an operator does about it. Unlike the vault's remedy, restoring really is
+#: the first move here: the ciphertext blobs are separate files that a corrupt
+#: metadata database does not touch, and metadata is the source of truth, so a
+#: restored ``documents.db`` makes the surviving blobs reachable again. 47
+#: characters, under ``MAX_DETAIL_VALUE_LEN``.
+UNREADABLE_STORE_REMEDY = "restore it from backup or re-upload the document"
+
+
+class DocumentStoreUnavailableError(PipelineError):
+    """The metadata database could not be read or written, so the request was refused.
+
+    Declared here beside :class:`InvalidCategoryError` for the reason
+    :mod:`secure_context_pipeline.errors` gives for both: nothing outside this
+    package catches it by type. It inherits the same 64-character detail ceiling as
+    every other member of the hierarchy.
+
+    **Why it exists.** Reproduced on the real ASGI app with every 4 KiB page of a
+    live ``documents.db`` below the header overwritten -- length preserved, so
+    ``aiosqlite.connect`` accepts it and ``PRAGMA integrity_check`` answers
+    ``database disk image is malformed``. ``POST /pipeline/run`` let
+    ``sqlite3.DatabaseError`` escape from :meth:`EncryptedDocumentStore.get_category`
+    to the ASGI layer: **500, ``content-type: text/plain``, body ``Internal Server
+    Error``, and none of the security headers** -- no CSP, no ``nosniff`` -- because
+    Starlette's ``ServerErrorMiddleware`` renders that outside the middleware that
+    adds them. The same defect ``AuditUnavailableError`` was created for, on the
+    third of the app's three SQLite stores.
+
+    **Why it is a refusal, in three measurements.** Everything this class refuses
+    has a plausible-looking degradation available, and each one is silent:
+
+    * ``get_category`` returning ``None`` -- "unclassified" -- is the cheapest fix
+      and it disables the category-scoped half of the registry. Measured end to end
+      on an intake record ending ``Follow-up appointment scheduled for
+      03/12/2024.``: 5 entities detected as ``medical``, 4 as ``None``, and the one
+      that disappears is ``DATE``, which carries ``only_in_doc_categories:
+      [medical]``. That date went to the provider in cleartext, inside a ``200``
+      whose egress gate reported clean.
+    * An unreadable store answering with **empty text** is the dangerous one,
+      because every downstream assertion still passes: measured, ``200 OK``, 0
+      entities detected, gate clean, and an answer that summarises a document that
+      was never read. A clean bill of health is exactly what an empty document
+      buys, which is why nothing here may substitute one.
+    * :meth:`EncryptedDocumentStore.sweep_orphans` is the worst case and it is a
+      *write*: it deletes every blob whose ``doc_id`` is not in the set the SELECT
+      returned. Degrade that SELECT to an empty set and the sweep does not collect
+      fewer orphans, it deletes **every document in the store** -- so on this file
+      the read failing must stop the deletes, not proceed without them.
+
+    Values are bounded by construction rather than validated, and the file NAME
+    rather than the path reaches the body -- both for the reasons
+    ``AuditUnavailableError`` states: this constructor runs on the failure path, and
+    an error body is not a place to describe the server's filesystem.
+    """
+
+    code = "DOCUMENT_STORE_UNAVAILABLE"
+
+    def __init__(self, *, operation: str, store_db: str, error: str) -> None:
+        super().__init__(
+            reason=UNREADABLE_STORE_REASON,
+            operation=operation[:MAX_DETAIL_VALUE_LEN],
+            store_db=store_db[:MAX_DETAIL_VALUE_LEN],
+            error=error[:MAX_DETAIL_VALUE_LEN],
+            remedy=UNREADABLE_STORE_REMEDY,
+        )
 
 
 class InvalidCategoryError(PipelineError):
@@ -218,6 +315,32 @@ class EncryptedDocumentStore:
 
     # -- lifecycle ----------------------------------------------------------
 
+    def _unavailable(
+        self, exc: BaseException, *, operation: str
+    ) -> DocumentStoreUnavailableError:
+        """The one refusal every SQLite call site here raises. See :data:`_UNREADABLE`.
+
+        A companion to that tuple and built for the same reason: the tuple makes the
+        call sites agree on what *unreadable* means, this makes them agree on what to
+        answer. Modelled on ``AuditLogger._unreadable``, including the split that
+        matters -- the full path goes to the server log, and only the file **name**
+        reaches the exception, because ``api/errors.py`` writes ``dict(exc.detail)``
+        into the HTTP body verbatim.
+        """
+        logger.error(
+            "document metadata database unreadable; the operation was refused",
+            extra={
+                "store_db": str(self._db_path),
+                "store_operation": operation,
+                "error": type(exc).__name__,
+            },
+        )
+        return DocumentStoreUnavailableError(
+            operation=operation,
+            store_db=self._db_path.name,
+            error=type(exc).__name__,
+        )
+
     @classmethod
     async def open(cls, settings: Settings, key_provider: KeyProvider | None = None) -> Self:
         """Build a store with its connection already established."""
@@ -253,14 +376,23 @@ class EncryptedDocumentStore:
             if db is None:
                 await aiofiles.os.makedirs(self._blob_dir, exist_ok=True)
                 db = await aiosqlite.connect(self._db_path)
-                db.row_factory = aiosqlite.Row
-                # WAL: readers never block the writer, which matters as soon as
-                # an upload and a retrieval overlap.
-                await db.execute("PRAGMA journal_mode=WAL")
-                await db.execute("PRAGMA synchronous=NORMAL")
-                await db.execute(_SCHEMA)
-                await db.execute(_INDEX)
-                await db.commit()
+                try:
+                    db.row_factory = aiosqlite.Row
+                    # WAL: readers never block the writer, which matters as soon
+                    # as an upload and a retrieval overlap.
+                    await db.execute("PRAGMA journal_mode=WAL")
+                    await db.execute("PRAGMA synchronous=NORMAL")
+                    await db.execute(_SCHEMA)
+                    await db.execute(_INDEX)
+                    await db.commit()
+                except _UNREADABLE as exc:
+                    # Closed before the raise: aiosqlite runs each connection on
+                    # a non-daemon thread, and a leaked one keeps the interpreter
+                    # alive at exit. Also note that ``self._db`` is still ``None``
+                    # here, so a later call re-opens rather than inheriting a
+                    # half-built connection.
+                    await db.close()
+                    raise self._unavailable(exc, operation="open") from exc
                 self._db = db
                 logger.debug("document store opened (data_dir=%s)", self._db_path.parent)
             return db
@@ -367,13 +499,21 @@ class EncryptedDocumentStore:
             # cannot be detached between resolving it and using it.
             async with self._write_lock:
                 db = await self._connection()
-                await db.execute(
-                    "INSERT INTO documents "
-                    "(doc_id, user_id, filename, doc_category, created_at, size_bytes) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (doc_id, user_id, filename, category, time.time(), len(content)),
-                )
-                await db.commit()
+                try:
+                    await db.execute(
+                        "INSERT INTO documents "
+                        "(doc_id, user_id, filename, doc_category, created_at, size_bytes) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (doc_id, user_id, filename, category, time.time(), len(content)),
+                    )
+                    await db.commit()
+                except _UNREADABLE as exc:
+                    # The shared rule -- see _UNREADABLE. Typed, and still a raise:
+                    # the ``except BaseException`` below is what unwinds the two
+                    # blobs, and it re-raises, so returning a ``doc_id`` here would
+                    # hand the caller an ID whose blobs have just been deleted.
+                    # Metadata is the source of truth in both directions.
+                    raise self._unavailable(exc, operation="put") from exc
         except BaseException:
             # Metadata is the source of truth; an orphan blob is unreachable but
             # still ciphertext on disk, so drop it rather than leave it behind.
@@ -461,17 +601,28 @@ class EncryptedDocumentStore:
         Scoped by ``user_id`` in the query itself, so another user's document is
         as absent as one that never existed.
 
+        A database this process cannot read raises
+        :class:`DocumentStoreUnavailableError` and **never** answers ``None``. The
+        two are a keystroke apart and worlds apart: ``None`` is a document the
+        uploader filed as unclassified, which costs 1 of 5 detections on a real
+        medical record (see that class), while an unreadable file is a condition
+        the caller has to be told about.
+
         Raises:
             StoreAuthError: no such document *for this user*.
+            DocumentStoreUnavailableError: the metadata database is unreadable.
         """
         if not _DOC_ID_RE.match(doc_id):
             raise StoreAuthError(doc_id=_safe_doc_id(doc_id))
         db = await self._connection()
-        async with db.execute(
-            "SELECT doc_category FROM documents WHERE doc_id = ? AND user_id = ?",
-            (doc_id, user_id),
-        ) as cursor:
-            row = await cursor.fetchone()
+        try:
+            async with db.execute(
+                "SELECT doc_category FROM documents WHERE doc_id = ? AND user_id = ?",
+                (doc_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+        except _UNREADABLE as exc:
+            raise self._unavailable(exc, operation="get_category") from exc
         if row is None:
             raise StoreAuthError(doc_id=_safe_doc_id(doc_id))
         category = row["doc_category"]
@@ -501,10 +652,20 @@ class EncryptedDocumentStore:
         the ``.raw`` and the ``.txt`` write strands exactly one of them. Names
         this method cannot parse are left alone -- it deletes files, and "I do
         not recognise this" is not grounds to remove it from a shared directory.
+
+        **An unreadable database stops the sweep before a single unlink.** This is
+        the one method here where degrading is not a smaller answer but a larger
+        action: ``known`` is the *keep* list, so a SELECT that fails softly and
+        leaves it empty turns a garbage collector into ``rm -rf`` over every blob
+        older than ``min_age_seconds``. The refusal is raised while ``removed`` is
+        still 0, which is what the test of the same name asserts.
         """
         db = await self._connection()
-        async with db.execute("SELECT doc_id FROM documents") as cursor:
-            rows = await cursor.fetchall()
+        try:
+            async with db.execute("SELECT doc_id FROM documents") as cursor:
+                rows = await cursor.fetchall()
+        except _UNREADABLE as exc:
+            raise self._unavailable(exc, operation="sweep_orphans") from exc
         known = {str(row["doc_id"]) for row in rows}
 
         cutoff = time.time() - max(min_age_seconds, 0.0)
@@ -535,14 +696,26 @@ class EncryptedDocumentStore:
         return removed
 
     async def list_docs(self, user_id: str) -> list[DocumentMeta]:
-        """Metadata for this user's documents, newest first. Never another user's."""
+        """Metadata for this user's documents, newest first. Never another user's.
+
+        An unreadable database raises rather than returning ``[]``: the empty list
+        is the honest answer for a user with no documents, and spending it on "I
+        cannot read the index" would tell any future listing UI to draw an empty
+        library over a store still full of blobs. No HTTP route reads this today --
+        it is the store's own inventory accessor -- which is exactly why the rule
+        is applied here now rather than when a route arrives and inherits the
+        fail-open.
+        """
         db = await self._connection()
-        async with db.execute(
-            "SELECT doc_id, filename, doc_category, created_at, size_bytes FROM documents "
-            "WHERE user_id = ? ORDER BY created_at DESC, doc_id",
-            (user_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        try:
+            async with db.execute(
+                "SELECT doc_id, filename, doc_category, created_at, size_bytes FROM documents "
+                "WHERE user_id = ? ORDER BY created_at DESC, doc_id",
+                (user_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        except _UNREADABLE as exc:
+            raise self._unavailable(exc, operation="list_docs") from exc
         return [
             DocumentMeta(
                 doc_id=str(row["doc_id"]),

@@ -124,9 +124,21 @@ RESPONSE_TOKENS = 500
 #:     restore 500 surrogates (pseudonym.)     120 - 123 ms / 500 ms   4.2x   repeated
 #:     obfuscate 2,000 words (pseudonym.)    0.401 - 0.419 s / 2 s     4.9x   repeated
 #:     obfuscate 2,000 words (tokenization)  0.382 - 0.399 s / 2 s     5.1x   repeated
-#:     restore 500 tokens, cold vault           60 - 73 ms / 500 ms    7.4x   repeated
-#:     restore 500 tokens, warm vault         5.12 - 5.40 ms / 500 ms   96x   single
+#:     restore 500 tokens, cold vault          188 ms / 500 ms          2.7x   repeated
+#:     restore 500 tokens, warm vault          138 ms / 500 ms          3.6x   single
 #:     vault lookup p99                          ~0.001 ms / 5 ms     ~4500x  single
+#:
+#: **The two token-restore rows were 73 ms (7.4x) and 5.4 ms (96x) until the restore
+#: stage began itemising what it restored.** Core requirement 7 wants a
+#: de-obfuscation event to name an entity type and a token, so the restorer now
+#: writes one ``DEOBFUSCATE`` row per distinct restored token ID -- the same
+#: one-row-per-entity shape the obfuscation engine already pays for on the way out.
+#: A hash-chained write costs ~0.55 ms, so a 500-token response spends 240 ms in the
+#: audit log and lands at 345 ms (1.4x) if the itemisation is uncapped; that is what
+#: ``restorer._MAX_RESTORE_ROWS`` (256) bounds, and the numbers above are with it.
+#: The added cost is now a constant, whatever the model sends back. The two rows are
+#: still the fastest way to see an ``AuditLogger.emit`` regression: they are almost
+#: entirely audit writes.
 #:
 #: The repetition earns its place on the two newest rows rather than being copied onto
 #: them out of symmetry: single-shot, the surrogate restore came in at 283.5 ms (1.8x,
@@ -137,10 +149,16 @@ RESPONSE_TOKENS = 500
 #:
 #: The surrogate restore is worth calling out because it had no budget test at all
 #: until recently: the section 12 restore row was asserted for the token pass only,
-#: and on the warm path the token pass is the cheap half by a factor of 23.
+#: and on the warm path the token pass used to be the cheap half by a factor of 23.
+#: It is not any more -- 138 ms against 124 ms -- and the reason is the itemisation
+#: above, not the matching: a pseudonym has no token ID, so the surrogate pass writes
+#: no per-entity rows and its number did not move.
 #:
-#: The last two are single-shot: no realistic contention reaches two to four orders of
-#: headroom, and repeating them would only cost time.
+#: The last two are single-shot. That was written when the warm restore sat at 96x,
+#: where no realistic contention reaches; at 3.6x it is now the second-tightest row
+#: in the module and single-shot is no longer justified by headroom -- it is left
+#: that way only because the same 500-token restore *is* repeated one test below,
+#: cold, so a regression in the shared path already has a best-of-3 witness.
 BENCH_REPEATS = 3
 
 

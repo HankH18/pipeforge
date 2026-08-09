@@ -72,7 +72,7 @@ from typing import Self
 
 import aiosqlite
 
-from secure_context_pipeline.errors import PipelineError
+from secure_context_pipeline.errors import AuditUnavailableError, PipelineError
 from secure_context_pipeline.models import (
     MAX_AUDIT_LABEL_LEN,
     MAX_DETAIL_VALUE_LEN,
@@ -192,6 +192,11 @@ GENESIS_HASH = ""
 #: are crashes *on the tamper-detection path, caused by the tamper being looked
 #: for*. ``tests/test_audit.py::test_every_audit_reader_shares_one_unreadable_rule``
 #: fails if a reader stops using this tuple.
+#:
+#: ``emit`` is on this list too, and reads *twice* under it -- the watermark and the
+#: chain tail -- resolving the two in opposite directions: the watermark degrades to
+#: the surviving tail, an unreadable tail refuses the write. Both are argued where
+#: they are caught.
 _UNREADABLE = (sqlite3.Error, ValueError, TypeError)
 
 _SCHEMA = """
@@ -367,6 +372,37 @@ class AuditLogger:
         """Where the log lives. Useful for backup/attestation tooling."""
         return self._db_path
 
+    def _unreadable(self, exc: BaseException, *, operation: str) -> AuditUnavailableError:
+        """The one refusal every entry point raises on a database it cannot read.
+
+        A companion to :data:`_UNREADABLE` and built for the same reason: that tuple
+        makes the three sites agree on *what* unreadable means, and this makes them
+        agree on what to *answer*. Two of them already did -- ``query`` and ``length``
+        each hand-built ``PipelineError(reason="audit_log_unreadable", ...)``, which is
+        two copies of one rule, the shape this file has been bitten by twice.
+
+        The full path goes to the server log and only the file **name** goes into the
+        exception, which ``api/errors.py`` writes into an HTTP body verbatim. The name
+        is what an operator needs (``data/audit.db`` is a bind mount they configured);
+        the absolute path is a description of the server's filesystem that no client
+        is owed, and under a pytest ``tmp_path`` it is also routinely longer than the
+        64-character detail ceiling that would then raise *from inside the error
+        path*.
+        """
+        logger.error(
+            "audit log unreadable; the operation was refused",
+            extra={
+                "audit_db": str(self._db_path),
+                "audit_operation": operation,
+                "error": type(exc).__name__,
+            },
+        )
+        return AuditUnavailableError(
+            operation=operation,
+            audit_db=self._db_path.name,
+            error=type(exc).__name__,
+        )
+
     # -- lifecycle ---------------------------------------------------------
 
     @classmethod
@@ -477,7 +513,23 @@ class AuditLogger:
         Raises :class:`PipelineError` if any field exceeds its ceiling, or if a
         ``detail`` key is not a string or a ``detail`` value is not a scalar -- see
         :func:`_reject_content_sized_fields`, which re-checks at the write boundary
-        because the schema's own validators are bypassable by assignment.
+        because the schema's own validators are bypassable by assignment. Those two
+        checks run **before** the ``try`` below, deliberately: a caller that hands
+        this method content is not a database that cannot be read, and folding the
+        two together would file the first under the second's error code.
+
+        A database this method cannot read raises
+        :class:`~secure_context_pipeline.errors.AuditUnavailableError` -- the refusal
+        ``query`` and ``length`` already answered with, and the reason it now has a
+        code of its own. What escaped here instead was the raw
+        ``sqlite3.DatabaseError``: measured through the real ASGI app on a file with
+        one 4 KiB page overwritten, ``POST /pipeline/run`` answered ``500``
+        ``text/plain`` ``Internal Server Error``, with no ``code``, no CSP and no
+        ``nosniff`` -- Starlette renders an unhandled exception outside the
+        middleware that adds them. The run was refused either way and must stay
+        refused; only the shape of the refusal changed. See
+        :meth:`_unreadable`, and ``verify_chain``'s "unreadable is not clean" rule
+        for the other half of the same argument.
 
         **``seq`` is allocated above the watermark, not above the surviving tail**,
         and that one-word difference is what stops a truncation healing itself.
@@ -502,105 +554,121 @@ class AuditLogger:
         detail = dict(event.detail)
         detail_json = canonical_json(detail)
 
-        async with self._lock:
-            for attempt in range(MAX_EMIT_ATTEMPTS):
-                # The write lock is taken BEFORE the tail is read, so no other
-                # process can allocate the same seq in between. This is the line
-                # that makes the retry below a belt-and-braces path rather than the
-                # mechanism -- with a deferred transaction the read is unprotected
-                # and the collision is routine.
-                await conn.execute("BEGIN IMMEDIATE")
-                try:
+        try:
+            async with self._lock:
+                for attempt in range(MAX_EMIT_ATTEMPTS):
+                    # The write lock is taken BEFORE the tail is read, so no other
+                    # process can allocate the same seq in between. This is the line
+                    # that makes the retry below a belt-and-braces path rather than the
+                    # mechanism -- with a deferred transaction the read is unprotected
+                    # and the collision is routine.
+                    await conn.execute("BEGIN IMMEDIATE")
                     try:
-                        watermark = await self._watermark()
-                    except _UNREADABLE as exc:
-                        # Writer degrades, verifier does not. See the docstring.
-                        logger.warning(
-                            "audit watermark unreadable; falling back to the surviving tail",
-                            extra={"error": type(exc).__name__},
+                        try:
+                            watermark = await self._watermark()
+                        except _UNREADABLE as exc:
+                            # Writer degrades, verifier does not. See the docstring.
+                            logger.warning(
+                                "audit watermark unreadable; falling back to the surviving tail",
+                                extra={"error": type(exc).__name__},
+                            )
+                            watermark = None
+
+                        async with conn.execute(_LAST_ENTRY_SQL) as cursor:
+                            row = await cursor.fetchone()
+                        if row is None:
+                            last_seq = 0
+                            prev_hash = GENESIS_HASH
+                        else:
+                            last_seq = int(row["seq"])
+                            prev_hash = str(row["entry_hash"])
+                        seq = max(last_seq, 0 if watermark is None else watermark) + 1
+
+                        payload = chain_payload(
+                            seq=seq,
+                            ts=event.ts,
+                            session_id=event.session_id,
+                            run_id=event.run_id,
+                            event_type=event.event_type,
+                            entity_type=event.entity_type,
+                            token_id=event.token_id,
+                            detail=detail,
                         )
-                        watermark = None
+                        entry_hash = compute_entry_hash(prev_hash, payload)
 
-                    async with conn.execute(_LAST_ENTRY_SQL) as cursor:
-                        row = await cursor.fetchone()
-                    if row is None:
-                        last_seq = 0
-                        prev_hash = GENESIS_HASH
-                    else:
-                        last_seq = int(row["seq"])
-                        prev_hash = str(row["entry_hash"])
-                    seq = max(last_seq, 0 if watermark is None else watermark) + 1
-
-                    payload = chain_payload(
-                        seq=seq,
-                        ts=event.ts,
-                        session_id=event.session_id,
-                        run_id=event.run_id,
-                        event_type=event.event_type,
-                        entity_type=event.entity_type,
-                        token_id=event.token_id,
-                        detail=detail,
-                    )
-                    entry_hash = compute_entry_hash(prev_hash, payload)
-
-                    await conn.execute(
-                        _INSERT_SQL,
-                        {
-                            "seq": seq,
-                            "ts": event.ts,
-                            "session_id": event.session_id,
-                            "run_id": event.run_id,
-                            "event_type": event.event_type,
-                            "entity_type": event.entity_type,
-                            "token_id": event.token_id,
-                            "detail": detail_json,
-                            "prev_hash": prev_hash,
-                            "entry_hash": entry_hash,
-                        },
-                    )
-                    try:
-                        await conn.execute(_META_BUMP_SQL, {"seq": seq})
-                    except sqlite3.Error as exc:
-                        # Best-effort, and deliberately so. If the second mark cannot
-                        # be advanced -- the table was dropped out from under this
-                        # connection, say -- the event itself still has to be
-                        # recorded: an audit writer that refuses to log because its
-                        # own bookkeeping is damaged converts a tampered mark into a
-                        # blind spot with no events in it at all, which is the
-                        # outcome the attacker wanted. sqlite_sequence still carries
-                        # a mark, and verify_chain still reads it.
-                        logger.warning(
-                            "audit watermark not advanced; the event was still recorded",
-                            extra={"audit_seq": seq, "error": type(exc).__name__},
+                        await conn.execute(
+                            _INSERT_SQL,
+                            {
+                                "seq": seq,
+                                "ts": event.ts,
+                                "session_id": event.session_id,
+                                "run_id": event.run_id,
+                                "event_type": event.event_type,
+                                "entity_type": event.entity_type,
+                                "token_id": event.token_id,
+                                "detail": detail_json,
+                                "prev_hash": prev_hash,
+                                "entry_hash": entry_hash,
+                            },
                         )
-                    await conn.commit()
-                except sqlite3.IntegrityError:
-                    # Another *process* took this seq between our read and our
-                    # insert; the asyncio lock above does not reach it. Roll back so
-                    # the next attempt reads a fresh snapshot, then re-chain onto the
-                    # tail they left. Dropping the event instead -- which is what this
-                    # did before -- is the one audit failure nothing can detect
-                    # afterwards, because the row was never written.
-                    await conn.rollback()
-                    if attempt == MAX_EMIT_ATTEMPTS - 1:
-                        raise PipelineError(
-                            reason="audit_seq_contention",
-                            attempts=MAX_EMIT_ATTEMPTS,
-                        ) from None
-                    logger.warning(
-                        "audit seq collided with another writer; re-chaining",
-                        extra={"audit_seq": seq, "attempt": attempt + 1},
-                    )
-                    continue
-                except BaseException:
-                    # Never leave the write transaction open: this connection is
-                    # reused for every later emit, and an open transaction turns one
-                    # failed write into "cannot start a transaction within a
-                    # transaction" on every write after it.
-                    with contextlib.suppress(Exception):
+                        try:
+                            await conn.execute(_META_BUMP_SQL, {"seq": seq})
+                        except sqlite3.Error as exc:
+                            # Best-effort, and deliberately so. If the second mark cannot
+                            # be advanced -- the table was dropped out from under this
+                            # connection, say -- the event itself still has to be
+                            # recorded: an audit writer that refuses to log because its
+                            # own bookkeeping is damaged converts a tampered mark into a
+                            # blind spot with no events in it at all, which is the
+                            # outcome the attacker wanted. sqlite_sequence still carries
+                            # a mark, and verify_chain still reads it.
+                            logger.warning(
+                                "audit watermark not advanced; the event was still recorded",
+                                extra={"audit_seq": seq, "error": type(exc).__name__},
+                            )
+                        await conn.commit()
+                    except sqlite3.IntegrityError:
+                        # Another *process* took this seq between our read and our
+                        # insert; the asyncio lock above does not reach it. Roll back so
+                        # the next attempt reads a fresh snapshot, then re-chain onto the
+                        # tail they left. Dropping the event instead -- which is what this
+                        # did before -- is the one audit failure nothing can detect
+                        # afterwards, because the row was never written.
                         await conn.rollback()
-                    raise
-                break
+                        if attempt == MAX_EMIT_ATTEMPTS - 1:
+                            raise PipelineError(
+                                reason="audit_seq_contention",
+                                attempts=MAX_EMIT_ATTEMPTS,
+                            ) from None
+                        logger.warning(
+                            "audit seq collided with another writer; re-chaining",
+                            extra={"audit_seq": seq, "attempt": attempt + 1},
+                        )
+                        continue
+                    except BaseException:
+                        # Never leave the write transaction open: this connection is
+                        # reused for every later emit, and an open transaction turns one
+                        # failed write into "cannot start a transaction within a
+                        # transaction" on every write after it.
+                        with contextlib.suppress(Exception):
+                            await conn.rollback()
+                        raise
+                    break
+        except _UNREADABLE as exc:
+            # The shared rule -- see _UNREADABLE -- resolved in the writer's
+            # direction: refuse, typed. The two readers already answered a
+            # database they cannot read with this error; `emit` let the raw
+            # `sqlite3.DatabaseError` reach the ASGI layer, which is a bare 500.
+            #
+            # It stays a raise. `_watermark` above degrades because a lost
+            # high-water mark still leaves a log that can be appended to, and a
+            # writer that fails closed on that silences the pipeline. A tail this
+            # method cannot read is the other case: there is no chain to extend,
+            # so the alternative to raising is releasing a run with no record of
+            # it -- which
+            # `test_no_release_survives_an_audit_write_that_failed_before_it`
+            # exists to forbid.
+            raise self._unreadable(exc, operation="emit") from exc
 
         # Token IDs and counts only -- never a value, never the detail payload's
         # provenance beyond its key count.
@@ -636,8 +704,10 @@ class AuditLogger:
         Results are ordered by ``seq`` ascending -- i.e. chain order, which is
         also insertion order.
 
-        A database this method cannot read raises :class:`PipelineError` with
-        ``reason="audit_log_unreadable"`` rather than letting a raw
+        A database this method cannot read raises
+        :class:`~secure_context_pipeline.errors.AuditUnavailableError` (which is a
+        :class:`PipelineError` carrying ``reason="audit_log_unreadable"``, as it did
+        before it had a code of its own) rather than letting a raw
         ``sqlite3.DatabaseError`` -- or, on a partially readable file, a bare
         ``TypeError`` from ``float(row["ts"])`` where a page came back as ``NULL``
         -- escape from the middle of a row loop. Both were observed on a
@@ -673,9 +743,7 @@ class AuditLogger:
                 async for row in cursor:
                     events.append(_row_to_event(row))
         except _UNREADABLE as exc:
-            raise PipelineError(
-                reason="audit_log_unreadable", error=type(exc).__name__
-            ) from exc
+            raise self._unreadable(exc, operation="query") from exc
         return events
 
     async def verify_chain(self, session_id: str | None = None) -> bool:
@@ -951,7 +1019,7 @@ class AuditLogger:
         ``since``/``until`` are inclusive ``ts`` bounds, matching :meth:`query`.
 
         Unreadable resolves the same way :meth:`query` resolves it -- a typed
-        :class:`PipelineError` with ``reason="audit_log_unreadable"`` rather than a
+        :class:`~secure_context_pipeline.errors.AuditUnavailableError` rather than a
         raw ``sqlite3.DatabaseError`` from inside the row fetch. Worth stating
         because ``GET /audit/verify`` calls :meth:`verify_chain` and *then* this,
         so hardening only the first one leaves the endpoint failing on the same
@@ -971,9 +1039,7 @@ class AuditLogger:
                 row = await cursor.fetchone()
             return 0 if row is None else int(row["n"])
         except _UNREADABLE as exc:
-            raise PipelineError(
-                reason="audit_log_unreadable", error=type(exc).__name__
-            ) from exc
+            raise self._unreadable(exc, operation="length") from exc
 
 
 async def _enable_wal(conn: aiosqlite.Connection) -> None:

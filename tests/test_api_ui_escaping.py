@@ -809,3 +809,282 @@ def test_the_contrast_arithmetic_rejects_the_hairline_it_replaced() -> None:
     # Anchors on the ends of the scale: identical colours are 1:1, black on white 21:1.
     assert _contrast("#151b23", "#151b23") == pytest.approx(1.0)
     assert _contrast("#000000", "#ffffff") == pytest.approx(21.0)
+
+
+# ---------------------------------------------------------------------------
+# index.html -- four claims a reviewer hit in a real browser
+#
+# Same rationale as the stylesheet section above: these are static properties of
+# shipped assets, so they belong beside the other asset checks and must run where
+# no JS runtime is installed. Each one is a promise the markup makes to the person
+# driving the demo, and each was measured wrong in Chrome 151 before the fix.
+# ---------------------------------------------------------------------------
+INDEX_HTML = REPO_ROOT / "secure_context_pipeline" / "ui" / "index.html"
+UI_DIR = INDEX_HTML.parent
+
+#: ``<link rel="icon" ... href="...">``, however the two attributes are ordered.
+_ICON = re.compile(r'<link\s+rel="icon"[^>]*\shref="([^"]+)"')
+#: The whole ``<details class="guard">`` element, contents included.
+_GUARD = re.compile(r"<details class=\"guard\">(.*?)</details>", re.S)
+#: The red LIVE REVIEW strip's own text, comments already stripped by the caller.
+_STRIP = re.compile(r"<span class=\"tag\">(.*?)</span>", re.S)
+
+
+def _markup() -> str:
+    """``index.html`` with its HTML comments removed.
+
+    Every claim below is about what the page *renders*. This file carries more
+    comment than markup -- the favicon note alone is 40 lines -- and those notes
+    quote the very strings these tests forbid, in order to say why they are gone.
+    Searching the raw file would therefore find the retracted copy in the sentence
+    retracting it and pass, which is the check believing its own footnote.
+    """
+    return re.sub(r"<!--.*?-->", "", INDEX_HTML.read_text(encoding="utf-8"), flags=re.S)
+
+
+def _flat(fragment: str) -> str:
+    """A markup fragment as one line of visible text, tags dropped."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment)).strip()
+
+
+def test_the_page_icon_is_same_origin_so_the_page_cannot_block_its_own_favicon() -> None:
+    """The icon added to silence a 404 was itself blocked, and traded one red line for two.
+
+    The first fix declared the icon as an inline ``data:image/png;base64,...`` URI, on the
+    written premise that "a favicon is fetched by the browser process and is not subject
+    to" ``img-src 'self'``. Measured against the running page, that is not what the
+    browser does: Chrome 151.0.7922.77 driven by playwright-core, cold load of
+    127.0.0.1:8075 with nothing clicked, logged TWO console errors, both ``Loading the
+    image 'data:image/png;base64,iVBOR...' violates the following Content Security Policy
+    directive: "img-src 'self'". The action has been blocked.`` A ``<link rel="icon">``
+    fetch is a renderer image fetch and ``img-src`` governs it. The same measurement
+    after this change: 0 console errors, and ``/favicon.png`` in the network log with no
+    ``/favicon.ico`` request at all.
+
+    So the property is not "an icon is declared" -- the blocked one satisfied that -- it
+    is that the icon is reachable UNDER the page's own policy. Same-origin is the whole
+    of it: ``_mount_ui`` mounts this directory at ``/``, so a file beside this one is
+    served from the origin ``'self'`` already permits, and not one token of the CSP had
+    to be spent. Widening ``img-src`` instead would have had to happen twice --
+    ``api/constants.py`` sends the same policy as a response header and the stricter of
+    the two wins -- and ``test_api.py`` refuses any source that is not ``'none'`` or
+    ``'self'``.
+    """
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    icon = _ICON.search(_markup())
+    assert icon, "index.html declares no icon, so every load asks for /favicon.ico and 404s"
+    href = icon.group(1)
+
+    # A scheme is what takes the fetch outside `'self'`. `data:` is the specific one
+    # measured as blocked; the rule is written against the general case so that `blob:`
+    # or a CDN cannot arrive later and pass a check aimed only at the last mistake.
+    assert not re.match(r"^[a-zA-Z][\w+.-]*:", href), (
+        f"the icon URL {href[:60]!r} carries a scheme, so it is not fetched from 'self' "
+        f"and the page's own img-src blocks it -- which is the console error back"
+    )
+    assert not href.startswith("//"), f"protocol-relative icon URL: {href}"
+
+    # Same-origin only helps if the origin actually serves it. This is the untracked-asset
+    # failure the inline version was written to avoid, checked instead of feared.
+    served = UI_DIR / href
+    assert served.is_file(), (
+        f"index.html points at {href}, which is not in {UI_DIR.name}/ -- the 404 is back, "
+        f"and this is the missing-from-a-clone failure the .gitignore note records"
+    )
+    assert served.stat().st_size > 0, f"{href} is an empty file"
+
+    # The point of doing it this way: the policy is untouched, so the two copies of it
+    # still agree and nothing had to be loosened to show a 16x16 icon.
+    csp = re.search(r'http-equiv="Content-Security-Policy"\s+content="([^"]+)"', html)
+    assert csp, "the CSP meta tag is gone"
+    directives = {
+        part.split()[0]: part.split()[1:]
+        for part in (p.strip() for p in csp.group(1).split(";"))
+        if part
+    }
+    assert directives.get("img-src") == ["'self'"], directives.get("img-src")
+    assert "data:" not in csp.group(1), "img-src was widened for the icon after all"
+
+
+def test_the_icon_rule_rejects_every_form_that_was_measured_blocked() -> None:
+    """The check above must fail on the markup it was written against, or it proves nothing.
+
+    Three shapes, and the first is the one that actually shipped and actually logged the
+    two errors. A checker that passes the inline base64 URI is a checker that would have
+    let the defect through, whatever it says about the current file.
+    """
+    blocked = (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9h",
+        "blob:127.0.0.1/8a7c",
+        "//example.invalid/favicon.png",
+    )
+    for href in blocked:
+        scheme = bool(re.match(r"^[a-zA-Z][\w+.-]*:", href)) or href.startswith("//")
+        assert scheme, f"{href} would be accepted as same-origin by the rule above"
+    # And the shipped form must NOT trip it, or the rule is simply "reject everything".
+    shipped = _ICON.search(_markup())
+    assert shipped and not re.match(r"^[a-zA-Z][\w+.-]*:", shipped.group(1))
+
+
+def test_creating_a_session_is_gated_because_it_erases_the_session_it_replaces() -> None:
+    """The confirmation guard was on the wrong button.
+
+    ``Destroy session...`` is double-gated -- arm, then a Confirm pushed to the far end of
+    the bar -- and ``Create session`` was a one-click, hintless, friendly-blue
+    ``class="go"`` primary at the top left that erases exactly the same thing:
+    ``createSession`` deletes the outgoing session before it reports success. Measured
+    against the live API with a session live, one click issued ``200 POST /sessions``
+    followed by ``204 DELETE /sessions/<the live one>``, with nothing asked first.
+
+    The gate is markup rather than app.js state, and that is what this file can assert:
+    ``<details>`` is a native two step that leaves the id, the listener and ``setBusy``'s
+    ``$('btn-session').disabled`` exactly as they were. Measured in Chrome 151 at 1550px
+    after the change: from the default state a real mouse click at the commit button's own
+    centre issues **0** requests to ``/sessions`` (``elementFromPoint`` there returns
+    BODY, ``checkVisibility()`` is false, and ``.focus()`` will not move focus to it), a
+    click on the summary opens the disclosure and issues 0, a second click on those same
+    pixels issues 0 -- the impatient-double-click hole the destroy gate was re-ordered for
+    -- and the commit button sits 207px below and 99px across from the summary's centre.
+    """
+    markup = _markup()
+    guard = _GUARD.search(markup)
+    assert guard, "the <details class=\"guard\"> around Create session is gone"
+    inside = guard.group(1)
+
+    assert 'id="btn-session"' in inside, (
+        "#btn-session is outside the guard, so one click erases the live vault again"
+    )
+    assert 'id="btn-session"' not in markup.replace(inside, ""), "a second, ungated create button"
+
+    # The summary is the arm, so it has to come first; a button ahead of it in the
+    # disclosure would be reachable by the same click that opens it.
+    summary = re.search(r"<summary>(.*?)</summary>", inside, re.S)
+    assert summary, "the guard has no <summary>, which is the step that arms it"
+    assert inside.index("<summary>") < inside.index('id="btn-session"')
+    # The SESSION_EXPIRED banner tells a reviewer to press these words by name.
+    assert "Create session" in _flat(summary.group(1)), _flat(summary.group(1))
+
+    # The consequence has to be ON the control, between the two movements -- the whole
+    # complaint was that the page only explained the erasure afterwards, in the banner.
+    body = re.search(r'<div class="guard-body">(.*?)</div>', inside, re.S)
+    assert body, "the guard has no body, so the consequence is still unstated before the click"
+    sentence = _flat(body.group(1))
+    # Printed BEFORE the commit button, not under it: the consequence has to be read on
+    # the way to the click, which is the whole difference from the banner that said it
+    # afterwards.
+    assert inside.index("</span>") < inside.index('id="btn-session"'), (
+        "the consequence sentence sits after the commit button, so the click comes first"
+    )
+    for word in ("REPLACES", "erases", "existed=1", "vault row"):
+        assert word in sentence, (word, sentence)
+
+    # Run is the page's repeatable, non-destructive primary and must be the only blue
+    # button on it; `.go` on the erasing control is what made the accident inviting.
+    session_button = re.search(r"<button[^>]*id=\"btn-session\"[^>]*>", inside)
+    assert session_button, inside
+    assert "go" not in re.findall(r'class="([^"]*)"', session_button.group(0))[0].split(), (
+        "Create session is styled as the friendly primary again"
+    )
+    assert re.search(r'<button id="btn-run" class="go big">', markup), (
+        "Run is no longer the primary -- the blue was moved, not removed"
+    )
+
+
+def test_the_gate_summary_keeps_the_border_the_contrast_rule_measures() -> None:
+    """The gate's arm is a ``<summary>``, and a summary is not a ``button``.
+
+    ``test_the_control_border_stays_visible_against_fill_and_surround`` reads the
+    ``input, select, button`` rule, so a control that is none of those three inherits none
+    of that guarantee -- and this one replaced a real ``<button>``. WCAG 2.1 1.4.11 wants
+    3:1 for the edge that says "this is a control": ``--line`` (#2b3542) manages 1.55:1
+    against the #0b0f14 fill and 1.39:1 against the #151b23 bar, ``--control-line``
+    (#5e6c7c) manages 3.58 and 3.23. This pins the summary to the second one, and pins
+    its two surfaces to the pairings that test already computes, so the gate cannot drift
+    onto a surround nothing has measured.
+    """
+    css = STYLE_CSS.read_text(encoding="utf-8")
+    root = dict(re.findall(r"(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{6})\s*;", _block(css, ":root")))
+    summary = _block(css, "details.guard > summary")
+    controls = _block(css, "input, select, button")
+
+    assert _colour(summary, "border", root) == _colour(controls, "border", root), (
+        "the gate's arm no longer carries the same edge as the controls beside it"
+    )
+    # Its own fill, and the bar it sits on, are both already-measured surfaces.
+    assert _colour(summary, "background", root) == _colour(controls, "background", root)
+    assert _contrast(_colour(summary, "border", root), _colour(summary, "background", root)) >= 3.0
+    assert _contrast(
+        _colour(summary, "border", root), _colour(_block(css, ".controls"), "background", root)
+    ) >= 3.0
+    # The open panel reuses `--panel`, which is `.controls`' own fill: no new surface.
+    assert _colour(_block(css, ".guard-body"), "background", root) == _colour(
+        _block(css, ".controls"), "background", root
+    ), "the open guard introduced a background nothing has computed a contrast against"
+
+
+def test_the_live_review_strip_does_not_promise_a_row_the_tail_does_not_show() -> None:
+    """"...and the audit tail shows VAULT_DESTROY" is a promise the screen does not keep.
+
+    Driven end to end in Chrome 151 at 1550x950 against 127.0.0.1:8075 -- arm
+    legal_brief_large.txt, Run, Destroy session, Confirm -- the row is fetched and
+    rendered: 349 rows, and ``1745 VAULT_DESTROY {"existed":1,"source":"api_logout"}`` is
+    the last of them. It is also 8068px down a box ``style.css`` caps at 260px, opened at
+    ``scrollTop`` 0 with NINE rows visible, so a reviewer who takes the sentence at its
+    word reads SESSION_CREATE, DETECT and seven OBFUSCATE and sees no destroy at all. On a
+    session past ``AUDIT_LIMIT`` the row is not in the page in the first place.
+
+    The strip therefore has to say what will actually be on screen and how to reach the
+    row. Asserted as a rule and not as a snapshot of today's wording: the forbidden thing
+    is a bare claim that the tail SHOWS the row, and the required thing is that the copy
+    place it at the end and send the reader there.
+    """
+    strip = _STRIP.search(_markup())
+    assert strip, "the LIVE REVIEW strip is gone"
+    text = _flat(strip.group(1))
+
+    assert "VAULT_DESTROY" in text, "the strip no longer names the row at all"
+    for promise in ("audit tail shows VAULT_DESTROY", "audit tail below shows VAULT_DESTROY"):
+        assert promise not in text, (
+            f"the strip promises {promise!r}; measured, that row is 8068px below the fold "
+            f"of a 260px box that opens showing nine rows"
+        )
+    assert "LAST row" in text, "nothing tells the reader where in the tail the row is"
+    assert "scroll" in text.lower(), "nothing tells the reader the row needs scrolling to"
+    assert "349" in text, "the copy does not say how far -- the number is what sets the expectation"
+
+
+def test_panels_2_and_3_name_the_provider_where_the_payload_is_read() -> None:
+    """"Raw LLM response" reads as a live model call, and the only disclosure was far away.
+
+    The header badge reads ``ok - mock/claude-opus-5 - en_core_web_lg`` with no title
+    attribute, three quarters of a 1550px page from panel 3. The other tell is ``llm_ms``,
+    measured at 0.1-1.0 ms across every run, and the stats legend tells the reader in so
+    many words that a timing chip is "not a safety signal". A reviewer who believes a real
+    model saw panel 2's contents has drawn the wrong conclusion about what was proved.
+
+    The label is unconditional because it is true in both configurations:
+    ``Settings.llm_provider`` defaults to ``"mock"`` and ``anthropic`` is reachable only by
+    setting ``SCP_LLM_PROVIDER``, so naming the switch is what keeps a static string
+    honest on a page that cannot know. Naming it is the assertion -- a bare "mock provider"
+    would be a new false claim the moment somebody sets a key, which is the failure mode
+    this whole file exists for.
+    """
+    markup = _markup()
+    for panel, heading in (("p2-provider", "h-p2"), ("p3-provider", "h-p3")):
+        span = re.search(r'<span id="' + panel + r'"(.*?)</span>', markup, re.S)
+        assert span, f"#{panel} is gone, so that panel names no provider"
+        text = _flat(span.group(1))
+        assert "mock" in text, (panel, text)
+        assert "SCP_LLM_PROVIDER" in text, (
+            f"#{panel} states the provider unconditionally; the page cannot know it "
+            f"statically, so it has to name the switch that decides it: {text!r}"
+        )
+        # It sits in the heading, beside the words it qualifies, and NOT inside the span
+        # `aria-labelledby` points at -- a region whose name grows a sentence is worse
+        # than one with no qualifier at all.
+        h2 = re.search(r"<h2>(.*?)</h2>", markup[markup.index('id="' + heading + '"') - 40 :], re.S)
+        assert h2 and panel in h2.group(1), f"#{panel} left the heading of #{heading}"
+        named = re.search(r'<span id="' + heading + r'">(.*?)</span>', markup, re.S)
+        assert named and panel not in named.group(1), (
+            f"#{panel} is inside #{heading}, so the region's accessible name now carries it"
+        )

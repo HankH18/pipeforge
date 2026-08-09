@@ -18,7 +18,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import pairwise
@@ -47,6 +47,7 @@ from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.obfuscation.strategies.base import (
     STRATEGIES,
     ObfuscationStrategy,
+    RestoreMode,
     StrategyContext,
     available_strategies,
     build_strategy,
@@ -222,6 +223,82 @@ def with_spec(registry: EntityRegistry, entity_type: str, **updates: object) -> 
     entities = dict(registry.entities)
     entities[entity_type] = spec.model_copy(update=updates)
     return registry.model_copy(update={"entities": entities})
+
+
+#: Every value :func:`~secure_context_pipeline.crypto.keys.derive_date_shift_days`
+#: can return: ``[-300, -30] u [30, 299]`` (build doc section 8, and that function's
+#: docstring). Enumerated rather than sampled, because the tests below need a
+#: statement about every session key rather than about the one a run drew. Each
+#: caller also asserts that *its* session's shift is a member, so a widened
+#: derivation goes red here instead of quietly making the enumeration partial.
+SESSION_SHIFTS = tuple(days for days in range(-300, 300) if abs(days) >= 30)
+
+
+def assert_no_session_shift_can_collide(sources: Sequence[str]) -> None:
+    """No shift the derivation can produce makes Tier 2 degrade any of ``sources``.
+
+    The date shift is a different constant on every run, and the reason is worth
+    naming precisely because it decides what a fix can look like: it is not
+    ``conftest``'s master key (several comments in this file say so and they are
+    wrong). ``SessionRegistry.create`` mints each session's key with
+    ``secrets.token_bytes(32)``, unrelated to any configured secret, so pinning
+    anything in ``conftest`` would not make one of these tests deterministic --
+    only stubbing the key mint would, and that would blind every test in the file
+    to every draw at once. The determinism has to come from the *inputs* instead.
+
+    Tier 2 degrades a date to a plain token whenever the shifted rendering collides
+    with a vaulted original (:meth:`PseudonymizationStrategy._shift_date`). A test
+    that asserts a *shifted* outcome for a set of dates is therefore only
+    deterministic if no reachable shift can produce that collision, and "no
+    reachable shift" is a property of the dates the test chose.
+
+    Two of them had not chosen safely, and both were live flakes rather than
+    theory: ``03/14/2024`` beside ``04/18/2024`` is 35 days, so a shift of +/-35
+    lands one on the other (3 reds in 600 whole-file runs), and the composite
+    line's ``03/11 / 09/17 / 10/01`` pair up at 190 and 204 days (4 reds in 600).
+    The floor is what makes a fix possible: ``|shift| >= 30`` always, so dates
+    inside a 29-day window are permanently out of each other's reach.
+
+    Rather than restate that as an arithmetic rule -- which would be a second,
+    weaker copy of the guard -- every shift in :data:`SESSION_SHIFTS` is actually
+    rendered and put to the guard's own three questions: does the rendering equal
+    its own source, does it swallow or get swallowed by an original, and do two
+    sources render one string. 540 shifts times a handful of dates is microseconds,
+    and the answer is exhaustive rather than measured.
+
+    This borrows :func:`occurs_as_a_unit` from the product deliberately. The
+    question is not "is the guard's boundary rule right?" -- that is asked, against
+    an independent oracle, by
+    ``test_the_sweep_and_the_gate_agree_on_what_counts_as_an_occurrence`` -- it is
+    "what will the guard *do* with these dates?", and only the guard's own rule can
+    answer that.
+    """
+    originals = {normalize(value) for value in sources}
+    for shift in SESSION_SHIFTS:
+        rendered: list[str] = []
+        for source in sources:
+            parsed = parse_source_date(source)
+            assert parsed is not None, f"{source!r} does not parse, so it cannot be shifted"
+            shifted = parsed.render(parsed.value + timedelta(days=shift))
+            folded = normalize(shifted)
+            assert folded != normalize(source), (
+                f"a shift of {shift} re-renders {source!r} as itself; Tier 2 would "
+                f"degrade it to a plain token on any key that draws that shift"
+            )
+            for value in originals:
+                assert not occurs_as_a_unit(value, folded), (
+                    f"a shift of {shift} renders {source!r} as {shifted!r}, which "
+                    f"carries the original {value!r}"
+                )
+                assert not occurs_as_a_unit(folded, value), (
+                    f"a shift of {shift} renders {source!r} as {shifted!r}, which the "
+                    f"original {value!r} carries"
+                )
+            rendered.append(shifted)
+        assert len(set(rendered)) == len(rendered), (
+            f"a shift of {shift} renders two of {list(sources)} as one string "
+            f"({rendered}); the second would degrade as a duplicate surrogate"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +493,26 @@ async def test_pseudonym_email_is_never_a_deliverable_address(env: Env) -> None:
 
 
 async def test_date_shift_preserves_the_interval_between_two_dates(env: Env) -> None:
-    text = "Seen on 03/14/2024 and again on 04/18/2024 for follow-up."
-    detections = [span(text, "03/14/2024", "DATE"), span(text, "04/18/2024", "DATE")]
+    """The two dates sit 14 days apart, and that is a determinism requirement.
+
+    They were 35 days apart (``03/14/2024`` and ``04/18/2024``), which is inside the
+    reachable shift range -- so on a session key drawing +/-35 the first date shifts
+    exactly onto the second, Tier 2 refuses to emit a verbatim original, and the
+    surrogate is a plain token that fails the format assertion below. Measured at 3
+    reds in 600 whole-file runs, on a suite that is otherwise green.
+
+    Nothing about the interval property needs a gap that large, and shrinking it
+    inside the +/-30 floor puts the two dates permanently out of each other's reach
+    on every key. :func:`assert_no_session_shift_can_collide` proves that by
+    enumeration rather than by arithmetic, and the collision this test used to
+    stumble into is owned deliberately by
+    ``test_a_shifted_date_landing_on_another_real_date_degrades_to_a_token``.
+    """
+    sources = ["03/14/2024", "03/28/2024"]
+    assert_no_session_shift_can_collide(sources)
+
+    text = "Seen on 03/14/2024 and again on 03/28/2024 for follow-up."
+    detections = [span(text, value, "DATE") for value in sources]
     result = await env.engine.obfuscate(
         env.session_id, text, detections, strategy="pseudonymization", doc_category="medical"
     )
@@ -425,8 +520,8 @@ async def test_date_shift_preserves_the_interval_between_two_dates(env: Env) -> 
     shifted = [record.surrogate for record in result.tokens]
     assert all(re.fullmatch(r"\d{2}/\d{2}/\d{4}", value) for value in shifted), shifted
     first, second = (datetime.strptime(value, "%m/%d/%Y").date() for value in shifted)
-    original_first = datetime.strptime("03/14/2024", "%m/%d/%Y").date()
-    original_second = datetime.strptime("04/18/2024", "%m/%d/%Y").date()
+    original_first = datetime.strptime(sources[0], "%m/%d/%Y").date()
+    original_second = datetime.strptime(sources[1], "%m/%d/%Y").date()
 
     assert (second - first) == (original_second - original_first), "interval survives"
     assert first != original_first, "the absolute date must not survive"
@@ -438,21 +533,36 @@ async def test_date_shift_preserves_the_interval_between_two_dates(env: Env) -> 
     strategy = build_strategy("pseudonymization", env.context())
     assert isinstance(strategy, PseudonymizationStrategy)
     assert (first - original_first).days == strategy.shift_days
+    assert strategy.shift_days in SESSION_SHIFTS, (
+        "this session drew a shift the enumeration above does not cover, so the "
+        "collision premise was proved over the wrong space"
+    )
 
     assert result.obfuscated_text == (
         f"Seen on {shifted[0]} and again on {shifted[1]} for follow-up."
     )
-    for original in ("03/14/2024", "04/18/2024"):
+    for original in sources:
         assert original not in result.obfuscated_text
 
 
 async def test_date_shift_re_renders_in_the_source_format(env: Env) -> None:
+    """Three formats, and the gaps between them are 7, 31 and 38 days on purpose.
+
+    Two of those gaps ARE inside the reachable shift range, and this test survives
+    them only because the collision the guard tests is between *rendered strings*
+    rather than between dates: a +31 shift takes ``May 9, 2024`` onto the same day
+    as ``9 June 2024``, but it renders it ``June 9, 2024``, which neither carries
+    nor is carried by ``9 June 2024``. That is a coincidence of the format mix
+    rather than a design, and the sibling interval test was flaky for exactly the
+    missing half of it -- so the premise is asserted rather than left implicit, and
+    a future edit that puts two of these dates in one format goes red here instead
+    of once every few hundred runs.
+    """
+    sources = ["2024-05-02", "May 9, 2024", "9 June 2024"]
+    assert_no_session_shift_can_collide(sources)
+
     text = "Admitted 2024-05-02, discharged May 9, 2024, follow-up 9 June 2024."
-    detections = [
-        span(text, "2024-05-02", "DATE"),
-        span(text, "May 9, 2024", "DATE"),
-        span(text, "9 June 2024", "DATE"),
-    ]
+    detections = [span(text, value, "DATE") for value in sources]
     result = await env.engine.obfuscate(
         env.session_id, text, detections, strategy="pseudonymization", doc_category="medical"
     )
@@ -468,12 +578,13 @@ async def test_date_shift_re_renders_in_the_source_format(env: Env) -> None:
     # and formatted with ``strftime`` rather than with the module's own tables.
     strategy = build_strategy("pseudonymization", env.context())
     assert isinstance(strategy, PseudonymizationStrategy)
+    assert strategy.shift_days in SESSION_SHIFTS, "the premise was proved over the wrong space"
     shift = timedelta(days=strategy.shift_days)
     by_original = {
         await env.vault.get_by_surrogate(env.session_id, record.surrogate): record.surrogate
         for record in result.tokens
     }
-    assert set(by_original) == {"2024-05-02", "May 9, 2024", "9 June 2024"}
+    assert set(by_original) == set(sources)
 
     iso = datetime(2024, 5, 2).date() + shift
     assert by_original["2024-05-02"] == iso.strftime("%Y-%m-%d")
@@ -512,20 +623,38 @@ async def test_a_composite_date_span_keeps_its_intervals_instead_of_degrading(
     put through the detector's real splitter. That keeps the test off spaCy while
     still exercising the production rule; whether spaCy really produces this span is
     a *detection* claim and is asserted where detection is tested.
+
+    **The three visit days are 7 and 14 days apart rather than the fixture's own
+    190 and 204, and that is the determinism fix rather than a cosmetic edit.** This
+    test asserts that no date degrades; Tier 2 degrades one whenever the session
+    shift renders it as another vaulted original, and the fixture's spacing puts
+    exactly four of the 540 reachable shifts (+/-190, +/-204) in that state. It cost
+    4 reds in 600 whole-file runs -- the failure this sweep started from. The shift
+    floor is what makes it fixable: ``|shift| >= 30``, so days inside a 29-day
+    window can never land on one another, proved by enumeration in
+    :func:`assert_no_session_shift_can_collide` rather than argued.
+
+    Nothing is lost by moving them. The claim here is about the *shape* of the line
+    -- one span covering two dates beside a third -- and the shape is what
+    ``fixtures/generator.py`` produces; the exact days spaCy returns are pinned in
+    ``tests/test_detection.py``, and the -204 collision the fixture's own days
+    reach is owned deliberately, with the shift computed rather than hoped for, by
+    ``test_a_shifted_date_landing_inside_a_longer_original_degrades``.
     """
-    text = "    Prior ambulatory visits: 03/11/2024, 09/17/2024, and 10/01/2024.\n"
-    composite = "03/11/2024, 09/17/2024"
-    sources = ["03/11/2024", "09/17/2024", "10/01/2024"]
+    text = "    Prior ambulatory visits: 03/11/2024, 03/18/2024, and 04/01/2024.\n"
+    composite = "03/11/2024, 03/18/2024"
+    sources = ["03/11/2024", "03/18/2024", "04/01/2024"]
 
     assert parse_source_date(composite) is None, (
         "premise: the composite is unparseable, so an unsplit span degrades to a "
         "plain token and this test is measuring the split rather than luck"
     )
+    assert_no_session_shift_can_collide(sources)
 
     detector = detector_module.Detector(registry, settings)
     dates = [
         *detector._split_composite_dates(text, span(text, composite, "DATE")),
-        span(text, "10/01/2024", "DATE"),
+        span(text, sources[2], "DATE"),
     ]
     for detection in dates:
         assert text[detection.start : detection.end] == detection.text
@@ -553,6 +682,7 @@ async def test_a_composite_date_span_keeps_its_intervals_instead_of_degrading(
 
     strategy = build_strategy("pseudonymization", env.context())
     assert isinstance(strategy, PseudonymizationStrategy)
+    assert strategy.shift_days in SESSION_SHIFTS, "the premise was proved over the wrong space"
     shift = timedelta(days=strategy.shift_days)
     for original in sources:
         expected = datetime.strptime(original, "%m/%d/%Y").date() + shift
@@ -629,7 +759,39 @@ async def test_name_component_linking_gives_a_consistent_fake_surname(env: Env) 
     assert len(full.split()) == 2 and " " not in standalone
 
     assert full.split()[-1] == standalone, (full, standalone)
-    assert full.split()[0] != standalone
+
+    # This line was `assert full.split()[0] != standalone`, and that is not true of
+    # every draw: Faker's en_US given-name and surname pools share 106 words, so two
+    # INDEPENDENT draws land on one word for about 1 session key in 2 500 (measured
+    # 12 in 40 000, e.g. a "Morgan Morgan" standing in for "John Smith"). That is a
+    # coincidence and a perfectly correct obfuscation -- not the defect the line was
+    # aimed at, which is a generator that keys both components on the same thing and
+    # so copies one draw into the other slot.
+    #
+    # The claim that IS true of every draw is that each component is keyed on
+    # ITSELF: the seed label is `NAME:{role}:{component}` (this is what makes the
+    # surname link across mentions in the first place), so changing the surname must
+    # not move the given name and changing the given name must not move the surname.
+    # A generator that copied one draw into both slots moves both, on every key.
+    #
+    # The probe is the strategy's own generator rather than a second engine call,
+    # because a second call would grow the session's originals set and so change the
+    # forbidden words the search runs against. The first assertion is what keeps the
+    # probe honest: it must reproduce the engine's own draw, or the two below are
+    # measuring a different search.
+    strategy = build_strategy("pseudonymization", env.context())
+    assert isinstance(strategy, PseudonymizationStrategy)
+    forbidden = frozenset({"john", "smith"})  # this document's original words
+    assert strategy._generate("NAME", "John Smith", 0, forbidden).text == full, (
+        "the probe is not reproducing the engine's own draw, so the two component "
+        "assertions below are about a different search"
+    )
+    assert strategy._generate("NAME", "John Jones", 0, forbidden).text.split()[0] == (
+        full.split()[0]
+    ), "the given name moved when only the surname changed: the components share a key"
+    assert strategy._generate("NAME", "Jane Smith", 0, forbidden).text.split()[-1] == (
+        standalone
+    ), "the surname moved when only the given name changed: the components share a key"
     # Word-bounded, not substring -- and the difference is a real 2.7% flake, not
     # pedantry. These read `assert "John" not in result.obfuscated_text`, which asks
     # whether the four characters occur ANYWHERE. Under pseudonymization the surrogate
@@ -725,6 +887,20 @@ async def test_name_component_linking_survives_a_collision_regeneration(env: Env
 
     Swept across session keys because the failure was key-dependent: one key
     proves nothing about a 1-in-80 event.
+
+    **No iteration is allowed to be skipped, and that replaced a tolerance.** The
+    loop used to `continue` past a run whose surrogates were not a name plus a
+    surname, count it, and accept up to 4 of 80 -- the hole being that a change
+    which degraded EVERY name to a plain token would skip all 80 and report zero
+    breakages. A 5% ceiling is a wide answer to that: it still lets 4 of the 80 keys
+    contribute nothing, and it was carrying a rate the code cannot actually produce.
+    Degradation needs `_fake_identifier` to spend all five attempts, and on this
+    input every rejection route is closed -- the per-component search has already
+    stepped past the forbidden words, there are no digits for the needle guard, and
+    the nesting guard explicitly permits `Smith`'s fake inside `John Smith`'s
+    because the originals nest too. Measured 0 in 8 000 fresh session keys (100x the
+    sweep), so the tolerance is not protecting against anything: every run must
+    produce two real fakes, and a run that does not is the failure itself.
     """
     text = "Smith arrived early. Later, John Smith signed the consent form."
     detections = [
@@ -732,8 +908,7 @@ async def test_name_component_linking_survives_a_collision_regeneration(env: Env
         span(text, "John Smith", "NAME"),
     ]
     broken: list[tuple[str, str]] = []
-    degraded = 0
-    for _ in range(80):
+    for index in range(80):
         # A fresh session is a fresh random session key, which is the variable the
         # failure depended on.
         session_id, _expires = await env.sessions.create("test-user")
@@ -742,19 +917,17 @@ async def test_name_component_linking_survives_a_collision_regeneration(env: Env
         )
         values = [record.surrogate for record in result.tokens]
         assert len(values) == 2, values
-        standalone = next((v for v in values if " " not in v), None)
-        full = next((v for v in values if " " in v), None)
-        if standalone is None or full is None:
-            degraded += 1  # guard exhausted into a plain token; leaks nothing
-            continue
+        for value in values:
+            assert not STRICT_TOKEN_RE.fullmatch(value), (
+                f"run {index}: {value!r} degraded to a plain token, so this key "
+                f"contributed nothing to the sweep -- and a change that degraded "
+                f"every name would otherwise be reported as zero breakages"
+            )
+        standalone = next(value for value in values if " " not in value)
+        full = next(value for value in values if " " in value)
         if full.split()[-1] != standalone:
             broken.append((standalone, full))
     assert broken == [], f"{len(broken)}/80 session keys broke name-component linking: {broken[:4]}"
-    # The `continue` above is the hole this sweep could otherwise fall through: a
-    # change that degraded EVERY name to a plain token would skip every iteration
-    # and report zero breakages. Measured 0/500 on random keys, so a 5% ceiling is
-    # far above the real rate and far below "the guard stopped faking".
-    assert degraded <= 4, f"{degraded}/80 runs never produced a fake name to compare"
 
 
 async def test_name_passthrough_keeps_titles_and_replaces_only_the_name(env: Env) -> None:
@@ -768,8 +941,25 @@ async def test_name_passthrough_keeps_titles_and_replaces_only_the_name(env: Env
     assert len(result.tokens) == 1
     fake = result.tokens[0].surrogate
     assert fake.startswith("Dr. ")
-    assert "Maria" not in fake
-    assert "Garcia" not in fake
+    # Word-bounded, and the third instance of the same 1-in-a-few-thousand defect
+    # this file has already fixed twice (at
+    # test_name_component_linking_gives_a_consistent_fake_surname and at
+    # test_name_and_client_identity_pseudonymize_to_the_same_person). These read
+    # `assert "Maria" not in fake`, which asks whether five characters occur
+    # ANYWHERE in a GENERATED name: Faker's en_US given-name pool contains
+    # "Mariah", and every session mints a fresh random key (see
+    # `assert_no_session_shift_can_collide` on where that randomness really comes
+    # from), so the draw lands there on about 1 session in 2 100 -- measured 28 in
+    # 60 000 draws of this exact source, every one of them "Dr. Mariah <surname>",
+    # and 0 of the 28 word-bounded. Each is a correct obfuscation called a leak.
+    #
+    # A plain \b rather than textrules.word_bounded_pattern, for the reason the two
+    # siblings give: borrowing the product's own boundary rule to check the
+    # product's output would make a shared bug invisible to both.
+    for original in ("Maria", "Garcia"):
+        assert not re.search(rf"\b{original}\b", fake), (
+            f"the original {original!r} survived as a word in the pseudonym: {fake!r}"
+        )
     # The title is passed through, so the *rest* must be a two-part fake -- not the
     # title alone, and not the title with the real name still attached.
     assert len(fake.removeprefix("Dr. ").split()) == 2, fake
@@ -3588,6 +3778,9 @@ async def test_a_value_the_session_already_mapped_is_never_re_derived(
         """Records every value it is asked to generate a surrogate for."""
 
         name = "counting-once"
+        # Not a token, so the restorer could only find it through the run's
+        # surrogate map. `register_strategy` requires the declaration.
+        restores_via = RestoreMode.SURROGATE_LOOKUP
         asked: ClassVar[list[str]] = []
 
         async def make_surrogate(
@@ -3644,6 +3837,9 @@ async def test_the_payload_carries_the_surrogate_the_vault_actually_holds(
         """Vaults the value itself before returning a surrogate it never stored."""
 
         name = "race-loser"
+        # Not a token, so the restorer could only find it through the run's
+        # surrogate map. `register_strategy` requires the declaration.
+        restores_via = RestoreMode.SURROGATE_LOOKUP
         vaulted: ClassVar[str] = ""
 
         async def make_surrogate(
@@ -3822,6 +4018,9 @@ async def test_dummy_strategy_plugs_in_with_zero_engine_changes(
     @register_strategy
     class ShoutingStrategy(ObfuscationStrategy):
         name = "shouting-dummy"
+        # Not a token, so the restorer could only find it through the run's
+        # surrogate map. `register_strategy` requires the declaration.
+        restores_via = RestoreMode.SURROGATE_LOOKUP
         seen: ClassVar[list[str]] = []
 
         async def make_surrogate(

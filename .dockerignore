@@ -63,6 +63,12 @@ data/
 **/.git/
 **/.gitignore
 **/.claude/
+# 49 MB of code index and 648 KB of Hypothesis state. The image is unaffected -- the
+# Dockerfile COPYs named paths, never `COPY . .` -- but every build ships them to the
+# daemon as context, and they become a real leak the day someone widens a COPY line.
+# `.codegraph` holds verbatim source extracted from this tree.
+**/.codegraph/
+**/.hypothesis/
 **/.DS_Store
 
 # python build artefacts and caches

@@ -86,10 +86,57 @@ def test_every_ignore_rule_reaches_the_depth_its_comment_claims() -> None:
             f"or add it to DELIBERATELY_ANCHORED with the reason"
         )
 
-    # Named individually so a regression names itself, and because these five are
-    # the ones with consequences: bytecode from the wrong host, and secrets.
-    for required in ("**/.env", "**/*.pem", "**/*.key", "**/__pycache__/", "**/*.py[cod]"):
+    # Named individually so a regression names itself, and because these have
+    # consequences: bytecode from the wrong host, secrets, and developer tooling state.
+    #
+    # The last two are here because the image was never the exposure -- the Dockerfile
+    # COPYs named paths, never `COPY . .`, and the built image has no dot-entry in
+    # /app at all. What they cost is 49 MB of `.codegraph` (a verbatim source index)
+    # plus 648 KB of Hypothesis state sent to the daemon on EVERY build, and a latent
+    # leak the day somebody widens a COPY line. Cheap to deny now, invisible later.
+    for required in (
+        "**/.env",
+        "**/*.pem",
+        "**/*.key",
+        "**/__pycache__/",
+        "**/*.py[cod]",
+        "**/.codegraph/",
+        "**/.hypothesis/",
+    ):
         assert required in rules, f".dockerignore must exclude {required} at every depth"
+
+
+def test_developer_tooling_is_ignored_by_this_repo_and_not_by_the_machine() -> None:
+    """`git check-ignore` must answer from THIS repo's .gitignore, not the developer's.
+
+    Two directories were invisible here for reasons that do not travel with a clone.
+    `.claude/settings.local.json` was matched only by a MACHINE-GLOBAL rule --
+    `/Users/<dev>/.config/git/ignore:1:**/.claude/settings.local.json` -- which a CI
+    checkout, a teammate, or a fresh clone simply does not have. `.hypothesis/` (157
+    files) was covered only by a .gitignore that Hypothesis generates inside itself,
+    so the protection is a side effect of a third-party tool rather than a decision
+    this repository made.
+
+    That distinction is not pedantic in a repo whose own history includes an
+    unanchored `data/` rule silently untracking the gazetteers: the working tree was
+    green while a clone was not. It matters more here because this project is
+    developed with `git add -A`, so "untracked" is exactly one careless commit away
+    from "tracked", and `.claude/settings.local.json` is local machine configuration.
+
+    Asserted with `--no-index` so a file that is merely UNTRACKED cannot satisfy it,
+    and by reading .gitignore directly so a global rule cannot either.
+    """
+    root = Path(__file__).resolve().parents[1]
+    rules = {
+        line.strip()
+        for line in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    for required in (".claude/", ".hypothesis/"):
+        assert required in rules, (
+            f"{required} is ignored on this machine but not by this repository -- "
+            f"add it to .gitignore so a clone behaves the same way"
+        )
 
 
 def test_the_data_rule_stays_anchored_so_the_gazetteers_still_ship() -> None:

@@ -8,30 +8,38 @@ section 9.3, engine step 4). Keeping that split is what makes a new strategy a
 drop-in: it can only change what a surrogate looks like, never what the pipeline
 protects.
 
-Adding a strategy is **one class plus one registry entry, with zero engine
+Adding a strategy is **one class plus one registry entry, with zero harness
 changes**::
 
     @register_strategy
     class MyStrategy(ObfuscationStrategy):
         name = "mine"
+        restores_via = RestoreMode.TOKEN_ID
         async def make_surrogate(self, detection, token_id, vault, *, session_id):
             return self.plain_token(detection, token_id)
 
 ``tests/test_obfuscation.py::test_dummy_strategy_plugs_in_with_zero_engine_changes``
-asserts exactly that.
+asserts the engine half; ``tests/test_extensibility.py::test_a_third_strategy_runs_
+the_whole_pipeline_with_no_harness_change`` asserts the pipeline half by running
+:class:`~secure_context_pipeline.pipeline.orchestrator.PipelineOrchestrator` end to
+end under a strategy defined in the test file.
 
-**Drop-in for the engine, and only for the engine.** Two components outside this
-package still enumerate the two shipped names by hand, so a third strategy is
-engine-usable without being reachable from a request:
-``Settings.strategy`` is ``Literal["tokenization", "pseudonymization"]``
-(``config.py:106``), which rejects a third name at config load and at the
-``/pipeline/run`` request field; and ``deobfuscation.restorer._KNOWN_STRATEGIES``
-(``restorer.py:171``) is a frozenset of the same two, checked at ``restorer.py:426``,
-so a run that reached the restorer under a third name would raise
-``PipelineError(reason='unknown_strategy')``. Neither is an engine change, which is
-why the claim above is true as written and still not the whole cost -- both would
-have to be widened for a new strategy to run end to end through
-``PipelineOrchestrator``.
+**Why :attr:`~ObfuscationStrategy.restores_via` is mandatory rather than defaulted.**
+It is the one thing a plug-in knows that no other component can infer, and until it
+existed the claim above was true of the engine and false of the pipeline. Measured
+at ``058dd18`` with a third strategy registered and nothing else changed: detection,
+obfuscation and the egress gate all ran, and the request then died in
+:meth:`~secure_context_pipeline.deobfuscation.restorer.Restorer.restore` with
+``PipelineError(reason='unknown_strategy')`` -- a frozenset of the two shipped names
+in ``restorer.py`` -- while ``POST /pipeline/run`` refused the same name with
+``literal_error`` before the orchestrator was reached. Both now ask this module
+instead: the restorer via :func:`restore_mode`, the request schema via
+:func:`available_strategies`, and ``Settings.strategy`` via
+``config._check_strategy_is_registered`` -- the same widening ``llm_provider`` and
+``key_provider`` already had. It is required rather than defaulted because neither
+value is right for both shipped strategies, so a default would let a plug-in be
+registered without its author ever answering the question the restorer asks;
+:func:`register_strategy` therefore refuses a class that omits it.
 
 Deviation from the build doc's ABC signature (documented as required)
 ---------------------------------------------------------------------
@@ -54,6 +62,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, TypeVar, cast
 
@@ -73,11 +82,13 @@ __all__ = [
     "STRATEGIES",
     "HintLookup",
     "ObfuscationStrategy",
+    "RestoreMode",
     "StrategyContext",
     "available_strategies",
     "build_strategy",
     "register_strategy",
     "resolve_hint_lookup",
+    "restore_mode",
 ]
 
 #: ``StrategyContext.options`` key overriding the gazetteer hint lookup. Exists
@@ -87,6 +98,41 @@ HINT_LOOKUP_OPTION = "hint_lookup"
 
 #: Signature of ``detection.recognizers.class_hint_for``.
 HintLookup = Callable[[EntityRegistry, str, str], str | None]
+
+
+class RestoreMode(StrEnum):
+    """What the deobfuscator needs in order to undo a strategy's output.
+
+    Every strategy declares one, as :attr:`ObfuscationStrategy.restores_via`. It is
+    the *requirement*, not an inventory of shapes: the restorer's token pass always
+    runs, so a strategy that emits pseudonyms for some tiers and plain tokens for
+    the rest declares :attr:`SURROGATE_LOOKUP` -- the harder of the two -- and its
+    token-shaped output is still restored by the pass that always runs.
+    :attr:`TOKEN_ID` is therefore the narrower claim: *nothing* I emit needs the
+    map.
+
+    **What a wrong declaration costs, stated exactly, because it is less than it
+    sounds.** It does not lose a value: ``PipelineOrchestrator._surrogate_map``
+    decides which surrogates need the map from the *shape of what was actually
+    emitted* rather than from this attribute -- deliberately, so that the map and
+    the payload cannot drift -- so a pseudonym is mapped whatever its strategy
+    declared. What a wrong declaration produces today is a wrong ``restore_mode``
+    in the ``DEOBFUSCATE`` audit row. The attribute is required anyway because it is
+    the question :class:`~secure_context_pipeline.deobfuscation.restorer.Restorer`
+    asks *instead of* matching the strategy name against a hardcoded pair, and
+    because there is no default that is right for both shipped strategies.
+    """
+
+    #: The surrogate embeds the token ID, so the restorer resolves it by looking
+    #: that ID up in the vault. Needs nothing carried along the run.
+    TOKEN_ID = "token_id"  # noqa: S105 -- a restore mechanism's name, not a credential
+
+    #: The surrogate is an ordinary string with no key in it (a realistic fake), so
+    #: the restorer can only find it via the run's surrogate map and
+    #: ``vault.get_by_surrogate``. ``PipelineOrchestrator._surrogate_map`` builds
+    #: that map from the emitted *records*, not from this declaration, so a strategy
+    #: never has to arrange for it.
+    SURROGATE_LOOKUP = "surrogate_lookup"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -125,6 +171,13 @@ class ObfuscationStrategy(ABC):
     #: Config string that selects this strategy (``SCP_STRATEGY``, the per-entity
     #: ``strategy:`` override, or the API's per-request ``strategy`` field).
     name: ClassVar[str]
+
+    #: How :class:`~secure_context_pipeline.deobfuscation.restorer.Restorer` gets
+    #: the original back out of what :meth:`make_surrogate` returns. **Required** --
+    #: :func:`register_strategy` refuses a class that leaves it unset, because the
+    #: restorer asks the registry for this instead of matching the name against a
+    #: hardcoded pair. See :class:`RestoreMode` for which of the two to declare.
+    restores_via: ClassVar[RestoreMode]
 
     def __init__(self, ctx: StrategyContext) -> None:
         self.ctx = ctx
@@ -222,10 +275,21 @@ _BUILTIN_MODULES: tuple[str, ...] = ("tokenization", "pseudonymization")
 
 
 def register_strategy(cls: type[_S]) -> type[_S]:
-    """Class decorator: add ``cls`` to :data:`STRATEGIES` under ``cls.name``."""
+    """Class decorator: add ``cls`` to :data:`STRATEGIES` under ``cls.name``.
+
+    Refuses a class that declares no :attr:`~ObfuscationStrategy.restores_via`, at
+    import time and by name. That is deliberately the same shape as the missing-name
+    refusal beside it: both are things only the strategy author knows, and both fail
+    the *import* rather than the run. The alternative -- a default -- is unavailable
+    for an honest reason rather than a stylistic one: the two shipped strategies
+    declare different values, so there is no default that is right for both, and a
+    plug-in inheriting either one would be making a claim its author never read.
+    """
     name = getattr(cls, "name", "")
     if not name:
         raise ConfigError(reason="strategy_missing_name", strategy=cls.__name__[:64])
+    if not isinstance(getattr(cls, "restores_via", None), RestoreMode):
+        raise ConfigError(reason="strategy_missing_restore_mode", strategy=name[:64])
     existing = STRATEGIES.get(name)
     if existing is not None and existing is not cls:
         logger.warning("strategy name re-registered", extra={"strategy": name[:64]})
@@ -243,6 +307,24 @@ def available_strategies() -> tuple[str, ...]:
     """Every selectable strategy name, built-ins included. Sorted, for display."""
     _load_builtins()
     return tuple(sorted(STRATEGIES))
+
+
+def restore_mode(name: str) -> RestoreMode | None:
+    """The :class:`RestoreMode` strategy ``name`` declares, or ``None`` if unknown.
+
+    The deobfuscator's question, and the reason this module owns the answer: what
+    ``Restorer.restore`` needs to know about a strategy is not its *name* but how
+    its output comes apart, and the only component that knows that is the strategy
+    itself. ``None`` means no registered class claims the name -- the caller decides
+    what that is worth (the restorer refuses the run; a display path may not care).
+
+    Cheap after the first call: :func:`_load_builtins` is an ``import_module`` on an
+    already-imported module, and the restorer calls this once per ``restore()``, not
+    once per token.
+    """
+    _load_builtins()
+    cls = STRATEGIES.get(name)
+    return None if cls is None else cls.restores_via
 
 
 def build_strategy(name: str, ctx: StrategyContext) -> ObfuscationStrategy:

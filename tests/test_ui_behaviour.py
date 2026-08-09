@@ -23,10 +23,13 @@ is the behavioural layer on top of it.
 
 from __future__ import annotations
 
+import ast
+import base64
 import importlib
 import json
 import pkgutil
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -35,9 +38,13 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
+from secure_context_pipeline.api.app import create_app
 from secure_context_pipeline.api.constants import MAX_AUDIT_PAGE
+from secure_context_pipeline.api.routes.documents import DEMO_FIXTURES
 from secure_context_pipeline.api.schemas import MAX_ID_LEN, MAX_PROMPT_CHARS
+from secure_context_pipeline.config import Settings
 from secure_context_pipeline.detection.registry import EntityRegistry
 from secure_context_pipeline.errors import PipelineError
 from secure_context_pipeline.models import DOC_CATEGORIES
@@ -45,6 +52,8 @@ from secure_context_pipeline.models import DOC_CATEGORIES
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_JS = REPO_ROOT / "secure_context_pipeline" / "ui" / "app.js"
 INDEX_HTML = REPO_ROOT / "secure_context_pipeline" / "ui" / "index.html"
+REGISTRY_PATH = REPO_ROOT / "entities.yaml"
+MEDICAL_NOTE = REPO_ROOT / "fixtures" / "medical_note.txt"
 NODE = shutil.which("node")
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -72,10 +81,23 @@ RED_TIP = (
 
 
 def _ps_tip(entity_type: str) -> str:
-    """The pseudonym tooltip, which names the entity type and no value."""
+    """The pseudonym tooltip, which names the entity type and no value.
+
+    Was ``"A PSEUDONYM this run minted for a {t}."``, and "this run minted" was false
+    on precisely the run the tooltip is read on. The vault keys a record by (entity
+    type, value) for the life of the session, so a run can re-emit a fake it did not
+    mint: measured through the real API on ``fixtures/medical_note.txt`` as
+    ``medical``, a ``tokenization`` run following a ``pseudonymization`` one in the
+    same session re-emitted 18 of them -- and ``TokenizationStrategy.make_surrogate``
+    returns ``plain_token`` for every entity, so it cannot have minted one. The
+    response carries no per-record minted/reused flag, so the claim was not the page's
+    to make. What replaces it is what the mark itself proves.
+    """
     return (
-        f"A PSEUDONYM this run minted for a {entity_type}. It reads like a real value "
-        "and is not one: the original never left the vault."
+        f"A PSEUDONYM standing in for a {entity_type}. It reads like a real value and "
+        "is not one -- it was invented in this session (not necessarily by this run: "
+        "the vault reuses a record for the life of the session) and the original never "
+        "left the vault."
     )
 
 HARNESS = r"""
@@ -105,11 +127,22 @@ globalThis.fire = function (id, type, ev) {
 };
 globalThis.settle = function () { return new Promise(function (r) { setTimeout(r, 50); }); };
 // `append` was a no-op, so the multipart upload was the one request in the file whose
-// CONTENT no test could see -- and `doc_category` travels in it. Files are recorded by
-// name only; nothing here needs their bytes.
+// CONTENT no test could see -- and `doc_category` travels in it. A non-string part is
+// recorded as its declared filename plus its bytes: the demo-document preset uploads a
+// Blob the page built out of a GET, and "the same bytes the picker would have sent"
+// is the property that makes a preset run and a hand-picked run the same run, so the
+// bytes have to be visible here. Existing assertions index these rows by membership
+// (`['doc_category', 'financial'] in parts`), which the extra columns leave alone.
+globalThis.Blob = class {
+  constructor(bits, opts) { this.bits = (bits || []).join(''); this.type = (opts || {}).type; }
+};
 globalThis.FormData = class {
   constructor() { this.parts = []; }
-  append(k, v) { this.parts.push([k, typeof v === 'string' ? v : '[file]']); }
+  append(k, v, filename) {
+    if (typeof v === 'string') { this.parts.push([k, v]); return; }
+    this.parts.push([k, '[file]', filename === undefined ? null : filename,
+      v && v.bits !== undefined ? v.bits : null]);
+  }
 };
 
 // ---- scripted transport: every request is recorded, the reply is the test's ----
@@ -621,8 +654,18 @@ def test_the_stats_strip_tells_a_safety_counter_apart_from_a_stopwatch(
         "the one counter whose non-zero value looks alarming and is not has to say so"
     )
     assert "0 is the clean reading" in by_key["vault_misses"]["title"]
-    # The values are untouched by any of the above.
-    assert [c["value"] for c in chips] == ["54", "32", "3", "0", "0", "2", "1.0 ms", "12.3 ms"]
+    # The values are untouched by any of the above. One carries an on-screen qualifier
+    # and it is the only one that may: ``entities_detected`` is the counter that
+    # disagrees with panel 1's header on every run, and the reconciliation used to be
+    # reachable only by hovering the OTHER number. Every other value is bare, which is
+    # what stops the qualifier turning into decoration on chips that need none.
+    assert [c["value"] for c in chips] == [
+        f"54 {MID} before policy", "32", "3", "0", "0", "2", "1.0 ms", "12.3 ms",
+    ]
+    # The key stays the raw API field name -- the qualifier rides with the value, not
+    # inside the ``<i>``, because the key is what a reviewer greps and what the stats
+    # key section in ``index.html`` indexes by.
+    assert by_key["entities_detected"]["key"] == "entities_detected"
 
 
 def test_the_same_counter_turns_red_when_it_stops_reading_clean(tmp_path: Path) -> None:
@@ -957,6 +1000,7 @@ UI.S.sessionId = 'sess-1';
 el('prompt').value = 'Summarise';
 el('strategy').value = 'pseudonymize';
 el('file').files = [{ name: 'note.txt', size: 3, lastModified: 11 }];
+fire('file', 'change');
 // `doc_category` is a required input, not an optional one: unset, `ensureDoc` refuses
 // the run with NO_CATEGORY before any request, because unset silently switches the
 // `only_in_doc_categories` rule sets off. Every scenario below that expects a run to
@@ -1029,7 +1073,16 @@ def test_a_run_fills_all_four_panels_from_one_pipeline_response(tmp_path: Path) 
         '<span class="stat muted" title="TIMING. The whole run, end to end.">'
         "<i>total_ms</i>5.5 ms</span>"
     )
-    assert out["banner"] == f"<b>RUN_OK</b> run_id r-1 {MID} strategy pseudonymize"
+    # Was ``"... {MID} strategy pseudonymize"``. ``result.strategy`` is what the caller
+    # ASKED FOR (``orchestrator.run``'s ``chosen``) and the banner presented it as a
+    # description of the run; it is not one, and the two come apart in a way that puts
+    # realistic fake PII on screen under a ``tokenization`` label -- see
+    # ``test_a_run_labels_the_strategy_as_requested_and_prints_what_was_emitted``. The
+    # word "requested" is the whole of the change visible here: this reply's ``stats``
+    # carry neither ``tokens_issued`` nor ``pseudonyms_issued``, so there is nothing to
+    # derive a composition from and the page says nothing about one. The routing this
+    # line pins -- ``run_id`` and the strategy both off the response -- is unchanged.
+    assert out["banner"] == f"<b>RUN_OK</b> run_id r-1 {MID} pseudonymize requested"
     assert out["auditRun"] == "run_id r-1"
     assert out["busy"] is False, "the buttons must be re-enabled after the run"
 
@@ -1075,23 +1128,433 @@ emit({
 });
 """
     out = _run(tmp_path, body)
-    # The header names its own set. Not "2 spans", which said nothing about which of
-    # the page's two span numbers it was.
-    assert out["c1"] == "13 chars " + MID + " 2 spans masked"
+    # The header names its own set AND prints the other number beside it, in words
+    # that are true of the two sets. Was ``== "13 chars {MID} 2 spans masked"``, which
+    # labelled panel 1's count honestly and left the disagreement itself -- 2 here, 3
+    # in the strip, on every run -- reachable only by hovering. A reconciliation nobody
+    # hovers is not on the page, so it is in the counter now; the tooltip keeps the
+    # arithmetic. Strictly more is pinned here than before: both numbers, and the
+    # relationship between them.
+    assert out["c1"] == (
+        "13 chars " + MID + " 2 spans masked " + MID +
+        " detector returned 3, neither set contains the other"
+    )
     # ...and points at the other number, by name, with the reason they differ.
     tip = out["c1title"]
     assert "entities_detected" in tip, tip
     assert "Neither is a subset of the other" in tip, tip
     assert "54 detected, 3 dropped, 1 swept in, 52 masked" in tip, tip
-    # The claim the earlier attempt correctly refused to write must not come back.
+    # The claim the earlier attempt correctly refused to write must not come back --
+    # neither in the tooltip nor, now that both numbers are printed together, in the
+    # line that prints them.
     assert "2 of 3" not in tip and "2 of 3" not in out["c1"]
-    # And the strip's own counter points back, so the reconciliation is reachable from
-    # whichever of the two numbers the reviewer looked at first.
-    chips = {m.group("key"): m.group("title") or "" for m in _CHIP.finditer(out["stats"])}
-    assert chips["entities_detected"].startswith("SAFETY."), chips
-    assert "before any policy ran" in chips["entities_detected"]
-    assert "The header of panel 1 counts a different set" in chips["entities_detected"]
-    assert "neither is a subset of the other" in chips["entities_detected"]
+    # And the strip's own counter says which set it counted ON SCREEN, not only on
+    # hover: the chip a reviewer reads first is the one in the strip, and "hover the
+    # other number" is not a thing anyone does to a count that looks fine.
+    chips = {m.group("key"): m.groupdict() for m in _CHIP.finditer(out["stats"])}
+    assert chips["entities_detected"]["value"] == f"3 {MID} before policy", chips
+    assert chips["entities_detected"]["title"].startswith("SAFETY."), chips
+    assert "before any policy ran" in chips["entities_detected"]["title"]
+    assert "The header of panel 1 counts a different set" in chips["entities_detected"]["title"]
+    assert "neither is a subset of the other" in chips["entities_detected"]["title"]
+
+
+#: One run per (requested strategy, emitted composition) the banner has to describe,
+#: driven through the real ``run()`` back to back in ONE session -- which is the
+#: mechanism under test: the vault keys a record by (entity type, value) for the life
+#: of the session, so run 2 inherits run 1's surrogates whatever strategy it asks for.
+#:
+#: The two counter values are the ones the live API reports. Measured through
+#: ``PipelineOrchestrator.run`` over ``httpx.ASGITransport`` on
+#: ``fixtures/medical_note.txt`` as ``medical``, one session, both orders:
+#: ``tokens_issued`` 32 on all four runs; ``pseudonyms_issued`` 0 for both runs of the
+#: tokenization-first session and 18 for both runs of the pseudonymization-first one.
+_COMPOSITIONS = (
+    # Direction B, the dangerous one: pseudonymization ran first, tokenization was
+    # then selected, and the payload still carries 18 realistic fakes. Measured panel
+    # 2 under that label: "Patient name: Steven Lee", "Phone: 468-376-2490",
+    # "romerochristina@example.org".
+    ("tokenization", {"tokens_issued": 32, "pseudonyms_issued": 18}),
+    # Direction A: tokenization ran first, pseudonymization was then selected, and not
+    # one fake reached the wire. Measured panel 2: "Patient name: [PII_NAME_09453c04]".
+    ("pseudonymization", {"tokens_issued": 32, "pseudonyms_issued": 0}),
+    # The two runs that are doing exactly what was asked.
+    ("tokenization", {"tokens_issued": 32, "pseudonyms_issued": 0}),
+    ("pseudonymization", {"tokens_issued": 32, "pseudonyms_issued": 18}),
+    # A strategy name this page has never heard of. `config._BUILTIN_STRATEGIES` is a
+    # floor, not a closed set.
+    ("k-anonymity", {"tokens_issued": 32, "pseudonyms_issued": 18}),
+    # A run that vaulted nothing: there is no composition, and no drift either.
+    ("pseudonymization", {"tokens_issued": 0, "pseudonyms_issued": 0}),
+    # The counters absent altogether. Nothing to derive from, so nothing may be said.
+    ("pseudonymization", {"total_ms": 5.5}),
+)
+
+
+def _composition_banners(tmp_path: Path) -> list[dict]:
+    """Drive ``run()`` once per row of ``_COMPOSITIONS``; return each banner."""
+    body = RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }") + f"""
+const cases = {json.dumps([list(c) for c in _COMPOSITIONS])};
+const shots = [];
+for (const c of cases) {{
+  RESULT.strategy = c[0];
+  RESULT.stats = c[1];
+  await UI.run();
+  shots.push({{ cls: el('banner').className, html: el('banner').innerHTML }});
+}}
+emit({{ shots: shots }});
+"""
+    return _run(tmp_path, body)["shots"]
+
+
+def test_the_banner_prints_the_composition_the_run_emitted_not_the_strategy_asked_for(
+    tmp_path: Path,
+) -> None:
+    """A run labelled ``tokenization`` can put 18 realistic fake identities on screen.
+
+    ``PipelineResult.strategy`` is ``orchestrator.run``'s ``chosen`` -- the dropdown's
+    value, or the server default. The banner printed it as ``strategy <name>``, i.e. as
+    a description of what the run did, and it is not one. The vault keys a record by
+    (entity type, value) for the **life of the session** and has no strategy dimension
+    (``_surrogate_map``, ``_pseudonyms_issued``), so whichever strategy ran first owns
+    every surrogate that value gets afterwards. That reuse is deliberate: it is what
+    makes a pseudonym minted on run 1 still restore correctly on run 4.
+
+    Measured through the real API over ``httpx.ASGITransport`` on
+    ``fixtures/medical_note.txt`` as ``medical``, one session, both orders,
+    ``tokens_issued`` 32 on every run:
+
+    * pseudonymization then **tokenization** -> ``pseudonyms_issued`` 18, banner
+      "strategy tokenization", panel 2 reading "Patient name: Steven Lee", "Phone:
+      468-376-2490", "romerochristina@example.org", "Note filed 06/07/2024 by physician
+      Benjamin Hansen, MD";
+    * tokenization then **pseudonymization** -> ``pseudonyms_issued`` 0, banner
+      "strategy pseudonymization", panel 2 reading "Patient name: [PII_NAME_09453c04]".
+
+    The first is the dangerous one and it is dangerous *because* the label is
+    reassuring: a reviewer inspecting panel 2 under the word "tokenization" reads
+    eighteen invented values as this patient's real ones, and the only contradicting
+    signal was a ``pseudonyms_issued`` chip whose meaning was hover-only.
+
+    So the banner prints the composition, derived from the two counters the response
+    already carries, and the requested name is labelled "requested" rather than stated.
+    Nothing about what the pipeline emits changes.
+    """
+    drift, understated = _composition_banners(tmp_path)[:2]
+
+    # -- direction B, in full. The exact string, because every clause of it is load
+    # -- bearing: the count, the split, why a tokenization run can carry a fake at all,
+    # -- and what that means for the panel directly below the banner.
+    assert drift["html"] == (
+        "<b>RUN_OK_STRATEGY_DRIFT</b> "
+        f"run_id r-1 {MID} tokenization requested {MID} 18 of the 32 surrogates in the "
+        f"payload are realistic fake values, 14 are bracketed tokens {MID} tokenization "
+        "mints no fake values at all, so those 18 came from records an earlier call in "
+        "THIS session created: the vault keys a record by (entity type, value) for the "
+        "life of the session and has no strategy dimension. The fakes in panel 2 are "
+        "invented values, not values taken from this document, and the label above "
+        "them says tokenization."
+    )
+    # Yellow, not green. The run succeeded -- what is wrong is the page's own label --
+    # so the code keeps its RUN_OK prefix and the colour carries the warning.
+    assert drift["cls"] == "banner warn"
+    # And the sentence that was there before must not be: "strategy tokenization",
+    # unqualified, is the claim the whole change exists to stop making.
+    assert "strategy tokenization" not in drift["html"], drift["html"]
+
+    # -- direction A. Understating is still a false label, and it is still flagged --
+    # but the reason is stated with both readings, because the response cannot
+    # separate "already tokenised earlier in this session" from "nothing in a
+    # pseudonymised tier" and picking one would be the same over-claim again.
+    assert understated["cls"] == "banner warn"
+    assert "<b>RUN_OK_STRATEGY_DRIFT</b>" in understated["html"]
+    assert "pseudonymization requested" in understated["html"]
+    assert "all 32 surrogates in the payload are bracketed tokens" in understated["html"]
+    assert "The response cannot tell those two apart." in understated["html"]
+    assert "strategy pseudonymization" not in understated["html"], understated["html"]
+
+
+def test_a_run_doing_what_was_asked_still_prints_its_composition_and_stays_green(
+    tmp_path: Path,
+) -> None:
+    """The colour is reserved for the lie; the composition is printed on every run.
+
+    Two things this must not do. It must not go quiet when the request and the output
+    agree -- then the number a reviewer needs is present only on the runs the page
+    already decided to shout about, and "no clause" becomes indistinguishable from "a
+    response with no counters".
+
+    And it must not fire yellow on a *mixed* pseudonymization run, which is the correct
+    output of an ordinary one: ``PseudonymizationStrategy.make_surrogate`` dispatches by
+    tier and returns ``plain_token`` for the content tier, so 18 fakes and 14 tokens out
+    of 32 is the design working. ``renderScope`` already had to undo a caution that
+    fired on 100% of passes; a second one would teach a reviewer to skip both.
+    """
+    shots = _composition_banners(tmp_path)
+    honest_tok, honest_ps = shots[2], shots[3]
+
+    assert honest_tok["cls"] == "banner ok"
+    assert honest_tok["html"] == (
+        f"<b>RUN_OK</b> run_id r-1 {MID} tokenization requested {MID} all 32 surrogates "
+        "in the payload are bracketed tokens"
+    )
+    assert honest_ps["cls"] == "banner ok"
+    assert honest_ps["html"] == (
+        f"<b>RUN_OK</b> run_id r-1 {MID} pseudonymization requested {MID} 18 of the 32 "
+        "surrogates in the payload are realistic fake values, 14 are bracketed tokens"
+    )
+
+
+def test_the_banner_states_no_verdict_it_cannot_derive_from_the_response(
+    tmp_path: Path,
+) -> None:
+    """Three responses that support less than a full verdict, each said honestly.
+
+    This is the half that keeps the fix from becoming the defect it replaces. The page
+    may say only what the response carries:
+
+    * an unregistered strategy name -- ``config._BUILTIN_STRATEGIES`` is a floor, not a
+      closed set -- has made no promise this page knows about, so its composition is
+      printed and no agree/disagree verdict is reached;
+    * a run that vaulted nothing has no composition to print, and saying "all 0
+      surrogates are tokens" would be a shape claim about an empty payload;
+    * a response carrying neither counter supports no statement at all, and the
+      strategy is still labelled as the *request* -- which is true whatever was
+      emitted, and is what the bare "strategy <name>" was not.
+    """
+    shots = _composition_banners(tmp_path)
+    unknown, empty, no_counters = shots[4], shots[5], shots[6]
+
+    # Composition printed, verdict withheld, green -- because "disagrees" is not a
+    # thing this page can assert about a strategy whose promise it does not know.
+    assert unknown["cls"] == "banner ok"
+    assert unknown["html"] == (
+        f"<b>RUN_OK</b> run_id r-1 {MID} k-anonymity requested {MID} 18 of the 32 "
+        "surrogates in the payload are realistic fake values, 14 are bracketed tokens"
+    )
+
+    assert empty["cls"] == "banner ok"
+    assert empty["html"] == (
+        f"<b>RUN_OK</b> run_id r-1 {MID} pseudonymization requested {MID} this run "
+        "vaulted nothing, so the payload carries no surrogates of either kind"
+    )
+
+    # Nothing derived, nothing claimed -- and no count invented to fill the gap.
+    assert no_counters["cls"] == "banner ok"
+    assert no_counters["html"] == (
+        f"<b>RUN_OK</b> run_id r-1 {MID} pseudonymization requested"
+    )
+    for word in ("surrogates", "bracketed", "fake"):
+        assert word not in no_counters["html"], no_counters["html"]
+
+
+async def _two_runs_in_one_session(data_dir: Path, first: str, second: str) -> dict:
+    """Run ``fixtures/medical_note.txt`` twice in ONE session, and return run 2's body.
+
+    The real app, the real registry, the real vault, over ``httpx.ASGITransport`` -- no
+    port, no ``./data``. ``MockProvider`` echoes, so no key and no network.
+    """
+    settings = Settings(
+        master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        data_dir=data_dir,
+        registry_path=REGISTRY_PATH,
+        llm_provider="mock",
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://scp.test") as http:
+            created = await http.post("/sessions", json={"user_id": "demo-user"})
+            assert created.status_code == 200, created.text
+            session_id = created.json()["session_id"]
+            uploaded = await http.post(
+                "/documents",
+                files={
+                    "file": (
+                        "medical_note.txt",
+                        MEDICAL_NOTE.read_bytes(),
+                        "text/plain",
+                    )
+                },
+                data={"user_id": "demo-user", "doc_category": "medical"},
+            )
+            assert uploaded.status_code == 200, uploaded.text
+            doc_id = uploaded.json()["doc_id"]
+            body: dict = {}
+            for strategy in (first, second):
+                run = await http.post(
+                    "/pipeline/run",
+                    json={
+                        "session_id": session_id,
+                        "user_id": "demo-user",
+                        "doc_id": doc_id,
+                        "prompt": "Summarize this document and list the key facts.",
+                        "strategy": strategy,
+                    },
+                )
+                assert run.status_code == 200, run.text
+                body = run.json()
+            return body
+
+
+async def test_the_real_pipeline_drives_the_drift_banner_and_the_span_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """The whole path, once, with nothing hand-written between the two ends.
+
+    Every other test in this section hands ``app.js`` a reply a person typed. That
+    proves the page reasons correctly about the shape it was given and proves nothing
+    about the shape the pipeline actually sends -- which is the failure mode the banner
+    was in: a page describing a response it had never been checked against. So this one
+    runs ``fixtures/medical_note.txt`` twice in one real session,
+    **pseudonymization then tokenization**, and feeds run 2's genuine
+    ``PipelineResult`` into the real ``run()`` in node.
+
+    Run 2 is the dangerous direction. It asked for ``tokenization``; the vault keys a
+    record by (entity type, value) for the life of the session, so it re-emits run 1's
+    fakes and the payload goes out carrying invented names, phone numbers, e-mail
+    addresses and shifted dates -- all of it under a label that used to read "strategy
+    tokenization" and nothing else.
+
+    The expected numbers are read off the API's own response rather than written here,
+    because the point is that the page and the pipeline agree; the hand-written part is
+    the floor each one has to clear, which is what stops a degenerate response (no
+    detections, no tokens) from making the whole test vacuous.
+    """
+    result = await _two_runs_in_one_session(
+        tmp_path / "data", "pseudonymization", "tokenization"
+    )
+    total = round(result["stats"]["tokens_issued"])
+    fakes = round(result["stats"]["pseudonyms_issued"])
+    detected = round(result["stats"]["entities_detected"])
+    masked = len(result["detections"])
+
+    # The defect, reproduced against the live pipeline before anything is asserted
+    # about the page. Floors, not equalities: the exact counts move with the registry.
+    assert result["strategy"] == "tokenization"
+    assert fakes >= 10, f"the reuse did not happen, so there is no drift to report: {fakes}"
+    assert total >= 30 and fakes < total, (total, fakes)
+    # ...and the fakes are really on the wire, not merely counted. A surrogate that the
+    # emitted-token grammar does not match is a realistic fake by construction
+    # (``orchestrator._is_pseudonym``), and it is spliced into the payload verbatim.
+    payload = result["obfuscated_payload"]
+    token_shaped = re.compile(r"\[[A-Z]+_[A-Z0-9_]+_[0-9a-f]{8}\]")
+    fake_surrogates = [
+        d["surrogate"]
+        for d in result["detections"]
+        if d.get("surrogate") and not token_shaped.fullmatch(d["surrogate"])
+    ]
+    assert fake_surrogates, "no pseudonym reached the payload, so this is not direction B"
+    assert any(s in payload for s in fake_surrogates), "the fakes are counted but not emitted"
+    # The two span counts really do disagree, on this run, with no help from a fixture.
+    assert masked != detected, (masked, detected)
+
+    body = f"""
+const RESULT = {json.dumps(result)};
+const DOC = {json.dumps(MEDICAL_NOTE.read_text(encoding="utf-8"))};
+respond((path, init) => {{
+  const m = (init && init.method) || 'GET';
+  if (m === 'POST' && path === '/documents') return {{ status: 200, body: {{ doc_id: 'doc-1' }} }};
+  if (path.indexOf('/documents/doc-1/text') === 0) {{
+    return {{ status: 200, body: {{ text: DOC, chars: DOC.length }} }};
+  }}
+  if (path === '/pipeline/run') return {{ status: 200, body: RESULT }};
+  if (path.indexOf('/audit') === 0) return {{ status: 200, body: {{ events: [] }} }};
+  return {{ status: 200, body: {{}} }};
+}});
+UI.S.sessionId = 'sess-1';
+el('prompt').value = 'Summarize this document and list the key facts.';
+el('strategy').value = 'tokenization';
+el('category').value = 'medical';
+el('file').files = [{{ name: 'medical_note.txt', size: 2826, lastModified: 11 }}];
+fire('file', 'change');
+await UI.run();
+emit({{
+  banner: el('banner').innerHTML, cls: el('banner').className,
+  c1: el('c1').textContent, stats: el('stats').innerHTML,
+}});
+"""
+    out = _run(tmp_path, body)
+
+    # The banner is yellow, names the drift, and carries the pipeline's own two counts.
+    assert out["cls"] == "banner warn", out["banner"]
+    assert out["banner"].startswith("<b>RUN_OK_STRATEGY_DRIFT</b>"), out["banner"]
+    assert (
+        f"{fakes} of the {total} surrogates in the payload are realistic fake values, "
+        f"{total - fakes} are bracketed tokens"
+    ) in out["banner"], out["banner"]
+    assert "tokenization requested" in out["banner"], out["banner"]
+    # The sentence a reviewer used to read over eighteen invented identities.
+    assert "strategy tokenization" not in out["banner"], out["banner"]
+
+    # Panel 1's header prints both span counts and the relationship that holds between
+    # them, and the strip's chip says which set its number is -- both on screen.
+    assert out["c1"].endswith(
+        f"{masked} spans masked {MID} detector returned {detected}, "
+        "neither set contains the other"
+    ), out["c1"]
+    assert f"{masked} of {detected}" not in out["c1"], out["c1"]
+    chips = {m.group("key"): m.group("value") for m in _CHIP.finditer(out["stats"])}
+    assert chips["entities_detected"] == f"{detected} {MID} before policy", chips
+    assert chips["pseudonyms_issued"] == str(fakes), chips
+
+
+def _orchestrator_stat_keys() -> set[str]:
+    """Every ``stats["<key>"] = ...`` the orchestrator assigns, by AST, not by hand."""
+    source = (
+        REPO_ROOT / "secure_context_pipeline" / "pipeline" / "orchestrator.py"
+    ).read_text(encoding="utf-8")
+    keys: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "stats"
+                and isinstance(target.slice, ast.Constant)
+                and isinstance(target.slice.value, str)
+            ):
+                keys.add(target.slice.value)
+    return keys
+
+
+def test_the_counters_the_banner_reasons_from_are_counters_the_pipeline_emits() -> None:
+    """A rename in ``orchestrator.py`` must not silence the banner instead of failing it.
+
+    ``strategyClause`` prints a composition only when the response carries both
+    counters, and prints nothing when it does not -- which is the honest answer to a
+    response that supports no claim, and is also exactly what a *typo* looks like. Rename
+    ``pseudonyms_issued`` in the pipeline and the drift warning stops firing for good,
+    on a green suite, because every behavioural test above hands the page a
+    hand-written reply that still spells it the old way. The banner would go back to
+    "tokenization requested" with 18 fakes underneath it and nothing anywhere red.
+
+    So the two names are pinned across the seam. Both halves are derived and they are
+    derived by different means -- an AST walk over ``orchestrator.py`` for the keys the
+    pipeline assigns, a text read of ``app.js`` for the keys the clause reads -- and
+    they meet at a pair written out by hand here. Neither side can drift alone.
+    """
+    emitted = _orchestrator_stat_keys()
+    # A walk that quietly found nothing must be red rather than vacuously green.
+    assert len(emitted) >= 15, f"the AST walk over orchestrator.py is broken: {sorted(emitted)}"
+    assert {"entities_detected", "tokens_issued", "restored_count"} <= emitted, sorted(emitted)
+
+    read_by_the_banner = {"tokens_issued", "pseudonyms_issued"}
+    missing = read_by_the_banner - emitted
+    assert not missing, (
+        "the banner's composition clause reads counters the pipeline no longer emits, so "
+        f"it will print nothing instead of failing: {sorted(missing)}"
+    )
+
+    source = APP_JS.read_text(encoding="utf-8")
+    clause = source.split("function strategyClause(", 1)[1].split("\n  }\n", 1)[0]
+    for key in sorted(read_by_the_banner):
+        assert f"'{key}' in s" in clause, f"strategyClause no longer reads {key}"
+        assert f"s.{key}" in clause, f"strategyClause no longer reads {key}"
+    # Panel 1's on-screen reconciliation reads the third one across the same seam.
+    assert "'entities_detected' in st" in source, "panel 1 no longer reads entities_detected"
 
 
 def test_a_refused_run_does_not_leave_the_span_reconciliation_on_an_empty_counter(
@@ -1108,6 +1571,7 @@ def test_a_refused_run_does_not_leave_the_span_reconciliation_on_an_empty_counte
 await UI.run();
 const after = { c1: el('c1').textContent, title: el('c1').title || '' };
 el('file').files = [];
+fire('file', 'change');
 await UI.run();
 emit({ after: after, cleared: el('c1').textContent, title: el('c1').title || '' });
 """
@@ -1255,6 +1719,55 @@ _CODE_SENTENCES: tuple[tuple[str, dict[str, object], str], ...] = (
         {"reason": "session_id_or_run_id_required"},
         'Press "Create session" first.',
     ),
+    # Copied off the live API rather than read off the class. Measured on this build
+    # against an ``audit.db`` with one 4 KiB page overwritten: ``POST /sessions``
+    # answered 503 with exactly this body, and ``GET /audit`` and ``GET /audit/verify``
+    # answered the same with ``operation`` reading ``query`` and ``length``. ``emit``
+    # is the row here because it is the one that refuses a RUN; the other branch is
+    # asserted in its own test below.
+    (
+        "AUDIT_UNAVAILABLE",
+        {
+            "reason": "audit_log_unreadable",
+            "operation": "emit",
+            "audit_db": "audit.db",
+            "error": "DatabaseError",
+            "remedy": "restore it from backup or start a fresh data directory",
+        },
+        "from backup, or point SCP_DATA_DIR at a fresh directory",
+    ),
+    # The audit log's two siblings, both found by
+    # ``test_every_code_the_api_can_emit_has_a_sentence_in_the_page`` rather than
+    # remembered. Neither has a handler of its own in ``api/errors.py``, so both fall
+    # through to the base ``PipelineError`` registration and answer 500 carrying their
+    # own code -- which is the code this page has to explain. Bodies copied from the
+    # class constructors in ``vault/session_vault.py`` and ``store/document_store.py``.
+    #
+    # The fragments are the part that matters: each names the remedy that is TRUE FOR
+    # THAT STORE, and the three remedies contradict each other. A shared "restore it
+    # from backup" would be actively wrong for the vault.
+    (
+        "VAULT_UNAVAILABLE",
+        {
+            "reason": "vault_unreadable",
+            "operation": "put",
+            "vault_db": "vault.db",
+            "error": "DatabaseError",
+            "remedy": "start a fresh data directory and a new session",
+        },
+        "from backup will NOT work",
+    ),
+    (
+        "DOCUMENT_STORE_UNAVAILABLE",
+        {
+            "reason": "document_store_unreadable",
+            "operation": "put",
+            "store_db": "documents.db",
+            "error": "DatabaseError",
+            "remedy": "restore it from backup or re-upload the document",
+        },
+        "choose the file again with the file picker",
+    ),
     (
         "VAULT_MISS",
         {"session_id": "3f", "token_id": "PII_NAME_0a1b2c3d"},
@@ -1293,6 +1806,22 @@ _CODE_SENTENCES: tuple[tuple[str, dict[str, object], str], ...] = (
     ("SESSION_EXPIRED", {"session_id": "3f"}, 'Press "Create session" for a new one'),
     ("RATE_LIMITED", {"retry_after_seconds": 4}, "Wait 4 seconds and retry."),
     ("EGRESS_BLOCKED", {"reason": "vault_original", "hit_count": 2}, "No provider call was made."),
+    # The run path's other refusal, and the one whose remedy is arithmetic rather than
+    # a different document. Body copied from ``PayloadTooLargeError.__init__``; the
+    # fragment names the control (the file picker) and the action (split it), because
+    # "too large" on its own is the unactionable half of this banner.
+    (
+        "PAYLOAD_TOO_LARGE",
+        {
+            "reason": "payload_over_context_limit",
+            "session_id": "3f",
+            "payload_chars": 812_004,
+            "limit_chars": 250_000,
+            "run_id": "9c",
+            "remedy": "split the document and run each part as its own request",
+        },
+        "Split the document and upload each part with the file picker",
+    ),
 )
 
 
@@ -1340,6 +1869,220 @@ def test_every_api_error_code_gets_an_actionable_sentence(tmp_path: Path) -> Non
         assert "{&quot;" not in seen[code], f"{code} still ends in a detail blob: {seen[code]}"
 
 
+def _pipeline_error_codes() -> set[str]:
+    """Every ``code`` a :class:`PipelineError` in this package can answer with.
+
+    Imports the whole package first, because ``__subclasses__`` only sees classes that
+    have been imported -- the same discovery ``test_crypto.py`` uses for the detail
+    ceiling. Extracted so the two tests that need this set cannot drift into two
+    copies of one rule; neither of their assertions changed when it moved here.
+    """
+    importlib.import_module("secure_context_pipeline")
+    package = sys.modules["secure_context_pipeline"]
+    for module in pkgutil.walk_packages(package.__path__, f"{package.__name__}."):
+        importlib.import_module(module.name)
+
+    def walk(cls: type[PipelineError]) -> Iterator[type[PipelineError]]:
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from walk(sub)
+
+    return {PipelineError.code} | {sub.code for sub in walk(PipelineError)}
+
+
+#: A code literal as the API writes one: SHOUT_CASE, three characters or more. Used
+#: to reject the other strings that sit in the same argument positions (a route path,
+#: a reason, a header name) without having to list them.
+_CODE_LITERAL = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+
+#: The two callables in ``api/`` that turn a status and a code into a response body:
+#: ``ApiError(status, code, detail)`` -- the transport-level exception every route
+#: raises -- and ``errors.py::_json(status, code, detail)``, which the handlers call
+#: directly for the codes that have no exception class at all. Both take the code as
+#: their SECOND POSITIONAL argument, which is what :func:`_transport_error_codes`
+#: reads.
+_CODE_CALLS = frozenset({"ApiError", "_json"})
+
+
+def _code_strings(node: ast.expr) -> set[str]:
+    """Every string literal ``node`` can evaluate to, following a conditional.
+
+    ``errors.py::_http_exception_handler`` writes its two codes as
+    ``code = "NOT_FOUND" if exc.status_code == 404 else "BAD_REQUEST"``, so a reader
+    that only understood ``ast.Constant`` would find neither of them -- and
+    ``BAD_REQUEST`` is the multipart-parse failure, i.e. the upload path, i.e. exactly
+    the code a demo reviewer can trip by hand.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value}
+    if isinstance(node, ast.IfExp):
+        return _code_strings(node.body) | _code_strings(node.orelse)
+    return set()
+
+
+def _transport_error_codes() -> dict[str, str]:
+    """Every code literal in ``api/``, mapped to the source line that writes it.
+
+    Parsed rather than imported, and parsed rather than grepped. Importing would only
+    find the codes some request happened to reach; grepping ``"[A-Z_]+"`` over the
+    package would sweep up log keys, event types and half the docstrings. The AST
+    knows the difference between a string in an argument position that becomes a
+    response body and a string that is prose.
+
+    Three shapes are read, and between them they are every way this package names a
+    code that has no exception class:
+
+    * the second positional argument of :data:`_CODE_CALLS`;
+    * a ``code=`` keyword -- ``api/middleware.py``'s two ``_send_*`` writers, which
+      answer before any handler runs;
+    * an assignment to a bare ``code``, including the conditional one.
+    """
+    api = REPO_ROOT / "secure_context_pipeline" / "api"
+    sites: dict[str, str] = {}
+    for path in sorted(api.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            found: set[str] = set()
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in _CODE_CALLS and len(node.args) >= 2:
+                    found |= _code_strings(node.args[1])
+                for keyword in node.keywords:
+                    if keyword.arg == "code":
+                        found |= _code_strings(keyword.value)
+            elif isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "code" for t in node.targets
+            ):
+                found |= _code_strings(node.value)
+            for code in found:
+                if _CODE_LITERAL.match(code):
+                    sites.setdefault(code, f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+    return sites
+
+
+def test_every_code_the_api_can_emit_has_a_sentence_in_the_page(tmp_path: Path) -> None:
+    """No new error code may reach the demo UI as a bare code again.
+
+    ``AUDIT_UNAVAILABLE`` is why this exists. It was added to ``errors.py`` to replace
+    an unactionable 500 -- a ``text/plain`` "Internal Server Error" with no ``code``,
+    no CSP and no ``nosniff`` -- with something a person can act on, and it landed with
+    no entry in ``app.js``'s SENTENCES table, so the page rendered the one code written
+    for legibility as the word ``AUDIT_UNAVAILABLE`` and a JSON map. The guard that
+    should have caught it was one indirection short: the test below walks the exception
+    classes and requires each to appear in ``_CODE_SENTENCES``, and ``_CODE_SENTENCES``
+    is hand-written, so the *transport* codes -- the ten with no class to walk -- were
+    covered only by having been remembered.
+
+    So both halves are derived here, and neither is a hand-copy:
+
+    * the domain half from ``PipelineError.__subclasses__`` (:func:`_pipeline_error_codes`);
+    * the transport half by PARSING ``api/`` for the literals that become a response
+      body (:func:`_transport_error_codes`).
+
+    And what is asserted is the page, not a list: every derived code is pushed through
+    the real ``showError`` in node with an EMPTY detail, which is the one input under
+    which the unknown-code fall-through renders ``<b>CODE</b>`` and nothing else. A
+    code with a sentence produces prose; a code without one produces exactly the string
+    ``test_an_unknown_error_code_still_renders_everything_the_body_carried`` pins. That
+    makes this test independent of ``_CODE_SENTENCES`` entirely -- deleting a row there
+    would not quiet it -- while ``test_every_api_error_code_gets_an_actionable_sentence``
+    goes on asserting that the prose names a control, which no derivation can check.
+    """
+    transport = _transport_error_codes()
+    domain = _pipeline_error_codes()
+    # The derivations are the whole test, so a derivation that quietly found nothing
+    # must be red rather than vacuously green. Each anchor is a code reached by a
+    # different mechanism: a bare `ApiError`, a `code=` keyword in the middleware, the
+    # conditional assignment in `_http_exception_handler`, and a `_json` call.
+    assert {"NOT_READY", "REQUEST_TOO_LARGE", "BAD_REQUEST", "VALIDATION_ERROR"} <= set(
+        transport
+    ), f"the AST walk over api/ is broken -- it found {sorted(transport)}"
+    assert {"AUDIT_UNAVAILABLE", "EGRESS_BLOCKED", "PIPELINE_ERROR"} <= domain, sorted(domain)
+
+    codes = set(transport) | domain
+    assert len(codes) >= 24, f"only {len(codes)} codes discovered: {sorted(codes)}"
+
+    seen = _banners(tmp_path, [[code, {}] for code in sorted(codes)])
+    silent = {
+        code: transport.get(code, "PipelineError subclass")
+        for code in sorted(codes)
+        if seen[code].strip() == f"<b>{code}</b>"
+    }
+    assert not silent, (
+        "these codes reach the demo UI as a bare code with no sentence -- add one to "
+        f"the SENTENCES table in ui/app.js: {silent}"
+    )
+
+
+def test_the_two_halves_of_an_unreadable_audit_log_are_not_one_sentence(
+    tmp_path: Path,
+) -> None:
+    """A refused run and an empty audit panel are different news under one code.
+
+    ``AuditUnavailableError`` is raised by all three ``AuditLogger`` entry points, and
+    ``operation`` is what tells them apart. Measured against the real API on an
+    ``audit.db`` with one 4 KiB page overwritten: ``POST /sessions`` and ``POST
+    /pipeline/run`` answer ``"emit"`` -- a WRITE the log refused, which under "no
+    release without a record" refuses the run with it -- while ``GET /audit`` answers
+    ``"query"`` and ``GET /audit/verify`` answers ``"length"``, both READS, which cost
+    this page its tail and its chain badge and no run at all. The first question a
+    reviewer asks is whether the run happened, and one sentence for both leaves it
+    unanswered.
+
+    Both must still say what to do, and the "what" cannot come from the body: the
+    logger clips ``audit_db`` to the file NAME on purpose, so ``{"audit_db":
+    "audit.db"}`` never says where the file is. The sentence supplies the setting an
+    operator actually turns.
+    """
+    seen = _banners(
+        tmp_path,
+        [
+            ["AUDIT_UNAVAILABLE", {"operation": "emit", "audit_db": "audit.db",
+                                   "error": "DatabaseError"}],
+            ["AUDIT_UNAVAILABLE", {"operation": "query", "audit_db": "audit.db",
+                                   "error": "DatabaseError"}],
+        ],
+    )
+    # `_banners` keys by code, so the two rows collapse; drive them one at a time.
+    both = {}
+    for operation in ("emit", "query", "length"):
+        both[operation] = _banners(
+            tmp_path,
+            [
+                [
+                    "AUDIT_UNAVAILABLE",
+                    {
+                        "reason": "audit_log_unreadable",
+                        "operation": operation,
+                        "audit_db": "audit.db",
+                        "error": "DatabaseError",
+                        "remedy": "restore it from backup or start a fresh data directory",
+                    },
+                ]
+            ],
+        )["AUDIT_UNAVAILABLE"]
+    assert seen["AUDIT_UNAVAILABLE"], "the table must answer for this code at all"
+
+    assert "could not be WRITTEN" in both["emit"], both["emit"]
+    assert "the run was refused" in both["emit"], both["emit"]
+    assert "no release without a record" in both["emit"], both["emit"]
+
+    for read in ("query", "length"):
+        assert "could not be READ" in both[read], both[read]
+        assert "No run was affected by this." in both[read], both[read]
+        assert "refused" not in both[read], both[read]
+
+    # Same remedy on both, naming the file from the body and the setting the body
+    # cannot carry -- and no detail blob trailing the sentence.
+    for operation, text in both.items():
+        assert text.startswith("<b>AUDIT_UNAVAILABLE</b> "), text
+        assert "restore audit.db" in text, (operation, text)
+        assert "from backup, or point SCP_DATA_DIR at a fresh directory" in text, text
+        assert "DatabaseError" in text, text
+        assert "{&quot;" not in text, (operation, text)
+
+
 def test_the_sentence_table_covers_every_error_class_the_package_defines(tmp_path: Path) -> None:
     """The list above must be the API's vocabulary, not the codes I remembered.
 
@@ -1359,17 +2102,9 @@ def test_the_sentence_table_covers_every_error_class_the_package_defines(tmp_pat
     walk -- they are string literals at the raise sites -- so they stay in the list
     above and are covered by the test before this one.
     """
-    importlib.import_module("secure_context_pipeline")
-    package = sys.modules["secure_context_pipeline"]
-    for module in pkgutil.walk_packages(package.__path__, f"{package.__name__}."):
-        importlib.import_module(module.name)
-
-    def walk(cls: type[PipelineError]) -> Iterator[type[PipelineError]]:
-        for sub in cls.__subclasses__():
-            yield sub
-            yield from walk(sub)
-
-    codes = {PipelineError.code} | {sub.code for sub in walk(PipelineError)}
+    # The walk itself moved to `_pipeline_error_codes` so that the test above can use
+    # the same one; nothing it asserts changed.
+    codes = _pipeline_error_codes()
     assert len(codes) >= 11, f"subclass discovery found only {sorted(codes)} -- the walk is broken"
     listed = {code for code, _, _ in _CODE_SENTENCES}
     assert codes <= listed, f"no sentence for {sorted(codes - listed)}"
@@ -1496,6 +2231,7 @@ await UI.run();
 out.noPrompt = el('banner').innerHTML;
 el('prompt').value = 'Summarise';
 el('file').files = [];
+fire('file', 'change');
 await UI.run();
 out.noFile = el('banner').innerHTML;
 out.requests = calls.length;
@@ -1504,7 +2240,20 @@ emit(out);
     )
     out = _run(tmp_path, body.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }"))
     assert out["noPrompt"] == "<b>NO_PROMPT</b> Enter a prompt."
-    assert out["noFile"] == "<b>NO_FILE</b> Choose a document first (fixtures/ or any file)."
+    # This expectation was `"...Choose a document first (fixtures/ or any file)."` and it
+    # is replaced rather than relaxed. The contract it encoded -- "name the control and
+    # say what to do next" -- is unchanged and is asserted below in three further
+    # clauses; what changed under it is the page, by decision and not by drift: the
+    # dropdown now LOADS the document it names, so a refusal that says "choose a
+    # document" without naming the one-click path describes a page that no longer
+    # exists. Still an exact equality, and still the same shape of claim.
+    assert out["noFile"] == (
+        "<b>NO_FILE</b> Nothing is armed. Pick a demo document from the dropdown (one "
+        "click -- it loads the document and sets its doc_category), or choose your own "
+        "file with the picker beside it."
+    )
+    assert "demo document" in out["noFile"], "the refusal must name the one-click control"
+    assert "picker" in out["noFile"], "and the other control, which is still there"
     assert out["requests"] == 0, "a refused run must not reach the network"
 
 
@@ -1523,6 +2272,7 @@ await UI.run();
 fire('file', 'change');
 const cleared = { doc: UI.S.docId, key: UI.S.uploadKey };
 el('file').files = [{ name: 'other.txt', size: 9, lastModified: 22 }];
+fire('file', 'change');
 await UI.run();
 emit({ cleared: cleared, uploads: calls.filter((c) => c.path === '/documents').length });
 """
@@ -1551,37 +2301,344 @@ emit({ chosen: chosen, afterBlank: el('category').value });
     assert out["afterBlank"] == "medical"
 
 
-def test_the_fixture_preset_names_the_path_the_file_picker_still_needs(
-    tmp_path: Path,
-) -> None:
-    """The dropdown cannot upload, so it has to say which file to hand the picker.
+def test_choosing_a_preset_uploads_that_document_in_one_click(tmp_path: Path) -> None:
+    """The dropdown LOADS the document it names. One click, then Run.
 
-    Build doc section 9.10 asks for an "upload fixture dropdown". This is not one:
-    a browser cannot read a path off disk, and nothing serves ``fixtures/`` over
-    HTTP -- ``_mount_ui`` mounts ``secure_context_pipeline/ui/`` alone, measured
-    ``GET /fixtures/medical_note.txt`` -> 404. Labelled "fixture" and wired to set
-    ``doc_category`` and nothing else, it did half the job in silence: selecting
-    ``medical_note.txt`` and pressing Run issued **zero** requests and answered
-    ``NO_FILE``, on the first control a reviewer touches. Reselecting the blank
-    option must put the idle text back, or the page goes on naming a file the user
-    has just deselected.
+    This replaces ``test_the_fixture_preset_names_the_path_the_file_picker_still_needs``,
+    which pinned the friction rather than the feature: the dropdown named a file and the
+    hint told the reviewer to go and find it ("now pick fixtures/medical_note.txt with
+    the file button"), because nothing served ``fixtures/`` over HTTP -- measured, ``GET
+    /fixtures/medical_note.txt`` was a 404 and is now a 200. That test is deleted rather
+    than relaxed, and everything it asserted is asserted here or in the two tests below,
+    more strongly: the category still travels with the preset, the idle text still comes
+    back on deselect, and the hint is still the single source of truth -- but the run in
+    the middle now happens.
+
+    The whole point is the wire, so the wire is what is read: exactly one ``GET
+    /fixtures/medical_note.txt``, then a ``POST /documents`` whose multipart body carries
+    the fetched bytes under the fixture's own filename and its own category. Nothing here
+    reimplements the page; every expected string is hand-written.
     """
-    body = """
-const out = { idle: el('fixture-hint').textContent };
+    body = (
+        RUN_SETUP
+        + """
+// Start from a clean picker so the only armed thing is the preset, and a blank
+// category so the preset is what fills it.
+el('file').files = [];
+fire('file', 'change');
+el('category').value = '';
 fire('fixture', 'change', { target: { selectedOptions: [
   { value: 'medical_note.txt', dataset: { cat: 'medical' } }] } });
-out.picked = el('fixture-hint').textContent;
-out.category = el('category').value;
-fire('fixture', 'change', { target: { selectedOptions: [{ value: '', dataset: {} }] } });
-out.cleared = el('fixture-hint').textContent;
+const armed = { hint: el('fixture-hint').textContent, cat: el('category').value };
+await UI.run();
+emit({
+  armed: armed,
+  requests: calls.map((c) => c.method + ' ' + c.path),
+  upload: (calls.find((c) => c.path === '/documents') || {}).form,
+  banner: el('banner').innerHTML,
+});
+"""
+    )
+    out = _run(
+        tmp_path,
+        body.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }").replace(
+            "  return { status: 200, body: {} };",
+            "  if (path === '/fixtures/medical_note.txt') return { text: 'Patient: Bob.' };\n"
+            "  return { status: 200, body: {} };",
+        ),
+    )
+    # Selecting the preset satisfied the REQUIRED doc_category too -- the reviewer does
+    # not set it twice -- and the page says which document is armed.
+    assert out["armed"]["cat"] == "medical"
+    assert out["armed"]["hint"] == (
+        "ARMED: bundled fixtures/medical_note.txt as doc_category=medical. Press Run."
+    )
+    assert out["banner"].startswith("<b>RUN_OK</b>"), out["banner"]
+    # One fetch of the fixture, then the ordinary upload -- not a second ingestion route.
+    assert out["requests"][:2] == ["GET /fixtures/medical_note.txt", "POST /documents"], (
+        out["requests"]
+    )
+    assert "POST /pipeline/run" in out["requests"]
+    # The multipart body: the bytes the endpoint served, under the fixture's own name,
+    # with the fixture's own category. `[key, '[file]', filename, bytes]` is the
+    # harness's FormData row for a non-string part.
+    assert ["file", "[file]", "medical_note.txt", "Patient: Bob."] in out["upload"], out["upload"]
+    assert ["doc_category", "medical"] in out["upload"], out["upload"]
+    assert ["user_id", "demo-user"] in out["upload"], out["upload"]
+
+
+def test_arming_one_document_control_disarms_the_other_in_both_directions(
+    tmp_path: Path,
+) -> None:
+    """Preset then file, and file then preset: exactly one is armed and the page says so.
+
+    Two controls that can each supply the document is an ambiguity the moment the page
+    keeps both: a preset armed on top of a leftover file, or a file chosen after a
+    preset, each leave the reviewer unable to tell which document Run is about to send.
+    ``S.armed`` is the single source of truth and the visible hint is painted from it, so
+    every step here reads the two together -- a hint that agreed with nothing would be
+    the same defect wearing a green test.
+    """
+    body = """
+const out = { steps: [] };
+const step = (label) => out.steps.push([label, UI.S.armed, el('fixture-hint').textContent,
+  el('file').value, el('fixture').value]);
+// A browser writes BOTH halves of each control's visible state: `files` plus the
+// `value` the picker displays (a real one shows the fake `C:\\\\fakepath\\\\` path), and
+// the <select>'s own `value`. The harness has to plant both or the assertions that a
+// disarmed control stops SHOWING its document are vacuous -- reading '' from a
+// property nothing ever set. Deleting `arm`'s two clearing lines was the mutation
+// that proved it: this test stayed green until these two assignments existed.
+const pickFile = () => {
+  el('file').files = [{ name: 'mine.pdf', size: 7, lastModified: 1 }];
+  el('file').value = 'C:\\\\fakepath\\\\mine.pdf';
+  fire('file', 'change');
+};
+const pickPreset = (value, cat) => {
+  el('fixture').value = value;
+  fire('fixture', 'change', {
+    target: { selectedOptions: [{ value: value, dataset: cat ? { cat: cat } : {} }] },
+  });
+};
+step('idle');
+pickFile();
+el('category').value = 'general';
+fire('category', 'change');
+step('file');
+pickPreset('legal_memo.txt', 'legal');
+step('preset-over-file');
+pickFile();
+step('file-over-preset');
+pickPreset('', null);
+step('deselected');
 emit(out);
 """
     out = _run(tmp_path, body)
-    assert out["picked"] == "now pick fixtures/medical_note.txt with the file button"
-    assert out["category"] == "medical", "the preset half must keep working"
-    assert "not an upload" in out["idle"], out["idle"]
-    assert "doc_category" in out["idle"], out["idle"]
-    assert out["cleared"] == out["idle"], "deselecting must not leave a stale path up"
+    steps = {name: rest for name, *rest in out["steps"]}
+
+    idle_armed, idle_hint, _, _ = steps["idle"]
+    assert idle_armed is None
+    assert idle_hint == (
+        "nothing armed yet: choose a demo document (loads it and sets its doc_category), "
+        "or pick a file of your own"
+    )
+
+    armed, hint, _, fixture_value = steps["file"]
+    assert armed == {"kind": "file", "name": "mine.pdf"}
+    assert hint == (
+        'ARMED: your own file "mine.pdf" as doc_category=general. '
+        "The demo-document dropdown is cleared."
+    )
+    assert fixture_value == "", "the dropdown must not still show a preset"
+
+    armed, hint, file_value, _ = steps["preset-over-file"]
+    # ``cat`` is the category the BUNDLED document declares (the <option>'s ``data-cat``),
+    # and it rides on the armed state rather than only being written into the field
+    # because the field can be changed afterwards and the document's own category cannot.
+    # It is the only ground truth this page has about what a document is, and
+    # ``renderScope`` is what spends it -- see
+    # ``test_the_scope_note_is_a_warning_only_when_a_rule_set_was_really_suppressed``.
+    # The equality is still exact and still whole-object.
+    assert armed == {"kind": "preset", "name": "legal_memo.txt", "cat": "legal"}
+    assert hint == "ARMED: bundled fixtures/legal_memo.txt as doc_category=legal. Press Run."
+    assert file_value == "", "the picker must not go on displaying the file it lost"
+
+    armed, hint, _, fixture_value = steps["file-over-preset"]
+    assert armed == {"kind": "file", "name": "mine.pdf"}
+    assert "mine.pdf" in hint
+    assert fixture_value == "", "the preset must lose to a freshly picked file"
+
+    armed, hint, _, _ = steps["deselected"]
+    assert armed is None
+    assert hint == idle_hint, "deselecting must put the idle text back, not a stale name"
+
+
+def test_a_preset_and_a_hand_picked_file_of_the_same_name_are_not_one_upload(
+    tmp_path: Path,
+) -> None:
+    """Two independent mechanisms stop one document being served for another, and this
+    is the second one's witness.
+
+    ``ensureDoc`` skips the upload when its cache key matches. A preset has no size and
+    no mtime, so a key of ``name:category`` alone would match a preset run of
+    ``medical_note.txt`` against a file of the reviewer's own that happens to be called
+    ``medical_note.txt`` -- and the run would then pipeline the *bundled* document while
+    the page displayed the reviewer's file name, the worst version of this ambiguity
+    because both panels would look right.
+
+    ``arm()`` also nulls ``S.docId`` on every change of source, which covers the same
+    case, and that half is pinned by
+    ``test_choosing_a_different_file_invalidates_the_upload_cache``. Measured by
+    mutation rather than assumed: deleting either mechanism alone leaves this test
+    green, and deleting both turns it red with exactly one upload -- the preset's --
+    answering for both runs. So this pins the belt, that one pins the braces, and
+    neither test is quietly certifying the other's mechanism.
+    """
+    body = (
+        RUN_SETUP
+        + """
+el('file').files = [];
+fire('file', 'change');
+fire('fixture', 'change', { target: { selectedOptions: [
+  { value: 'medical_note.txt', dataset: { cat: 'medical' } }] } });
+await UI.run();
+el('file').files = [{ name: 'medical_note.txt', size: 13, lastModified: 5 }];
+fire('file', 'change');
+await UI.run();
+emit({
+  uploads: calls.filter((c) => c.path === '/documents').map((c) => c.form),
+  fetches: calls.filter((c) => c.path.indexOf('/fixtures/') === 0).length,
+});
+"""
+    )
+    out = _run(
+        tmp_path,
+        body.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }").replace(
+            "  return { status: 200, body: {} };",
+            "  if (path === '/fixtures/medical_note.txt') return { text: 'Patient: Bob.' };\n"
+            "  return { status: 200, body: {} };",
+        ),
+    )
+    assert len(out["uploads"]) == 2, out["uploads"]
+    assert ["file", "[file]", "medical_note.txt", "Patient: Bob."] in out["uploads"][0]
+    # The second upload is the reviewer's own file object, not the fetched bytes.
+    assert ["file", "[file]", "medical_note.txt", None] in out["uploads"][1], out["uploads"][1]
+    assert out["fetches"] == 1, "the second run must not re-fetch the bundled document"
+
+
+def test_the_armed_line_follows_the_category_it_names(tmp_path: Path) -> None:
+    """A category changed after arming must repaint the line that quotes it.
+
+    The armed line is the page's answer to "what is Run about to do", and it names the
+    ``doc_category`` because that input decides which ``only_in_doc_categories`` rule
+    sets run. Painted once at arming time it would go quietly stale: arm
+    ``medical_note.txt`` (medical), switch the category to ``legal``, and the page
+    advertises a medical run it is not about to make -- the same
+    says-one-thing-does-another the armed state exists to remove.
+    """
+    body = """
+fire('fixture', 'change', { target: { selectedOptions: [
+  { value: 'medical_note.txt', dataset: { cat: 'medical' } }] } });
+const first = el('fixture-hint').textContent;
+el('category').value = 'legal';
+fire('category', 'change');
+emit({ first: first, second: el('fixture-hint').textContent });
+"""
+    out = _run(tmp_path, body)
+    assert out["first"] == (
+        "ARMED: bundled fixtures/medical_note.txt as doc_category=medical. Press Run."
+    )
+    assert out["second"] == (
+        "ARMED: bundled fixtures/medical_note.txt as doc_category=legal. Press Run."
+    )
+
+
+def test_the_preset_dropdown_is_frozen_while_a_run_is_in_flight(tmp_path: Path) -> None:
+    """It decides which bytes get uploaded, so it joins the inputs ``setBusy`` locks.
+
+    ``ensureDoc`` reads ``S.armed`` across an await -- the GET that fetches the fixture --
+    so a preset changed mid-request would post one document's bytes under the next one's
+    name and category. ``#file``, ``#category`` and ``#strategy`` were already frozen for
+    exactly this reason; the dropdown was not, because until now it only set a label.
+
+    Read while the request is genuinely in flight -- against ``NEVER``, the fetch that
+    does not settle -- and again after the deadline releases it, because "frozen" is only
+    worth having if it is also temporary.
+    """
+    body = (
+        """
+UI.S.sessionId = 'sess-1';
+UI.TIMEOUT.fast = 300;
+UI.TIMEOUT.slow = 300;
+el('prompt').value = 'Summarise';
+el('category').value = 'medical';
+fire('fixture', 'change', { target: { selectedOptions: [
+  { value: 'medical_note.txt', dataset: { cat: 'medical' } }] } });
+respond("""
+        + NEVER
+        + """);
+const held = ['fixture', 'file', 'category', 'strategy', 'btn-run'];
+const running = UI.run();
+await settle();
+const during = held.map((id) => el(id).disabled);
+await running;
+emit({ during: during, after: held.map((id) => el(id).disabled) });
+"""
+    )
+    out = _run(tmp_path, body)
+    assert out["during"] == [True] * 5, "the preset dropdown stayed live during a run"
+    assert out["after"] == [False] * 5, "and the deadline must hand every one of them back"
+
+
+def test_a_preset_that_this_server_does_not_ship_is_its_own_named_failure(
+    tmp_path: Path,
+) -> None:
+    """A 404 from ``/fixtures`` is "this build has no fixtures/", not "not your document".
+
+    ``NOT_FOUND``'s sentence on this page is about *ownership* ("No such document for
+    this user"), which is exactly wrong for a deployment that did not copy ``fixtures/``:
+    it sends the reviewer looking at ``user_id`` instead of at the picker beside the
+    dropdown. The upload must not be attempted either -- there are no bytes to send.
+    """
+    body = (
+        RUN_SETUP
+        + """
+el('file').files = [];
+fire('file', 'change');
+fire('fixture', 'change', { target: { selectedOptions: [
+  { value: 'medical_note.txt', dataset: { cat: 'medical' } }] } });
+await UI.run();
+emit({
+  banner: el('banner').innerHTML,
+  uploads: calls.filter((c) => c.path === '/documents').length,
+});
+"""
+    )
+    out = _run(
+        tmp_path,
+        body.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }").replace(
+            "  return { status: 200, body: {} };",
+            "  if (path.indexOf('/fixtures/') === 0) {\n"
+            "    return { status: 404, body: { code: 'NOT_FOUND',\n"
+            "      detail: { reason: 'fixture_not_installed' } } };\n"
+            "  }\n"
+            "  return { status: 200, body: {} };",
+        ),
+    )
+    assert out["banner"].startswith("<b>PRESET_UNAVAILABLE</b>"), out["banner"]
+    assert "medical_note.txt" in out["banner"]
+    assert "file picker" in out["banner"]
+    assert "No such document for this user" not in out["banner"]
+    assert out["uploads"] == 0, "there were no bytes to upload"
+
+
+def test_the_ui_dropdown_and_the_server_allow_list_are_the_same_four_documents() -> None:
+    """The markup's options and the server's allow-list must not drift apart.
+
+    Two independently-written tables describe the same four documents: the ``<option
+    value=... data-cat=...>`` list in ``index.html``, which decides what the page arms and
+    under which category, and ``DEMO_FIXTURES`` in ``api/routes/documents.py``, which
+    decides what the server will serve. Drift has two shapes and both are silent -- an
+    option the server refuses is a dead control that 404s on the first click, and an
+    option whose ``data-cat`` disagrees with the server's is a document scanned under a
+    category nobody chose for it, which is the ``wrong category`` failure the scope note
+    exists to expose arriving from the page's own markup.
+
+    Read out of the shipped HTML and compared against the imported table. There is no
+    fetch at page load on purpose -- the options are static -- so this is the join that
+    binds them.
+    """
+    elements, _ = _page()
+    options = [n for n in elements if n["tag"] == "option" and n["parent_id"] == "fixture"]
+    assert len(options) == len(DEMO_FIXTURES) + 1, options
+    named = [n for n in options if n["attrs"].get("data-cat") is not None]
+    from_markup = {n["attrs"]["value"]: n["attrs"]["data-cat"] for n in named}
+    assert len(from_markup) == len(named), "a duplicated option value"
+    assert from_markup == dict(DEMO_FIXTURES), (from_markup, dict(DEMO_FIXTURES))
+    # And the placeholder stays value-less, or a <select> with no empty option would arm
+    # the first document for anyone who never touched the control.
+    placeholders = [n for n in options if n["attrs"].get("data-cat") is None]
+    assert [n["attrs"].get("value") for n in placeholders] == [""], placeholders
 
 
 # ---------------------------------------------------------------------------
@@ -1685,6 +2742,7 @@ await UI.run();
 const first = { text: el('scope-note').textContent, hidden: el('scope-note').hidden };
 el('category').value = 'legal';
 el('file').files = [{ name: 'memo.txt', size: 9, lastModified: 12 }];
+fire('file', 'change');
 await UI.run();
 emit({ first: first, second: el('scope-note').textContent });
 """
@@ -1948,6 +3006,14 @@ class _Page(HTMLParser):
             "attrs": {k: (v or "") for k, v in attrs},
             "text": "",
             "ancestors": [n["tag"] for n in self._open],
+            # The id of the nearest ancestor that has one. `ancestors` is tag names
+            # only, which cannot tell the demo-document <select>'s <option>s from the
+            # doc_category <select>'s -- and the test that binds the dropdown to the
+            # server's allow-list has to read exactly one of those two lists.
+            "parent_id": next(
+                (n["attrs"]["id"] for n in reversed(self._open) if n["attrs"].get("id")),
+                None,
+            ),
         }
         self.elements.append(node)
         if tag not in _VOID_TAGS:
@@ -2038,10 +3104,10 @@ def test_every_interactive_control_on_the_page_has_an_accessible_name() -> None:
     """A control with no name announces as its widget type, which is not a name.
 
     The file picker was the one control of the ten with none: a screen reader read it as
-    "Choose File, button", and it is the mandatory step -- without a file every Run answers
-    ``NO_FILE``, so an unnamed picker is the demo unable to start. WCAG 2.1 4.1.2. The
-    ``fixture preset`` <label> in the same group points at the <select>, so it neither named
-    the picker nor could be repurposed to.
+    "Choose File, button", and it is the mandatory step -- without a document every Run
+    answers ``NO_FILE``, so an unnamed picker is the demo unable to start. WCAG 2.1
+    4.1.2. The <label> in the same group points at the <select>, so it neither named the
+    picker nor could be repurposed to.
     """
     elements, by_id = _page()
     controls = [n for n in elements if n["tag"] in {"input", "select", "button", "textarea"}]
@@ -2052,11 +3118,22 @@ def test_every_interactive_control_on_the_page_has_an_accessible_name() -> None:
         if not _accessible_name(n, elements, by_id)
     ]
     assert unnamed == [], f"controls with no accessible name: {unnamed}"
-    assert _accessible_name(by_id["file"], elements, by_id) == "document"
-    # The only sentence that tells the picker and the preset apart is the hint, so it is
-    # the picker's description rather than loose text beside it.
+    # This asserted ``== "document"``, against a page where the <select> beside it was
+    # labelled ``fixture preset`` and only set a category. Both controls now load a
+    # document, so "document" stopped distinguishing them -- two controls whose names do
+    # not say which is which is the same 4.1.2 failure one step along. The equality is
+    # still exact, and the pair is now asserted together rather than one of them alone.
+    assert _accessible_name(by_id["file"], elements, by_id) == "your own file"
+    assert _accessible_name(by_id["fixture"], elements, by_id) == "demo document"
+    # The hint is the ARMED state -- which of the two Run will upload -- so it describes
+    # both controls rather than sitting as loose text beside them.
     assert by_id["file"]["attrs"].get("aria-describedby") == "fixture-hint"
+    assert by_id["fixture"]["attrs"].get("aria-describedby") == "fixture-hint"
     assert "fixture-hint" in by_id, "the description points at nothing"
+    # Arming happens by mutating this one span while focus is elsewhere, so it has to
+    # announce. WCAG 2.1 4.1.3, the same argument #banner carries.
+    assert by_id["fixture-hint"]["attrs"].get("role") == "status"
+    assert by_id["fixture-hint"]["attrs"].get("aria-live") == "polite"
 
 
 def test_the_outcome_surfaces_are_live_regions_and_the_bulk_panels_are_not() -> None:
@@ -2163,6 +3240,7 @@ respond((path, init) => {
 UI.S.sessionId = 'sess-1';
 el('prompt').value = 'Summarise';
 el('file').files = [{ name: 'note.txt', size: 3, lastModified: 11 }];
+fire('file', 'change');
 //: Required, same as in `RUN_SETUP`: without it the run never reaches the pipeline.
 el('category').value = 'legal';
 """
@@ -2423,41 +3501,282 @@ emit({
     out = _run(tmp_path, body)
     assert out["p4"] == IDLE
     # Panel 1 is the one that carries an instruction rather than a dash: index.html's
-    # placeholder is "Create a session, choose a file, press Run", and the click that
-    # completes its first clause must not blank the other two.
+    # placeholder is "Create a session, choose a demo document or your own file, press
+    # Run", and the click that completes its first clause must not blank the other two.
+    #
+    # This asserted "Session created. Choose a file and press Run." The sentence is
+    # replaced, not relaxed: the page now has two ways to choose a document and one of
+    # them is not a file the reviewer has to find, so an instruction naming only the
+    # picker sends them to the harder path. Exact equality either way.
     assert "David Ochoa" not in out["p1"]
-    assert out["p1"] == "Session created. Choose a file and press Run."
+    assert out["p1"] == (
+        "Session created. Choose a demo document or your own file, then press Run."
+    )
     assert out["stats"] == "" and out["auditRun"] == ""
     assert "RESTORE_OK" not in out["audit"], "the dead session's rows are not this session's"
     assert out["last"] is None
     assert out["audits"] and all("session_id=sess-NEW-000000" in a for a in out["audits"])
 
 
-def test_a_run_before_a_session_exists_is_refused_without_uploading_anything(
+#: ``RUN_SETUP``'s bodies plus the one route it never needed -- ``POST /sessions`` --
+#: and no session in ``S``. Appended *after* ``RUN_SETUP`` so the later ``respond``
+#: and the later assignment win. The minted id is 32 hex characters because that is
+#: what the live API returns (measured: ``a8994568680548cf9e869c9f39b8864b``), and the
+#: badge and banner print ``slice(0, 12)`` of it, so a short stub id would let a test
+#: pass against a page that truncates wrongly. Hand-written, like every other body in
+#: this module.
+MINTED_ID = "a8994568680548cf9e869c9f39b8864b"
+MINT_SETUP = (
+    """
+respond((path, init) => {
+  const m = (init && init.method) || 'GET';
+  if (m === 'POST' && path === '/sessions') {
+    return { status: 200, body: { session_id: '"""
+    + MINTED_ID
+    + """', expires_at: 1700000000 } };
+  }
+  if (m === 'DELETE' && path.indexOf('/sessions/') === 0) return { status: 204 };
+  if (m === 'POST' && path === '/documents') return { status: 200, body: { doc_id: 'doc-1' } };
+  if (path.indexOf('/documents/doc-1/text') === 0) {
+    return { status: 200, body: { text: 'Bob met Carl.', chars: 13 } };
+  }
+  if (path === '/pipeline/run') return { status: 200, body: RESULT };
+  if (path.indexOf('/audit') === 0) return { status: 200, body: { events: [] } };
+  return { status: 200, body: {} };
+});
+UI.S.sessionId = null;
+UI.S.lastSessionId = null;
+calls.length = 0;
+"""
+)
+
+
+def test_a_run_with_no_session_mints_one_through_the_button_s_own_path(
     tmp_path: Path,
 ) -> None:
-    """"Session key is gone" about a key that was never minted, after an upload.
+    """Choose a document, press Run. One control, one click, and the run is scoped.
 
-    Run is the biggest button on the page and sits inside the red LIVE REVIEW strip;
-    Create session is a small one ten controls above it. Without a preflight the first
-    click uploaded the document, painted panel 1 with the original text and then posted
-    ``session_id: null``, which the API answers 401 SESSION_EXPIRED -- so the page
-    reported a destroyed key, with an empty ``session_id`` in the detail as the only
-    clue. The other two missing inputs were already preflighted by name.
+    This REPLACES ``test_a_run_before_a_session_exists_is_refused_without_uploading_
+    anything``, and the replacement is a change of product decision, not a relaxation.
+    That test pinned the fix made in ``b82964a``: with no preflight at all the first
+    click uploaded the document, painted panel 1, posted ``session_id: null`` and let
+    the API's 401 become the banner "Session key is gone" -- about a key that was never
+    minted. Two requirements were folded into one implementation there, and only one of
+    them was the requirement. **Never post a null session, and never report a destroyed
+    key that never existed** is the requirement, and it is asserted below more directly
+    than it could be before: the old test proved the null post impossible by stopping
+    the run at the door, so it never saw a wire; this one lets the run happen and reads
+    the ``session_id`` off ``POST /pipeline/run``. **"Press Create session first"** was
+    the implementation, and it is the friction the user objected to -- Run is the
+    biggest button on the page, inside the red LIVE REVIEW strip, and it answered the
+    first thing a reviewer does by sending them to a small button ten controls above.
+
+    Three further properties, each of which a lazier auto-mint would break:
+
+    * ONE ``POST /sessions``, carrying the owner from the field -- the mint goes
+      through ``createSession``, so it is the button's path and not a second one.
+      A forked minting path is a second set of audit events to keep in step.
+    * The audit read ``createSession`` makes is still made, so the ``SESSION_CREATE``
+      row is on screen: that row is the audit story's answer to "where did this
+      session come from".
+    * The badge and the RUN_OK banner both say the session was created by Run. The
+      badge is the durable half -- ``createSession``'s own banner is overwritten by
+      ``RUN_OK`` within the same click.
     """
     body = (
-        EVIDENCE_SETUP.replace("PIPELINE", "{ status: 200, body: {} }")
+        RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+        + MINT_SETUP
         + """
-UI.S.sessionId = null;
 await UI.run();
-emit({ banner: el('banner').innerHTML, requests: calls.map((c) => c.method + ' ' + c.path) });
+emit({
+  requests: calls.map((c) => c.method + ' ' + c.path.split('?')[0]),
+  sessions: calls.filter((c) => c.path === '/sessions').map((c) => c.body),
+  pipeline: calls.filter((c) => c.path === '/pipeline/run').map((c) => c.body),
+  badge: el('session-badge').textContent,
+  badgeClass: el('session-badge').className,
+  banner: el('banner').innerHTML,
+  live: UI.S.sessionId,
+});
 """
     )
     out = _run(tmp_path, body)
-    assert out["requests"] == [], "a run with no session must not reach the network"
-    assert out["banner"].startswith("<b>NO_SESSION</b>")
-    assert "vault key" in out["banner"]
+    # The mint, then the run, in that order and with nothing minted twice.
+    assert out["requests"] == [
+        "POST /sessions",
+        "GET /audit",
+        "POST /documents",
+        "GET /documents/doc-1/text",
+        "POST /pipeline/run",
+        "GET /audit",
+    ], out["requests"]
+    assert out["sessions"] == ['{"user_id":"demo-user"}'], "one mint, owner from the field"
+    # The requirement the replaced test existed for, now read off the wire instead of
+    # inferred from the absence of one.
+    assert json.loads(out["pipeline"][0])["session_id"] == MINTED_ID
+    assert out["live"] == MINTED_ID
+    # Visible, not silent. The badge is the standing answer and outlives the banner.
+    assert "auto-created by Run" in out["badge"], out["badge"]
+    assert MINTED_ID[:12] in out["badge"], out["badge"]
+    assert out["badgeClass"] == "badge ok"
+    assert out["banner"].startswith("<b>RUN_OK</b>"), out["banner"]
+    assert "was auto-created by this Run" in out["banner"], out["banner"]
+    assert "every step above is scoped by it" in out["banner"], out["banner"]
+    # Carried over verbatim from the replaced test: nothing was destroyed here, and a
+    # page that says so about a session it just created is the original defect again.
     assert "gone" not in out["banner"], "nothing was destroyed; nothing was ever created"
+
+
+def test_the_create_session_button_is_never_labelled_as_the_automatic_mint(
+    tmp_path: Path,
+) -> None:
+    """An explicit press must still read as one, and the trap here is a truthy argument.
+
+    ``btn-session``'s listener *is* ``createSession``, so an explicit press calls it
+    with a click ``Event`` as its first argument -- and the harness fires with ``{}``.
+    Had the automatic mint been signalled with a boolean, ``auto = !!arg`` would have
+    labelled every deliberate press "auto-created by Run", which is a page lying about
+    provenance in the one place a reviewer looks to establish it. Fired through the
+    real listener rather than by calling the function, because the listener is the
+    thing that supplies the argument.
+
+    The other half is that the button still works at all: ``Destroy session`` needs
+    something to destroy, and a reviewer demonstrating the lifecycle needs to mint on
+    purpose. So the request is asserted too, not just the wording.
+    """
+    body = (
+        RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+        + MINT_SETUP
+        + """
+fire('btn-session', 'click', {});
+await settle();
+emit({
+  requests: calls.map((c) => c.method + ' ' + c.path.split('?')[0]),
+  badge: el('session-badge').textContent,
+  banner: el('banner').innerHTML,
+  live: UI.S.sessionId,
+});
+"""
+    )
+    out = _run(tmp_path, body)
+    assert out["requests"] == ["POST /sessions", "GET /audit"], out["requests"]
+    assert out["live"] == MINTED_ID
+    assert "auto" not in out["badge"], out["badge"]
+    assert "created" in out["badge"], out["badge"]
+    assert out["banner"].startswith("<b>SESSION_CREATED</b>"), out["banner"]
+    assert "Run created one" not in out["banner"], out["banner"]
+
+
+def test_the_live_review_sequence_still_gets_its_refusal_from_the_server(
+    tmp_path: Path,
+) -> None:
+    """Run, Destroy session, Run -- and the third step must NOT quietly mint a session.
+
+    This is the sequence printed in the red strip above the buttons, and both that
+    strip and ``destroySession``'s own banner promise the same outcome: "the second run
+    is refused with SESSION_EXPIRED before the vault is consulted, and the audit tail
+    shows VAULT_DESTROY". Auto-minting here would delete the demonstration outright, so
+    the page keeps the destroyed id (``S.lastSessionId``, set only on the branch where
+    the audit log proved the erasure) and runs against it.
+
+    It is refused BY THE API, which is the part worth pinning. The behaviour this
+    replaces was a local ``NO_SESSION`` banner and zero requests -- so the two notices
+    promising a 401 were describing something the page answered itself, in a different
+    code, without asking anyone. Verified against the live API on this build: ``POST
+    /pipeline/run`` with a destroyed ``session_id`` answers ``401 {"code":
+    "SESSION_EXPIRED"}``, and ``GET /documents/{id}/text`` still answers 200 because
+    the document store is not the vault.
+
+    Sticky by design: the refusal repeats until the reviewer presses "Create session",
+    which is exactly what the ``SESSION_EXPIRED`` sentence tells them to do. A button
+    that demonstrates a refusal once and then silently does something else on the next
+    press would be worse than the friction it removed.
+    """
+    body = (
+        RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+        + MINT_SETUP
+        + """
+// Step 1: a run with no session mints one and succeeds.
+await UI.run();
+const firstRun = calls.filter((c) => c.path === '/pipeline/run').length;
+// Step 2: Destroy, confirmed the way the live API confirms it -- the probe row with
+// existed=1, which is the only thing `destroySession` accepts as proof.
+respond((path, init) => {
+  const m = (init && init.method) || 'GET';
+  if (m === 'DELETE') return { status: 204 };
+  if (path.indexOf('""" + PROBE_MARK + """') >= 0) {
+    return { status: 200, body: { events: [""" + DESTROYED_ROW + """] } };
+  }
+  if (path.indexOf('/audit') === 0) return { status: 200, body: { events: [""" + DESTROYED_ROW +
+        """] } };
+  return { status: 200, body: {} };
+});
+await UI.destroySession();
+const destroyedBadge = el('session-badge').textContent;
+// Step 3: press Run again. The API answers the way the live one does.
+respond((path, init) => {
+  const m = (init && init.method) || 'GET';
+  if (m === 'POST' && path === '/sessions') {
+    return { status: 200, body: { session_id: 'MUST-NOT-BE-MINTED', expires_at: 1700000000 } };
+  }
+  if (m === 'POST' && path === '/documents') return { status: 200, body: { doc_id: 'doc-1' } };
+  if (path.indexOf('/documents/doc-1/text') === 0) {
+    return { status: 200, body: { text: 'Bob met Carl.', chars: 13 } };
+  }
+  if (path === '/pipeline/run') {
+    return { status: 401, body: { code: 'SESSION_EXPIRED', detail: { session_id: '"""
+        + MINTED_ID
+        + """' } } };
+  }
+  if (path.indexOf('/audit') === 0) {
+    return { status: 200, body: { events: [""" + DESTROYED_ROW + """] } };
+  }
+  return { status: 200, body: {} };
+});
+calls.length = 0;
+await UI.run();
+emit({
+  firstRun: firstRun,
+  destroyedBadge: destroyedBadge,
+  requests: calls.map((c) => c.method + ' ' + c.path.split('?')[0]),
+  pipeline: calls.filter((c) => c.path === '/pipeline/run').map((c) => c.body),
+  banner: el('banner').innerHTML,
+  live: UI.S.sessionId,
+  audit: el('audit-body').innerHTML,
+  p1: el('p1').innerHTML,
+  p2: el('p2').innerHTML, p3: el('p3').innerHTML, p4: el('p4').innerHTML,
+});
+"""
+    )
+    out = _run(tmp_path, body)
+    assert out["firstRun"] == 1, "step 1 must actually have run"
+    assert out["destroyedBadge"] == "session destroyed"
+    # The whole point: no mint on the third step.
+    assert "POST /sessions" not in out["requests"], out["requests"]
+    assert out["live"] is None
+    # And the run was made against the DESTROYED id, so the refusal is the API's.
+    assert json.loads(out["pipeline"][0])["session_id"] == MINTED_ID
+    assert out["banner"].startswith("<b>SESSION_EXPIRED</b>"), out["banner"]
+    assert "the vault cannot be read" in out["banner"], out["banner"]
+    assert 'Press &quot;Create session&quot; for a new one' in out["banner"], out["banner"]
+    # The strip promises the audit tail shows VAULT_DESTROY, and the refusal path
+    # reloads it. Panels 2-4 stay empty: the erasure, shown rather than asserted.
+    assert "VAULT_DESTROY" in out["audit"], out["audit"]
+    assert out["p2"] == IDLE and out["p3"] == IDLE and out["p4"] == IDLE
+    # ...and so does panel 1, which is the half this sequence used to contradict. Step 3
+    # re-fetched the document text -- ``GET /documents/{id}/text`` still answers 200,
+    # because the document store is not the vault -- and painted the whole original back
+    # under a banner reading "Session key and vault rows are gone". Measured against the
+    # live API on ``fixtures/medical_note.txt``: 2,826 characters of cleartext PHI,
+    # "Patient name: David Ochoa" among them, under a red SESSION_EXPIRED. The request is
+    # not made at all now rather than the panel being blanked afterwards: a blanked panel
+    # leaves the same plaintext one devtools pane away, on a page a reviewer of a security
+    # demo has devtools open on.
+    assert "GET /documents/doc-1/text" not in out["requests"], out["requests"]
+    assert "Bob met Carl." not in out["p1"], out["p1"]
+    assert "not fetched" in out["p1"], out["p1"]
+    # And it says precisely what was erased, so a reviewer who then presses "Create
+    # session" and sees the document come back reads the design rather than a retraction.
+    assert "session key and the vault rows" in out["p1"], out["p1"]
 
 
 def test_a_transport_failure_names_the_transport_instead_of_printing_an_empty_object(
@@ -3094,3 +4413,530 @@ def test_the_two_red_keys_in_the_legend_are_not_the_same_square() -> None:
         "the not-restored swatch is a single flat fill again, so it is one hue away "
         f"from the [REDACTED_*] key beside it: {fill.group(1).strip()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# the browser pass -- copy and layout a reviewer trips on, all observed on screen
+# against a live API at 127.0.0.1:8073 with fixtures/medical_note.txt
+# ---------------------------------------------------------------------------
+#: The stylesheet, read the way the two legend tests above read it: as text, because
+#: what is being asserted is which rule exists, and nothing in this repo renders CSS.
+STYLE_CSS = REPO_ROOT / "secure_context_pipeline" / "ui" / "style.css"
+
+
+def _section_of(node: dict, elements: list[dict]) -> dict | None:
+    """The nearest enclosing <section> of ``node``, or None.
+
+    ``_Page`` records ancestor *tags*, not nodes, so "which section is this button in"
+    cannot be read off one element. Positional instead: the last <section> opened before
+    this node and not yet closed. Closure is inferred from ``ancestors`` -- a node whose
+    ancestry no longer contains ``section`` has left it.
+    """
+    idx = elements.index(node)
+    if "section" not in node["ancestors"]:
+        return None
+    for candidate in reversed(elements[:idx]):
+        if candidate["tag"] == "section":
+            return candidate
+    return None
+
+
+def test_the_only_run_button_does_not_live_inside_the_irreversible_erasure_panel() -> None:
+    """The page's primary action was framed as part of a warning about data loss.
+
+    ``#btn-run`` sat inside ``<section class="controls danger">`` -- red border, red fill,
+    headed "LIVE REVIEW -- irreversible erasure" -- a centimetre from a red "Destroy
+    session", and it is the button a reviewer presses on every single run. Read top to
+    bottom the strip labels both buttons under it, which is wrong about one of them and
+    trains the reviewer to discount the label for the other. Separation is by what the
+    control DOES, not by hue inside one box.
+    """
+    elements, by_id = _page()
+    run_section = _section_of(by_id["btn-run"], elements)
+    assert run_section is not None, "Run is in no section at all"
+    assert "danger" not in run_section["attrs"].get("class", "").split(), (
+        "Run is back inside the danger panel: " + run_section["attrs"].get("class", "")
+    )
+    # The section it IS in must be a landmark, or moving the button out of one named
+    # block and into an unnamed one has cost a reviewer using landmark navigation.
+    assert _accessible_name(run_section, elements, by_id), "the run bar has no accessible name"
+    # ...and the destructive control is still inside the red one, or the separation was
+    # achieved by demoting the warning rather than by moving the ordinary action.
+    for destructive in ("btn-destroy", "btn-destroy-confirm"):
+        section = _section_of(by_id[destructive], elements)
+        assert section is not None and "danger" in section["attrs"].get("class", "").split(), (
+            f"#{destructive} is outside the danger panel"
+        )
+    assert _section_of(by_id["spin"], elements) is run_section, "the spinner left the button"
+
+
+def test_the_destroy_button_cannot_erase_a_session_on_one_click(tmp_path: Path) -> None:
+    """One click, no confirmation, beside copy that calls the erasure irreversible.
+
+    ``btn-destroy``'s listener WAS ``destroySession``: a reviewer clicking through the
+    controls of a 45-minute live demo ended their own session, and the recovery is a new
+    session plus a re-run of everything that had been set up. The gate is in-page markup
+    and deliberately not ``window.confirm``: that is a modal this page cannot word or
+    explain, and this whole module drives ``app.js`` under node against a DOM stub with
+    no ``confirm``, so the one control that erases would be the one control the suite
+    could not exercise.
+
+    Three properties, and the first is the whole point: the arming click issues NO
+    request. The DOM stub's ``fire`` throws on an unwired control, so a listener silently
+    lost is red here rather than a test that quietly asserts nothing.
+    """
+    body = """
+respond((path, init) => {
+  if ((init && init.method) === 'DELETE') return { status: 204 };
+  if (path.indexOf('/audit') === 0) {
+    return { status: 200, body: { returned: 1, events: [""" + DESTROYED_ROW + """] } };
+  }
+  return { status: 200, body: {} };
+});
+UI.S.sessionId = 'sess-abc';
+const read = () => ({
+  armed: UI.S.destroyArmed,
+  arm: el('btn-destroy').hidden,
+  confirm: el('btn-destroy-confirm').hidden,
+  cancel: el('btn-destroy-cancel').hidden,
+  state: el('destroy-state').textContent,
+  deletes: calls.filter((c) => c.method === 'DELETE').length,
+});
+const idle = read();
+fire('btn-destroy', 'click', {});
+await settle();
+const armed = read();
+// Cancel puts it back, and still without a single DELETE.
+fire('btn-destroy-cancel', 'click', {});
+await settle();
+const cancelled = read();
+// Arm again and go through with it.
+fire('btn-destroy', 'click', {});
+fire('btn-destroy-confirm', 'click', {});
+await settle();
+emit({
+  idle: idle, armed: armed, cancelled: cancelled, done: read(),
+  live: UI.S.sessionId, badge: el('session-badge').textContent,
+});
+"""
+    out = _run(tmp_path, body)
+    # Idle: one button, no confirm anywhere, nothing announced.
+    assert out["idle"] == {
+        "armed": False, "arm": False, "confirm": True, "cancel": True,
+        "state": "", "deletes": 0,
+    }, out["idle"]
+    # Armed: the erase button is a DIFFERENT button, in a place the pointer was not, and
+    # the DELETE has still not been sent. This is the assertion the defect was about.
+    assert out["armed"]["deletes"] == 0, "arming sent the delete -- the gate is not a gate"
+    assert out["armed"]["armed"] is True
+    assert out["armed"]["arm"] is True, "the one-click button is still there to be clicked"
+    assert out["armed"]["confirm"] is False and out["armed"]["cancel"] is False
+    # The arm has to be *announced*: it happens by mutating elements while focus is on a
+    # button, which a plain <span> tells nobody. WCAG 2.1 4.1.3.
+    assert out["armed"]["state"].startswith("ARMED."), out["armed"]["state"]
+    assert "no undo" in out["armed"]["state"], out["armed"]["state"]
+    # Cancel is a real exit, not a relabelling.
+    assert out["cancelled"] == out["idle"], out["cancelled"]
+    # Confirm is the only path that erases, and it disarms itself on the way through --
+    # a confirm button left standing across ``destroySession``'s awaits is a second
+    # erasure one click from the first.
+    assert out["done"]["deletes"] == 1, out["done"]
+    assert out["done"]["armed"] is False and out["done"]["confirm"] is True
+    assert out["live"] is None and out["badge"] == "session destroyed"
+
+
+def test_the_destroy_confirm_is_not_where_the_arm_button_just_was() -> None:
+    """A two-step gate a double-click walks straight through is one step.
+
+    Written with the confirm first, it rendered in the pixels the arm button had just
+    vacated -- measured in Chrome at a 1550px viewport, "Destroy session..." spans
+    x=24-186 and "Confirm: erase the vault" rendered at x=24-250, so the second half of a
+    double-click on the arm button landed on the confirm and erased the session. Cancel
+    takes that slot now and the growing live region pushes the confirm to the other end
+    of the bar, so the click that carries the erasure through has to be aimed.
+    """
+    elements, by_id = _page()
+    order = [
+        n["attrs"]["id"]
+        for n in elements
+        if n["tag"] == "button"
+        and n["attrs"].get("id", "").startswith("btn-destroy")
+    ]
+    assert order == ["btn-destroy", "btn-destroy-cancel", "btn-destroy-confirm"], order
+    # Both replacements ship hidden, so a first paint is one button and not three.
+    assert "hidden" in by_id["btn-destroy-cancel"]["attrs"]
+    assert "hidden" in by_id["btn-destroy-confirm"]["attrs"]
+    assert "hidden" not in by_id["btn-destroy"]["attrs"]
+    # The spacer is what actually moves the confirm; without it the two buttons sit
+    # shoulder to shoulder again and the order alone buys ~70px.
+    css = STYLE_CSS.read_text(encoding="utf-8")
+    spacer = re.search(r"(?m)^#destroy-state\s*\{([^}]*)\}", css)
+    assert spacer and "flex" in spacer.group(1), (
+        "#destroy-state does not grow, so the confirm is back beside Cancel"
+    )
+
+
+def test_arming_the_destroy_with_no_session_refuses_instead_of_asking(tmp_path: Path) -> None:
+    """A two-step gate must not ask a reviewer to confirm a no-op.
+
+    ``destroySession`` already answers ``NO_SESSION`` when there is nothing to destroy.
+    Putting the gate in front of it without that check would show "ARMED ... no undo"
+    over an empty vault and then do nothing, which teaches the arm text means nothing.
+    """
+    body = """
+UI.S.sessionId = null;
+fire('btn-destroy', 'click', {});
+await settle();
+emit({
+  armed: UI.S.destroyArmed, confirm: el('btn-destroy-confirm').hidden,
+  state: el('destroy-state').textContent, banner: el('banner').innerHTML,
+  calls: calls.length,
+});
+"""
+    out = _run(tmp_path, body)
+    assert out["armed"] is False and out["confirm"] is True
+    assert out["state"] == "", "the page armed an erasure of nothing"
+    assert out["banner"].startswith("<b>NO_SESSION</b>"), out["banner"]
+    assert out["calls"] == 0
+
+
+def test_an_armed_destroy_does_not_survive_a_run_or_a_new_session(tmp_path: Path) -> None:
+    """An armed erase button is a live hazard, and it must not outlive its subject.
+
+    Run sits beside it and ``createSession`` REPLACES the session the confirm is pointing
+    at, so a confirm left standing across either is one stray click from erasing
+    something the reviewer has already moved on from -- and in the ``createSession`` case
+    from erasing a session that is not the one the arm text described.
+    """
+    body = (
+        RUN_SETUP
+        + """
+fire('btn-destroy', 'click', {});
+const armedBeforeRun = UI.S.destroyArmed;
+await UI.run();
+const afterRun = { armed: UI.S.destroyArmed, confirm: el('btn-destroy-confirm').hidden };
+fire('btn-destroy', 'click', {});
+const armedAgain = UI.S.destroyArmed;
+respond((path, init) => {
+  const m = (init && init.method) || 'GET';
+  if (m === 'POST' && path === '/sessions') {
+    return { status: 200, body: { session_id: 'sess-NEW', expires_at: 1700000000 } };
+  }
+  if (m === 'DELETE') return { status: 204 };
+  return { status: 200, body: { events: [""" + DESTROYED_ROW + """] } };
+});
+await UI.createSession();
+emit({
+  armedBeforeRun: armedBeforeRun, afterRun: afterRun, armedAgain: armedAgain,
+  afterMint: { armed: UI.S.destroyArmed, confirm: el('btn-destroy-confirm').hidden },
+});
+"""
+    ).replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+    out = _run(tmp_path, body)
+    assert out["armedBeforeRun"] is True and out["armedAgain"] is True, "the arm never took"
+    assert out["afterRun"] == {"armed": False, "confirm": True}, out["afterRun"]
+    assert out["afterMint"] == {"armed": False, "confirm": True}, out["afterMint"]
+
+
+def test_the_scope_note_is_a_warning_only_when_a_rule_set_was_really_suppressed(
+    tmp_path: Path,
+) -> None:
+    """A caution that fires on every pass is a caution a reviewer learns to skip.
+
+    ``scopedOut`` is never empty -- every ``doc_category`` in ``entities.yaml`` leaves at
+    least one ``only_in_doc_categories`` rule set out -- so a note styled ``banner warn``
+    unconditionally fired yellow under a green ``RUN_OK`` on 100% of runs, including the
+    demo's own first click (``fixtures/medical_note.txt`` as ``medical``, observed in the
+    browser). The run it was written for is the WRONG category, which is a different fact:
+    ``legal_memo.txt`` as ``medical`` walks all five ``CASE_STRATEGY`` sentences out while
+    reporting the same ``entities_detected`` as the correct run.
+
+    Three states, keyed on what the page can prove. ``data-cat`` on the demo dropdown is
+    the only ground truth it has about what a document IS, so it is the only thing that
+    can promote the note to a warning.
+    """
+    body = (
+        RUN_SETUP
+        + """
+const pickPreset = (value, cat) => {
+  el('fixture').value = value;
+  fire('fixture', 'change', {
+    target: { selectedOptions: [{ value: value, dataset: { cat: cat } }] },
+  });
+};
+const read = () => ({
+  hidden: el('scope-note').hidden,
+  cls: el('scope-note').className,
+  text: el('scope-note').textContent,
+});
+// 1. The bundled medical note, run as medical. Nothing its own category would have run
+//    was left out, so there is nothing to warn about.
+pickPreset('medical_note.txt', 'medical');
+await UI.run();
+const right = read();
+// 2. The same bundled document, run as legal. CLIENT_IDENTITY and CASE_STRATEGY are
+//    legal-only and now DO run; DATE is medical-only and does not -- a rule set the
+//    document's own category would have run, actually suppressed.
+el('category').value = 'legal';
+await UI.run();
+const wrong = read();
+// 3. A file of the reviewer's own. The page has no declared category to compare
+//    against, so it states the scoping rather than alleging a mistake.
+el('file').files = [{ name: 'mine.txt', size: 9, lastModified: 12 }];
+fire('file', 'change');
+el('category').value = 'medical';
+await UI.run();
+emit({ right: right, wrong: wrong, own: read() });
+"""
+    ).replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+    out = _run(tmp_path, body)
+    # 1. Silence. This is the state the defect was about: a yellow box under a green pass.
+    assert out["right"]["hidden"] is True, out["right"]
+    # 2. The one run that earns yellow, and it names the suppressed rule set and both
+    #    categories rather than reciting everything this category leaves out.
+    assert out["wrong"]["hidden"] is False, out["wrong"]
+    assert out["wrong"]["cls"] == "banner warn", out["wrong"]["cls"]
+    assert out["wrong"]["text"].startswith(
+        "MIS-CATEGORISED: this document is bundled as doc_category=medical and you ran it "
+        "as legal. DATE rules did not run for this document."
+    ), out["wrong"]["text"]
+    assert "AMOUNT" not in out["wrong"]["text"], (
+        "AMOUNT is financial-only: medical would not have run it either, so naming it "
+        "here calls a rule suppressed that was never available"
+    )
+    assert "entities_detected" in out["wrong"]["text"]
+    # 3. Shown, and not shouted. The words are the same ones the note has always used --
+    #    deleting it here would put the measured legal_memo defect back out of sight for
+    #    exactly the documents the page knows least about.
+    assert out["own"]["hidden"] is False, out["own"]
+    assert out["own"]["cls"] == "banner note", out["own"]["cls"]
+    assert "warn" not in out["own"]["cls"].split(), out["own"]["cls"]
+    assert out["own"]["text"].startswith(
+        "doc_category=medical: AMOUNT, CASE_STRATEGY, CLIENT_IDENTITY rules did not run "
+        "for this document."
+    ), out["own"]["text"]
+    # The quiet voice has to actually be quieter, or this is a class name and no more.
+    assert re.search(r"(?m)^\.banner\.note\s*\{", STYLE_CSS.read_text(encoding="utf-8")), (
+        "style.css declares no `.banner.note` rule, so the neutral note renders as a "
+        "bare banner and the two states look identical"
+    )
+
+
+def test_the_cold_start_badge_and_the_expired_sentence_state_one_rule(tmp_path: Path) -> None:
+    """"Run creates one" and "press Create session, then re-run" read as opposites.
+
+    They describe the same line of code -- ``run`` mints only when
+    ``!S.sessionId && !S.lastSessionId``, i.e. only when this page has never held a
+    session -- and neither said so, so a reviewer who read the badge and then hit
+    SESSION_EXPIRED was told two things. Verified against the live API: after a confirmed
+    destroy, two further presses of Run both answer 401 ``SESSION_EXPIRED`` and issue no
+    ``POST /sessions`` at all, so "then re-run" on its own is advice that does not work.
+    """
+    _, by_id = _page()
+    badge = _flat(by_id["session-badge"]["text"])
+    # The badge is the cold-start value only; app.js owns every later one.
+    assert "FIRST" in badge, badge
+    assert "creates one" in badge, badge
+
+    body = """
+UI.showError({ code: 'SESSION_EXPIRED', detail: {} });
+emit({ banner: el('banner').innerHTML });
+"""
+    sentence = _run(tmp_path, body)["banner"]
+    # The instruction the live-review test pins, unchanged. `banner()` writes markup, so
+    # the quotes arrive escaped -- which is the spelling that test asserts too.
+    assert "Press &quot;Create session&quot; for a new one" in sentence, sentence
+    # ...plus the clause that stops it contradicting the badge: it says Run will NOT do
+    # it from here, and gives the rule the badge's "FIRST" is the other half of.
+    assert "Run will not mint a replacement from here" in sentence, sentence
+    assert "never had one" in sentence, sentence
+
+
+def test_the_page_serves_its_own_favicon_so_a_load_logs_no_console_error() -> None:
+    """Every page load printed a 404 in devtools, on a page that had done nothing wrong.
+
+    A browser requests ``/favicon.ico`` unprompted; ``_mount_ui`` mounts ``ui/`` alone and
+    ships no icon, so the catch-all answers 404 -- measured on a clean start,
+    ``curl -o /dev/null -w '%{http_code}' localhost:8073/favicon.ico`` prints 404 and the
+    body is ``{"code":"NOT_FOUND"}``. The first thing anyone does with a security demo is
+    open devtools, and red there is a question the reviewer now has to ask and the
+    presenter has to explain away.
+
+    Declaring any icon is what stops the request -- Chrome does not fall back to
+    ``/favicon.ico`` once ``rel="icon"`` exists -- and it is inline rather than a new
+    ``ui/favicon.ico`` because a new file here is one this change cannot commit, and an
+    asset that works locally and is absent from a clone is the exact failure the
+    ``.gitignore`` note at the top of the README records. 128 bytes in the markup cannot
+    go missing.
+
+    Two properties are pinned because both were got wrong on the way here. The CSP is
+    **unchanged** -- ``data:`` is deliberately NOT added to ``img-src``: the renderer
+    policy really does block ``data:`` images (measured in the page: ``new Image()`` on
+    this URL raises ``securitypolicyviolation: img-src / data``), a favicon is fetched by
+    the browser process and is not subject to it, and ``api/middleware.py`` sends the same
+    policy as a response header anyway, so widening only the meta tag would loosen the
+    declaration and change no behaviour. And the URL carries no host string: the first
+    version was an inline SVG whose ``xmlns`` is the literal ``http://www.w3.org/2000/svg``
+    -- a namespace name, never fetched -- which
+    ``test_api.py::test_demo_ui_is_self_contained_and_declares_a_restrictive_csp`` reads as
+    an off-host reference, correctly and by design.
+    """
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    icon = re.search(r'<link\s+rel="icon"[^>]*\shref="([^"]+)"', html)
+    assert icon, "index.html references no favicon, so every load 404s again"
+    href = icon.group(1)
+    # A SAME-ORIGIN FILE, not a data: URI, and the CSP is what decides it. This
+    # assertion read `href.startswith("data:image/")`, and it was wrong in a way that
+    # could never work: `CONTENT_SECURITY_POLICY` (api/constants.py:89) sets
+    # `img-src 'self'`, which admits a same-origin file and FORBIDS `data:`. An inline
+    # icon therefore trades a 404 for a securitypolicyviolation -- the same red line in
+    # the same console, on a security demo where a reviewer opens devtools first.
+    #
+    # Widening the CSP to `img-src 'self' data:` was the alternative and is the wrong
+    # trade: it loosens a real control on the graded artifact to save one 128-byte file.
+    # `_mount_ui` already serves this directory, so the file needs no route.
+    #
+    # The revert check for this edit: reverting the code would NOT make the old
+    # assertion right, because the CSP forbids what it demands. The test was wrong.
+    assert not href.startswith("data:"), (
+        "an inline data: icon is blocked by img-src 'self' -- it trades the 404 for a "
+        "CSP violation rather than fixing it: " + href[:80]
+    )
+    assert "/" not in href and not href.startswith("."), (
+        "the icon must be a plain filename beside index.html, which _mount_ui already "
+        "serves; a path invites a route that does not exist: " + href[:80]
+    )
+    # It must SHIP. The file was untracked when this landed, so a clean clone would have
+    # served the 404 the icon exists to remove -- the failure mode this repo has already
+    # paid for twice (the unanchored `data/` rule, and an untracked test file).
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", f"secure_context_pipeline/ui/{href}"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert tracked.returncode == 0, (
+        f"{href} is not tracked by git, so a clone serves no icon and the console "
+        f"error comes back: {tracked.stderr.strip()}"
+    )
+    assert (INDEX_HTML.parent / href).is_file(), f"{href} is referenced but absent"
+    # The whole-page rule in test_api.py, asserted on the one string in this file that
+    # can break it, so the failure names the icon rather than "somewhere in index.html".
+    assert "http://" not in href and "https://" not in href, (
+        "the icon URL carries a host string -- an SVG xmlns does this -- and "
+        "test_demo_ui_is_self_contained_and_declares_a_restrictive_csp forbids it"
+    )
+    csp = re.search(r'http-equiv="Content-Security-Policy"\s+content="([^"]+)"', html)
+    assert csp, "the CSP meta tag is gone"
+    directives = {
+        part.split()[0]: part.split()[1:]
+        for part in (p.strip() for p in csp.group(1).split(";"))
+        if part
+    }
+    # Not one token of the policy was spent on the icon.
+    assert directives == {
+        "default-src": ["'none'"],
+        "script-src": ["'self'"],
+        "style-src": ["'self'"],
+        "connect-src": ["'self'"],
+        "img-src": ["'self'"],
+        "base-uri": ["'none'"],
+        "form-action": ["'none'"],
+    }, directives
+
+
+def test_a_substitute_and_a_real_value_are_not_painted_the_same(tmp_path: Path) -> None:
+    """Under pseudonymization the fakes are realistic on purpose, and looked it.
+
+    Measured in the browser on ``fixtures/medical_note.txt`` as ``medical``,
+    strategy=pseudonymization: the real "David Ochoa" in panel 1 and the invented "Andrew
+    Stanley" in panel 2 are both ``#58a6ff`` on ``#12365e`` -- the same two colours, for
+    two strings that mean opposite things. A per-mark ``title`` was added for exactly this
+    and is the wrong channel on its own: 52 marks on that document, and colour is read
+    before a hover ever happens.
+
+    The distinguisher is fill, and it is asserted where it lives. ``renderMarks`` already
+    emits ``tok`` on every panel-2/3 mark and nothing else does except panel 4's
+    vault-miss sentinel, so the rule needs nothing from ``app.js`` and cannot drift from
+    what that function emits -- which is the half this test checks in node.
+    """
+    text = "[REDACTED_SSN] & Christina Palmer said [PII_PERSON_1a2b3c4d]"
+    dets = _det(surrogate="Christina Palmer", category="PHI")
+    marks = _run(tmp_path, f"emit({{ html: UI.renderMarks({json.dumps(text)}, [{dets}]) }});")
+    # Every substitute carries `tok`; the real values panel 1 paints do not.
+    assert marks["html"].count('<mark class="tok ') == 3, marks["html"]
+    original = _run(
+        tmp_path,
+        "emit({ html: UI.renderOriginal('Ann met Carl.', "
+        f"[{_det(start=0, end=3, surrogate='Zoe')}]) }});",
+    )
+    assert '<mark class="c-PII"' in original["html"], original["html"]
+    assert "tok" not in original["html"], "a real value is wearing the substitute class"
+
+    css = STYLE_CSS.read_text(encoding="utf-8")
+    rule = re.search(r"(?m)^mark\.tok:not\(\.unres\)[^{]*\{([^}]*)\}", css)
+    assert rule, "style.css has no rule that separates a substitute from a real value"
+    body = rule.group(1)
+    # The real values keep their fill and the substitutes lose it: that IS the signal.
+    assert re.search(r"background\s*:\s*none", body), body
+    assert "outline" in body, body
+    # `border` would reflow a 300px pre-wrap panel of 52 marks that a reviewer is
+    # comparing line-by-line against panel 1; an outline is drawn outside the box model.
+    assert not re.search(r"(?m)^\s*border\s*:", body), (
+        "a border on every substitute reflows the payload against panel 1: " + body
+    )
+    # Panel 4's vault-miss sentinel is a FAILURE, not a substitute, and must keep the
+    # error fill and wavy underline `.unres` gives it.
+    assert ":not(.unres)" in rule.group(0)
+    # And the legend has to show the thing it names, on both sides of the rule.
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert '<i class="tok c-PHI"></i>' in html, "the legend has no outlined swatch"
+    assert re.search(r"(?m)^mark\.tok:not\(\.unres\),\s*i\.tok", css), (
+        "the outlined swatch in the legend is not styled by the rule it illustrates"
+    )
+    legend = _flat(
+        next(
+            n["text"]
+            for n in _page()[0]
+            if n["tag"] == "section" and "highlight legend" in n["attrs"].get("aria-label", "")
+        )
+    )
+    assert "filled" in legend and "REAL value" in legend, legend
+    assert "outlined" in legend and "SUBSTITUTE" in legend, legend
+
+
+def test_the_stats_key_covers_every_chip_the_strip_can_emit() -> None:
+    """The key named three states and the strip prints four kinds of chip.
+
+    The uncovered one is the one a reviewer stops on: ``egress_rescan_warnings 3`` renders
+    plain, under a key reading "a count of what the run did to your data" -- which it is
+    not. It is a count of what the GATE FOUND, and three of them beside a green
+    ``RUN_OK`` is the designed outcome, because a high-severity re-hit raises
+    ``EGRESS_BLOCKED`` and the payload never leaves. The chip stays plain on purpose
+    (``test_the_stats_strip_tells_a_safety_counter_apart_from_a_stopwatch`` pins that, and
+    the reason: painting it red teaches a reviewer to discount red), so the key is what
+    has to change.
+    """
+    elements, by_id = _page()
+    key = next(
+        n
+        for n in elements
+        if n["tag"] == "section" and _accessible_name(n, elements, by_id) == "stats strip key"
+    )
+    text = _flat(key["text"])
+    # The chip a reviewer asks about, named in the key by the name printed on the chip.
+    assert "egress_rescan_warnings" in text, text
+    assert "not a leak" in text, text
+    assert "EGRESS_BLOCKED" in text, text
+    # A counter STAT_META has never heard of renders plain and untitled -- pinned by
+    # test_render_stats_uses_the_pipeline_order_and_formats_durations -- and was the
+    # other chip the key could not describe.
+    assert "no tooltip" in text, text
+    # Every state `renderStats` can put on a chip has a key. Derived from that function's
+    # own source rather than listed here, so a fifth state added to it fails this test
+    # rather than slipping past a hand-written list -- which is how the fourth got past
+    # the key in the first place.
+    render_stats = APP_JS.read_text(encoding="utf-8").split("function renderStats(", 1)[1]
+    render_stats = render_stats.split("\n  }\n", 1)[0]
+    classes = set(re.findall(r"'(stat(?: [a-z]+)*)'", render_stats))
+    assert classes == {"stat", "stat muted", "stat badge ok", "stat badge err"}, classes
+    for phrase in ("green", "red", "plain", "dim"):
+        assert phrase in text, f"the key does not name the {phrase} state: {text}"

@@ -32,10 +32,12 @@ from secure_context_pipeline.deobfuscation.restorer import (
     _HINT_TAIL_RE,
     _MAX_LABEL_LEN,
     _MAX_MISS_ROWS,
+    _MAX_RESTORE_ROWS,
     MISS_FABRICATED,
     MISS_INDETERMINATE,
     MISS_LOST,
     PSEUDONYMIZATION,
+    RESTORE_ACTION,
     TOKENIZATION,
     UNRESOLVED_ENTITY,
     Restorer,
@@ -49,6 +51,7 @@ from secure_context_pipeline.llm.mock_provider import (
     MockProvider,
     plan_mutations,
 )
+from secure_context_pipeline.models import AuditEvent
 from secure_context_pipeline.pipeline import egress_gate
 from secure_context_pipeline.surrogates import (
     MAX_ENTITY_TYPE_LEN,
@@ -189,6 +192,23 @@ MANGLED_FORMS = [
     # Mismatched brackets: the grammar accepts any opener with any closer, and it
     # should -- a model that mangles one bracket often mangles the pair.
     ("{PHI_NAME_1a2b3c4d]", "John Smith"),
+    # Section 9.7 tolerates "a case-mangled hash" and section 5's requirement 6
+    # asks for "paraphrased or grammatically modified forms". Only the hash was
+    # case-tolerant, so every form on the left below was NO MATCH and left the
+    # token in the answer the user reads.
+    ("[phi_name_1a2b3c4d]", "John Smith"),
+    ("[Phi_Name_1a2b3c4d]", "John Smith"),
+    ("[phi_name_1A2B3C4D]", "John Smith"),
+    ("**[phi_name_1a2b3c4d]**'s", "John Smith's"),
+    ("phi-name-1a2b3c4d", "John Smith"),
+    ("[phi_medication_2f4a1b3c|oral-antidiabetic]", "Metformin"),
+    # Whitespace was allowed after the opening bracket, around the pipe and before
+    # the closer -- but not at the two separators, so a token a model wrapped mid-
+    # token did not restore.
+    ("[PHI_NAME_\n1a2b3c4d]", "John Smith"),
+    ("[PHI_NAME\n_1a2b3c4d]", "John Smith"),
+    ("[PHI\n_NAME_1a2b3c4d]", "John Smith"),
+    ("[PHI_ NAME_ 1a2b3c4d]", "John Smith"),
 ]
 
 
@@ -555,26 +575,30 @@ async def test_mangled_hint_mopup_never_eats_the_models_prose(
 
 
 # --------------------------------------------------------------------------
-# The hint stranded on a token that lost BOTH brackets -- LEFT ALONE.
+# The hint stranded on a token that lost BOTH brackets, WITH NO HINT MAP
+# SUPPLIED -- left alone.
 #
 # `_consume_unclosed_tail` terminates on the closer that BALANCES the opener, so
 # it never runs on a token carrying neither -- section 9.6's `bracket_dropped`
-# mutation applied twice. The hint therefore survives into the answer welded to
-# the restored original: with a vault of {'2f4a1b3c': 'Metformin'} the user reads
-# "Metformin|oral-antidiabetic", while the bracketed spelling of the same token
-# reads "Metformin". That asymmetry is visible in panel 4 of the demo and it is
-# ACCEPTED, not overlooked.
+# mutation applied twice. With nothing else to go on, the hint survives into the
+# answer welded to the restored original: with a vault of {'2f4a1b3c':
+# 'Metformin'} the user reads "Metformin|oral-antidiabetic", while the bracketed
+# spelling of the same token reads "Metformin".
 #
-# A mop-up for it was written and reverted. Without a bracket there is no
-# delimiter, so the only thing left to bound a deletion by is the hint ALPHABET,
-# `[a-z0-9-]{1,24}` -- which is also ordinary English. The three rows marked
-# WHY IT WAS REVERTED are the model's own words that the mop-up deleted, measured
-# against that implementation with all of its table-cell and length guards in
-# place. The only honest bound is the finite gazetteer hint vocabulary, and
-# `restorer.py` cannot reach it (it is handed a vault and settings, never a
-# registry, and `orchestrator._surrogate_map` carries pseudonyms only) -- nor
-# would it close the hole, since "cardiovascular", "renal" and "insulin" are all
-# real class hints and all real English. See `_consume_unclosed_tail`'s docstring.
+# Every row here calls `restore` WITHOUT `hints`, and that is what the table is
+# about: the answer to "can this be cleaned up from the response text alone?" is
+# still no. A mop-up that tried was written and reverted. Without a bracket there
+# is no delimiter, so the only thing left to bound a deletion by is the hint
+# ALPHABET, `[a-z0-9-]{1,24}` -- which is also ordinary English. The three rows
+# marked WHY IT WAS REVERTED are the model's own words that the mop-up deleted,
+# measured against that implementation with all of its table-cell and length
+# guards in place.
+#
+# What DID close it is a different kind of bound and it arrives from the run
+# rather than from the text: `restore(hints=...)` carries the hint this run wrote
+# for each token ID, and `_consume_emitted_hint` will remove those exact bytes and
+# no others. That path has its own table below, including all three reverted rows
+# re-run with a real map to show they stay refused.
 #
 # Same shape as the table above: the second element is the FULL expected output,
 # because the failure this guards against is a DELETION and a substring check
@@ -647,6 +671,26 @@ async def test_a_hint_stranded_by_a_dropped_bracket_costs_no_word_of_the_answer(
     assert TOKEN_RE.search(result.text) is None
 
 
+#: The hint alphabet, plus the ordinary English that lives inside it. Shared by
+#: the two property tests below so that "the same runs, with and without a map"
+#: is true of the code and not only of a docstring.
+BRACKETLESS_HINT_RUNS = (
+    "cardiovascular",
+    "oral-antidiabetic",
+    "renal",
+    "insulin",
+    "and",
+    "per-protocol",
+    "active",
+    "a",
+    "9",
+    "a-1-b",
+    # Exactly the emitter's own bound -- the most hint-like run there is, and
+    # still not ours to delete once the brackets that made it ours are gone.
+    "x" * MAX_HINT_LEN,
+)
+
+
 async def test_no_word_after_a_bracketless_token_is_ever_deleted(
     restorer: Restorer,
 ) -> None:
@@ -657,23 +701,16 @@ async def test_no_word_after_a_bracketless_token_is_ever_deleted(
     whole hint alphabet plus a sample of ordinary English that lives inside it:
     after a token that lost both brackets, EVERY word the model wrote is still in
     the answer. It is the assertion that goes red the moment a stranded-hint
-    mop-up is reintroduced, whatever guards it ships with.
+    mop-up driven by the RESPONSE TEXT is reintroduced, whatever guards it ships
+    with -- no `hints` is passed here, so nothing but the text is available to
+    such a mop-up, which is exactly the input the reverted one had.
+
+    The run-supplied map is a different question and gets its own property test,
+    `test_a_hint_map_can_only_delete_the_bytes_that_map_authorises`: there the
+    same eleven runs are offered with a map naming a DIFFERENT hint, and they
+    survive for a reason this test cannot see.
     """
-    for run in (
-        "cardiovascular",
-        "oral-antidiabetic",
-        "renal",
-        "insulin",
-        "and",
-        "per-protocol",
-        "active",
-        "a",
-        "9",
-        "a-1-b",
-        # Exactly the emitter's own bound -- the most hint-like run there is, and
-        # still not ours to delete once the brackets that made it ours are gone.
-        "x" * MAX_HINT_LEN,
-    ):
+    for run in BRACKETLESS_HINT_RUNS:
         text = f"The chart mentions PHI_MEDICATION_2f4a1b3c|{run} today."
 
         result = await restorer.restore(SESSION, text, strategy=TOKENIZATION)
@@ -681,6 +718,250 @@ async def test_no_word_after_a_bracketless_token_is_ever_deleted(
         assert result.text == f"The chart mentions Metformin|{run} today.", (run, result.text)
         for word in text.split("|", 1)[1].split():
             assert word in result.text, (run, word, result.text)
+
+
+# --------------------------------------------------------------------------
+# The same stranded hint, WITH the run's own hint map -- consumed, and only ever
+# the bytes the map authorises.
+#
+# `restore(hints={token_id: hint})` is what the orchestrator can supply because it
+# holds `TokenRecord.surrogate` for everything it minted, so the hint written after
+# the pipe is knowable without a registry and without the gazetteers. That turns
+# the question from "is this run of lowercase letters hint-shaped?" -- which is
+# also the question "is this an English word?", and is why the text-only mop-up was
+# reverted -- into "are these the exact bytes we wrote after this exact token?".
+#
+# Reproduced before the fix on the real pipeline, fixtures/medical_note.txt under
+# pseudonymization: panel 4 line 5 read
+#   - The closing section mentions chest pain|cardiovascular.
+# against panel 3's
+#   - The closing section mentions PHI_DIAGNOSIS_7f029e2e|cardiovascular.
+# while the bracketed spelling one line up restored cleanly to "asthma.".
+# --------------------------------------------------------------------------
+
+#: The hint this run wrote for each token ID -- the shape ``Restorer.restore``
+#: takes and the orchestrator can build from the surrogates it minted.
+EMITTED_HINTS = {MED_ID: "oral-antidiabetic", NAME_ID: "cardiovascular"}
+
+HINT_MAP_CONSUMES_ONLY_WHAT_WE_WROTE = [
+    # The demo's exact shape: both brackets gone, hint welded to the value.
+    (
+        "The chart mentions PHI_MEDICATION_2f4a1b3c|oral-antidiabetic.",
+        "The chart mentions Metformin.",
+    ),
+    # Mid-sentence, so the words on BOTH sides have to survive the splice.
+    (
+        "Started PHI_MEDICATION_2f4a1b3c|oral-antidiabetic and improved.",
+        "Started Metformin and improved.",
+    ),
+    # Ordinary prose after a restored token, spelled out at length because that is
+    # the failure mode the reverted mop-up had: a sentence that reads correctly is
+    # the only evidence that nothing was quietly removed from it.
+    (
+        "PHI_NAME_1a2b3c4d|cardiovascular risk was reviewed; follow up in two weeks"
+        " with the clinic and repeat the panel.",
+        "John Smith risk was reviewed; follow up in two weeks with the clinic and"
+        " repeat the panel.",
+    ),
+    # REVERTED COUNTER-EXAMPLE 1, re-run with a real map. "and" is in the hint
+    # alphabet and is not what we wrote for 1a2b3c4d, so it stays.
+    (
+        "PHI_NAME_1a2b3c4d|and the rest follows.",
+        "John Smith|and the rest follows.",
+    ),
+    # REVERTED COUNTER-EXAMPLE 2.
+    (
+        "PHI_NAME_1a2b3c4d|per-protocol review pending.",
+        "John Smith|per-protocol review pending.",
+    ),
+    # REVERTED COUNTER-EXAMPLE 3 -- the compact two-column markdown table whose
+    # status cell the old mop-up ate.
+    (
+        "name|status\nPHI_NAME_1a2b3c4d|active\n",
+        "name|status\nJohn Smith|active\n",
+    ),
+    # BOUND: the following character must not continue the hint. Our hint is a
+    # PREFIX of the model's word in both rows, and taking it would leave "s" and
+    # "-plus" orphaned in the answer.
+    (
+        "Started PHI_MEDICATION_2f4a1b3c|oral-antidiabetics today.",
+        "Started Metformin|oral-antidiabetics today.",
+    ),
+    (
+        "Started PHI_MEDICATION_2f4a1b3c|oral-antidiabetic-plus today.",
+        "Started Metformin|oral-antidiabetic-plus today.",
+    ),
+    # BOUND: the pipe must be the very next character. A spaced pipe is a table
+    # column separator, and `| active |` is how the model writes one; what we emit
+    # never has a space there, so nothing we wrote is lost by refusing this. All
+    # three spacings are here because each one falls to a different one-line
+    # relaxation -- skipping space before the pipe, after it, or both -- and a row
+    # spaced on both sides is refused by any of the three.
+    (
+        "The chart mentions PHI_MEDICATION_2f4a1b3c | oral-antidiabetic today.",
+        "The chart mentions Metformin | oral-antidiabetic today.",
+    ),
+    (
+        "The chart mentions PHI_MEDICATION_2f4a1b3c |oral-antidiabetic today.",
+        "The chart mentions Metformin |oral-antidiabetic today.",
+    ),
+    (
+        "The chart mentions PHI_MEDICATION_2f4a1b3c| oral-antidiabetic today.",
+        "The chart mentions Metformin| oral-antidiabetic today.",
+    ),
+    # BOUND: the map is keyed by token ID. MRN_ID has no entry, so its own
+    # bracketless hint is not ours to touch even though another token's is.
+    (
+        "Locator PHI_MRN_9c8d7e6f|oral-antidiabetic here.",
+        "Locator MRN-4471902|oral-antidiabetic here.",
+    ),
+    # The hash the model upper-cased still finds its hint: every other lookup in
+    # the restorer keys on the lowercased ID and this one must not be the exception.
+    (
+        "The chart mentions PHI_MEDICATION_2F4A1B3C|oral-antidiabetic.",
+        "The chart mentions Metformin.",
+    ),
+    # A possessive still lands on the value, past the consumed hint.
+    (
+        "PHI_NAME_1a2b3c4d|cardiovascular's chart.",
+        "John Smith's chart.",
+    ),
+    # Emphasis still collapses around the widened span. The mock never combines
+    # `bold` with `bracket_dropped` -- one class per token -- but a real model
+    # bolds and mangles the same run freely, and a mirrored `**` left orphaned by
+    # a span that grew underneath it is the exact artefact the mirroring exists to
+    # prevent.
+    (
+        "Started **PHI_MEDICATION_2f4a1b3c|oral-antidiabetic** today.",
+        "Started Metformin today.",
+    ),
+    # The BRACKETED spellings are `_consume_unclosed_tail`'s business and the map
+    # must not change either of them: the first is already absorbed by TOKEN_RE,
+    # the second is the opener-only form whose tail that function declines --
+    # and which the map then legitimately claims, because those bytes are ours.
+    (
+        "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic] daily.",
+        "Take Metformin daily.",
+    ),
+    (
+        "Take [PHI_MEDICATION_2f4a1b3c|oral-antidiabetic tomorrow.",
+        "Take Metformin tomorrow.",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    HINT_MAP_CONSUMES_ONLY_WHAT_WE_WROTE,
+    ids=[case[0][:48] for case in HINT_MAP_CONSUMES_ONLY_WHAT_WE_WROTE],
+)
+async def test_a_run_supplied_hint_map_consumes_only_the_bytes_it_names(
+    restorer: Restorer, text: str, expected: str
+) -> None:
+    """Exact output. A deletion is invisible to a substring check, so none is used."""
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, hints=EMITTED_HINTS
+    )
+
+    assert result.text == expected
+    assert TOKEN_RE.search(result.text) is None
+
+
+async def test_a_hint_map_can_only_delete_the_bytes_that_map_authorises(
+    restorer: Restorer,
+) -> None:
+    """The property, over the same runs the no-map property test uses.
+
+    Each run is offered while the map names a DIFFERENT hint for that token, so
+    the only thing standing between the model's word and deletion is byte
+    equality with what we wrote. `oral-antidiabetic` is itself one of the runs and
+    is therefore skipped here -- it is the one string the map does authorise, and
+    the row above covers it.
+    """
+    for run in BRACKETLESS_HINT_RUNS:
+        if run == EMITTED_HINTS[MED_ID]:
+            continue
+        text = f"The chart mentions PHI_MEDICATION_2f4a1b3c|{run} today."
+
+        result = await restorer.restore(
+            SESSION, text, strategy=TOKENIZATION, hints=EMITTED_HINTS
+        )
+
+        assert result.text == f"The chart mentions Metformin|{run} today.", (run, result.text)
+
+
+async def test_a_hint_the_emitter_could_not_have_written_is_dropped_from_the_map(
+    restorer: Restorer,
+) -> None:
+    """A wrong caller must not be able to authorise an arbitrary deletion.
+
+    The map reaches `restore` from outside this module, and it names bytes to
+    remove from the user's answer. Every value is therefore put back through
+    `HINT_RE` -- the same `[a-z0-9-]{1,24}` gate `format_surrogate` applies before
+    a hint can reach a payload -- so the longest deletion any caller can ask for
+    is 25 characters and none of the four values below buys a single one.
+    """
+    text = "PHI_NAME_1a2b3c4d|and the rest follows. Repeat the panel."
+    unwritable = (
+        "and the rest follows.",  # spaces: never a hint, and a whole clause
+        "AND",  # upper case: HINT_RE is lowercase-only
+        "",  # empty: would make the bare pipe the whole tail
+        "a" * (MAX_HINT_LEN + 1),  # past the emitter's own bound
+    )
+
+    for value in unwritable:
+        result = await restorer.restore(
+            SESSION, text, strategy=TOKENIZATION, hints={NAME_ID: value}
+        )
+
+        assert result.text == "John Smith|and the rest follows. Repeat the panel.", (
+            value,
+            result.text,
+        )
+
+
+async def test_the_hint_map_is_keyed_case_insensitively_like_issued(
+    restorer: Restorer,
+) -> None:
+    """The map's KEYS fold, exactly as `issued`'s do.
+
+    `derive_token_id` only ever returns lowercase hex, so the shipped orchestrator
+    cannot produce an upper-cased key -- which is precisely why this needs its own
+    test: nothing else in the suite would notice the fold being dropped, and the
+    next caller to build the map from a source that upper-cases hex would silently
+    get no consumption at all rather than an error. `issued` documents itself as
+    case-insensitive and this map sits beside it in the same call.
+    """
+    text = "The chart mentions PHI_MEDICATION_2f4a1b3c|oral-antidiabetic."
+
+    result = await restorer.restore(
+        SESSION,
+        text,
+        strategy=TOKENIZATION,
+        hints={MED_ID.upper(): "oral-antidiabetic"},
+    )
+
+    assert result.text == "The chart mentions Metformin."
+
+
+async def test_the_hint_map_is_inert_on_the_answer_when_the_run_emitted_no_hints(
+    restorer: Restorer,
+) -> None:
+    """An empty or absent map must reproduce the older behaviour byte for byte.
+
+    Most runs emit no annotated tokens at all, so this is the common path rather
+    than an edge: `hints=None`, `hints={}` and a map for other tokens must all
+    leave a stranded hint exactly where the no-map table says it is.
+    """
+    text = "The chart mentions PHI_MEDICATION_2f4a1b3c|oral-antidiabetic."
+    expected = "The chart mentions Metformin|oral-antidiabetic."
+
+    for supplied in (None, {}, {"deadbeef": "oral-antidiabetic"}):
+        result = await restorer.restore(
+            SESSION, text, strategy=TOKENIZATION, hints=supplied
+        )
+
+        assert result.text == expected, (supplied, result.text)
 
 
 # --------------------------------------------------------------------------
@@ -3021,7 +3302,18 @@ async def test_audit_records_counts_and_no_originals(
     result = await restorer.restore(SESSION, text, strategy=TOKENIZATION, run_id=RUN)
 
     events = await audit.query(session_id=SESSION)
-    assert [event.run_id for event in events] == [RUN, RUN]
+    # Four rows, not two: the VAULT_MISS for `deadbeef`, the stage row, and one
+    # entity row per distinct token restored (core requirement 7 -- see
+    # `test_every_restored_token_gets_its_own_audit_row`). What this line has always
+    # been asserting is that EVERY row carries the run ID; the count is respelled
+    # exactly rather than loosened to `len(events)`, so it still binds.
+    assert [event.run_id for event in events] == [RUN] * 4
+    assert [event.event_type for event in events] == [
+        VAULT_MISS,
+        DEOBFUSCATE,
+        DEOBFUSCATE,
+        DEOBFUSCATE,
+    ]
 
     summary = next(event for event in events if event.event_type == DEOBFUSCATE)
     assert summary.detail["restored"] == result.restored_count == 2
@@ -3032,6 +3324,322 @@ async def test_audit_records_counts_and_no_originals(
     dumped = json.dumps([event.model_dump() for event in events])
     for original in TOKENS.values():
         assert original not in dumped
+    assert await audit.verify_chain() is True
+
+
+# --------------------------------------------------------------------------
+# Core requirement 7: a de-obfuscation event carries "timestamp, session ID,
+# entity type, token (not original value), and action", and the log is
+# "queryable for compliance reporting".
+#
+# It carried the first two and the counts. `entity_type` and `token_id` were NULL
+# on every DEOBFUSCATE row, so the trail itemised only what could NOT be given
+# back (VAULT_MISS) and said nothing about what was.
+# --------------------------------------------------------------------------
+
+
+def _audit_file_bytes(db_path: Path) -> bytes:
+    """The audit DB as raw bytes, WAL sidecar included.
+
+    Scanning the file rather than the query result is what makes "no originals in
+    the audit log" a statement about the *storage* and not about the accessor the
+    test happened to use -- the same technique, and the same three suffixes, as
+    ``leakage/test_leakage_harness.py``'s ``audit_bytes``. Synchronous and outside
+    the test body on purpose: blocking file reads do not belong in a coroutine.
+    """
+    blob = b""
+    for suffix in ("", "-wal", "-shm"):
+        sidecar = Path(str(db_path) + suffix)
+        if sidecar.is_file():
+            blob += sidecar.read_bytes()
+    return blob
+
+
+def _entity_rows(events: list[AuditEvent]) -> list[AuditEvent]:
+    """The per-entity DEOBFUSCATE rows -- the itemisation, not the stage row."""
+    return [
+        event
+        for event in events
+        if event.event_type == DEOBFUSCATE and event.detail.get("action") == RESTORE_ACTION
+    ]
+
+
+async def test_every_restored_token_gets_its_own_audit_row(
+    restorer: Restorer, audit: AuditLogger
+) -> None:
+    """The compliance question -- "which entities were restored?" -- must be a query.
+
+    Answered the way a reviewer would answer it: filter the session's log to the
+    de-obfuscation rows that name a token, and read the pairs off. Before this the
+    same query returned nothing at all, because ``entity_type`` and ``token_id``
+    were ``NULL`` on the one row per call.
+
+    ``occurrences`` counts *splices*, mirroring the ``OBFUSCATE`` row the engine
+    writes for the same entity -- so the two halves of the round trip line up on
+    ``token_id`` and on the same entity-type vocabulary (``NAME``, not
+    ``PHI_NAME``: the engine writes ``record.entity_type``).
+    """
+    text = (
+        "[PHI_NAME_1a2b3c4d] and [PHI_NAME_1a2b3c4d] take "
+        "[PHI_MEDICATION_2f4a1b3c]; [PHI_NAME_deadbeef] does not."
+    )
+
+    result = await restorer.restore(SESSION, text, strategy=TOKENIZATION, run_id=RUN)
+
+    assert result.restored_count == 3
+    rows = _entity_rows(await audit.query(session_id=SESSION, event_type=DEOBFUSCATE))
+    by_id = {row.token_id: row for row in rows}
+    assert set(by_id) == {NAME_ID, MED_ID}, "one row per DISTINCT restored token ID"
+    assert by_id[NAME_ID].entity_type == "NAME"
+    assert by_id[NAME_ID].detail["category"] == "PHI"
+    assert by_id[NAME_ID].detail["occurrences"] == 2
+    assert by_id[MED_ID].detail["occurrences"] == 1
+    for row in rows:
+        assert row.detail["strategy"] == TOKENIZATION
+        assert row.session_id == SESSION and row.run_id == RUN
+        assert row.ts > 0.0
+
+    # A token that MISSED is not a restored entity, and must not be listed as one.
+    assert "deadbeef" not in by_id
+    misses = await audit.query(session_id=SESSION, event_type=VAULT_MISS)
+    assert len(misses) == 1
+
+    # The stage row survives alongside: it carries the eleven things the entity
+    # rows cannot, and `outcome` is the one that says the answer was released.
+    stage = [
+        event
+        for event in await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+        if event.detail.get("outcome") == "ok"
+    ]
+    assert len(stage) == 1
+    assert stage[0].detail["restored"] == 3
+    assert stage[0].entity_type is None and stage[0].token_id is None
+    assert await audit.verify_chain() is True
+
+
+async def test_the_restored_row_names_the_entity_type_however_the_model_cased_it(
+    restorer: Restorer, audit: AuditLogger
+) -> None:
+    """One entity must not become three entity types because the model shouted.
+
+    ``TOKEN_RE`` groups 1 and 2 are case-tolerant now -- that is what makes a
+    lower-cased token restore at all -- which makes them case-*unreliable* as a
+    label. Unnormalised, the ``entity_type`` column follows whichever spelling the
+    model happened to use *first* for each ID, and a compliance report grouping by
+    entity type splits one entity across ``NAME``, ``name`` and ``Name``.
+
+    The lower-cased occurrence is deliberately first in the text, and the second
+    entity is title-cased throughout: with the canonical spelling leading, the
+    label is right by accident and this test passes against an unnormalised
+    column. Verified by mutation -- dropping the ``.upper()`` leaves the earlier
+    draft of this test green and reddens this one.
+    """
+    text = (
+        "[phi_name_1a2b3c4d], [PHI_NAME_1a2b3c4d] and [Phi_Name_1a2b3c4d] are one person, "
+        "and [Phi_Medication_2f4a1b3c] is what they take."
+    )
+
+    await restorer.restore(SESSION, text, strategy=TOKENIZATION, run_id=RUN)
+
+    rows = _entity_rows(await audit.query(session_id=SESSION, event_type=DEOBFUSCATE))
+    by_id = {row.token_id: row for row in rows}
+    assert set(by_id) == {NAME_ID, MED_ID}
+    assert by_id[NAME_ID].entity_type == "NAME"
+    assert by_id[MED_ID].entity_type == "MEDICATION"
+    assert {row.detail["category"] for row in rows} == {"PHI"}
+    assert by_id[NAME_ID].detail["occurrences"] == 3
+
+
+async def test_no_original_value_reaches_the_new_rows_measured_on_the_stored_bytes(
+    settings: Settings, audit: AuditLogger, tmp_path: Path
+) -> None:
+    """Section 16 is unconditional, and the new rows are three more chances to break it.
+
+    Checked against the SQLite file itself -- WAL sidecar included -- rather than
+    against the query result, so it is a statement about the storage and not about
+    the accessor. The vault here holds values chosen to be unmissable if any of
+    them were ever copied into a label, a detail or a column.
+
+    The row's ``token_id`` is the field the neighbouring ``VAULT_MISS`` path had to
+    suppress, and the reason it needs no suppression here is structural rather than
+    argued: a row is written only for an ID the **vault resolved**, so the document
+    reference code that leaked eight digits of a real MRN into that column -- which
+    by definition has no vault row -- cannot reach this path at all.
+    """
+    originals = {
+        NAME_ID: "Marisol Vanterpool",
+        MED_ID: "Metformin 500mg",
+        MRN_ID: "MRN-4471902",
+    }
+    restorer = Restorer(
+        vault=FakeVault(tokens=originals), settings=settings, audit=audit
+    )
+    text = (
+        "[PHI_NAME_1a2b3c4d] takes [phi_medication_2f4a1b3c|oral-antidiabetic]; "
+        "the chart is [PHI_MRN_9c8d7e6f]."
+    )
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued=set(originals), run_id=RUN
+    )
+
+    assert result.restored_count == 3
+    rows = _entity_rows(await audit.query(session_id=SESSION, event_type=DEOBFUSCATE))
+    assert {row.token_id for row in rows} == set(originals)
+
+    blob = _audit_file_bytes(tmp_path / "audit.db")
+    assert blob, "premise: the audit file must exist, or this test proves nothing"
+    for original in originals.values():
+        assert original.encode("utf-8") not in blob, original
+        # ...and the surname alone, in case a label ever carried half of one.
+        assert original.split()[-1].encode("utf-8") not in blob, original
+
+
+async def test_the_entity_type_on_a_restored_row_is_bounded_by_the_grammar(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """The residual, pinned rather than argued: that label is the MODEL's bytes.
+
+    A model that keeps our hash and rewrites the type body puts its own text in the
+    ``entity_type`` column -- the same shape as the leak the ``VAULT_MISS`` path
+    documents, one field to the left. Three things bound it, and this pins all
+    three so a later widening is loud: the grammar
+    (``[A-Za-z][A-Za-z0-9_]{0,63}``, ASCII by construction), the 48-character cap,
+    and the vault-resolution gate that keeps a *fabricated* ID out of the column
+    entirely.
+
+    What makes the residual acceptable rather than merely small is the fourth fact,
+    which is asserted in
+    ``test_no_original_value_reaches_the_new_rows_measured_on_the_stored_bytes``: a
+    vaulted original is never shown to the model under either strategy, so the text
+    it can put there is text this run did not vault.
+    """
+    # 60 characters: inside the grammar's 64-character body bound, so it is the
+    # 48-character audit cap that has to do the truncating here rather than the
+    # matcher quietly declining to match at all.
+    shouted = "MARISOL_VANTERPOOL" + "_X" * 21
+    assert len(shouted) == 60
+    restorer = Restorer(vault=FakeVault(tokens=TOKENS), settings=settings, audit=audit)
+
+    result = await restorer.restore(
+        SESSION,
+        f"[PHI_{shouted}_1a2b3c4d] was reviewed, [PHI_NAME_deadbeef] was not.",
+        strategy=TOKENIZATION,
+        issued={NAME_ID},
+        run_id=RUN,
+    )
+
+    assert result.restored_count == 1
+    rows = _entity_rows(await audit.query(session_id=SESSION, event_type=DEOBFUSCATE))
+    assert [row.token_id for row in rows] == [NAME_ID]
+    label = rows[0].entity_type
+    assert label is not None
+    assert len(label) == _MAX_LABEL_LEN, "the cap must bound the column, not decorate it"
+    assert label == shouted.upper()[:_MAX_LABEL_LEN]
+    # The fabricated ID reached no entity row at all -- it never resolved.
+    assert "deadbeef" not in {row.token_id for row in rows}
+
+
+async def test_a_restore_that_failed_its_assertion_itemises_nothing(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """No answer was released, so no entity was restored, so no entity row.
+
+    The stage row is still written -- with ``outcome: assertion_failed`` -- because
+    the incident has to be in the log. Itemising alongside it would put "restored"
+    rows in the trail of a run whose output the user never saw.
+    """
+    restorer = Restorer(vault=LeakyVault(tokens=TOKENS), settings=settings, audit=audit)
+
+    with pytest.raises(PipelineError):
+        await restorer.restore(
+            SESSION,
+            "[PHI_NAME_1a2b3c4d]",
+            strategy=TOKENIZATION,
+            # Both IDs, as `test_a_token_this_run_did_issue_still_fails_loudly` does:
+            # the second is the live token the broken vault hands back, and without
+            # it in `issued` the residue is merely FOREIGN and the run completes.
+            issued=[NAME_ID, "5e6f7a8b"],
+            run_id=RUN,
+        )
+
+    events = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert [event.detail["outcome"] for event in events] == ["assertion_failed"]
+    assert _entity_rows(events) == []
+
+
+async def test_a_pseudonym_restore_is_counted_but_not_itemised(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """A declared boundary, pinned so it cannot be mistaken for an oversight.
+
+    A fake carries no token ID -- that is what makes it a pseudonym -- and the fake
+    itself must never enter an audit row, so there is nothing to key an entity row
+    on. The surrogate half of a restore is therefore reported by the stage row's
+    counts, and the entities behind it are named by the ``OBFUSCATE`` rows the
+    engine wrote when it minted them.
+    """
+    restorer = Restorer(
+        vault=FakeVault(surrogates={"Sherri Lopez": "Maria Torres"}),
+        settings=settings,
+        audit=audit,
+    )
+
+    result = await restorer.restore(
+        SESSION,
+        "Sherri Lopez signed the form.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"Sherri Lopez": "Maria Torres"},
+        run_id=RUN,
+    )
+
+    assert result.restored_count == 1
+    events = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+    assert _entity_rows(events) == []
+    stage = next(event for event in events if event.detail.get("outcome") == "ok")
+    assert stage.detail["restored"] == 1
+    assert "Sherri Lopez" not in json.dumps([event.model_dump() for event in events])
+
+
+async def test_the_itemisation_is_capped_and_the_cap_is_recorded(
+    settings: Settings, audit: AuditLogger
+) -> None:
+    """A row costs 0.48 ms; the stage budget is 500 ms (section 12).
+
+    The volume here is *ours* -- one row per entity the document had, the same
+    ceiling the engine's ``OBFUSCATE`` rows already pay -- so unlike
+    ``_MAX_MISS_ROWS`` this cap is a latency bound rather than an adversary bound.
+    Measured: the 500-token synthetic response in ``tests/test_benchmarks.py``
+    costs 240 ms of audit writes uncapped, which took the cold-vault restore
+    benchmark from 105 ms to 345 ms against a 500 ms budget. The largest shipped
+    fixture restores 251 distinct IDs, so the cap is set above that and does not
+    bite on any real document in this repository.
+
+    What survives the cap is asserted, not assumed: the count, the cap itself, and
+    the stage row's total.
+    """
+    count = _MAX_RESTORE_ROWS + 8
+    tokens = {f"{index:08x}": f"value-{index}" for index in range(count)}
+    restorer = Restorer(vault=FakeVault(tokens=tokens), settings=settings, audit=audit)
+    text = " ".join(f"[PII_NAME_{token_id}]" for token_id in tokens)
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued=set(tokens), run_id=RUN
+    )
+
+    assert result.restored_count == count
+    events = await audit.query(session_id=SESSION, event_type=DEOBFUSCATE, limit=1000)
+    itemised = [row for row in _entity_rows(events) if row.token_id is not None]
+    assert len(itemised) == _MAX_RESTORE_ROWS
+
+    suppressed = [row for row in _entity_rows(events) if row.token_id is None]
+    assert len(suppressed) == 1
+    assert suppressed[0].detail["reason"] == "restored_rows_suppressed"
+    assert suppressed[0].detail["suppressed"] == count - _MAX_RESTORE_ROWS
+    assert suppressed[0].detail["row_cap"] == _MAX_RESTORE_ROWS
+    # Reconstructible: what was itemised plus what was dropped is what happened.
+    stage = next(event for event in events if event.detail.get("outcome") == "ok")
+    assert len(itemised) + int(suppressed[0].detail["suppressed"]) == stage.detail["restored"]
     assert await audit.verify_chain() is True
 
 
@@ -3076,7 +3684,12 @@ async def test_500_token_response_restores_under_500ms(
     assert result.restored_count == token_count
     assert result.vault_misses == 0
     assert TOKEN_RE.search(result.text) is None
-    # Generous margin against the 500 ms budget; typical run is ~5 ms.
+    # Margin against the 500 ms budget. ~5 ms until the restore stage began writing
+    # one audit row per distinct restored token (core requirement 7); ~140 ms now,
+    # of which the itemisation is ~135 -- see `_MAX_RESTORE_ROWS`, which is what
+    # keeps this a constant rather than a number the response length chooses.
+    # Uncapped, the same 500 tokens measured 290-345 ms and this assertion failed
+    # intermittently.
     assert elapsed_ms < 500.0, f"restore took {elapsed_ms:.1f} ms for {token_count} tokens"
 
 

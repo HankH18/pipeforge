@@ -248,12 +248,20 @@ def load_registry(path: str | Path | None = None) -> EntityRegistry:
         # An entity type is an opaque string to the engine, vault, restorer and audit
         # -- that is what makes config-only extensibility real. It is *not* opaque to
         # the surrogate grammar: ``format_surrogate`` builds
-        # ``[{category}_{entity_type}_{token_id}]`` and ``TOKEN_RE`` only matches
-        # ``[A-Z][A-Z0-9_]*``. So a perfectly reasonable-looking config addition --
-        # ``2FA_CODE`` (leading digit) or ``MedicalId`` (lowercase) -- emits a token
-        # that is vaulted and spliced but which the restorer can never match and
-        # which never enters the egress gate's skip-list. The value would be
-        # obfuscated and then silently never restored.
+        # ``[{category}_{entity_type}_{token_id}]``, and the two patterns that have to
+        # read that back both demand ``[A-Z][A-Z0-9_]*`` -- ``ENTITY_TYPE_RE``, which
+        # is what this check runs, and ``STRICT_TOKEN_RE``, which is what the egress
+        # gate builds its skip-list from. So a perfectly reasonable-looking config
+        # addition -- ``2FA_CODE`` (leading digit) or ``MedicalId`` (lowercase) --
+        # emits a token that is vaulted and spliced but never enters the gate's
+        # skip-list, so the gate re-scans it as ordinary document text.
+        #
+        # ``TOKEN_RE`` is the one pattern that no longer agrees, and the difference is
+        # worth naming rather than eliding: it is deliberately case-tolerant (a model
+        # that lower-cases a token still has to restore), so ``MedicalId`` would in
+        # fact match there and ``2FA_CODE`` still would not. Tolerance in the restorer
+        # is not a licence in the registry -- the *emitter* is what this guards, and it
+        # must produce a marker every reader accepts, not just the most forgiving one.
         #
         # The formatters validate too, but that fires deep inside a request, long
         # after the config was accepted. Startup is the honest place to fail: the

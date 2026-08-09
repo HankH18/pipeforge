@@ -26,6 +26,11 @@ adversary on the app host is out of scope for this tier.
 
 No original value ever reaches a log line or an exception. Everything emitted
 here is a count, a session ID, a token ID, or a short machine code.
+
+**A vault.db this process cannot read refuses the run.** See
+:data:`_UNREADABLE` and :class:`VaultUnavailableError`: the rule, and the reason
+it resolves in the refusing direction rather than the degrading one, are stated
+there once for the six call sites that refuse and the one that does not.
 """
 
 from __future__ import annotations
@@ -55,7 +60,14 @@ from secure_context_pipeline.vault.session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DEFAULT_DB_FILENAME", "MAX_COLLISION_RETRIES", "SessionVault"]
+__all__ = [
+    "DEFAULT_DB_FILENAME",
+    "MAX_COLLISION_RETRIES",
+    "UNREADABLE_VAULT_REASON",
+    "UNREADABLE_VAULT_REMEDY",
+    "SessionVault",
+    "VaultUnavailableError",
+]
 
 DEFAULT_DB_FILENAME = "vault.db"
 
@@ -63,6 +75,93 @@ DEFAULT_DB_FILENAME = "vault.db"
 #: few thousand entities per session that is vanishingly rare, but it is handled
 #: rather than assumed away. Eight re-derivations is already absurd headroom.
 MAX_COLLISION_RETRIES = 8
+
+#: What "this database is not readable" means, in one place, for every call site
+#: that touches SQLite here. Copied deliberately from
+#: ``audit/logger.py::_UNREADABLE`` rather than re-decided: ``audit.db``,
+#: ``vault.db`` and ``documents.db`` are three files of one shape, they failed the
+#: same way, and the audit half of the fix has already argued the membership.
+#:
+#: Only two of the three arms are reachable at this boundary and saying so is the
+#: point of writing it down. ``sqlite3.Error`` is the corrupt-file case measured
+#: below. ``ValueError`` is aiosqlite's ``no active connection``, raised when the
+#: connection thread is gone -- distinct from the orderly ``vault_closed`` that
+#: :meth:`SessionVault._require_conn` raises, which is a ``PipelineError`` and is
+#: deliberately NOT caught here. ``TypeError`` is inherited from the shared rule
+#: and nothing in this module is known to raise it; it is kept so that the three
+#: files cannot drift apart, and ``tests/test_vault.py::
+#: test_the_vault_and_the_audit_log_share_one_unreadable_rule`` fails if they do.
+_UNREADABLE = (sqlite3.Error, ValueError, TypeError)
+
+#: The machine half of the refusal, and the word that goes in the HTTP body.
+UNREADABLE_VAULT_REASON = "vault_unreadable"
+
+#: What an operator does about it. Deliberately *not* the audit log's "restore it
+#: from backup": a restored vault.db is undecryptable garbage, because the session
+#: keys that its rows are bound to live only in this process's
+#: :class:`SessionRegistry` and die with it (see the module docstring). Starting
+#: clean and re-creating the session is the only thing that works. 52 characters,
+#: under ``MAX_DETAIL_VALUE_LEN``.
+UNREADABLE_VAULT_REMEDY = "start a fresh data directory and a new session"
+
+
+class VaultUnavailableError(PipelineError):
+    """The vault database could not be read or written, so the operation was refused.
+
+    Declared here rather than in :mod:`secure_context_pipeline.errors` for the
+    reason that module's docstring gives for ``InvalidCategoryError`` and the two
+    other package-local subclasses: nothing outside this package catches it by
+    type. It inherits the same 64-character detail ceiling as every other member
+    of the hierarchy.
+
+    **Why it exists.** Reproduced on the real ASGI app with every 4 KiB page of a
+    live ``vault.db`` below the header overwritten -- length preserved, so
+    ``aiosqlite.connect`` accepts it and ``PRAGMA integrity_check`` answers
+    ``database disk image is malformed``. ``POST /pipeline/run`` let
+    ``sqlite3.DatabaseError`` escape from ``get_by_token`` -> ``_fetch_one`` to the
+    ASGI layer: **500, ``content-type: text/plain``, body ``Internal Server
+    Error``, and none of the security headers** -- no CSP, no ``nosniff`` --
+    because Starlette's ``ServerErrorMiddleware`` renders that outside the
+    middleware that adds them. Byte-identical to what a genuine bug produces, and
+    carrying no ``code`` a client could branch on. This is the same defect
+    ``AuditUnavailableError`` was created for, on the second of the app's three
+    SQLite stores.
+
+    **Why it is a refusal and not a degradation.** The tempting alternative is to
+    fold an unreadable row into :class:`VaultMissError`, which every other read
+    failure here already collapses into -- absent row, wrong session, spliced AAD.
+    Measured on the real pipeline with the vault answering ``VaultMissError``
+    instead of raising: ``200 OK``, all 5 entities detected and obfuscated, the
+    provider called, and a ``restored_text`` in which every one of the four
+    originals is the literal string ``[UNRESOLVED_ENTITY]`` -- 0 of 4 restored.
+    A half-restored answer delivered as success is worse than no answer, because
+    nothing in the response says the vault was unreadable. ``VaultMissError`` means
+    "this session has no such entry", which is a fact about the data; this means
+    "I cannot tell", which is a fact about the file.
+
+    **What it does not cover:** :meth:`SessionVault.destroy` still swallows a failed
+    DELETE. That is argued at the catch, and it is the one place where degrading is
+    correct -- see the comment there.
+
+    Every value is bounded by construction rather than validated, for the reason
+    ``AuditUnavailableError`` gives: this constructor runs *on* the failure path, so
+    a ``ValueError`` out of it would restore the bare 500 it exists to remove. The
+    file NAME, not the path: an error body is not a place to describe the server's
+    filesystem, and under a pytest ``tmp_path`` the path routinely exceeds the
+    64-character ceiling.
+    """
+
+    code = "VAULT_UNAVAILABLE"
+
+    def __init__(self, *, operation: str, vault_db: str, error: str) -> None:
+        super().__init__(
+            reason=UNREADABLE_VAULT_REASON,
+            operation=operation[:MAX_DETAIL_VALUE_LEN],
+            vault_db=vault_db[:MAX_DETAIL_VALUE_LEN],
+            error=error[:MAX_DETAIL_VALUE_LEN],
+            remedy=UNREADABLE_VAULT_REMEDY,
+        )
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS vault_entries (
@@ -266,13 +365,24 @@ class SessionVault:
             if str(parent):
                 await asyncio.to_thread(parent.mkdir, parents=True, exist_ok=True)
             conn = await aiosqlite.connect(self._db_path)
-            conn.row_factory = aiosqlite.Row
-            # WAL so a reader never blocks the single writer; NORMAL sync is the
-            # standard WAL durability trade and this data is disposable by design.
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA synchronous=NORMAL")
-            await conn.executescript(_SCHEMA)
-            await conn.commit()
+            try:
+                conn.row_factory = aiosqlite.Row
+                # WAL so a reader never blocks the single writer; NORMAL sync is
+                # the standard WAL durability trade and this data is disposable
+                # by design.
+                await conn.execute("PRAGMA journal_mode=WAL")
+                await conn.execute("PRAGMA synchronous=NORMAL")
+                await conn.executescript(_SCHEMA)
+                await conn.commit()
+            except _UNREADABLE as exc:
+                # The connection is closed before the raise, and that is not
+                # tidiness: aiosqlite runs each connection on a NON-DAEMON thread,
+                # and this method's own docstring records what a leaked one does --
+                # it keeps the interpreter alive at exit. A raw raise from here left
+                # exactly that behind, on the startup path, which is where a
+                # corrupt data directory is first met.
+                await conn.close()
+                raise self._unavailable(exc, operation="open") from exc
             self._conn = conn
             logger.debug("vault opened", extra={"vault_db": str(self._db_path)})
 
@@ -312,6 +422,32 @@ class SessionVault:
         if conn is None:
             raise PipelineError(reason="vault_closed")
         return conn
+
+    def _unavailable(self, exc: BaseException, *, operation: str) -> VaultUnavailableError:
+        """The one refusal every SQLite call site here raises. See :data:`_UNREADABLE`.
+
+        A companion to that tuple and built for the same reason: the tuple makes the
+        call sites agree on what *unreadable* means, this makes them agree on what to
+        answer. Modelled on ``AuditLogger._unreadable``, including the split that
+        matters -- the full path goes to the server log, and only the file **name**
+        reaches the exception, because ``api/errors.py`` writes ``dict(exc.detail)``
+        into the HTTP body verbatim. ``data/vault.db`` is a bind mount the operator
+        configured and is what they act on; the absolute path is a description of the
+        server's filesystem no client is owed.
+        """
+        logger.error(
+            "vault database unreadable; the operation was refused",
+            extra={
+                "vault_db": str(self._db_path),
+                "vault_operation": operation,
+                "error": type(exc).__name__,
+            },
+        )
+        return VaultUnavailableError(
+            operation=operation,
+            vault_db=self._db_path.name,
+            error=type(exc).__name__,
+        )
 
     # -- write -------------------------------------------------------------
 
@@ -369,19 +505,29 @@ class SessionVault:
                 original.encode("utf-8"),
                 aead.vault_aad(session_id, token_id),
             )
-            await conn.execute(
-                _INSERT_SQL,
-                (
-                    session_id,
-                    token_id,
-                    stored.entity_type,
-                    stored.surrogate,
-                    nonce,
-                    ciphertext,
-                    stored.created_at,
-                ),
-            )
-            await conn.commit()
+            try:
+                await conn.execute(
+                    _INSERT_SQL,
+                    (
+                        session_id,
+                        token_id,
+                        stored.entity_type,
+                        stored.surrogate,
+                        nonce,
+                        ciphertext,
+                        stored.created_at,
+                    ),
+                )
+                await conn.commit()
+            except _UNREADABLE as exc:
+                # The shared rule -- see _UNREADABLE -- resolved in the refusing
+                # direction, and this is the arm that matters most. The cache is
+                # written on the line below; catching the failure and carrying on
+                # would leave a session whose plaintext index says an entity is
+                # vaulted while no row exists, so the value survives exactly as
+                # long as this process and is unrestorable after it. Refusing
+                # keeps the cache and the file in agreement.
+                raise self._unavailable(exc, operation="put") from exc
             cache.add(index, stored, original)
 
     @staticmethod
@@ -442,7 +588,14 @@ class SessionVault:
             hit = cache.by_token.get(token_id)
             if hit is not None:
                 return hit
-        row = await self._fetch_one(_SELECT_ROW_SQL, (session_id, token_id))
+        try:
+            row = await self._fetch_one(_SELECT_ROW_SQL, (session_id, token_id))
+        except _UNREADABLE as exc:
+            # The shared rule -- see _UNREADABLE. Caught HERE rather than inside
+            # `_fetch_one` so the refusal can name the accessor the caller invoked;
+            # "get_by_token" is what an operator reads in the HTTP body, and
+            # "fetch" would be a fact about this class's internals.
+            raise self._unavailable(exc, operation="get_by_token") from exc
         return self._decrypt_row(session_id, session_key, row, token_id=token_id)
 
     async def get_by_surrogate(self, session_id: str, surrogate: str) -> str:
@@ -455,7 +608,10 @@ class SessionVault:
             hit = cache.by_surrogate.get(surrogate)
             if hit is not None:
                 return hit
-        row = await self._fetch_one(_SELECT_SURROGATE_ROW_SQL, (session_id, surrogate))
+        try:
+            row = await self._fetch_one(_SELECT_SURROGATE_ROW_SQL, (session_id, surrogate))
+        except _UNREADABLE as exc:
+            raise self._unavailable(exc, operation="get_by_surrogate") from exc
         return self._decrypt_row(session_id, session_key, row, token_id=None)
 
     async def get_by_original(
@@ -704,7 +860,20 @@ class SessionVault:
                     deleted = cursor.rowcount
                     await cursor.close()
                     await conn.commit()
-                except (sqlite3.Error, ValueError):
+                except _UNREADABLE:
+                    # The shared rule -- see _UNREADABLE -- and the ONE call site
+                    # here that resolves it in the degrading direction, for the
+                    # reason this method's docstring gives: the real erasure is the
+                    # caller popping the session key, which turns every surviving
+                    # row into undecryptable garbage. Raising here would make an
+                    # unreadable vault.db turn `DELETE /sessions/{id}` -- the
+                    # logout button -- into an error the user cannot clear, while
+                    # the cache pop and the tombstone above have already done the
+                    # part that matters. The audit logger's `_watermark` degrades
+                    # against the same tuple for the same shape of reason.
+                    #
+                    # Widened from `(sqlite3.Error, ValueError)` to the shared
+                    # tuple so the three files carry one rule rather than two.
                     logger.warning(
                         "vault row delete failed; rows are undecryptable once the key is gone",
                         extra={"session_id": _short(session_id)},
@@ -726,6 +895,14 @@ class SessionVault:
         row left behind by the previous process is undecryptable garbage taking
         up disk -- and, worse, would otherwise make a session ID look live to a
         naive query.
+
+        Refuses rather than sweeps on an unreadable file (:data:`_UNREADABLE`).
+        This method is a bulk DELETE driven by a SELECT, so degrading is not
+        "collect fewer orphans": a SELECT that fails while the DELETEs proceed
+        deletes rows it never listed, and a caller that swallowed the refusal
+        would start a server against a database it cannot read and only find out
+        on the first request. The startup path is exactly where a corrupt data
+        directory is first met, so it is the place to say so.
         """
         known = frozenset(known_session_ids)
         deleted = 0
@@ -733,18 +910,23 @@ class SessionVault:
         # Resolved under the lock, not before it: see the note in :meth:`put`.
         async with self._lock:
             conn = self._require_conn()
-            cursor = await conn.execute(_DISTINCT_SESSIONS_SQL)
-            rows = await cursor.fetchall()
-            await cursor.close()
-            orphans = [str(row["session_id"]) for row in rows if row["session_id"] not in known]
-            orphan_count = len(orphans)
-            for session_id in orphans:
-                cursor = await conn.execute(_DELETE_SESSION_SQL, (session_id,))
-                deleted += cursor.rowcount
+            try:
+                cursor = await conn.execute(_DISTINCT_SESSIONS_SQL)
+                rows = await cursor.fetchall()
                 await cursor.close()
-                self._caches.pop(session_id, None)
-            if orphans:
-                await conn.commit()
+                orphans = [
+                    str(row["session_id"]) for row in rows if row["session_id"] not in known
+                ]
+                orphan_count = len(orphans)
+                for session_id in orphans:
+                    cursor = await conn.execute(_DELETE_SESSION_SQL, (session_id,))
+                    deleted += cursor.rowcount
+                    await cursor.close()
+                    self._caches.pop(session_id, None)
+                if orphans:
+                    await conn.commit()
+            except _UNREADABLE as exc:
+                raise self._unavailable(exc, operation="sweep_orphans") from exc
         logger.info(
             "orphan vault rows swept",
             extra={"orphan_sessions": orphan_count, "rows_deleted": deleted},
@@ -755,7 +937,10 @@ class SessionVault:
 
     async def row_count(self, session_id: str) -> int:
         """Number of persisted rows for a session. Diagnostics and tests."""
-        row = await self._fetch_one(_COUNT_SESSION_SQL, (session_id,))
+        try:
+            row = await self._fetch_one(_COUNT_SESSION_SQL, (session_id,))
+        except _UNREADABLE as exc:
+            raise self._unavailable(exc, operation="row_count") from exc
         return 0 if row is None else int(row["n"])
 
     def cached_session_ids(self) -> frozenset[str]:
@@ -765,6 +950,16 @@ class SessionVault:
     # -- internals ---------------------------------------------------------
 
     async def _fetch_one(self, sql: str, params: tuple[object, ...]) -> aiosqlite.Row | None:
+        """One row, or ``None`` for no row -- never ``None`` for an unreadable file.
+
+        The distinction this helper must preserve is between "no such row" and "I
+        cannot read the file": both are an absence to the caller and only the first
+        is a fact about the session. It preserves it by letting the driver error
+        through -- each of the three callers (``get_by_token``, ``get_by_surrogate``,
+        ``row_count``) converts it to :class:`VaultUnavailableError` under its own
+        name, because that name is what reaches the HTTP body. See that class for
+        what collapsing the second case into the first costs, measured.
+        """
         # Resolved under the lock, not before it: see the note in :meth:`put`.
         async with self._lock:
             conn = self._require_conn()

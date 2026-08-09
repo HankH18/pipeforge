@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import inspect
 import itertools
 import logging
@@ -38,12 +39,17 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
+from secure_context_pipeline.api.app import create_app
+from secure_context_pipeline.audit import logger as audit_logger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto import aead
 from secure_context_pipeline.crypto.keys import derive_token_id, derive_vault_key, normalize
+from secure_context_pipeline.deobfuscation.restorer import Restorer
 from secure_context_pipeline.errors import (
     CryptoAuthError,
     PipelineError,
@@ -2785,3 +2791,415 @@ async def test_concurrent_session_isolation(
     assert vault.originals_for_session(session_a) == frozenset()
     assert vault.originals_for_session(session_b) == frozenset(values)
     assert len(read_rows(db_path, session_b)) == len(values)
+
+
+# ---------------------------------------------------------------------------
+# 15. a vault.db this process cannot read
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+API_OWNER = "alice"
+
+#: One occurrence of each entity, no value that is a substring of another -- the
+#: same shape ``tests/test_api.py`` uses, so what the ASGI test below measures is
+#: the refusal and not the detector.
+API_DOC_TEXT = """CLINIC INTAKE RECORD
+
+Patient name: David Ochoa.
+
+MRN: 9224297.
+
+Phone: (704) 555-0151.
+"""
+
+
+async def api_session(http: AsyncClient, user_id: str = API_OWNER) -> str:
+    response = await http.post("/sessions", json={"user_id": user_id})
+    assert response.status_code == 200, response.text
+    session_id: str = response.json()["session_id"]
+    return session_id
+
+
+async def api_run(http: AsyncClient, session_id: str, doc_id: str) -> Any:
+    return await http.post(
+        "/pipeline/run",
+        json={
+            "user_id": API_OWNER,
+            "doc_id": doc_id,
+            "prompt": "Summarise this record in two sentences.",
+            "session_id": session_id,
+        },
+    )
+
+
+def wreck_every_page_but_the_header(path: Path) -> None:
+    """Garbage every page of a real SQLite file except page 1, keeping its length.
+
+    Genuinely corrupt, not a patched raise. The length is what gets past ``open``:
+    the header records the database size in pages, so a *short* file is rejected
+    outright while a full-length file whose data pages are dead is opened happily
+    and fails only when something reads one. Page 1 survives because that is where
+    the schema lives, and ``SessionVault._connect`` runs ``CREATE TABLE IF NOT
+    EXISTS`` and has to parse it.
+
+    :func:`integrity_check` on the result reports ``database disk image is
+    malformed``, and every test below calls it rather than trusting this function
+    -- a corruption that SQLite shrugged off would make the refusals it measures
+    prove nothing.
+    """
+    data = bytearray(path.read_bytes())
+    page = 4096
+    assert len(data) >= 2 * page, "database is too small for this corruption to be meaningful"
+    for start in range(page, len(data), page):
+        data[start : start + page] = (b"\xde\xad\xbe\xef" * (page // 4))[: len(data) - start]
+    path.write_bytes(bytes(data))
+
+
+def integrity_check(path: Path) -> str:
+    """``PRAGMA integrity_check`` through the stdlib driver, errors included."""
+    conn = sqlite3.connect(path)
+    try:
+        try:
+            return str(conn.execute("PRAGMA integrity_check").fetchone())
+        except sqlite3.DatabaseError as exc:
+            return f"{type(exc).__name__}: {exc}"
+    finally:
+        conn.close()
+
+
+async def fill_and_wreck(
+    vault: SessionVault,
+    session_registry: SessionRegistry,
+    db_path: Path,
+    *,
+    surrogate: str | None = None,
+) -> tuple[str, TokenRecord]:
+    """Store one entity, then physically wreck the file underneath the vault.
+
+    Closed and re-opened around the corruption rather than written behind SQLite's
+    back, so the page cache cannot mask it: the returned vault reads the same bytes
+    a restarted process would.
+    """
+    session_id, _ = await session_registry.create("test-user")
+    record = await put_value(vault, session_registry, session_id, VALUE_A, surrogate=surrogate)
+    await vault.close()
+    wreck_every_page_but_the_header(db_path)
+    assert "malformed" in integrity_check(db_path), (
+        f"the file is still readable, so nothing below is measuring a refusal: "
+        f"{integrity_check(db_path)}"
+    )
+    await vault._connect()
+    return session_id, record
+
+
+async def test_a_corrupt_vault_refuses_the_read_rather_than_reporting_a_miss(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """An unreadable row is not an absent row, and the difference is the whole fix.
+
+    Every other read failure in this module collapses into ``VaultMissError`` on
+    purpose -- absent, wrong session, spliced AAD -- because distinguishing them is
+    an oracle. A file SQLite cannot parse is not in that family: the restorer
+    *degrades* on ``VaultMissError`` (``restorer.py`` catches it and appends to
+    ``unresolved``), so folding this into it answers ``200 OK`` with every original
+    replaced by ``[UNRESOLVED_ENTITY]`` -- measured on the real pipeline, 0 of 4
+    restored, provider called, nothing in the response saying the vault was
+    unreadable.
+
+    A *cold* instance is used because a warm cache would answer from RAM and never
+    reach SQLite -- the read path this test exists for is the one the restorer takes
+    after a process restart or a cache drop.
+    """
+    session_id, record = await fill_and_wreck(vault, session_registry, db_path)
+    cold = await SessionVault.open(db_path, session_registry)
+    try:
+        with pytest.raises(vault_module.VaultUnavailableError) as by_token:
+            await cold.get_by_token(session_id, record.token_id)
+        with pytest.raises(vault_module.VaultUnavailableError) as by_surrogate:
+            await cold.get_by_surrogate(session_id, record.surrogate)
+    finally:
+        await cold.close()
+
+    for caught, operation in ((by_token, "get_by_token"), (by_surrogate, "get_by_surrogate")):
+        error = caught.value
+        # The load-bearing negative: a subclass check would let a future
+        # `VaultUnavailableError(VaultMissError)` pass this test while the restorer
+        # went on degrading, which is the exact fail-open being closed here.
+        assert not isinstance(error, VaultMissError)
+        assert error.code == "VAULT_UNAVAILABLE"
+        assert error.detail["reason"] == "vault_unreadable"
+        assert error.detail["operation"] == operation
+        assert error.detail["vault_db"] == "vault.db"
+        assert error.detail["error"] == "DatabaseError"
+        assert isinstance(error.__cause__, sqlite3.DatabaseError)
+        # Nothing derived from the driver or the filesystem: `api/errors.py` writes
+        # this map into the HTTP body verbatim.
+        rendered = f"{error!r} {error} {sorted(error.detail.items())}"
+        assert str(db_path) not in rendered
+        assert str(db_path.parent) not in rendered
+        assert "malformed" not in rendered
+        # ...and the remedy is something an operator can act on, spelled out here
+        # rather than compared to the imported constant, which would pass against
+        # `remedy: ""`.
+        remedy = str(error.detail["remedy"])
+        assert remedy == vault_module.UNREADABLE_VAULT_REMEDY
+        assert "fresh data directory" in remedy and "new session" in remedy
+
+
+async def test_a_corrupt_vault_refuses_the_write_and_leaves_no_phantom_cache_entry(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """``put`` must refuse, and must not record the entity as vaulted anyway.
+
+    The failure lands between the encrypt and ``cache.add``. Logging it and
+    continuing -- the shape a "resilient" store invites -- leaves a session whose
+    plaintext index says the value is vaulted while no row exists: restorable for
+    the life of this process and gone for ever after it, with the audit log
+    recording a successful obfuscation either way.
+    """
+    session_id, _ = await fill_and_wreck(vault, session_registry, db_path)
+    later = await make_record(session_registry, session_id, VALUE_B)
+
+    with pytest.raises(vault_module.VaultUnavailableError) as caught:
+        await vault.put(session_id, later, VALUE_B)
+
+    assert caught.value.detail["operation"] == "put"
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+    # The refused value is not in the index, so nothing downstream can believe it
+    # was stored. `get_by_original` is cache-only, so this reads the exact
+    # structure the engine consults.
+    assert await vault.get_by_original(session_id, "PATIENT_NAME", normalize(VALUE_B)) is None
+    assert VALUE_B not in vault.originals_for_session(session_id)
+
+
+async def test_a_corrupt_vault_refuses_the_startup_sweep_rather_than_deleting_blind(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path
+) -> None:
+    """``sweep_orphans`` is a bulk DELETE driven by a SELECT, so it must not degrade.
+
+    Startup is where a corrupt data directory is first met. A sweep that swallowed
+    the read failure would start the server against a database it cannot use and
+    defer the discovery to the first request -- and, worse, its DELETEs are driven
+    by the list the failed SELECT was supposed to produce.
+    """
+    session_id, _ = await fill_and_wreck(vault, session_registry, db_path)
+    with pytest.raises(vault_module.VaultUnavailableError) as caught:
+        await vault.sweep_orphans([session_id])
+    assert caught.value.detail["operation"] == "sweep_orphans"
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+
+
+async def test_a_corrupt_vault_still_lets_logout_finish(
+    vault: SessionVault,
+    session_registry: SessionRegistry,
+    db_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``destroy`` is the one caller that degrades, and this pins that it still does.
+
+    The real erasure at logout is the caller popping the session key, which turns
+    every surviving row into undecryptable garbage; the DELETE is hygiene. Raising
+    here would make an unreadable ``vault.db`` turn the logout button into an error
+    the user cannot clear, while the cache pop and the tombstone -- the parts that
+    stop a late ``note_unrestorable`` from resurrecting plaintext -- have already
+    happened. Asserted, not assumed, because it is the one asymmetry in the module.
+    """
+    session_id, _ = await fill_and_wreck(vault, session_registry, db_path)
+    # ``close()`` inside the helper drops every cache, so one is rebuilt the way a
+    # live run does -- otherwise ``destroy`` would have no cache to pop and the
+    # assertion below would hold vacuously.
+    vault.note_unrestorable(session_id, VALUE_A)
+    assert vault.cached_session_ids() == frozenset({session_id})
+
+    with caplog.at_level(logging.WARNING, logger="secure_context_pipeline.vault.session_vault"):
+        await vault.destroy(session_id)
+
+    # The DELETE really did fail -- without this the whole test would pass against
+    # a database that was never corrupted.
+    assert "vault row delete failed" in caplog.text
+    assert vault.cached_session_ids() == frozenset()
+    assert session_id in vault._destroyed
+    # And the tombstone is real: a late redact-band needle cannot rebuild the cache.
+    vault.note_unrestorable(session_id, VALUE_A)
+    assert vault.originals_for_session(session_id) == frozenset()
+
+
+async def test_an_unreadable_vault_refuses_restoration_instead_of_half_restoring(
+    vault: SessionVault, session_registry: SessionRegistry, db_path: Path, settings: Settings
+) -> None:
+    """The real :class:`Restorer` over a real corrupt file: refuse, do not degrade.
+
+    This is the fail-closed claim proved at the component that would otherwise
+    swallow it, rather than inferred from the exception type. ``Restorer.restore``
+    catches ``VaultMissError`` by design -- an unknown token degrades, never crashes
+    -- so if an unreadable vault reached it as a miss the call would *succeed* and
+    hand back a response with ``[UNRESOLVED_ENTITY]`` where the patient's name was.
+    Here the same call over a genuinely malformed file raises instead, and the
+    control below shows the degrade path is otherwise live in this exact setup.
+    """
+    # A pseudonym rather than the default ``[PHI_..._<token>]`` surrogate, so the
+    # response carries nothing token-shaped and the *surrogate* pass -- the one
+    # ``restorer.py`` degrades in -- is what reaches the vault.
+    pseudonym = "Marguerite Okonkwo"
+    session_id, _record = await fill_and_wreck(
+        vault, session_registry, db_path, surrogate=pseudonym
+    )
+    response = f"The record for {pseudonym} was reviewed."
+    call = {
+        "strategy": "pseudonymization",
+        # Present as a key with no usable original, which is the documented way to
+        # force the vault lookup instead of answering from the run's own map.
+        "surrogates": {pseudonym: ""},
+        "issued": set[str](),
+    }
+
+    cold = await SessionVault.open(db_path, session_registry)
+    healthy = await SessionVault.open(db_path.parent / "healthy.db", session_registry)
+    try:
+        with pytest.raises(vault_module.VaultUnavailableError) as caught:
+            await Restorer(vault=cold, settings=settings).restore(session_id, response, **call)
+
+        # Control: the degrade path IS live for this exact call. The same restore
+        # against a HEALTHY vault that simply has no such surrogate returns a
+        # result -- with the placeholder -- rather than raising. Without it, the
+        # raise above could be any refusal on any earlier line.
+        degraded = await Restorer(vault=healthy, settings=settings).restore(
+            session_id, response, **call
+        )
+    finally:
+        await cold.close()
+        await healthy.close()
+
+    assert caught.value.detail["operation"] == "get_by_surrogate"
+    assert "UNRESOLVED" not in str(caught.value)
+    assert degraded.vault_misses == 1
+    assert "UNRESOLVED_ENTITY" in degraded.text, degraded.text
+    assert pseudonym not in degraded.text
+
+
+def test_the_vault_and_the_audit_log_share_one_unreadable_rule() -> None:
+    """One rule for three files, checked rather than asserted in a comment.
+
+    This proves agreement, not correctness -- the corrupt-file tests above are what
+    prove the rule is right. It exists because ``vault.db`` reproduced the audit
+    log's defect exactly, months after that one was fixed, and a tuple copied into
+    a second module with no link between them is how that happens again.
+    """
+    assert vault_module._UNREADABLE == audit_logger._UNREADABLE
+    assert vault_module._UNREADABLE == (sqlite3.Error, ValueError, TypeError)
+
+
+async def test_a_corrupt_vault_refuses_a_pipeline_run_over_the_real_asgi_app(
+    tmp_path: Path,
+) -> None:
+    """The reported defect at the boundary a reviewer actually sees.
+
+    The sibling of ``test_api.py::test_a_corrupt_audit_log_refuses_the_run_as_a_typed_503``,
+    on the second of the three SQLite stores. A fresh app on its own data
+    directory, a healthy run first, then the live ``vault.db`` physically wrecked
+    on disk and the same request repeated. Nothing is monkeypatched -- no patched
+    accessor, no injected raise -- so what is asserted is the behaviour of the
+    shipped code on a file SQLite genuinely cannot read.
+
+    ``raise_app_exceptions`` is left at its default ``True``, which is load-bearing:
+    anything still escaping unhandled makes this test *error* with that exception
+    rather than read a status code off a Starlette-generated 500. The old behaviour
+    -- ``sqlite3.DatabaseError`` out of ``get_by_token``, rendered as ``500
+    text/plain Internal Server Error`` with no CSP and no ``nosniff`` -- cannot pass
+    this test by accident.
+
+    A fresh session is used so the first vault touch is a cold-cache read, which is
+    deterministic. The warm case was measured too and is not a hole: repeating the
+    run on the *original* session refuses identically, because the engine's
+    collision check asks the vault about token IDs this run has not seen.
+    """
+    settings = Settings(
+        master_key=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        data_dir=tmp_path / "corrupt-vault-data",
+        registry_path=REPO_ROOT / "entities.yaml",
+        llm_provider="mock",
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        services = app.state.services
+        provider_calls = 0
+        real_complete = services.orchestrator._provider.complete_detailed
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal provider_calls
+            provider_calls += 1
+            return await real_complete(*args, **kwargs)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://scp.test") as http:
+            with mock.patch.object(
+                services.orchestrator._provider, "complete_detailed", counting
+            ):
+                doc_id = (
+                    await http.post(
+                        "/documents",
+                        files={"file": ("intake.txt", API_DOC_TEXT.encode(), "text/plain")},
+                        data={"user_id": API_OWNER, "doc_category": "medical"},
+                    )
+                ).json()["doc_id"]
+
+                # Control: the identical request succeeds on a healthy vault.
+                # Without it the refusal below could come from a broken fixture.
+                healthy = await api_run(http, await api_session(http), doc_id)
+                assert healthy.status_code == 200, healthy.text
+                assert provider_calls == 1, "premise: a healthy run reaches the provider"
+                assert "David Ochoa" in healthy.json()["restored_text"]
+
+                # Wreck the file under the live app. Closed and reopened rather
+                # than written behind SQLite's back, so the page cache cannot mask
+                # it: this is the same file the next request opens.
+                await services.vault.close()
+                wreck_every_page_but_the_header(settings.data_dir / "vault.db")
+                assert "malformed" in integrity_check(settings.data_dir / "vault.db")
+                await services.vault._connect()
+
+                refused = await api_run(http, await api_session(http), doc_id)
+
+    # FIRST, before anything about the shape of the answer: the run was refused
+    # before the payload was sent.
+    assert provider_calls == 1, "the refused run must not have reached the provider"
+
+    body = refused.json()
+    assert body["code"] == "VAULT_UNAVAILABLE"
+    assert body["detail"]["reason"] == "vault_unreadable"
+    assert body["detail"]["vault_db"] == "vault.db"
+    assert body["detail"]["error"] == "DatabaseError"
+    assert body["detail"]["remedy"] == vault_module.UNREADABLE_VAULT_REMEDY
+
+    # 500 is what the `PipelineError` catch-all in `api/errors.py` answers, and it
+    # is pinned rather than loosened to `>= 500` so the remaining gap is visible:
+    # the audit sibling answers **503** because that module registers
+    # `AuditUnavailableError` explicitly, and registering these two classes the same
+    # way is a change in `api/errors.py`, outside this change's grant. When that
+    # registration lands this line becomes 503 -- deliberately, not by accident.
+    # Everything else asserted here is already true and stays true either way.
+    assert refused.status_code == 500, refused.text
+
+    # Fail CLOSED: no answer at all, rather than an answer with the originals
+    # missing from it. `[UNRESOLVED_ENTITY]` is what a degrading vault produces.
+    assert "restored_text" not in refused.text
+    assert "UNRESOLVED_ENTITY" not in refused.text
+    assert "David Ochoa" not in refused.text
+
+    # The bare 500 was `text/plain`, carried no `code`, and had none of these
+    # headers, because ServerErrorMiddleware renders outside the middleware that
+    # adds them. A typed refusal is an ordinary response and gets the same
+    # hardening as every other one.
+    assert refused.headers["content-type"].startswith("application/json")
+    assert "Internal Server Error" not in refused.text
+    assert refused.headers["x-content-type-options"] == "nosniff"
+    csp = refused.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in csp
+    assert "default-src 'none'" in csp
+
+    # No filesystem path and no driver text in the body. The file NAME is what an
+    # operator acts on; the path is a description of the server's disk.
+    assert str(settings.data_dir) not in refused.text
+    assert "malformed" not in refused.text
+    assert "sqlite" not in refused.text.lower()
+    assert "Traceback" not in refused.text

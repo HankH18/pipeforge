@@ -13,6 +13,53 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Secure Context Pipeline — demo</title>
 <link rel="stylesheet" href="style.css">
+<!-- Every page load logged a console error before this line, and the server log shows
+     the cause: a browser asks for /favicon.ico unprompted, `_mount_ui` mounts this
+     directory alone and shipped no icon, so the catch-all answered
+     `404 {"code":"NOT_FOUND"}`. Measured on a clean start,
+     `curl -o /dev/null -w '%{http_code}' 127.0.0.1:8075/favicon.ico` prints 404. On a
+     security demo that is red in devtools on a page that has done nothing wrong, and
+     opening devtools is the first thing anyone does with a security demo.
+
+     Declaring ANY icon is what stops that request -- Chrome does not fall back to
+     /favicon.ico once a `rel="icon"` link exists -- but WHICH icon decides whether the
+     console goes quiet or swaps one red line for two.
+
+     The first version of this line was an inline `data:image/png;base64,...` URI, and
+     the comment that shipped with it asserted that "a favicon is fetched by the browser
+     process and is not subject to" `img-src 'self'`. That is not what the browser does.
+     Measured against this exact page, Chrome 151.0.7922.77 driven by playwright-core with
+     `page.on('console')`: TWO console errors on a cold load of 127.0.0.1:8075, both
+     reading `Loading the image 'data:image/png;base64,iVBOR...' violates the following
+     Content Security Policy directive: "img-src 'self'". The action has been blocked.`
+     The `<link rel="icon">` fetch IS a renderer image fetch and `img-src` governs it, so
+     the inline icon traded a 404 for a CSP violation and the page still had no icon.
+
+     The fix is a real, same-origin file, and it is deliberately the fix rather than
+     widening the policy:
+
+     * `img-src 'self'` is UNCHANGED, and so is every other directive. `favicon.png` is
+       served from this same mount (`_mount_ui` mounts this directory at `/`, so no route
+       was added), so it is same-origin and `'self'` already permits it. Re-measured the
+       same way after this change: 0 console errors, and the network log holds `/`,
+       `/style.css`, `/app.js`, `/favicon.png` and `/health` -- no `/favicon.ico` request
+       at all. Adding `data:` instead would have had to be done TWICE -- `api/constants.py`
+       sends the same policy as a response header, both apply, and the stricter wins -- and
+       `test_api.py::test_demo_ui_is_self_contained_and_declares_a_restrictive_csp` refuses
+       any source that is not `'none'` or `'self'`, which is a rule worth more than an icon.
+     * It is a FILE now, against the instinct that produced the inline version. That
+       instinct was right about the risk -- an asset that works locally and is missing from
+       a clone is this repository's own worst historical bug, the unanchored `data/` in
+       `.gitignore` -- and wrong about the remedy: the answer is `git check-ignore`
+       (measured: `secure_context_pipeline/ui/favicon.png` matches no ignore rule, exit 1)
+       and a commit, not markup that the renderer refuses to load.
+     * PNG rather than SVG, and the reason is unchanged: an SVG's mandatory `xmlns` is
+       spelled as a w3.org URL -- an XML namespace NAME, never fetched, and
+       indistinguishable from a genuine off-host reference to the self-containment test
+       above, which scans this whole file for `http` and `https` and correctly failed on
+       it. This comment cannot spell that string either, for the same reason. The bytes
+       are the same 128-byte 16x16 icon the inline version carried. -->
+<link rel="icon" type="image/png" href="favicon.png">
 </head>
 <body>
 
@@ -38,40 +85,108 @@
   </div>
 
   <div class="grp">
-    <button id="btn-session" class="go">Create session</button>
-    <span id="session-badge" class="badge muted" role="status" aria-live="polite">no session</span>
+    <!-- The button stays, and stays explicit: a reviewer demonstrating the lifecycle
+         needs to mint a session on purpose, and Destroy session needs something to
+         destroy. It is no longer a PREREQUISITE, which is what the badge now says.
+         Run mints one through this same function when none is live (app.js
+         `MINT_BY_RUN`), so the first thing a reviewer does -- choose a document, press
+         Run -- is one control and one click, and the badge then reads "auto-created by
+         Run" for as long as that session lives. The badge is a live region, so this
+         string is only its starting value; app.js owns every later one.
+
+         The word doing the work below is FIRST. This read "no session -- Run creates
+         one", which is true only at cold start and read as a flat rule -- and the
+         SESSION_EXPIRED banner then says the opposite, "Press Create session ... then
+         re-run". Both are correct about the code and they contradicted each other as
+         copy. `run` mints only when `!S.sessionId && !S.lastSessionId`, i.e. only when
+         this page has never held a session: after a destroy it deliberately keeps
+         running against the dead id so the 401 comes from the API (that IS the live
+         review), and after a TTL lapse `S.sessionId` is still set, so Run re-sends the
+         expired id. In every state except cold start, Run does NOT mint. The badge now
+         says "first" and the SESSION_EXPIRED sentence now says why Run will not do it
+         from there; together they are one rule rather than two claims. -->
+    <!-- THE GUARD WAS ON THE WRONG BUTTON. "Destroy session..." is double-gated -- arm,
+         then a Confirm deliberately pushed to the far end of the bar -- and this control
+         was a one-click, unlabelled, friendly-blue `class="go"` primary sitting top-left
+         that erases exactly the same thing. `createSession` deletes the outgoing session
+         BEFORE it reports success (see `replaceSession`: it will not print SESSION_CREATED
+         until the audit log records that erasure as existed=1), so with a session live one
+         click on this button is an irreversible loss of the key and every vault row, and
+         the page only said so afterwards, in the banner. Measured against the live API
+         with session a8742471510a... live: one click issued `200 POST /sessions` and then
+         `204 DELETE /sessions/a8742471510a...`, with no prompt, no arm step and no hint
+         text before it. A reviewer pressing the create-a-session button to find out what a
+         session IS loses the vault behind the four panels they are reading.
+
+         So the destructive path is the guarded one now, and the guard is <details>: two
+         deliberate movements (open the disclosure, then press the button inside it) with
+         the consequence printed BETWEEN them, on the control, before the click. Not a
+         `confirm()` -- the destroy gate three sections down refuses it for two reasons
+         that apply here unchanged, a modal this page cannot word or style and a
+         `tests/test_ui_behaviour.py` DOM stub with no `window.confirm`. And not a second
+         arm/confirm button pair, because that gate is app.js state and this one is
+         markup: <details> is a native two-step that works with the id, the listener and
+         `setBusy`'s `$('btn-session').disabled` exactly as they are, so nothing about
+         WHAT a create does changed and every existing assertion about it still describes
+         the same function.
+         The "..." on the summary is this page's existing spelling for "this arms
+         something" -- it is what "Destroy session..." means -- and the summary keeps the
+         literal words "Create session" because the SESSION_EXPIRED banner tells a reviewer
+         to press them by name. `class="go"` is gone: Run is the page's non-destructive
+         primary and should be the only blue button on it. -->
+    <details class="guard">
+      <summary>Create session&hellip;</summary>
+      <div class="guard-body">
+        <span class="hint">With a session already live this REPLACES it, and replacing it
+          erases it: the outgoing session is deleted first, and the banner reports
+          SESSION_CREATED only once the audit log records that erasure as
+          <code>existed=1</code>. Same irreversible loss of the key and every vault row as
+          the red bar below &mdash; so, same two movements. With no session live it only
+          mints one, and you do not need it at all: the FIRST Run mints its own.</span>
+        <button id="btn-session" class="danger-btn">Mint a new session key</button>
+      </div>
+    </details>
+    <span id="session-badge" class="badge muted" role="status" aria-live="polite">no session yet
+      &mdash; the FIRST Run creates one</span>
   </div>
 
-  <!-- Build doc section 9.10 calls this an "upload fixture dropdown". It is not one,
-       and cannot be from here: a browser cannot read a path off disk, and nothing
-       serves fixtures/ over HTTP -- _mount_ui mounts this directory alone, so
-       GET /fixtures/medical_note.txt is a 404. Labelled "fixture", sitting next to
-       a list of fixture filenames, it promised the upload and did half the job in
-       silence: selecting medical_note.txt and pressing Run issued zero requests and
-       answered NO_FILE, on the first control a reviewer touches. The label and the
-       hint now say what it does -- preset the doc_category each bundled document must
-       be scanned under, and name the path to hand the picker. Recorded in README
-       section 8's deviation ledger; the hint text lives in app.js so the idle and
-       chosen states have one source. -->
+  <!-- This dropdown now LOADS the document it names. It used to only preset
+       doc_category: it listed four filenames and then asked the reviewer to go find
+       that same file on disk with the picker beside it ("now pick
+       fixtures/medical_note.txt with the file button"), because nothing served
+       fixtures/ over HTTP -- _mount_ui mounts this directory alone, and
+       GET /fixtures/medical_note.txt was a measured 404. A control that names a file
+       and then makes you fetch it is friction on the FIRST thing a reviewer touches,
+       and before the hint was added it was worse than friction: selecting
+       medical_note.txt and pressing Run issued zero requests and answered NO_FILE.
+       api/routes/documents.py now serves exactly these four names (an allow-list, not
+       a file server -- see its docstring), so choosing one arms it, sets its
+       doc_category, and Run uploads it through the same POST /documents the picker
+       uses. The picker stays for a reviewer's own document; arming either one disarms
+       the other, and #fixture-hint below says which is armed. Recorded in README
+       section 8's deviation ledger against 9.10; every string lives in app.js so the
+       idle text and the armed text have one source. -->
   <div class="grp">
-    <label for="fixture">fixture preset</label>
-    <select id="fixture">
-      <option value="">— none —</option>
-      <option value="medical_note.txt" data-cat="medical">medical_note.txt</option>
-      <option value="legal_memo.txt" data-cat="legal">legal_memo.txt</option>
-      <option value="financial_disclosure.txt" data-cat="financial">financial_disclosure.txt</option>
-      <option value="legal_brief_large.txt" data-cat="legal">legal_brief_large.txt</option>
+    <label for="fixture">demo document</label>
+    <select id="fixture" aria-describedby="fixture-hint">
+      <option value="">— none (use your own file) —</option>
+      <option value="medical_note.txt" data-cat="medical">medical_note.txt (medical)</option>
+      <option value="legal_memo.txt" data-cat="legal">legal_memo.txt (legal)</option>
+      <option value="financial_disclosure.txt" data-cat="financial">financial_disclosure.txt (financial)</option>
+      <option value="legal_brief_large.txt" data-cat="legal">legal_brief_large.txt (legal)</option>
     </select>
     <!-- The only control that loads a document was the one control on the page with no
          accessible name: a screen reader announced it as "Choose File, button", and the
          one visible <label> in this group points at the <select> beside it, so sighted
-         users were misdirected too. Without a file every Run answers NO_FILE, so an
-         unnamed picker is the demo failing to start. The hint carries the sentence that
-         tells the two controls apart ("a preset, not an upload"), so it is this input's
-         description rather than decoration. -->
-    <label for="file">document</label>
+         users were misdirected too. Without a document every Run answers NO_FILE, so an
+         unnamed picker is the demo failing to start. The hint is now the ARMED state of
+         both controls -- which of the two Run will actually upload -- so it is the
+         description of each of them rather than decoration, and it is a live region:
+         arming happens by mutating this one span, and a mutation on a plain <span> is
+         announced to nobody. -->
+    <label for="file">your own file</label>
     <input type="file" id="file" accept=".txt,.md,.pdf,.docx" aria-describedby="fixture-hint">
-    <span class="hint" id="fixture-hint"></span>
+    <span class="hint" id="fixture-hint" role="status" aria-live="polite"></span>
   </div>
 
   <!-- The first option was `(none)`, selectable and the default, and the natural path
@@ -108,7 +223,28 @@
   </div>
 </section>
 
-<section class="controls danger" id="review-pair" aria-label="live review sequence">
+<!-- Run has its own bar, and that is the point of the bar. It used to live INSIDE the
+     red panel below, headed "LIVE REVIEW -- irreversible erasure" and sitting a
+     centimetre from a red "Destroy session": the ordinary, repeatable, non-destructive
+     primary action of the whole page was framed as part of a warning about irreversible
+     erasure. A reviewer reading the strip top-to-bottom reads the warning as the label
+     of both buttons under it, which is wrong about one of them and teaches them to
+     discount it for the other. The two are now separated by what they DO -- press this
+     one as often as you like; the one below cannot be undone -- rather than by colour
+     alone inside one box. -->
+<section class="controls" aria-label="run the pipeline">
+  <button id="btn-run" class="go big">Run <span id="spin" class="spin" hidden></span></button>
+  <!-- "to the provider" is the third place on this page that reads as a live model call,
+       swept as a sibling of the panel 2 and 3 labels below. It points at those labels
+       rather than repeating the switch a third time: the belief a reviewer has to not
+       form is "a real model saw that payload", and the payload is read on the panels. -->
+  <span class="hint">Uploads the armed document, detects and obfuscates it, sends only the
+    obfuscated payload to the provider named on panels 2 and 3, and restores the answer into
+    panel 4. Nothing here is destructive and it can be repeated. If this page has never held
+    a session, this is also what creates one.</span>
+</section>
+
+<section class="controls danger" id="review-pair" aria-label="destructive controls">
   <!-- Names what the sequence actually demonstrates. It read "vault-miss demo", which
        this flow cannot produce: /pipeline/run calls _require_session before it reaches
        services.orchestrator.run, so a destroyed session is refused 401 SESSION_EXPIRED
@@ -119,12 +255,57 @@
        contradicting the banner three lines below it. The genuine vault-miss path is a
        model inventing a token inside a *live* session: demo.py and
        test_vault_miss_on_deobfuscation exercise it. -->
-  <span class="tag">LIVE REVIEW &mdash; irreversible erasure: click <b>Run</b>, then
-    <b>Destroy session</b>, then <b>Run</b> again &mdash; the second run is refused with
-    SESSION_EXPIRED before the vault is consulted, and the audit tail shows
-    VAULT_DESTROY</span>
-  <button id="btn-run" class="go big">Run <span id="spin" class="spin" hidden></span></button>
-  <button id="btn-destroy" class="danger-btn big">Destroy session</button>
+  <!-- "...and the audit tail shows VAULT_DESTROY" was a promise the screen does not keep,
+       and this is the third string in this repository caught claiming more than the page
+       delivers. Driven end to end in Chrome 151 at 1550x950 against 127.0.0.1:8075 --
+       arm legal_brief_large.txt, Run, Destroy session, Confirm -- the row IS fetched and
+       IS rendered: 349 rows, and `1745 VAULT_DESTROY {"existed":1,"source":"api_logout"}`
+       is the last of them. It is also 8068px down a scroll box `style.css` caps at 260px,
+       with `scrollTop` 0 and NINE rows visible: a reviewer who takes this sentence at its
+       word looks at rows 1-9 (SESSION_CREATE, DETECT, seven OBFUSCATE) and sees no
+       destroy. On a session past `AUDIT_LIMIT` (1000) events the row is not in the page at
+       all.
+       So the sentence now says what the reviewer will actually see and how to reach the
+       row, with the number that makes the scroll expected rather than a surprise. Two
+       halves of this claim were printed and only one lives here; the other is app.js's
+       VAULT_DESTROYED banner ("The audit tail below shows VAULT_DESTROY."), reported as a
+       handoff rather than edited from this file. Surfacing the row instead of describing
+       it is one line in `destroySession` -- scroll `.tablewrap` to its last row after the
+       refresh -- and is deliberately NOT done here as a CSS `column-reverse`, because that
+       silently reverses the tail for every OTHER load too and would double-reverse against
+       the newest-first fetch the same finding proposes for `loadAudit`. -->
+  <span class="tag">LIVE REVIEW &mdash; irreversible erasure: press <b>Run</b> above, then
+    <b>Destroy session</b> here, then <b>Run</b> above again &mdash; the second run is refused
+    with SESSION_EXPIRED before the vault is consulted, and VAULT_DESTROY is written as the
+    LAST row of the session. The audit tail below opens at row 1 and shows nine at a time
+    (349 rows on the large brief), so scroll it to the END to read
+    <code>existed=1</code></span>
+  <!-- Two steps, and NOT a `confirm()` dialog. One click on the single red button erased
+       the session outright -- next to copy that calls the erasure irreversible -- so a
+       reviewer exploring the controls destroyed their own demo, and the recovery is a
+       fresh session and a re-run of everything. `confirm()` was the obvious fix and is
+       the wrong one twice over: it is a modal the page cannot style or explain, and it
+       blocks the automation harness (`tests/test_ui_behaviour.py` drives this file under
+       node with a ~30-line DOM stub that has no `window.confirm`), so the gate would be
+       untestable by the suite that tests everything else here.
+
+       The arm/confirm pair is in-page markup instead: `btn-destroy` arms, and swaps
+       itself for a confirm and a cancel. `destroy-state` is a live region because arming
+       happens by mutating these elements while focus is on a button -- the same WCAG 2.1
+       4.1.3 argument #banner and #fixture-hint carry.
+
+       THE ORDER IS THE OTHER HALF OF THE GATE and was got wrong first: with the confirm
+       written here first it rendered at x=24, the exact pixels "Destroy session..." had
+       just occupied (measured in the browser at 1550px: the arm button spans 24-186, the
+       confirm 24-250), so a double-click on one spot carried the erasure through and the
+       gate stopped one impatient click short of being no gate at all. CANCEL takes that
+       slot instead, and `destroy-state` sits between the two with `flex: 1 1 auto` so the
+       confirm is pushed to the far end of the bar -- a deliberate second movement, past
+       the sentence saying what it does. -->
+  <button id="btn-destroy" class="danger-btn big">Destroy session&hellip;</button>
+  <button id="btn-destroy-cancel" class="big" hidden>Cancel</button>
+  <span id="destroy-state" class="hint" role="status" aria-live="polite"></span>
+  <button id="btn-destroy-confirm" class="danger-btn big" hidden>Confirm: erase the vault</button>
 </section>
 
 <div id="banner" class="banner" role="alert" aria-live="assertive" aria-atomic="true" hidden></div>
@@ -158,10 +339,33 @@
 <section class="legend" aria-label="stats strip key">
   <span class="key"><i class="badge ok"></i>green &mdash; a safety counter reading its clean
     value of 0</span>
+  <!-- Swept as a sibling of the LIVE REVIEW strip's retracted promise, and it is the same
+       shape: copy that sends the reader to the audit tail for a specific row. Measured,
+       the tail opens at scrollTop 0 and shows nine rows of up to AUDIT_LIMIT, so "says
+       which token" was true of the LOG and not of the screen. It now says which of the
+       two it means, in the same words the strip uses. -->
   <span class="key"><i class="badge err"></i>red &mdash; the same counter, non-zero: the
-    audit tail below says which token</span>
-  <span class="key">plain &mdash; a count of what the run did to your data</span>
+    audit tail below records which token, in a row you will have to scroll to</span>
+  <!-- This key named three states and the strip prints four kinds of chip, so there was
+       one it did not cover -- and it is the one a reviewer stops on. `egress_rescan_warnings
+       3` renders plain, under a key that reads "a count of what the run did to your data",
+       which it is not: it is a count of what the GATE FOUND, and 3 of them beside a green
+       RUN_OK is the designed outcome rather than a near miss. Nothing on the page said so
+       except a tooltip, and a reviewer who has to hover a number to find out whether it is
+       bad will read the number as bad. The chip is deliberately still plain -- a
+       high-severity re-hit raises EGRESS_BLOCKED and the payload never leaves, so a warning
+       is by construction a hit the gate decided not to deny, and painting it red would
+       teach a reviewer to discount red. So the KEY is what changes: it now covers every
+       chip the strip can emit, including the one the API has not written yet. -->
+  <span class="key">plain &mdash; every counter that is neither of those: what the run did to
+    your data (<code>tokens_issued</code>, <code>redactions</code>), and the safety counters
+    with no single clean value. <code>egress_rescan_warnings 3</code> is the second kind
+    &mdash; hits the gate's own detector found and LOGGED; a high-severity one would have
+    raised EGRESS_BLOCKED instead and nothing would have been sent &mdash; so a non-zero
+    reading there beside a green pass is the design, not a leak.</span>
   <span class="key muted">dim &mdash; a stage timing, not a safety signal</span>
+  <span class="key muted">plain with no tooltip &mdash; a counter this page has no note for:
+    the API started reporting it after this build, and it is shown rather than dropped</span>
   <span class="key muted">hover any counter for what it actually counts</span>
 </section>
 
@@ -178,6 +382,22 @@
        restored_count of 32. app.js gives it .unres now; without a key here a
        reviewer sees a colour the legend does not explain. -->
   <span class="key"><i class="unres"></i>not restored (vault miss)</span>
+  <!-- The colour above says WHICH KIND of value a highlight is. Until this pair it did
+       not say whether the highlighted string is a real one, and under pseudonymization
+       that is the question the four-panel layout exists to answer. Measured on
+       fixtures/medical_note.txt run as `medical` with strategy=pseudonymization: panel 1
+       paints the real "David Ochoa" PII blue on #12365e, and panel 2 paints the invented
+       "Andrew Stanley" PII blue on the identical #12365e. Two strings that mean opposite
+       things, the same to the eye. A per-mark tooltip was added for this and it is the
+       wrong channel -- nobody hovers 52 marks, and colour is read before anything else.
+       Fill is now the answer: FILLED is a value out of your document, OUTLINED is
+       something the run put in its place, and the hue still means the category on both
+       sides. -->
+  <span class="key"><i class="c-PHI"></i>filled &mdash; a REAL value out of your document
+    (panel 1 only)</span>
+  <span class="key"><i class="tok c-PHI"></i>outlined &mdash; a SUBSTITUTE this run emitted
+    (panels 2 and 3): a token, a [REDACTED_*] marker, or a realistic fake. Never a real
+    value, however much it reads like one</span>
 </section>
 
 <!-- Each panel is its own region, named by the static half of its heading only. The
@@ -189,14 +409,40 @@
 <main class="panels">
   <div class="panel" role="region" aria-labelledby="h-p1">
     <h2><span id="h-p1">1 · Original text</span> <span id="c1" class="count"></span></h2>
-    <pre id="p1" class="body">Create a session, choose a file, press Run.</pre>
+    <!-- This read "Create a session, choose a demo document or your own file, press
+         Run", which was the friction written down: three steps, the first of them a
+         different button. Run now mints the session itself when none is live, so the
+         instruction printed largest on the page is the two steps that are left. -->
+    <pre id="p1" class="body">Choose a demo document or your own file, then press Run.</pre>
   </div>
+  <!-- WHICH provider, said where the payload is read. "Raw LLM response" reads as a live
+       model call, and the only disclosure that it is not was the `mock/` prefix inside the
+       health badge in the far top-right corner -- no tooltip, three-quarters of a
+       1550px-wide page away from panel 3. A reviewer who believes a real model saw panel
+       2's contents has been shown something else entirely: on mock nothing left the
+       process, and that is the claim the four panels exist to make. The other tell is
+       `llm_ms`, measured at 0.1-1.0 ms, and the stats legend above explicitly tells the
+       reader that a timing chip is "not a safety signal".
+       The label is static and unconditional because it is true in BOTH configurations:
+       `Settings.llm_provider` defaults to "mock" (config.py) and `anthropic` is reachable
+       only by setting SCP_LLM_PROVIDER, so naming the switch says which one ran without
+       the page having to know. The dynamic half -- `health()` already holds
+       `h.llm_provider`, so it can overwrite these two spans with the measured value -- is
+       an app.js change and is reported as a handoff; the ids are here for it, and until it
+       lands these read correctly on their own rather than being empty placeholders.
+       Sibling of #h-p2/#h-p3 rather than inside them: `aria-labelledby` points at those
+       spans alone, so the region names stay "2 - Outbound obfuscated payload" and
+       "3 - Raw LLM response" and do not grow a sentence. -->
   <div class="panel" role="region" aria-labelledby="h-p2">
-    <h2><span id="h-p2">2 · Outbound obfuscated payload</span> <span id="c2" class="count"></span></h2>
+    <h2><span id="h-p2">2 · Outbound obfuscated payload</span> <span id="p2-provider"
+      class="prov">bound for the provider &mdash; <b>mock</b> unless
+      <code>SCP_LLM_PROVIDER=anthropic</code></span> <span id="c2" class="count"></span></h2>
     <pre id="p2" class="body">—</pre>
   </div>
   <div class="panel" role="region" aria-labelledby="h-p3">
-    <h2><span id="h-p3">3 · Raw LLM response</span> <span id="c3" class="count"></span></h2>
+    <h2><span id="h-p3">3 · Raw LLM response</span> <span id="p3-provider"
+      class="prov">answered by the provider &mdash; <b>mock</b> unless
+      <code>SCP_LLM_PROVIDER=anthropic</code></span> <span id="c3" class="count"></span></h2>
     <pre id="p3" class="body">—</pre>
   </div>
   <div class="panel" role="region" aria-labelledby="h-p4">

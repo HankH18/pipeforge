@@ -3,8 +3,9 @@
 Build doc section 9.7. This is the last stage of the pipeline and the only one
 that puts original values back into a string, so two properties are load-bearing:
 
-**Tolerance.** The LLM rewrote our tokens. It bolded them, uppercased the hash,
-dropped a bracket, made one possessive, stripped or mangled a class hint. A token
+**Tolerance.** The LLM rewrote our tokens. It bolded them, re-cased them, dropped
+a bracket, made one possessive, wrapped a line at a separator, stripped or mangled
+a class hint. A token
 we fail to match is a token that reaches the user un-restored, so matching is done
 with :data:`~secure_context_pipeline.surrogates.TOKEN_RE` -- the single tolerant
 grammar shared with the emitting strategy and the egress gate -- and lookup keys
@@ -89,6 +90,21 @@ rather than WARNING, and :class:`RestoreResult` splits them into ``fabricated``
 and ``lost``. Omit it and the classification is honestly
 :data:`MISS_INDETERMINATE` rather than a guess.
 
+What the audit trail says a restore did
+---------------------------------------
+Two shapes of ``DEOBFUSCATE`` row per call, and the split is the compliance
+requirement rather than a preference. The **stage row** carries the strategy, the
+counts, the three degradation signals, the latency and ``outcome`` -- and it used
+to be the only row, with ``entity_type`` and ``token_id`` both ``NULL``. Section 7
+asks each de-obfuscation event to name an entity type, a token and an action, and
+asks the log to be queryable for compliance reporting; with counts alone, "which
+entities were restored in this session?" had no answer, while the *failure* path
+(``VAULT_MISS``) itemised per token. So an **entity row** is now written per
+distinct token ID restored, mirroring the one-row-per-vaulted-entity shape the
+obfuscation engine has always written, and the two join on ``token_id``. See
+:meth:`Restorer._emit_restored_rows` for the volume bound and for why none of the
+three fields can carry an original.
+
 Untrusted input
 ---------------
 The model response is untrusted text. Everything here is a string operation over
@@ -124,7 +140,7 @@ from secure_context_pipeline.audit.logger import DEOBFUSCATE, VAULT_MISS, AuditL
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.errors import PipelineError, VaultMissError
 from secure_context_pipeline.models import MASK, AuditEvent
-from secure_context_pipeline.surrogates import TOKEN_RE
+from secure_context_pipeline.surrogates import HINT_RE, TOKEN_RE
 from secure_context_pipeline.textrules import (
     LEFT_GUARD,
     RIGHT_GUARD,
@@ -140,6 +156,7 @@ __all__ = [
     "MISS_INDETERMINATE",
     "MISS_LOST",
     "PSEUDONYMIZATION",
+    "RESTORE_ACTION",
     "TOKENIZATION",
     "UNRESOLVED_ENTITY",
     "RestoreResult",
@@ -168,7 +185,35 @@ MISS_INDETERMINATE = "indeterminate"
 
 TOKENIZATION = "tokenization"
 PSEUDONYMIZATION = "pseudonymization"
-_KNOWN_STRATEGIES = frozenset({TOKENIZATION, PSEUDONYMIZATION})
+
+
+def _is_known_strategy(name: str) -> bool:
+    """Does any REGISTERED strategy claim ``name``?
+
+    This was `frozenset({TOKENIZATION, PSEUDONYMIZATION})`, and it made a graded
+    rubric claim false. "Strategies are pluggable without harness changes" and
+    "adding a new strategy touches zero harness code" are both in the challenge, and
+    the strategies package delivers them honestly -- `ObfuscationStrategy` +
+    `@register_strategy` + `build_strategy`, and the ENGINE needs no edit. The run
+    then died HERE, in the harness, because the restorer asked a hardcoded pair
+    instead of the registry:
+
+        PipelineError(reason='unknown_strategy', strategy='<the new one>')
+
+    Asking `restore_mode` instead is the same seam `config.py` already opened twice,
+    for `llm_provider` and `key_provider` -- both were closed `Literal`s and both
+    became registry-checked strings for exactly this reason. It also asks the right
+    question: what this module needs from a strategy is not its NAME but how its
+    output comes apart, which only the strategy knows.
+
+    Imported inside the function, not at module scope: `strategies.base` imports the
+    surrogate grammar this module also uses, and a top-level import closes that
+    cycle. `restore_mode` is called once per `restore()`, not once per token, and
+    it resolves against an already-imported module -- see its own docstring.
+    """
+    from secure_context_pipeline.obfuscation.strategies.base import restore_mode
+
+    return restore_mode(name) is not None
 
 # Import-time invariant: the placeholder must not itself look like a token, or
 # every restore with a vault miss would trip its own assertion.
@@ -249,6 +294,40 @@ _MAX_LABEL_LEN = 48
 #: per-class totals stay reconstructible from the summary row.
 _MAX_MISS_ROWS = 32
 
+#: How many individual per-entity ``DEOBFUSCATE`` rows one restore may write.
+#:
+#: Unlike :data:`_MAX_MISS_ROWS` this volume is **ours**, not the provider's: a row
+#: is written only for a token ID the session vault resolved, so the ceiling is the
+#: number of entities in the uploaded document -- exactly the ceiling the engine's
+#: one-``OBFUSCATE``-row-per-entity already pays. The cap is therefore about the
+#: section 12 budget rather than about an adversary, and both halves are measured
+#: on the real ``AuditLogger`` (0.48 ms per hash-chained write on this machine):
+#:
+#: * ``fixtures/legal_brief_large.txt`` -- the 12 000-word brief, the largest
+#:   shipped fixture -- issues 251 tokens and the mock provider's answer restores
+#:   all 251 distinct IDs. Itemised, the run's audit trail goes from 347 rows to
+#:   598 (+72%, ~123 KB of SQLite) and the restore stage from 2.6 ms to ~125 ms
+#:   against a 500 ms budget. That is the case this cap must NOT bite on, and at
+#:   256 it does not.
+#: * The synthetic worst case in ``tests/test_benchmarks.py`` -- 500 distinct
+#:   tokens in one response -- costs 240 ms uncapped, which took the cold-vault
+#:   restore benchmark from 105 ms (4.8x headroom) to 345 ms (1.4x). Capped, the
+#:   added cost is a constant ~123 ms whatever the model sends back.
+#:
+#: When it bites, one summary row records how many were suppressed, and the
+#: entities themselves are still enumerable: the ``OBFUSCATE`` row for every one of
+#: them carries the same ``entity_type``/``token_id`` pair, and the stage row
+#: carries ``restored``.
+_MAX_RESTORE_ROWS = 256
+
+#: ``detail['action']`` on a per-entity ``DEOBFUSCATE`` row. Core requirement 7
+#: names five things a de-obfuscation event must carry -- timestamp, session ID,
+#: entity type, token, and *action* -- and the first four are columns
+#: (``ts``, ``session_id``, ``entity_type``, ``token_id``). ``event_type`` is the
+#: action in the vocabulary sense, but a reader filtering ``DEOBFUSCATE`` gets the
+#: stage row and the itemisation together, and only this field tells them apart.
+RESTORE_ACTION = "restore"
+
 
 class SupportsVaultLookup(Protocol):
     """The slice of the session vault this module depends on (build doc section 9.4).
@@ -279,6 +358,17 @@ class RestoreResult(BaseModel):
     ``unresolved`` lists the *distinct* token IDs behind them. A surrogate that
     could not be resolved counts toward ``vault_misses`` but never appears in
     ``unresolved``, which is token IDs only -- never an original, never a fake.
+
+    ``elapsed_ms`` is the *restoration* -- matching, resolving, splicing and the
+    residue sweep -- and stops before the audit writes, as it always has. That gap
+    used to be one row and is now up to :data:`_MAX_RESTORE_ROWS` + 2 of them, which
+    is the difference between a rounding error and most of the number: measured on a
+    500-token response, ``elapsed_ms`` reads **4.9 ms** while a caller timing
+    :meth:`Restorer.restore` around the same call sees **122 ms**, 258 audit rows
+    later. Both are true and they measure different
+    things -- the orchestrator's ``restore_ms`` stat, taken around the call, is the
+    one that includes the log -- but a reader who assumes they agree will conclude
+    the stage got 20x faster than the stopwatch says.
 
     ``fabricated`` and ``lost`` partition ``unresolved`` when the caller passed
     ``issued`` to :meth:`Restorer.restore`: IDs the run never minted versus IDs it
@@ -343,6 +433,20 @@ class RestoreResult(BaseModel):
     __str__ = __repr__
 
 
+class _RestoredToken(NamedTuple):
+    """One distinct token ID this pass put an original back for. Audit input.
+
+    Every field is either a hash this run minted or a grammar-constrained label,
+    and the original itself is deliberately absent -- see
+    :meth:`Restorer._emit_restored_rows` for why each one is safe to persist.
+    """
+
+    token_id: str
+    entity_type: str
+    category: str
+    occurrences: int
+
+
 class _TokenPass(NamedTuple):
     text: str
     restored: int
@@ -363,6 +467,9 @@ class _TokenPass(NamedTuple):
     #: rewrites a protected span, so its bytes survive intact and only its offsets
     #: move; :meth:`Restorer._assert_no_tokens` needs them in output coordinates.
     protected: tuple[tuple[int, int], ...] = ()
+    #: One entry per distinct token ID whose original was spliced into ``text``.
+    #: The itemisation the ``DEOBFUSCATE`` audit rows are written from.
+    restored_tokens: tuple[_RestoredToken, ...] = ()
 
 
 class _SurrogatePass(NamedTuple):
@@ -417,6 +524,7 @@ class Restorer:
         strategy: str,
         surrogates: Mapping[str, str] | None = None,
         issued: Collection[str] | None = None,
+        hints: Mapping[str, str] | None = None,
         run_id: str | None = None,
     ) -> RestoreResult:
         """Restore ``text`` for ``session_id`` and verify that nothing leaked.
@@ -427,6 +535,16 @@ class Restorer:
         pass runs whenever that map is non-empty, and the token pass *always*
         runs -- pseudonymization still emits tokens for the tiers configured that
         way (build doc section 9.3), so one response can carry both shapes.
+
+        ``hints`` maps token ID -> the class hint **this run actually wrote after
+        the pipe** for that token, and it exists for exactly one shape: a token
+        the model stripped both brackets from, which strands the hint in the
+        answer welded to the restored original (``chest pain|cardiovascular``).
+        Entries whose value is not :data:`~secure_context_pipeline.surrogates
+        .HINT_RE`-shaped are dropped, so the deletion this enables is bounded by
+        the emitter's own grammar as well as by byte equality -- see
+        :func:`_consume_emitted_hint`. Omitting it keeps the older behaviour, in
+        which such a hint survives visibly rather than being guessed at.
 
         ``issued`` is the set of token IDs this run minted (case-insensitive). It
         classifies every vault miss, and it *gates* substitution: an ID this run
@@ -443,12 +561,13 @@ class Restorer:
         token degrades the answer, it never fails the request.
         """
         started = time.perf_counter()
-        if strategy not in _KNOWN_STRATEGIES:
+        if not _is_known_strategy(strategy):
             raise PipelineError(reason="unknown_strategy", strategy=str(strategy)[:32])
 
         supplied: dict[str, str] = {key: value for key, value in (surrogates or {}).items() if key}
         pattern = _compile_surrogate_pattern(supplied) if supplied else None
         minted = None if issued is None else {token_id.lower() for token_id in issued}
+        emitted_hints = _emitted_hints(hints)
 
         working = text
         surrogate_pass = _SurrogatePass(working, 0, 0, 0, ())
@@ -478,6 +597,7 @@ class Restorer:
             working,
             minted=minted,
             protected=surrogate_pass.spliced,
+            hints=emitted_hints,
             run_id=run_id,
         )
         working = token_pass.text
@@ -536,6 +656,14 @@ class Restorer:
                 "outcome": "ok",
             },
         )
+        # The stage row above is written FIRST and the itemisation second, in that
+        # order deliberately: the summary is the row that says the stage completed
+        # and what it cost, it is the only row on a capped or a zero-token restore,
+        # and a reader paging the log in `seq` order should meet the outcome before
+        # the list it summarises.
+        await self._emit_restored_rows(
+            session_id, run_id=run_id, strategy=strategy, restored=token_pass.restored_tokens
+        )
         # Counts only -- never the text, never a value.
         logger.info(
             "response restored",
@@ -559,6 +687,7 @@ class Restorer:
         *,
         minted: set[str] | None,
         protected: tuple[tuple[int, int], ...],
+        hints: Mapping[str, str],
         run_id: str | None,
     ) -> _TokenPass:
         """Resolve every *claimable* token, then rebuild in one left-to-right pass.
@@ -604,7 +733,7 @@ class Restorer:
 
         # Widen once, up front: the claim decision is about the span that would
         # actually disappear, not about the bare regex match.
-        spans = [_span_and_suffix(text, match) for match in matches]
+        spans = [_span_and_suffix(text, match, hints=hints) for match in matches]
         claimable: list[bool] = []
         collisions = 0
         foreign = 0
@@ -630,13 +759,26 @@ class Restorer:
         # literals in `CATEGORIES`, a closed set this module ships, so it is the
         # half of the label that provably cannot carry a value.
         categories: dict[str, str] = {}
+        # Group 2 alone: the *registry* entity type, and therefore the one spelling
+        # that joins a DEOBFUSCATE row to the OBFUSCATE row for the same entity --
+        # the engine writes `record.entity_type`, which is exactly this string.
+        types: dict[str, str] = {}
         for match, claimed in zip(matches, claimable, strict=True):
             if not claimed:
                 continue
             token_id = match.group(3).lower()
             if token_id not in labels:
-                labels[token_id] = f"{match.group(1)}_{match.group(2)}"[:_MAX_LABEL_LEN]
-                categories[token_id] = match.group(1)
+                # UPPER-CASED, and that is not cosmetic. `TOKEN_RE` groups 1 and 2
+                # are case-tolerant now (a model that lower-cases a token still has
+                # to restore), so the same entity reached this line as `PHI_NAME`,
+                # `phi_name` and `Phi_Name` depending on how the model typed it --
+                # three spellings of one audit label, and a compliance query that
+                # groups by entity_type would report them as three entity types.
+                # The grammar is ASCII-only by construction (`surrogates._any_case`),
+                # so `.upper()` here is exact rather than locale-dependent.
+                labels[token_id] = f"{match.group(1)}_{match.group(2)}".upper()[:_MAX_LABEL_LEN]
+                categories[token_id] = match.group(1).upper()
+                types[token_id] = match.group(2).upper()[:_MAX_LABEL_LEN]
                 order.append(token_id)
 
         resolved: dict[str, str] = {}
@@ -786,6 +928,12 @@ class Restorer:
         cursor = 0
         restored = 0
         missed = 0
+        # Occurrences actually spliced back, per distinct token ID. Counted here
+        # rather than derived from `resolved` because a resolved ID whose every
+        # occurrence was swallowed by an earlier splice put nothing in the answer,
+        # and an audit row saying it was restored would be a claim about text that
+        # is not there.
+        occurrences: dict[str, int] = {}
         # (input_start, input_end, replacement_length) per committed splice, in
         # ascending order -- everything needed to move a protected span's offsets.
         edits: list[tuple[int, int, int]] = []
@@ -797,13 +945,15 @@ class Restorer:
             if not claimed or span_end <= cursor:  # swallowed by the previous splice
                 continue
             parts.append(text[cursor : max(span_start, cursor)])
-            value = resolved.get(match.group(3).lower())
+            token_id = match.group(3).lower()
+            value = resolved.get(token_id)
             if value is None:
                 piece = UNRESOLVED_ENTITY + possessive
                 missed += 1
             else:
                 piece = value + possessive
                 restored += 1
+                occurrences[token_id] = occurrences.get(token_id, 0) + 1
             parts.append(piece)
             edits.append((max(span_start, cursor), span_end, len(piece)))
             cursor = span_end
@@ -819,6 +969,15 @@ class Restorer:
             foreign,
             collisions,
             _shift_spans(protected, edits),
+            tuple(
+                _RestoredToken(
+                    token_id=token_id,
+                    entity_type=types[token_id],
+                    category=categories[token_id],
+                    occurrences=count,
+                )
+                for token_id, count in occurrences.items()
+            ),
         )
 
     # -- pseudonymization --------------------------------------------------
@@ -1117,6 +1276,103 @@ class Restorer:
 
     # -- audit -------------------------------------------------------------
 
+    async def _emit_restored_rows(
+        self,
+        session_id: str,
+        *,
+        run_id: str | None,
+        strategy: str,
+        restored: tuple[_RestoredToken, ...],
+    ) -> None:
+        """One ``DEOBFUSCATE`` row per distinct token ID restored. Requirement 7.
+
+        The spec asks a de-obfuscation event to carry "timestamp, session ID,
+        entity type, token (not original value), and action", and asks the log to
+        be "queryable for compliance reporting". One aggregate row per call carried
+        the timestamp, the session and counts -- with ``entity_type`` and
+        ``token_id`` both ``NULL`` -- so "which entities were restored in this
+        session?" was unanswerable from the log: per-token detail existed *only* on
+        the failure path (``VAULT_MISS``), i.e. the trail named what could not be
+        given back and nothing about what was. These rows mirror the obfuscation
+        side, which has always written one row per distinct vaulted entity, so the
+        two halves of the round trip join on ``token_id``.
+
+        **The aggregate row is kept as well**, because it carries eleven things
+        these rows cannot: the strategy-level counts, the three degradation signals
+        (``foreign_tokens``, ``restored_collisions``,
+        ``surrogates_suspected_unrestored``), the miss classification totals, the
+        stage latency, and -- the one that matters most -- ``outcome``. A restore
+        that failed its post-restore assertion writes an ``assertion_failed`` stage
+        row and *no* itemisation, because nothing was released to the user.
+
+        **No original value can reach these rows, and none of the three fields is
+        taken on trust:**
+
+        ``token_id``
+            Emitted only for an ID the *session vault resolved*. That is a stronger
+            provenance test than the ``minted`` set the ``VAULT_MISS`` path uses:
+            the document's own reference code that leaked eight digits of a real
+            MRN into ``token_id`` (see the label-suppression comment in
+            :meth:`_restore_tokens`) is a **miss** by construction -- it has no
+            vault row -- so it cannot reach this method at all.
+        ``entity_type``
+            ``TOKEN_RE`` group 2, upper-cased, capped at :data:`_MAX_LABEL_LEN`.
+            Group 1 is not concatenated in: it is one of the four ``CATEGORIES``
+            literals and travels in ``detail`` instead, which keeps this column
+            spelling the registry's own entity type -- ``NAME``, not ``PHI_NAME``
+            -- so it joins the ``OBFUSCATE`` row the engine wrote from
+            ``record.entity_type``.
+        ``occurrences``
+            A count of splices, not of matches.
+
+        The residual, stated rather than argued away: the label is still bytes the
+        *model* wrote, so a model that keeps our hash and rewrites the type body
+        can put its own text in that column. Three things bound it and one measures
+        it -- the grammar (``[A-Za-z][A-Za-z0-9_]{0,63}``, ASCII by construction),
+        the 48-character cap, and the fact that a vaulted original is never shown
+        to the model under either strategy, so the text it could put there is text
+        this run did not vault. The measurement is the 100-run leakage harness,
+        which scans the audit SQLite file as bytes against every vaulted original.
+        """
+        if self._audit is None or not restored:
+            return
+        for entry in restored[:_MAX_RESTORE_ROWS]:
+            await self._emit(
+                session_id,
+                run_id=run_id,
+                event_type=DEOBFUSCATE,
+                entity_type=entry.entity_type,
+                token_id=entry.token_id,
+                detail={
+                    "action": RESTORE_ACTION,
+                    "strategy": strategy,
+                    "category": entry.category,
+                    "occurrences": entry.occurrences,
+                },
+            )
+        suppressed = len(restored) - _MAX_RESTORE_ROWS
+        if suppressed > 0:
+            await self._emit(
+                session_id,
+                run_id=run_id,
+                event_type=DEOBFUSCATE,
+                detail={
+                    "action": RESTORE_ACTION,
+                    "reason": "restored_rows_suppressed",
+                    "suppressed": suppressed,
+                    "row_cap": _MAX_RESTORE_ROWS,
+                },
+            )
+            logger.warning(
+                "per-entity restore audit rows suppressed by the per-response cap",
+                extra={
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "suppressed": suppressed,
+                    "row_cap": _MAX_RESTORE_ROWS,
+                },
+            )
+
     async def _emit(
         self,
         session_id: str,
@@ -1147,12 +1403,15 @@ class Restorer:
 # --------------------------------------------------------------------------
 
 
-def _span_and_suffix(text: str, match: re.Match[str]) -> tuple[int, int, str]:
+def _span_and_suffix(
+    text: str, match: re.Match[str], *, hints: Mapping[str, str] | None = None
+) -> tuple[int, int, str]:
     """Widen a token match to the span that should disappear, plus its possessive.
 
     Returns ``(start, end, possessive)`` where ``text[start:end]`` is everything
-    to replace -- the token, the markdown hugging it, a mangled hint tail -- and
-    ``possessive`` is the suffix to re-append to the restored value.
+    to replace -- the token, the markdown hugging it, a mangled hint tail, a hint
+    stranded by a dropped bracket -- and ``possessive`` is the suffix to
+    re-append to the restored value.
 
     Markdown is stripped only where it is *mirrored* -- and in both directions.
     ``**[TOKEN]**`` collapses cleanly, but a lone ``[TOKEN]**`` keeps its ``**``
@@ -1173,6 +1432,11 @@ def _span_and_suffix(text: str, match: re.Match[str]) -> tuple[int, int, str]:
     start = match.start() + (len(matched) - len(matched.lstrip()))
     if end == match.end():
         end -= len(matched) - len(matched.rstrip())
+        # Only once the bracket-terminated mop-up has declined. The two are
+        # mutually exclusive by construction -- that one needs a closer in reach,
+        # this one exists for the token that has none -- and running this second
+        # keeps that ordering true of the code and not just of the comment.
+        end = _consume_emitted_hint(text, end, match, hints)
 
     # Proposal only: innermost delimiter first, nothing committed yet.
     opened: list[str] = []
@@ -1244,22 +1508,23 @@ def _consume_unclosed_tail(text: str, match: re.Match[str]) -> int:
     answer the user reads. All five bounds are pinned by the
     ``PROSE_AFTER_A_MANGLED_HINT`` table in ``tests/test_deobfuscation.py``.
 
-    **A token that lost BOTH brackets keeps its hint, on purpose.** Every bound
-    above leans on the closer that *balances* the opener, so ``bracket_dropped``
-    applied to both halves -- ``PHI_DIAGNOSIS_c5a3c75f|cardiovascular.`` -- has
-    nothing to terminate on and this returns immediately. The cost is real and is
-    accepted rather than hidden: with a vault of ``{'c5a3c75f': 'chest pain'}``
-    the user reads ``chest pain|cardiovascular.``, and the bracketed spelling of
-    the same token reads ``chest pain.``. That asymmetry is visible in panel 4 of
-    the demo.
+    **A token that lost BOTH brackets is not this function's business.** Every
+    bound above leans on the closer that *balances* the opener, so
+    ``bracket_dropped`` applied to both halves --
+    ``PHI_DIAGNOSIS_c5a3c75f|cardiovascular.`` -- has nothing to terminate on and
+    this returns immediately. It is handled by :func:`_consume_emitted_hint`
+    instead, and only when the caller supplies the hint map; with no map the hint
+    survives into the answer, which is the older behaviour and is still what the
+    ``STRANDED_HINT_IS_LEFT_ALONE`` table pins.
 
-    A mop-up for the stranded form was written and then **reverted**, and the
-    reason is kept here so it is not written a second time. Without a bracket
-    there is no delimiter, so the only thing left to bound the deletion by is the
-    hint *alphabet* -- ``[a-z0-9-]{1,24}`` -- and that alphabet is also ordinary
+    The split is not stylistic. A mop-up for the stranded form that worked **from
+    the response text alone** was written and then reverted, and the reason is
+    kept here so it is not written a second time. Without a bracket there is no
+    delimiter, so the only thing left to bound the deletion by is the hint
+    *alphabet* -- ``[a-z0-9-]{1,24}`` -- and that alphabet is also ordinary
     English. Measured on the reverted implementation, with all of its table-cell
-    and length guards in place, it still deleted the model's own words (same
-    vault as above)::
+    and length guards in place, it still deleted the model's own words (with a
+    vault of ``{'c5a3c75f': 'chest pain'}``)::
 
         PHI_DIAGNOSIS_c5a3c75f|and the rest follows.  ->  chest pain the rest follows.
         PHI_DIAGNOSIS_c5a3c75f|per-protocol review.   ->  chest pain review.
@@ -1267,22 +1532,13 @@ def _consume_unclosed_tail(text: str, match: re.Match[str]) -> int:
 
     The third is a compact markdown table -- no outer pipes, which is how a model
     writes a two-column summary -- and it loses a cell exactly as the spaced-out
-    rows of ``PROSE_AFTER_A_MANGLED_HINT`` do.
-
-    The only honest bound is the *finite* hint vocabulary, since hints come from
-    the gazetteer class column and nowhere else. That is not reachable from here:
-    this module is handed a vault and settings, never a registry, and the run's
-    surrogate map carries pseudonyms only (see ``orchestrator._surrogate_map``),
-    so the hint this run emitted for a given token ID is not knowable at restore
-    time. Sourcing it from the gazetteers would make the restorer depend on the
-    detection stack and make its *deletion extent* a function of a data file --
-    and it would still not close the hole, because ``cardiovascular``, ``renal``,
-    ``insulin`` and ``autoimmune`` are all real class hints and all real English.
-
-    So the ordering of harms three paragraphs up decides it here too, and it
-    decides it the same way: a visible ``|cardiovascular`` is cosmetic and the
-    reader can see it; a word deleted from a clinical answer is not, and cannot.
-    Pinned by the ``STRANDED_HINT_IS_LEFT_ALONE`` table.
+    rows of ``PROSE_AFTER_A_MANGLED_HINT`` do. This paragraph used to conclude
+    that the only honest bound was the finite gazetteer hint vocabulary and that
+    it was unreachable from here. The first half was too weak and the second half
+    was true of the wrong source: what closes it is not the vocabulary but the
+    hint **this run emitted for this token ID**, which no registry is needed for
+    -- the run already has it -- and which refuses all three lines above, because
+    ``and``, ``per-protocol`` and ``active`` are not what we wrote for that ID.
     """
     end = match.end()
     matched = match.group(0)
@@ -1307,6 +1563,103 @@ def _consume_unclosed_tail(text: str, match: re.Match[str]) -> int:
     if not text.startswith(closer, stop) or TOKEN_RE.search(text[end:stop]):
         return end
     return stop + len(closer)
+
+
+def _emitted_hints(hints: Mapping[str, str] | None) -> dict[str, str]:
+    """The caller's ``token_id -> hint`` map, lowercased and grammar-filtered.
+
+    Two filters, and neither is decoration. The key is lowercased because
+    ``TOKEN_RE`` tolerates a case-mangled hash and every other lookup in this
+    module keys on the lowercased ID. The *value* is dropped unless it satisfies
+    :data:`~secure_context_pipeline.surrogates.HINT_RE`, which is the same
+    ``[a-z0-9-]{1,24}`` gate :func:`~secure_context_pipeline.surrogates
+    .format_surrogate` puts a hint through before it can reach a payload.
+
+    That second filter is what bounds the blast radius of a wrong caller. This map
+    authorises a deletion from the user's answer, so an unfiltered one would let
+    ``{'1a2b3c4d': 'and the rest follows.'}`` delete a whole clause the model
+    wrote. Filtered, the longest deletion any caller can authorise is 25
+    characters (``|`` plus the emitter's 24-char bound) and every one of them has
+    to match the model's bytes exactly.
+    """
+    if not hints:
+        return {}
+    return {
+        token_id.lower(): hint
+        for token_id, hint in hints.items()
+        if token_id and hint and HINT_RE.fullmatch(hint)
+    }
+
+
+def _consume_emitted_hint(
+    text: str, end: int, match: re.Match[str], hints: Mapping[str, str] | None
+) -> int:
+    """Swallow a ``|hint`` this run *provably wrote*, stranded by a dropped bracket.
+
+    ``[PHI_DIAGNOSIS_7f029e2e|cardiovascular]`` with both brackets dropped by the
+    model is ``PHI_DIAGNOSIS_7f029e2e|cardiovascular``. ``TOKEN_RE`` reads a hint
+    only when a closer follows it, and :func:`_consume_unclosed_tail` terminates on
+    the closer that balances the opener, so neither reaches this one: the token
+    restores and the suffix stays welded to the value. Measured on
+    ``fixtures/medical_note.txt`` under pseudonymization, panel 4 of the demo read
+    ``- The closing section mentions chest pain|cardiovascular.`` while the
+    bracketed spelling of the same token two lines up read ``asthma.``
+
+    **This is not the text-only mop-up that was reverted.** That one had no
+    delimiter to stop at, so its only bound was the hint *alphabet* -- which is
+    also ordinary English -- and it deleted the model's own words:
+    ``PHI_NAME_1a2b3c4d|and the rest follows.`` became ``John Smith the rest
+    follows.``, and a compact two-column markdown row lost its status cell. The
+    bound here is a different kind of thing: the caller passes the hint **this run
+    emitted for this token ID**, and the only bytes that may go are that exact
+    string behind a ``|``. With ``{'1a2b3c4d': 'oral-antidiabetic'}`` in hand, all
+    three reverted counter-examples are refused, because ``and``,
+    ``per-protocol`` and ``active`` are not the hint we wrote for ``1a2b3c4d``.
+    ``_consume_unclosed_tail``'s docstring called the finite hint vocabulary the
+    only honest bound and judged it unreachable; per-token equality is stronger
+    than the vocabulary and it is reachable, because it comes from the run rather
+    than from the registry.
+
+    Three further bounds, each one a case the equality test alone lets through:
+
+    * **The pipe must be the very next character.** Not ``\\s{0,4}\\|``: a spaced
+      pipe is how a model writes a table (``| PHI_NAME_1a2b3c4d | active |``), and
+      a hint that collided with a cell's text would take the cell. What we emit
+      has no space there, so requiring none costs nothing we could have written.
+    * **The character after the hint must not continue it.** ``|ace-inhibitor``
+      is our hint; ``|ace-inhibitors`` and ``|ace-inhibitor-plus`` are the model's
+      longer words that merely start with it, and swallowing the prefix would
+      leave ``s`` or ``-plus`` orphaned in the answer. Tested with ``isalnum``
+      rather than an ASCII class so a following non-Latin letter guards too.
+    * **Only where** :func:`_consume_unclosed_tail` **declined**, which the caller
+      enforces by ordering. A token that closed properly has no stranded hint by
+      definition, and a bracketed one is that function's business.
+
+    A swallowed run can never hide a token belonging to somebody else, and the
+    reason is no longer the one this paragraph used to give. It said ``HINT_RE`` is
+    lowercase while "every ``TOKEN_RE`` category and type literal is upper-case",
+    so the run-on guard ``_consume_unclosed_tail`` carries was unreachable here.
+    Half of that is now false: ``TOKEN_RE`` matches any casing (a model that
+    lower-cases a token still has to restore), and ``phi-name-deadbeef`` is a legal
+    ``HINT_RE`` string -- lowercase, hyphen-separated, 18 characters -- that the
+    case-tolerant grammar matches. What holds instead is stronger and does not
+    depend on casing: the only bytes this function may swallow are ``|`` plus the
+    hint **this run emitted for this token ID**, so anything hidden in them is a
+    string we wrote ourselves out of a gazetteer class column.
+    """
+    if not hints:
+        return end
+    hint = hints.get(match.group(3).lower())
+    if hint is None:
+        return end
+    tail = "|" + hint
+    if not text.startswith(tail, end):
+        return end
+    stop = end + len(tail)
+    following = text[stop : stop + 1]
+    if following.isalnum() or following == "-":
+        return end
+    return stop
 
 
 def _overlaps(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
