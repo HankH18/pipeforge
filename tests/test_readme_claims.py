@@ -1972,3 +1972,38 @@ def test_the_formatter_divergence_section_1_states_is_the_one_ruff_reports() -> 
         f"the formatter divergence is restated as {sorted(restated)} elsewhere on the page "
         f"and measured at {reformat}"
     )
+
+
+def test_the_readme_does_not_disclose_a_failing_test_while_the_suite_is_green() -> None:
+    """A stale "one test is failing" disclosure is worse than no disclosure.
+
+    Section 1 used to carry a paragraph naming
+    `test_the_page_serves_its_own_favicon_so_a_load_logs_no_console_error` as red,
+    telling the reader to "expect `2688 passed, 1 failed, 1 skipped`" and to treat
+    anything else as a finding. The test was then rewritten for the real
+    same-origin `ui/favicon.png` and went green -- and the paragraph stayed. So the
+    page instructed a reviewer to expect a failure that could not occur, and the
+    honest-disclosure paragraph had become the least accurate thing on the page.
+
+    Nothing caught it. The sibling assertion `passed + skipped == collected`
+    already implied a green tree, but arithmetic in one section cannot contradict
+    prose in another loudly enough to fail a suite -- so the two drifted apart for
+    as long as nobody re-read them together. This test is that re-reading.
+
+    It is deliberately about the SHAPE of the claim rather than about the favicon:
+    any future "expect N passed, M failed" is caught the moment the failure it
+    describes is fixed. Which is the moment it becomes a lie, and also exactly the
+    moment everyone's attention has moved on.
+    """
+    text = flat(readme_text())
+
+    live_failure_claims = re.findall(r"\d+ passed, (\d+) failed, \d+ skipped", text)
+    disclosed = [int(count) for count in live_failure_claims]
+
+    assert not any(count > 0 for count in disclosed), (
+        "the README tells a reviewer to expect a failing suite "
+        f"({live_failure_claims}), but `passed + skipped == collected` is asserted "
+        "in this same file, so the tree is green. Delete the disclosure with the "
+        "fix that made it stale -- a reviewer who trusts it will discount a real "
+        "regression as the one they were told to expect."
+    )

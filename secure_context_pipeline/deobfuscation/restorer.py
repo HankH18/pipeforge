@@ -307,18 +307,35 @@ _MAX_MISS_ROWS = 32
 #:   shipped fixture -- issues 251 tokens and the mock provider's answer restores
 #:   all 251 distinct IDs. Itemised, the run's audit trail goes from 347 rows to
 #:   598 (+72%, ~123 KB of SQLite) and the restore stage from 2.6 ms to ~125 ms
-#:   against a 500 ms budget. That is the case this cap must NOT bite on, and at
-#:   256 it does not.
+#:   against a 500 ms budget. That is the case this cap must NOT bite on, and it
+#:   is what sets the floor below -- see the sizing note after the second bullet.
 #: * The synthetic worst case in ``tests/test_benchmarks.py`` -- 500 distinct
 #:   tokens in one response -- costs 240 ms uncapped, which took the cold-vault
 #:   restore benchmark from 105 ms (4.8x headroom) to 345 ms (1.4x). Capped, the
-#:   added cost is a constant ~123 ms whatever the model sends back.
+#:   added cost is bounded whatever the model sends back.
+#:
+#: The value is 512 rather than 256 because 256 cleared the 251-token brief by
+#: five rows -- a 2% margin, so any document slightly larger than the biggest one
+#: shipped would have started truncating its itemisation. 512 is 2x that real
+#: ceiling. Re-measured on the cold-vault benchmark at three candidate values:
+#:
+#: =====  ========  =============
+#: cap    500-tok   vs 500 ms
+#: =====  ========  =============
+#: 256    184 ms    2.7x headroom
+#: 512    283 ms    1.8x headroom
+#: 768    289 ms    1.7x headroom
+#: =====  ========  =============
+#:
+#: So 512 buys 2x the margin over any realistic document for 100 ms of a budget
+#: that still has 1.8x left, and 768 buys almost nothing further -- past ~512 the
+#: synthetic case is bounded by its own 500 distinct tokens, not by the cap.
 #:
 #: When it bites, one summary row records how many were suppressed, and the
 #: entities themselves are still enumerable: the ``OBFUSCATE`` row for every one of
 #: them carries the same ``entity_type``/``token_id`` pair, and the stage row
 #: carries ``restored``.
-_MAX_RESTORE_ROWS = 256
+_MAX_RESTORE_ROWS = 512
 
 #: ``detail['action']`` on a per-entity ``DEOBFUSCATE`` row. Core requirement 7
 #: names five things a de-obfuscation event must carry -- timestamp, session ID,

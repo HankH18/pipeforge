@@ -280,35 +280,38 @@ ruff check .
 Everything below is output from this repository, not an estimate.
 
 ```
-2690 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
+2693 passed, 1 skipped       # full suite WITH node on PATH, pasted as `pytest -q` printed it.
                              #   The skip is the real-network LLM smoke test.
                              #   Without node it is 111 skipped -- the 110 UI behaviour tests go
                              #   with it. See Path B above.
-                             #   2691 collected: 158 leakage + 7 bench + rest unit + integration
+                             #   2694 collected: 158 leakage + 7 bench + rest unit + integration
 mypy --strict                # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
-97% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
+98% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
                              #   5041 statements, 79 missed; 1272 branches, 57 partial (package only; see below)
 ```
 
-**One test is failing on the working tree this block was measured from, and the block says so
-rather than letting a reviewer discover it.** The counts above are the ones a *correct* tree
-yields — collection, the marker split and the coverage figures are all re-derived from the tree
-by `tests/test_readme_claims.py`, and `passed + skipped` is asserted to equal what `pytest`
-collects. What the tree currently prints is one failure short of it:
-`tests/test_ui_behaviour.py::test_the_page_serves_its_own_favicon_so_a_load_logs_no_console_error`
-requires the page's `rel="icon"` to be an inline `data:` URI, and the page now ships a real
-same-origin `ui/favicon.png` because the inline form was measured *blocked* by the page's own CSP
-(Deviation 68). The test is the old claim's own pin, left behind by the change it was written
-for; it is red for the right reason and is owned by the file it lives in, not by this section.
-Until it is replaced, expect `2688 passed, 1 failed, 1 skipped` and treat the failure as this
-one — anything else is a finding.
+**The block is green, and it is checked rather than pasted.** Collection, the marker split and
+the coverage figures are all re-derived from the tree by `tests/test_readme_claims.py`, and
+`passed + skipped` is asserted to equal what `pytest` collects — so a stale number here reddens
+the suite instead of misleading a reviewer.
 
-**The coverage line is the one figure in that block a red run *moves*, and it moved.** It read
-98% and now reads 97%: a failing test leaves its own code paths unexecuted, so `missed` and
-`partial` are inflated by whatever is red at the moment of measurement, and the pasted figures
-were taken on a tree that was. Read the coverage line as a **floor** — a green run lands at or
-above it — and re-derive it rather than trusting it, which is what checklist step 5 exists for.
+This paragraph used to say the opposite, and how it went stale is worth one line. It disclosed
+`test_the_page_serves_its_own_favicon_so_a_load_logs_no_console_error` as red — the test required
+the page's `rel="icon"` to be an inline `data:` URI, and the page had moved to a real same-origin
+`ui/favicon.png` because the inline form was measured *blocked* by the page's own CSP (Deviation
+68). The test was then rewritten to pin the favicon actually shipped, and went green; the
+paragraph telling reviewers to *expect* a failure stayed behind. An honest disclosure that
+outlives its defect is the least accurate thing on the page, because a reviewer who trusts it
+discounts a real regression as the one they were told to expect. It is now pinned by
+`::test_the_readme_does_not_disclose_a_failing_test_while_the_suite_is_green`, which fails on any
+"expect N passed, M failed" the moment the failure it describes is fixed.
+
+**The coverage line is the one figure in that block a red run *moves*.** A failing test leaves
+its own code paths unexecuted, so `missed` and `partial` are inflated by whatever is red at the
+moment of measurement — which is why this line read 97% while the favicon test above was red,
+against the same 5041/79/1272/57 it reports now. Re-measured green it is 98%. Read it as a
+**floor** — and re-derive it rather than trusting it, which is what checklist step 5 exists for.
 The three figures the block states *exactly* are not affected: the collected count, the marker
 split and the `statements` denominator are properties of the source rather than of a run, and
 `tests/test_readme_claims.py` re-derives all three from the tree on every suite.
@@ -373,8 +376,8 @@ correctness content, and it is now the *only* thing `ruff` is not gating.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py`
-and `fixtures/` — it is **98%** of **25,012** statements: **24,361** for the package plus
-`tests/` plus `fixtures/`, and `demo.py`'s **651** on top of that. It is published as its two
+and `fixtures/` — it is **98%** of **25,041** statements: **24,379** for the package plus
+`tests/` plus `fixtures/`, and `demo.py`'s **662** on top of that. It is published as its two
 addends because it is the most rot-prone number on this page — every test module added moves it,
 and it was 55 statements adrift within one commit of being written — so
 `tests/test_readme_claims.py` re-derives all three from the source tree in
@@ -414,7 +417,7 @@ uses coverage's own reporter and is checked file by file against a real run.
 
 **`demo.py` has to be measured on its own**, and the reason is a small trap: the demo tests load
 it by *file path* under a synthetic module name, so `--cov=demo` warns `module-not-imported` and
-silently omits all 651 of its statements from the total. `coverage run --include='demo.py'` is
+silently omits all 662 of its statements from the total. `coverage run --include='demo.py'` is
 what reports it. Those two files were the last real gaps:
 `demo.py` sat at **26%** and `fixtures/generator.py` at **69%** while every module around them
 was above 90, because each defect this audit found got a regression test and nothing went back
@@ -452,7 +455,7 @@ falsifies exactly one condition and asserts that one named check goes red. The w
 test asserts the ledger rather than the section headings, which come from `section()` calls and
 survive the demonstrations under them being deleted: with RUN B and the fail-closed section
 removed, the demo still printed every heading and still exited 0 on `PASS -- 10/10 checks
-passed, 0 failures`. That file is now 54 tests.
+passed, 0 failures`. That file is now 55 tests.
 
 **Leakage harness** (`pytest -m leakage`, 100 runs, both strategies alternating, varied seeds):
 

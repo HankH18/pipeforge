@@ -135,8 +135,8 @@ RESPONSE_TOKENS = 500
 #: one-row-per-entity shape the obfuscation engine already pays for on the way out.
 #: A hash-chained write costs ~0.55 ms, so a 500-token response spends 240 ms in the
 #: audit log and lands at 345 ms (1.4x) if the itemisation is uncapped; that is what
-#: ``restorer._MAX_RESTORE_ROWS`` (256) bounds, and the numbers above are with it.
-#: The added cost is now a constant, whatever the model sends back. The two rows are
+#: ``restorer._MAX_RESTORE_ROWS`` (512) bounds, and the numbers above are with it.
+#: The added cost is now bounded, whatever the model sends back. The two rows are
 #: still the fastest way to see an ``AuditLogger.emit`` regression: they are almost
 #: entirely audit writes.
 #:

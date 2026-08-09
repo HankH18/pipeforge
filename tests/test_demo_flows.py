@@ -15,9 +15,12 @@ network, no API key, and nothing written to the repository's real ``./data`` or 
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import os
+import secrets
 import sqlite3
+import subprocess
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -1617,3 +1620,51 @@ async def test_the_destruction_check_goes_red_when_nothing_was_actually_destroye
     # alone rather than about the whole section going red together.
     control = graded["restoration WORKS before destruction (control for the next check)"]
     assert control.ok is True, control.detail
+
+
+def test_a_corrupt_store_makes_the_demo_exit_rather_than_hang(tmp_path: Path) -> None:
+    """demo.py must return an exit code on a damaged data directory, not hang forever.
+
+    `build_harness` opened the audit log, then the store, then the vault, with no
+    unwind between them. aiosqlite runs every connection on a NON-DAEMON thread, so
+    when the store raised on a corrupt `documents.db` the already-open AUDIT
+    connection kept the interpreter alive and the process printed its traceback and
+    then sat there. Measured before the fix: exit 124 under a 45-second `timeout`.
+    Observed in the wild holding `data/audit.db` for 24 minutes until killed by hand,
+    which is also how this was found -- it had corrupted nothing, but nothing else
+    could open the log while it lived.
+
+    The store's own `open()` is careful and closes its half before raising; the leak
+    was one frame up. And the `finally: await harness.close()` at the call site
+    cannot help, because `build_harness` never returns a harness to close.
+
+    Run as a SUBPROCESS with a hard timeout, because that is the only way to observe
+    the defect: in-process the leaked thread does not block anything, and the hang
+    exists only at interpreter exit. `timeout` is generous -- the failure mode is
+    "never", not "slow" -- and the assertion is on the return code rather than on
+    stderr, so it survives any rewording of the error.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    # A file SQLite will open and then choke on: real header, garbage pages. A
+    # zero-byte file is silently valid, so it would not reproduce anything.
+    (data_dir / "documents.db").write_bytes(b"SQLite format 3\x00" + os.urandom(8192))
+
+    result = subprocess.run(
+        [sys.executable, "demo.py"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "SCP_DATA_DIR": str(data_dir),
+            "SCP_MASTER_KEY": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+        },
+        check=False,
+    )
+    assert result.returncode != 0, "a corrupt store must fail the demo, not pass it"
+    assert "DOCUMENT_STORE_UNAVAILABLE" in (result.stderr + result.stdout), (
+        "the failure must name the store, or a reviewer cannot tell a bad data "
+        f"directory from a broken pipeline: {result.stderr[-300:]}"
+    )

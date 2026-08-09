@@ -3749,3 +3749,35 @@ async def test_a_document_reference_the_model_echoes_never_reaches_the_audit_log
     assert mrn_digits not in serialised, (
         f"eight digits of an MRN reached the audit row: {serialised}"
     )
+
+
+def test_the_restore_row_cap_clears_the_largest_shipped_fixture_with_real_margin() -> None:
+    """The cap must not bite on any document a reviewer can actually upload.
+
+    This is the guard that was missing when `_MAX_RESTORE_ROWS` was 256. The
+    largest shipped fixture -- the 12 000-word `legal_brief_large` -- issues 251
+    tokens, so 256 cleared it by FIVE rows. It degraded loudly rather than
+    silently (a `restored_rows_suppressed` row), but a document 2% larger than the
+    biggest one in the repo would have started truncating its itemisation, and the
+    only thing standing between a reviewer and that was luck about document size.
+
+    Asserting 2x rather than "clears it" is the whole point: a margin of five is
+    arithmetically a pass and practically a trap. If a future fixture grows past
+    half the cap, this reddens and forces the same measurement again rather than
+    letting the margin erode silently back to 2%.
+
+    The 251 is not re-derived here -- doing so would mean running Presidio over
+    12 000 words inside a unit test. It is pinned by the itemisation benchmark in
+    `tests/test_benchmarks.py`, which restores that exact fixture end to end; this
+    test guards the ARITHMETIC relationship, which is the half that regressed.
+    """
+    largest_shipped_fixture_tokens = 251
+
+    assert _MAX_RESTORE_ROWS >= 2 * largest_shipped_fixture_tokens, (
+        f"cap {_MAX_RESTORE_ROWS} leaves only "
+        f"{_MAX_RESTORE_ROWS - largest_shipped_fixture_tokens} rows over the "
+        f"{largest_shipped_fixture_tokens}-token brief; a slightly larger document "
+        "would truncate its de-obfuscation audit trail. Re-measure the cold-vault "
+        "restore benchmark before raising it -- the cap exists for the section 12 "
+        "500 ms budget, not for an adversary."
+    )

@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import difflib
 import hashlib
 import logging
@@ -53,7 +54,7 @@ import sys
 import textwrap
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal
@@ -670,10 +671,37 @@ async def build_harness(settings: Settings, provider: DetailedLLMProvider) -> Ha
     await asyncio.to_thread(data_dir.mkdir, parents=True, exist_ok=True)
 
     registry = load_registry(settings.registry_path)
-    audit = await AuditLogger.open(data_dir / AUDIT_DB_FILENAME)
-    store = await EncryptedDocumentStore.open(settings)
-    sessions = SessionRegistry(settings)
-    vault = await SessionVault.open(data_dir / VAULT_DB_FILENAME, sessions)
+
+    # Unwound in reverse if anything below fails, exactly as `api/lifespan.py` does,
+    # and for a reason that is not tidiness: aiosqlite runs each connection on a
+    # NON-DAEMON thread, so one left open keeps the interpreter alive at exit.
+    #
+    # Without this, a corrupt `documents.db` made `demo.py` PRINT ITS TRACEBACK AND
+    # THEN HANG FOREVER -- measured at 45 s under `timeout`, exit 124, and observed
+    # in the wild holding `audit.db` for 24 minutes until it was killed by hand.
+    # The store's own `open()` is careful and closes its half before raising; what
+    # leaked was the AUDIT connection, already open two lines up. The `finally:
+    # await harness.close()` at the call site cannot help, because `build_harness`
+    # never returns to produce a harness to close.
+    #
+    # A reviewer meets this the first time a data directory is damaged, and a demo
+    # that hangs reads as a broken pipeline rather than a bad file.
+    opened: list[Callable[[], Awaitable[None]]] = []
+    try:
+        audit = await AuditLogger.open(data_dir / AUDIT_DB_FILENAME)
+        opened.append(audit.close)
+        store = await EncryptedDocumentStore.open(settings)
+        opened.append(store.close)
+        sessions = SessionRegistry(settings)
+        vault = await SessionVault.open(data_dir / VAULT_DB_FILENAME, sessions)
+        opened.append(vault.close)
+    except BaseException:
+        # BaseException, not Exception: a cancelled startup must release the
+        # threads too, and that is the realistic case under a timeout.
+        for close in reversed(opened):
+            with contextlib.suppress(Exception):
+                await close()
+        raise
 
     # Session keys never survive a process restart, so rows left by a previous
     # run are undecryptable garbage. Same startup hygiene the API performs.
