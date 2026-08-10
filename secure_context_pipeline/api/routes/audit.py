@@ -74,8 +74,11 @@ MAX_AUDIT_OFFSET = 2**63 - 1
 #: durability; neither bounds **cost**, and ``GET /audit/verify`` is the one read
 #: in this API whose cost is unbounded and monotonically rising.
 #:
-#: :meth:`AuditLogger.verify_chain` recomputes a SHA-256 ``chain_payload`` for
-#: every row in ``audit_events`` -- ``_CHAIN_SQL`` has no ``WHERE`` clause, and
+#: :meth:`AuditLogger.verify_chain` recomputes an HMAC-SHA256 over the
+#: ``chain_payload`` of every row in ``audit_events`` -- keyed since the chain was
+#: keyed, and priced the same, because an HMAC is two compressions more than the
+#: bare digest this comment used to name and the walk is dominated by the row
+#: fetch either way -- ``_CHAIN_SQL`` has no ``WHERE`` clause, and
 #: the scoped form walks the whole chain as well because it has to know each
 #: row's predecessor. Measured on this build, anonymously, with no session and no
 #: credential of any kind: 0.7 ms at 0 rows, 7.4 ms at 1 000, 35.2 ms at 5 000,

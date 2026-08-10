@@ -60,7 +60,7 @@ from secure_context_pipeline.detection.registry import (
     load_registry,
 )
 from secure_context_pipeline.errors import ConfigError, DetectionError
-from secure_context_pipeline.models import Detection
+from secure_context_pipeline.models import DOC_CATEGORIES, Detection
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.obfuscation.strategies.base import available_strategies
 from secure_context_pipeline.pipeline.egress_gate import _INDEPENDENT_PATTERNS
@@ -2957,22 +2957,39 @@ HELD_OUT_IN_POLICY_COVERAGE_FLOOR = 0.93
 #
 # **This table, not the floor table, is the source of truth for the README's
 # per-entity numbers.** A floor is a promise about the future; these are the facts.
+#
+# **Re-measured when the undeclared-category default was made fail-closed**
+# (``Detector._scoped_types``). This is the "closing a gap means editing this table
+# in the same commit" case the paragraph above describes, and it is the reason the
+# assertion is ``==`` rather than ``>=``: four rows got BETTER and a one-sided
+# assertion would have said nothing. 16 of the 53 held-out documents carry
+# ``doc_category=None``, and the scoped rules were previously not run on any of
+# them. Four rows moved, all upward on coverage:
+#
+#   AMOUNT   21 -> 22 covered   ('$96,000' in ho_visa_letter, previously not looked for)
+#   DATE      3 ->  4 covered   ('10/02/2024' in ho_hr_investigation, ditto)
+#   DOB      29 -> 32 covered   (three ISO dates now claimed by DATE, which was absent)
+#   NAME     47 -> 48 covered   (see HELD_OUT_INCIDENTAL_MASKS -- masked, wrongly typed)
+#
+# Totals 334/332 -> 340/337 of 366. The tuned table (COVERAGE_MEASURED) did NOT
+# move, nor did the 873-span fixture census at natural categories: nothing about a
+# document whose category IS declared changed.
 HELD_OUT_COVERAGE_MEASURED: dict[str, tuple[int, int, int]] = {
     "ACCOUNT_NUMBER": (19, 19, 19),
     "ADDRESS": (5, 5, 5),
-    "AMOUNT": (21, 21, 25),
+    "AMOUNT": (22, 22, 25),
     "CASE_ID": (15, 15, 15),
     "CASE_STRATEGY": (2, 2, 2),
     "CLIENT_IDENTITY": (12, 12, 13),
-    "DATE": (3, 3, 10),
+    "DATE": (4, 4, 10),
     "DIAGNOSIS": (21, 21, 21),
-    "DOB": (29, 28, 33),
+    "DOB": (32, 31, 33),
     "EMAIL": (43, 43, 43),
     "INSURANCE_ID": (5, 5, 5),
     "LAB_RESULT": (7, 7, 7),
     "MEDICATION": (18, 18, 18),
     "MRN": (12, 12, 15),
-    "NAME": (47, 46, 58),
+    "NAME": (48, 46, 58),
     "PHONE": (47, 47, 47),
     "PRIVILEGED_MARKER": (2, 2, 2),
     "SETTLEMENT_TERM": (0, 0, 2),
@@ -2982,8 +2999,13 @@ HELD_OUT_COVERAGE_MEASURED: dict[str, tuple[int, int, int]] = {
 
 #: ``(covered, typed, total)`` over the whole held-out corpus, and over the subset
 #: the registry's document-category scoping actually asks for.
-HELD_OUT_TOTALS_MEASURED = (334, 332, 366)
-HELD_OUT_IN_POLICY_MEASURED = (334, 332, 355)
+#:
+#: The in-policy denominator is unchanged at 355 -- ``measure_held_out``'s
+#: ``in_scope`` predicate still reads the registry's raw ``allowed_in``, so it still
+#: counts only values the DECLARED scoping asks for, and the fail-closed default
+#: does not widen a declared category. The numerators moved with the table above.
+HELD_OUT_TOTALS_MEASURED = (340, 337, 366)
+HELD_OUT_IN_POLICY_MEASURED = (338, 335, 355)
 
 # entity type -> (how many of its held-out values fall short, and why).
 #
@@ -3103,6 +3125,15 @@ HELD_OUT_MISS_SHAPES: dict[str, tuple[int, str]] = {
 HELD_OUT_INCIDENTAL_MASKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     # A dot-separated birth date reads as a phone number: PHONE '09.14.1958' @ 0.40.
     ("DOB", "ho_pt_visit", "09.14.1958", ("PHONE",)),
+    # The SECOND occurrence of the same name in the same chat log, and it is new:
+    # ho_chat_log carries no doc_category, so before the fail-closed default DATE was
+    # never run on it and this name was in the CLEAR (it is the +1 in NAME's 47 -> 48).
+    # A timestamp span now runs on into it exactly as the DOB one above does. Masked
+    # under the wrong type is strictly better than not masked, and this row is here
+    # rather than absent because the ``==`` assertion is what forces the trade to be
+    # written down instead of averaged into a total. (Sorted order: this row precedes
+    # its DOB sibling because the tuples are compared elementwise and 'DATE' < 'DOB'.)
+    ("NAME", "ho_chat_log", "Priyanka Raghunathan", ("DATE",)),
     # DOB's span here is '09:15  Priyanka Raghunathan' -- a chat timestamp that ran on
     # into the speaker's name, so the name is masked as a birth date.
     ("NAME", "ho_chat_log", "Priyanka Raghunathan", ("DOB",)),
@@ -3973,17 +4004,85 @@ _UNLABELLED_SSN_CARRIERS = [
 ]
 
 
-def _registry_ssn_pattern_compiled() -> Any:
-    """The shipped registry's SSN backstop, compiled the way Presidio compiles it.
+def _registry_pattern_compiled(entity_type: str) -> Any:
+    """The shipped registry's rule for ``entity_type``, compiled as Presidio compiles it.
 
     ``regex``, not ``re``: ``presidio_analyzer.pattern_recognizer`` imports ``regex``,
     so that is the engine that actually evaluates this string against document text,
     and the two dialects are not the same language.
+
+    **This used to be ``_registry_ssn_pattern_compiled()``, hard-wired to ``SSN``, and
+    that was the defect the section header above already names in the abstract.** The
+    header says the tests below "DISCOVER the entries rather than enumerating them, so
+    an entry added tomorrow is covered on the next run instead of being silently
+    skipped"; the bodies then hard-wired the SSN registry rule, an SSN-only corpus, and
+    ``assert entity_type == "SSN"`` with the message *"no registry rule mirrors it"* --
+    which was untrue on the day it was written, since ``entities.yaml`` has shipped
+    ``MRN.patterns``, ``ACCOUNT_NUMBER.patterns`` and ``TAX_ID.patterns`` throughout.
+    So an entry added tomorrow did not get covered on the next run: it made the test
+    ERROR, which is the same hand-enumeration failure the parametrisation exists to
+    avoid, relocated from the ``parametrize`` line into the body.
     """
     import regex
 
-    patterns = load_registry(Path("entities.yaml")).spec("SSN").patterns
+    patterns = load_registry(Path("entities.yaml")).spec(entity_type).patterns
     return regex.compile("|".join(f"(?:{p})" for p in patterns))
+
+
+#: Label / value corpora per gate entity type. SSN's is the original one, unchanged;
+#: the other three are the same construction -- every label spelling the gate accepts,
+#: crossed with the separators, middles and value spellings that exercise both
+#: quantifier bounds -- so a new entry is checked rather than skipped.
+_GATE_LABELS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
+    # entity_type: (labels, middles, values)
+    "SSN": (
+        ("SSN", "ssn", "S.S.N.", "Social Security", "Soc. Sec.", "SS#", "ITIN"),
+        ("", " Number", " no.", " is"),
+        ("123456789", "123-45-6789", "123 45 6789", "078051120"),
+    ),
+    "MRN": (
+        ("MRN", "mrn", "MRNs", "Medical Record", "medical  record", "MEDICAL RECORD"),
+        ("", " Number", " no.", " Ref", " Number is"),
+        ("4471902", "447190", "4471902123", "33188024"),
+    ),
+    "ACCOUNT_NUMBER": (
+        ("Account", "account", "acct", "Acct", "A/C", "a/c", "Accounts"),
+        ("", " Number", " no.", " Ident", " Number is"),
+        ("100200300400", "88123456", "12345678901234567", "1234 5678 9012", "1234-5678-9012-3456"),
+    ),
+    "TAX_ID": (
+        ("EIN", "ein", "E.I.N.", "FEIN", "TIN", "Employer ID", "Employer Identification",
+         "Tax ID", "Taxpayer ID", "Federal Tax ID", "Taxpayer Identification"),
+        ("", " Number", " no.", " is"),
+        ("12-3456789", "123456789", "12 3456789", "12.3456789"),
+    ),
+}
+
+#: Carriers with no label at all, for the entries that claim an unlabelled grouping.
+#: An entry whose type is absent here is label-anchored and gets the labelled corpus
+#: alone -- which is why the ``claimed``/``checked`` floors below still bind.
+_UNLABELLED_VALUES: dict[str, tuple[str, ...]] = {
+    "SSN": tuple(_UNLABELLED_SSN_VALUES),
+    "TAX_ID": ("12-3456789", "94-1234567", "00-0000001", "99-9999999", "13-1234567"),
+}
+
+
+def _gate_corpus(entity_type: str) -> list[str]:
+    """Every document the containment tests below ask a gate entry about."""
+    labels, middles, values = _GATE_LABELS[entity_type]
+    documents = [
+        carrier.format(v=value)
+        for carrier in _UNLABELLED_SSN_CARRIERS
+        for value in _UNLABELLED_VALUES.get(entity_type, ())
+    ]
+    documents += [
+        f"Member {label}{middle}{separator}{value} on file."
+        for label in labels
+        for middle in middles
+        for separator in ("", " ", ": ", ", ", " (", " [", "/", "=", " -- ", " " * 20)
+        for value in values
+    ]
+    return documents
 
 
 @pytest.mark.parametrize("index", range(len(_INDEPENDENT_PATTERNS)))
@@ -3996,21 +4095,17 @@ def test_every_egress_gate_pattern_is_contained_by_the_registry(index: int) -> N
     hand-listed index set produces.
     """
     entity_type, gate_pattern = _INDEPENDENT_PATTERNS[index]
-    registry_pattern = _registry_ssn_pattern_compiled()
-    assert entity_type == "SSN", f"entry {index} claims {entity_type}; no registry rule mirrors it"
+    # Replaces `assert entity_type == "SSN"`, which claimed no registry rule mirrored
+    # any other type and was false when written. The real intent -- an entry the
+    # registry cannot mirror must fail rather than be waved through -- is kept and is
+    # now asserted against the registry instead of against a literal.
+    assert entity_type in _GATE_LABELS, (
+        f"gate entry {index} claims {entity_type} and this test has no corpus for it; "
+        "add one rather than narrowing the parametrisation"
+    )
+    registry_pattern = _registry_pattern_compiled(entity_type)
 
-    documents = [
-        carrier.format(v=value)
-        for carrier in _UNLABELLED_SSN_CARRIERS
-        for value in _UNLABELLED_SSN_VALUES
-    ]
-    documents += [
-        f"Member {label}{middle}{separator}{value} on file."
-        for label in ("SSN", "ssn", "S.S.N.", "Social Security", "Soc. Sec.", "SS#", "ITIN")
-        for middle in ("", " Number", " no.", " is")
-        for separator in ("", " ", ": ", ", ", " (", " [", "/", "=", " -- ", " " * 20)
-        for value in ("123456789", "123-45-6789", "123 45 6789", "078051120")
-    ]
+    documents = _gate_corpus(entity_type)
 
     missed: list[tuple[str, str]] = []
     span_mismatch: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
@@ -4034,8 +4129,8 @@ def test_every_egress_gate_pattern_is_contained_by_the_registry(index: int) -> N
     assert not missed, (
         f"{len(missed)} strings gate entry {index} claims and the registry does not. "
         f"Each is a document pass 3 blocks and the detector could have vaulted -- 422 "
-        f"EGRESS_BLOCKED, demo exit 1. Widen entities.yaml -> SSN.patterns; do NOT "
-        f"narrow the gate. First 5: {missed[:5]}"
+        f"EGRESS_BLOCKED, demo exit 1. Widen entities.yaml -> {entity_type}.patterns; "
+        f"do NOT narrow the gate. First 5: {missed[:5]}"
     )
     assert not span_mismatch, (
         f"{len(span_mismatch)} strings where both claim but the spans differ, so the "
@@ -4056,17 +4151,14 @@ async def test_every_egress_gate_pattern_is_vaultable_not_merely_blockable(
     the shipped detector and asserts the span *and* the band, which is what turns
     "pass 3 would not block" into "the round trip works".
     """
-    _entity_type, gate_pattern = _INDEPENDENT_PATTERNS[index]
-    documents = [
-        carrier.format(v=value)
-        for carrier in _UNLABELLED_SSN_CARRIERS
-        for value in _UNLABELLED_SSN_VALUES
-    ] + [
-        f"Member {label}{separator}{value} on file."
-        for label in ("SSN", "Social Security Number", "ITIN")
-        for separator in ("", " ", ": ", ", ", " [", "/", "=", " -- ", "  ")
-        for value in ("123456789", "123-45-6789", "078051120", "912-70-1234")
-    ]
+    entity_type, gate_pattern = _INDEPENDENT_PATTERNS[index]
+    # Same generalisation as the pattern-level test above, and for the same reason: the
+    # SSN-only corpus this used to build could not exercise a gate entry of any other
+    # type, so a new entry failed the `checked > 20` floor instead of being measured.
+    # `financial` stays the category for the SSN and FIN types; MRN is PHI and its
+    # values are only claimed in a medical document, which is the point of the scope.
+    documents = _gate_corpus(entity_type)
+    category = "medical" if entity_type == "MRN" else "financial"
 
     unvaultable: list[str] = []
     checked = 0
@@ -4078,7 +4170,7 @@ async def test_every_egress_gate_pattern_is_vaultable_not_merely_blockable(
         checked += 1
         covering = [
             d
-            for d in await detector.detect(document, "financial")
+            for d in await detector.detect(document, category)
             if d.start <= start and end <= d.end and d.score >= settings.threshold_obfuscate
         ]
         if not covering:
@@ -4593,7 +4685,17 @@ async def test_amount_fires_only_in_financial_documents(detector: Detector) -> N
     text = "The payment of $4,250.00 cleared."
     assert "AMOUNT" in types_of(await detector.detect(text, "financial"))
     assert "AMOUNT" not in types_of(await detector.detect(text, "general"))
-    assert "AMOUNT" not in types_of(await detector.detect(text, None))
+    # TEST WRONG (superseded). This line read ``not in ... detect(text, None)`` and
+    # was asserting the fail-open default as the contract: a document whose category
+    # the uploader simply did not send was scanned with every scoped rule switched
+    # off. ``doc_category`` is an OPTIONAL multipart form field, so that was one
+    # omitted field away and on the uploader's side of the trust boundary; the same
+    # omission disabled CASE_STRATEGY (``action: redact``) on attorney work product.
+    # ``None`` now means "no category declared", which buys MORE rules, never fewer
+    # -- see ``Detector._scoped_types``. The declared-category halves above are
+    # untouched and still pin the scoping; this half is the stronger claim, not a
+    # weaker one, because it fails if the fail-closed default ever regresses.
+    assert "AMOUNT" in types_of(await detector.detect(text, None))
 
 
 async def test_case_strategy_fires_only_in_legal_documents(detector: Detector) -> None:
@@ -4601,6 +4703,170 @@ async def test_case_strategy_fires_only_in_legal_documents(detector: Detector) -
     assert "CASE_STRATEGY" in types_of(await detector.detect(text, "legal"))
     assert "CASE_STRATEGY" not in types_of(await detector.detect(text, "general"))
     assert "CASE_STRATEGY" not in types_of(await detector.detect(text, "medical"))
+
+
+# ---------------------------------------------------------------------------
+# 4b. An UNDECLARED doc_category is fail-closed
+#
+# `doc_category` arrives on an OPTIONAL multipart form field (`POST /documents`),
+# so "no category" is what an uploader gets by leaving a field out -- and it used to
+# mean "run none of the scoped rules" rather than "run all of them". That put the
+# only `action: redact` entity in the registry behind a field the uploader controls.
+# The tests below are the contract in the other direction. Section 4 above still
+# owns the DECLARED half: a category that IS stated still scopes, and none of those
+# assertions moved.
+# ---------------------------------------------------------------------------
+
+#: One document per category-scoped entity, and the exact substring that must not be
+#: left in the clear. Keyed by entity so
+#: :func:`test_every_category_scoped_entity_survives_an_undeclared_category` can
+#: DISCOVER the scoped set from the shipped registry and fail on a key it has no
+#: sample for -- a new ``only_in_doc_categories`` entity added to ``entities.yaml``
+#: tomorrow reddens this file rather than silently inheriting an untested default.
+#: The shipped privileged brief, read once at import. Read here rather than inside
+#: the async test because ASYNC240 (correctly) refuses a blocking ``Path.read_text``
+#: on the event loop, and because reading it once is what a fixture is for.
+PRIVILEGED_BRIEF = (
+    Path(__file__).resolve().parent.parent / "fixtures" / "legal_memo.txt"
+).read_text()
+
+SCOPED_ENTITY_SAMPLES: dict[str, tuple[str, str]] = {
+    "DATE": ("Follow-up appointment scheduled for 03/12/2024.", "03/12/2024"),
+    "AMOUNT": ("The payment of $4,250.00 cleared.", "$4,250.00"),
+    "CLIENT_IDENTITY": ("Our client Jamie Kent approved the filing.", "Jamie Kent"),
+    "CASE_STRATEGY": (
+        "Our litigation strategy is to delay the deposition.",
+        "Our litigation strategy is to delay the deposition",
+    ),
+}
+
+
+async def test_an_absent_doc_category_applies_every_category_rule(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """**The acceptance case.** A privileged brief uploaded with NO category.
+
+    ``fixtures/legal_memo.txt`` is attorney work product -- its first line says so --
+    and this is the document an uploader gets by posting it to ``POST /documents``
+    and leaving the optional ``doc_category`` field off the form. Measured on the
+    shipped registry before the fix: 33 detections, no ``CASE_STRATEGY``, against 38
+    and five of them when ``legal`` was declared. ``CASE_STRATEGY`` is the only
+    ``action: redact`` entity in the registry -- the one class the engine destroys
+    irreversibly regardless of confidence -- so one omitted form field disabled the
+    strongest control in the pipeline on the document that most needed it.
+
+    Asserted on the real fixture rather than a sentence written to satisfy the
+    regex, and asserted through ``registry.action_of`` rather than by naming
+    ``redact`` here, so this stays a claim about *the highest-protection class* and
+    not about one string.
+    """
+    text = PRIVILEGED_BRIEF
+    assert "ATTORNEY WORK PRODUCT" in text, "premise: this fixture is privileged material"
+    redacting = {name for name in registry.entities if registry.action_of(name) is not None}
+    assert redacting, "premise: the registry has at least one categorical-action entity"
+
+    undeclared = await detector.detect(text, None)
+    declared = await detector.detect(text, "legal")
+
+    assert "CASE_STRATEGY" in types_of(undeclared), (
+        "a legal brief uploaded with no doc_category must still have its strategy "
+        "paragraphs redacted; this is the fail-open the optional form field created"
+    )
+    # Every categorical-action entity the declared run found, the undeclared run
+    # must find too. Derived from the run, so it cannot go stale against the registry.
+    assert redacting & types_of(declared) <= types_of(undeclared)
+    assert len(undeclared) >= len(declared), (
+        f"undeclared={len(undeclared)} declared={len(declared)}: an undeclared "
+        "category must never buy FEWER detections than a declared one"
+    )
+
+
+@pytest.mark.parametrize("entity_type", sorted(SCOPED_ENTITY_SAMPLES))
+async def test_every_category_scoped_entity_survives_an_undeclared_category(
+    detector: Detector, registry: EntityRegistry, entity_type: str
+) -> None:
+    """No scoped value is left in the clear merely because no category was declared.
+
+    Coverage, not label, is the assertion -- see :func:`uncovered`. That distinction
+    is load-bearing for exactly one of the four: with no category declared,
+    ``CLIENT_IDENTITY`` loses the specificity bonus it is paid inside a legal
+    document, so "Jamie Kent" comes back typed ``NAME``. The value is masked either
+    way, which is the guarantee; the tier is not, and pretending otherwise here
+    would be asserting something the fix deliberately does not claim.
+    """
+    scoped = {n for n, spec in registry.entities.items() if spec.only_in_doc_categories}
+    assert scoped == set(SCOPED_ENTITY_SAMPLES), (
+        "entities.yaml's scoped set and this sample table disagree; add a document "
+        f"for each of {sorted(scoped - set(SCOPED_ENTITY_SAMPLES))}"
+    )
+    text, fragment = SCOPED_ENTITY_SAMPLES[entity_type]
+    own_category = registry.spec(entity_type).only_in_doc_categories[0]
+
+    in_category = await detector.detect(text, own_category)
+    assert uncovered(text, in_category, fragment) == "", "premise: found in its own category"
+    undeclared = await detector.detect(text, None)
+    assert uncovered(text, undeclared, fragment) == "", (
+        f"{entity_type}'s value went out in the clear with no doc_category declared"
+    )
+
+
+def test_an_undeclared_category_asks_for_a_superset_of_every_declared_one(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """Layer 1, as a property over the whole registry rather than one entity.
+
+    ``test_the_recognizer_request_is_what_scopes_an_entity_out`` pins ``AMOUNT`` by
+    name. This says the same thing for every category at once and for whatever
+    ``entities.yaml`` holds tomorrow: the recogniser request built for an undeclared
+    category contains the request built for each declared one, and the undeclared
+    request is the whole registry. A future entity scoped to a category nobody
+    thought about is covered without editing this test.
+    """
+    undeclared = set(detector._entities_for(None))
+    for category in sorted(DOC_CATEGORIES):
+        assert set(detector._entities_for(category)) <= undeclared, (
+            f"{category} asks for a recognizer an undeclared category does not"
+        )
+    # The request is in the ANALYZER's namespace, not the registry's: a
+    # ``presidio:``-backed entity is asked for under its built-in name and only a
+    # ``patterns:``/``gazetteer:`` entity is asked for under its own. Re-derived here
+    # rather than borrowed from ``Detector._custom_names``, so this stays an
+    # independent statement of the mapping instead of a mirror of the code under test.
+    selectors = {
+        spec.presidio if spec.presidio else name
+        for name, spec in registry.entities.items()
+        if spec.is_recognizer_backed
+    }
+    assert selectors <= undeclared, sorted(selectors - undeclared)
+
+
+def test_the_specificity_bonus_needs_a_declared_category(detector: Detector) -> None:
+    """The half of the fix that protects precision, asserted at its own seam.
+
+    ``_claimant_in_window`` pays +1 to an entity restricted to *this* document's
+    category, because a restriction the document satisfies is evidence of a more
+    specific claim. With no category declared there is no such evidence, and paying
+    the bonus anyway hands every ``PERSON`` in an unclassified document to
+    ``CLIENT_IDENTITY``.
+
+    **Driven at the seam because neither corpus can see this at all.** Measured with
+    the bonus patched back to unconditional: all 35 ``NAME`` spans over the 24
+    documents in ``RECALL_CORPUS`` + ``HELD_OUT_CORPUS`` that carry no
+    ``doc_category`` become ``CLIENT_IDENTITY``, and *both* recall tables stay
+    exactly where they are -- 317/317/320 and 340/337/366 -- because
+    :data:`LABEL_ALIASES` accepts either label for a ``PERSON`` truth value. The
+    aliasing is right (typed recall is a utility measure, not a security one) and it
+    means this assertion is the only thing in the suite that fails when the gate on
+    the bonus is removed. It is not redundant with the recall tables; it is the part
+    they are structurally unable to check.
+    """
+    text = "Our client Jamie Kent approved the filing."
+    at = text.index("Jamie Kent")
+    end = at + len("Jamie Kent")
+    claimants = ("NAME", "CLIENT_IDENTITY")
+
+    assert detector._claimant_in_window(claimants, text, end, "legal", 0) == "CLIENT_IDENTITY"
+    assert detector._claimant_in_window(claimants, text, end, None, 0) == "NAME"
 
 
 def test_the_recognizer_request_is_what_scopes_an_entity_out(detector: Detector) -> None:
@@ -4619,7 +4885,12 @@ def test_the_recognizer_request_is_what_scopes_an_entity_out(detector: Detector)
     assert "AMOUNT" in detector._entities_for("financial")
     assert "AMOUNT" not in detector._entities_for("medical")
     assert "AMOUNT" not in detector._entities_for("general")
-    assert "AMOUNT" not in detector._entities_for(None)
+    # TEST WRONG (superseded), same edit and same reason as the ``not in`` line in
+    # ``test_amount_fires_only_in_financial_documents``: an UNDECLARED category is
+    # not a category that scopes anything out. The performance argument this test
+    # protects is about ``medical``/``general`` -- documents that positively are not
+    # financial -- and both of those assertions are untouched above.
+    assert "AMOUNT" in detector._entities_for(None)
 
 
 def test_the_detection_scope_guard_refuses_an_out_of_category_span(
@@ -4645,7 +4916,12 @@ def test_the_detection_scope_guard_refuses_an_out_of_category_span(
     result = SimpleNamespace(entity_type="AMOUNT", start=15, end=24, score=0.9)
     assert detector._to_detection(result, text, 0, "financial") is not None
     assert detector._to_detection(result, text, 0, "medical") is None
-    assert detector._to_detection(result, text, 0, None) is None
+    # TEST WRONG (superseded), third instance of the same fail-open contract. The
+    # guard is still live -- the ``"medical"`` line above is what proves that, and it
+    # is the case the docstring's argument is actually about. ``None`` is not an
+    # out-of-category span; it is an unstated category, and layer 3 now agrees with
+    # layers 1 and 2 that an unstated category admits everything.
+    assert detector._to_detection(result, text, 0, None) is not None
 
 
 # ---------------------------------------------------------------------------

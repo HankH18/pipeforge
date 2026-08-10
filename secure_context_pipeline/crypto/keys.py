@@ -1,6 +1,7 @@
 """Key hierarchy and HMAC derivations (build doc section 8).
 
     env master key  --HKDF-->  per-user document key      (derived on demand, never stored)
+    env master key  --HKDF-->  audit chain MAC key        (derived on demand, never stored)
     session key     --HKDF-->  per-session vault key      (session key is in-memory only)
     session key     --HMAC-->  token IDs, date shift, faker seeds
 
@@ -18,11 +19,13 @@ Two properties follow from the construction rather than from policy:
 separation has to be argued, not assumed.
 
 *HKDF (master key, session key).* Each ``info`` string carries a purpose prefix
-(``doc:``, ``vault:``, ``kms-wrap``) before the variable part, and the variable
-part is a single identifier with no further structure, so no two purposes can
-produce the same ``info``. The master key and the session key are different input
-keying material besides, so ``doc:`` and ``vault:`` derivations could not collide
-even if the strings did.
+(``doc:``, ``vault:``, ``kms-wrap``, ``audit-chain``) before the variable part, and
+the variable part is a single identifier with no further structure, so no two
+purposes can produce the same ``info``. The two constant labels differ in their
+first byte from each other and from both prefixes, so neither can be reached by any
+``user_id`` or ``session_id``. The master key and the session key are different
+input keying material besides, so ``doc:`` and ``vault:`` derivations could not
+collide even if the strings did.
 
 *HMAC (session key).* One session key backs three unrelated derivations, and their
 message spaces are provably disjoint rather than merely different::
@@ -73,12 +76,14 @@ from secure_context_pipeline.crypto.aead import KEY_LEN, decrypt, encrypt
 from secure_context_pipeline.errors import ConfigError
 
 __all__ = [
+    "AUDIT_CHAIN_INFO",
     "HKDF_SALT",
     "MAX_TOKEN_COUNTER",
     "EnvKeyProvider",
     "KeyProvider",
     "MockKMSKeyProvider",
     "build_key_provider",
+    "derive_audit_chain_key",
     "derive_date_shift_days",
     "derive_faker_seed",
     "derive_token_id",
@@ -292,6 +297,38 @@ def derive_vault_key(session_key: bytes, session_id: str) -> bytes:
     if not session_id:
         raise ConfigError(reason="empty_session_id")
     return _hkdf(session_key, b"vault:" + session_id.encode("utf-8"))
+
+
+#: HKDF ``info`` for the audit chain's MAC key. Its own label, for the same reason
+#: ``doc:``, ``vault:`` and ``kms-wrap`` have theirs: the audit key must be
+#: independent of every document key, so a compromised document key is not also a
+#: licence to rewrite the record of what happened to that document.
+#:
+#: It cannot collide with the others by construction rather than by inspection.
+#: ``doc:``/``vault:`` derivations begin with those literal prefixes and this does
+#: not; ``kms-wrap`` differs in its first byte. ``vault:`` is keyed on a *session*
+#: key besides, which is different input keying material entirely.
+AUDIT_CHAIN_INFO = b"audit-chain"
+
+
+def derive_audit_chain_key(master_key: bytes) -> bytes:
+    """``HKDF(master_key, info="audit-chain")`` -- the audit log's MAC key.
+
+    The audit chain's ``entry_hash`` is an HMAC under this key, so an attacker who
+    can write the SQLite file cannot recompute the chain over their edits. See
+    :func:`~secure_context_pipeline.audit.logger.compute_entry_hash` for what that
+    does and does not buy.
+
+    Derived on demand and never stored, exactly like :func:`derive_vault_key`. The
+    length is checked rather than assumed for the reason spelled out in
+    :func:`_check_session_key`: ``hmac.new`` accepts a zero-length key without
+    complaint, and a zero-length key would make every entry hash *publicly
+    computable* -- which is precisely the property this derivation exists to
+    remove, silently restored.
+    """
+    if len(master_key) != KEY_LEN:
+        raise ConfigError(reason="master_key_wrong_length", length=len(master_key))
+    return _hkdf(master_key, AUDIT_CHAIN_INFO)
 
 
 # ---------------------------------------------------------------------------

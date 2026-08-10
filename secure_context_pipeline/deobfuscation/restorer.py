@@ -2570,6 +2570,81 @@ def _canonical_by_shape(surrogates: Iterable[str]) -> dict[str, str]:
     return {shape: next(iter(owners)) for shape, owners in claims.items() if len(owners) == 1}
 
 
+def _fold_word(word: str) -> str:
+    """One word, case- and compatibility-folded. NFKC only where it can do anything.
+
+    ``casefold`` and ``lower`` are identical on ASCII and NFKC is the identity on
+    it, so the ASCII branch is the same answer computed without two C calls per
+    word -- and words are the unit this scan iterates over most.
+    """
+    return word.lower() if word.isascii() else unicodedata.normalize("NFKC", word).casefold()
+
+
+def _alnum_words(text: str) -> tuple[list[str], list[int], list[int]]:
+    """Split into maximal alphanumeric runs: ``(folded_words, starts, ends)``.
+
+    The word rule is :meth:`str.isalnum` and nothing else -- deliberately Python's
+    own Unicode classification rather than this package's
+    :data:`~secure_context_pipeline.pipeline.egress_gate._ALNUM`
+    (``[^\\W_]``), because a backstop that imports the rule it is backstopping is
+    blind wherever that rule is. The two agree on the cases anyone has looked at,
+    which is the point: they were derived apart, so a mistake in one is not
+    automatically a mistake in the other.
+
+    Offsets are into ``text`` exactly as given -- folding happens per word, after
+    the boundaries are fixed -- so a length-changing fold (``ﬁ`` -> ``fi``,
+    ``ß`` -> ``ss``) cannot move a span out from under the ``spliced`` exclusion.
+    The pattern-based scan this replaced had to special-case that by refusing to
+    fold at all when NFKC changed the text's length.
+    """
+    words: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    start = -1
+    for index, char in enumerate(text):
+        if char.isalnum():
+            if start < 0:
+                start = index
+        elif start >= 0:
+            words.append(_fold_word(text[start:index]))
+            starts.append(start)
+            ends.append(index)
+            start = -1
+    if start >= 0:
+        words.append(_fold_word(text[start:]))
+        starts.append(start)
+        ends.append(len(text))
+    return words, starts, ends
+
+
+def _surrogate_word_keys(surrogates: Iterable[str]) -> set[tuple[str, ...]]:
+    """Every issued fake as a tuple of folded words, plus each first line of a wrapped one.
+
+    A surrogate may contain a newline -- the detector emits NAME spans that run
+    past a hard wrap into the next field's label (``Duane Ingram\\n    Date``), and
+    the fake minted for one carries the wrap. The model usually quotes only the
+    name half, so the first line is registered as a key of its own. That policy is
+    the same one the previous implementation applied, and is kept on purpose: it is
+    a decision about *what counts as a near miss*, argued in README section 7, not
+    a piece of the matcher's machinery.
+
+    Empty keys are dropped -- a surrogate of pure punctuation has no word to look
+    for, and an empty tuple would match at every position.
+    """
+    keys: set[tuple[str, ...]] = set()
+    for fake in surrogates:
+        if not fake:
+            continue
+        whole = tuple(_alnum_words(fake)[0])
+        if whole:
+            keys.add(whole)
+        if "\n" in fake:
+            head = tuple(_alnum_words(fake.split("\n", 1)[0])[0])
+            if head:
+                keys.add(head)
+    return keys
+
+
 def _count_surrogate_near_misses(
     text: str, surrogates: Iterable[str], *, spliced: tuple[tuple[int, int], ...]
 ) -> int:
@@ -2581,69 +2656,90 @@ def _count_surrogate_near_misses(
     lower-cased mention reaches the user **as the fake**, with ``restored_count``
     0, ``vault_misses`` 0, ``surrogates_seen`` 0 and outcome ``ok``. Nothing in
     the answer or the audit row distinguished that from a document that simply had
-    no pseudonyms in it.
+    no pseudonyms in it. This counts those. It never resolves and never rewrites,
+    so the reason for case-sensitivity is untouched -- a count cannot splice a name
+    into a sentence.
 
-    This scans once more, case-insensitively and NFKC-folded, and *counts*. It
-    never resolves and never rewrites, so the reason for case-sensitivity is
-    untouched -- a count cannot splice a name into a sentence. Spans the surrogate
-    pass wrote are excluded for the same reason
-    :meth:`Restorer._assert_no_surrogates` excludes them: a restored original
-    legitimately contains other entities' fakes.
+    **It is derived independently of the matcher it backstops, and that is the
+    whole design.** This function used to call
+    ``_compile_surrogate_pattern(..., fold=True)``: the same alternation, the same
+    ``LEFT_GUARD``/``RIGHT_GUARD``, the same ``\\s+`` flexing, compiled
+    case-insensitively. A backstop built from the thing it backstops is blind in
+    exactly the places that thing is blind, and the blindness was demonstrable
+    rather than theoretical -- emptying ``_compile_surrogate_pattern``'s alternation
+    (``ordered = []``) took this counter to **0** on an upper-cased heading, a
+    shouted surname *and* a quoted first line: every case it exists to catch,
+    silent, with the matcher broken. README section 7 gap 3 recorded that as an
+    open gap. It is now closed by arriving at the question a different way:
 
-    The enumeration above used to include "or a pluralised surname" and that was
-    false. The folded build is still :func:`_compile_surrogate_pattern`, which
-    still writes ``RIGHT_GUARD`` per branch, so the ``es`` of ``Lopezes`` fails the
-    guard exactly as it does in the resolving build. Measured against the real
-    restorer with ``Lopez`` issued: ``The Lopezes met.`` counts **0** while ``THE
-    LOPEZ FILE.`` counts 1. The counter is an upper bound in the *case* dimension
-    and inherits every boundary rule of the matcher it backstops -- README section
-    7 gap 3 records that, and records why a genuinely independent counter is a
-    design change rather than a patch.
+    * words are maximal :meth:`str.isalnum` runs, not regex alternatives -- so
+      there is no shared pattern to compile, no shared boundary assertion, and no
+      shared escaping;
+    * each fake becomes a **tuple of folded words**, and the scan asks whether
+      consecutive words in the answer equal one, which is a dict/set question
+      rather than a backtracking one;
+    * boundaries fall out of the tokenisation instead of being asserted: ``Lopez``
+      cannot match inside ``Lopezes`` because ``lopezes`` is one word and is not
+      ``lopez``. That reproduces the measured behaviour of the old scan (``The
+      Lopezes met.`` -> 0, ``THE LOPEZ FILE.`` -> 1) by a route that shares nothing
+      with it, which is the only kind of agreement worth having here.
 
-    **First lines are counted separately.** A surrogate may contain a newline: the
-    detector emits NAME spans that run past a hard wrap into the next field's
-    label (``Duane Ingram\\n    Date``), and the fake minted for one carries the
-    wrap. ``\\s+`` flexing keeps the whole fake matching when the model re-wraps
-    it, but not when the model quotes only the *name* half -- and then the fake
-    reaches the user with all three counters at zero, which is the exact blindness
-    this function exists to remove. Each such surrogate's first line is added to
-    the folded alternation as its own alternative. Longest-first ordering means a
-    surviving full fake is still counted once, not twice, and a surrogate with no
-    newline in it adds nothing, so the numbers README section 7 gap 3 quotes are
-    unchanged.
+    The independence is checked the same way it was measured: blinding
+    ``_compile_surrogate_pattern`` no longer changes any count. See
+    ``test_the_near_miss_counter_survives_a_blinded_matcher``.
+
+    Two places the two mechanisms deliberately *disagree*, both in the safe
+    direction for an upper bound:
+
+    * punctuation inside a fake is not required to reappear, so a phone-number
+      surrogate the model re-punctuated is counted here and was not before;
+    * a match is excluded only when it lies wholly inside a span the surrogate pass
+      wrote -- unchanged, and for the same reason
+      :meth:`Restorer._assert_no_surrogates` excludes them: a restored original
+      legitimately contains other entities' fakes.
 
     Deliberately an upper bound. ``Long`` counts its lowercase common-word twin,
     and that over-count is preferable to a signal that goes quiet exactly when the
-    fake is an ordinary word -- the case where a reader most needs to look.
+    fake is an ordinary word -- the case where a reader most needs to look. Non-zero
+    means "look", never "fail".
     """
-    # NFKC catches the equal-length compatibility forms (fullwidth Latin, ligature
-    # digraphs). Anything that changes the length has moved the spliced offsets,
-    # and a near-miss count is not worth mis-scoping the exclusion for, so that
-    # case scans the original text instead of guessing at a mapping.
-    folded = unicodedata.normalize("NFKC", text)
-    if len(folded) != len(text):
-        folded = text
-    issued = list(surrogates)
-    heads = [
-        head
-        for head in (fake.split("\n", 1)[0].strip() for fake in issued if "\n" in fake)
-        if head
-    ]
-    pattern = _compile_surrogate_pattern([*issued, *heads], fold=True)
-    if pattern is None:
+    keys = _surrogate_word_keys(surrogates)
+    if not keys:
         return 0
-    return sum(
-        1
-        for match in pattern.finditer(folded)
-        if not any(
-            start <= match.start() and match.end() <= end for start, end in spliced
-        )
-    )
+    # Longest first, so a surviving full fake is counted once rather than once for
+    # itself and again for its first line. Same outcome the alternation's
+    # longest-first ordering produced, reached by sorting the key lengths.
+    widths = sorted({len(key) for key in keys}, reverse=True)
+    openers = {key[0] for key in keys}
+
+    words, starts, ends = _alnum_words(text)
+    total = len(words)
+    count = 0
+    index = 0
+    while index < total:
+        # One set lookup rejects the overwhelming majority of positions before any
+        # tuple is built. Without it this is len(widths) slices per word.
+        if words[index] not in openers:
+            index += 1
+            continue
+        for width in widths:
+            stop = index + width
+            if stop > total or tuple(words[index:stop]) not in keys:
+                continue
+            match_start, match_end = starts[index], ends[stop - 1]
+            if not any(start <= match_start and match_end <= end for start, end in spliced):
+                count += 1
+            # Advance past the whole match whether or not it was counted: an
+            # occurrence excused by a splice is still one occurrence, and letting
+            # the cursor re-enter it would count its own suffixes.
+            index = stop
+            break
+        else:
+            index += 1
+    return count
 
 
-def _compile_surrogate_pattern(
-    surrogates: Iterable[str], *, fold: bool = False
-) -> re.Pattern[str] | None:
+def _compile_surrogate_pattern(surrogates: Iterable[str]) -> re.Pattern[str] | None:
     """One alternation, longest alternative first, boundary-guarded per side.
 
     Longest-first is the whole game. Python tries alternatives in written order
@@ -2708,10 +2804,14 @@ def _compile_surrogate_pattern(
     indistinguishable from a correctly restored two-word original.
     :func:`_canonical_by_shape` maps the flexed match back to the issued key.
 
-    ``fold=True`` compiles the same alternation case-insensitively. That form is
-    used **only** by :func:`_count_surrogate_near_misses` to count; nothing is
-    ever resolved through it, because the reason case-sensitivity exists is that
-    folding it turns ``long`` into a splice site.
+    **There is no case-insensitive build of this pattern, and there must not be.**
+    A ``fold=True`` parameter existed for one caller,
+    :func:`_count_surrogate_near_misses`, which used the folded alternation to
+    count survivals -- and so the backstop shared its every boundary rule and every
+    blind spot with the matcher it was meant to backstop. That counter is now
+    derived independently and this parameter is gone with it, which is what stops
+    it growing back: a second caller wanting a folded build has to add the
+    parameter again, and reviewing that addition is reviewing the coupling.
     """
     ordered = sorted({s for s in surrogates if s}, key=lambda s: (-len(s), s))
     if not ordered:
@@ -2741,7 +2841,7 @@ def _compile_surrogate_pattern(
         groups.append(f"{LEFT_GUARD}(?:{'|'.join(guarded)})")
     if unguarded:
         groups.append(f"(?:{'|'.join(unguarded)})")
-    return re.compile("|".join(groups), re.IGNORECASE if fold else 0)
+    return re.compile("|".join(groups))
 
 
 # Moved to `textrules`, which owns the "does this value occur here" decision for

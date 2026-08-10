@@ -277,13 +277,13 @@ that produces it — re-derive rather than trust, which is what checklist step 5
 #### The numbers this repository prints
 
 ```
-2980 passed, 1 skipped       # full suite WITH node on PATH, as `pytest -q` printed it.
+3058 passed, 1 skipped       # full suite WITH node on PATH, as `pytest -q` printed it.
                              #   The skip is the real-network LLM smoke test.
-                             #   2981 collected: 169 leakage + 9 bench + rest unit + integration
+                             #   3059 collected: 169 leakage + 9 bench + rest unit + integration
 mypy                         # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 98% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
-                             #   5,291 statements, 82 missed; 1,366 branches, 60 partial (package only)
+                             #   5,392 statements, 83 missed; 1,406 branches, 64 partial (package only)
 ```
 
 **That block is checked rather than pasted, and this is the one place it appears.** Collection,
@@ -345,7 +345,7 @@ this document and not that file.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py` and
-`fixtures/` — it is **98%** of **26,971** statements: **26,281** for the package plus `tests/`
+`fixtures/` — it is **98%** of **27,367** statements: **26,677** for the package plus `tests/`
 plus `fixtures/`, and `demo.py`'s **690** on top of that. It is published as its two addends
 because `demo.py` has to be measured separately: the demo tests load it by *file path* under a
 synthetic module name, so `--cov=demo` warns `module-not-imported` and silently drops all 690 of
@@ -602,7 +602,8 @@ constant, which is a **number justified against one channel silently setting ano
 security floor**, and it was a live leak: with `552140` — a value the detector is *required* to
 vault — the payload `Internal routing tag: MRN552140B must match the ledger.` missed on all four
 limbs at once (the trailing `B` denies both word boundaries, six digits is one below the shared
-floor, and pass 3 carries an SSN recogniser only) and released a vaulted MRN byte for byte. Fixed,
+floor, and pass 3 carried an SSN recogniser only at the time — it covers `MRN` now, §7 gap 5) and
+released a vaulted MRN byte for byte. Fixed,
 and — the part that matters more — pinned *at the seam* by
 `test_no_shipped_identifier_pattern_can_match_below_the_gate_s_run_floor`, which reads
 `entities.yaml` itself and goes red if config and constant ever disagree again. That test is
@@ -734,13 +735,21 @@ nothing else running, one quiet invocation:
 
 | Measurement | This run | Budget | Headroom | Scoring |
 |---|---|---|---|---|
-| Obfuscate 2,000 words (tokenization) | 0.379 s | 2 s | 5.3× | best of 3 |
-| Obfuscate 2,000 words (pseudonymization) | 0.395 s | 2 s | 5.1× | best of 3 |
-| Vault lookup p99 (1,000 cached reads) | 0.001 ms | 5 ms | 4,612.8× | single shot |
-| Restore a 500-token response (warm vault) | 34.378 ms | 500 ms | 14.5× | single shot |
-| Restore a 500-token response (cold vault) | 87.948 ms | 500 ms | 5.7× | best of 3 |
-| Restore a 500-surrogate response (pseudonymization) | 121.750 ms | 500 ms | 4.1× | best of 3 |
-| Full pipeline, 12k-word brief (mock provider) | 6.652 s | 15 s | 2.3× | best of 3 |
+| Obfuscate 2,000 words (tokenization) | 0.364 s | 2 s | 5.5× | best of 3 |
+| Obfuscate 2,000 words (pseudonymization) | 0.377 s | 2 s | 5.3× | best of 3 |
+| Vault lookup p99 (1,000 cached reads) | 0.001 ms | 5 ms | 5,213.6× | single shot |
+| Restore a 500-token response (warm vault) | 33.035 ms | 500 ms | 15.1× | single shot |
+| Restore a 500-token response (cold vault) | 85.938 ms | 500 ms | 5.8× | best of 3 |
+| Restore a 500-surrogate response (pseudonymization) | 67.149 ms | 500 ms | 7.4× | best of 3 |
+| Full pipeline, 12k-word brief (mock provider) | 6.565 s | 15 s | 2.3× | best of 3 |
+
+**One row moved for a reason rather than by drift, and it is worth naming.** The
+500-surrogate restore was **121.750 ms** at 4.1× headroom until this pass and is **67.149 ms**
+at 7.4× now. That is §7 gap 3's closure showing up in a shipped benchmark: the near-miss counter
+that pass runs is no longer a case-insensitive rebuild of the restorer's own alternation over
+1,000 surrogates but a word-tuple lookup, and the independence bought a large constant factor as
+a side effect. It is the one row where a re-measurement is attributable rather than a
+re-observation.
 
 **The budget column is the claim; every other column is one observation on one laptop.** The route
 to that framing is worth more than the numbers. The table carried single point values, then
@@ -1097,14 +1106,14 @@ worst case.
 | **Vault database stolen at rest** | AES-256-GCM under a key derived from an in-memory-only session key. The session key is never persisted. | Live-process memory scraping. Session-lifetime plaintext lives in RAM by design (that is what makes a < 5 ms lookup possible). **Declared out of scope for this tier.** |
 | **Cross-session access, same user** | Per-session HKDF vault keys, AAD binding to `session_id:token_id`, non-deterministic token IDs across sessions | None identified. A row copied between sessions fails GCM authentication. |
 | **Log or audit exfiltration** (*reading* the log) | Length ceilings that make the log incapable of holding *content* (`detail` values 64 chars, label columns 128), enforced again at the write boundary; no call site that writes a value; and the leakage harness scanning the raw DB **bytes** on all 100 runs | **A short identifier would fit, and the schema cannot tell.** `detail={"v": "John Smith"}` validates — see below. The guarantee is "nothing writes one", measured, not "the schema forbids one". Plus traffic analysis of event counts and timings. |
-| **Audit tampering** (*writing* to the log) | SHA-256 hash chain over every event, plus **two independent high-water marks** (`sqlite_sequence` and a trigger-guarded `audit_chain_meta`) so deleting the newest rows is caught — and `seq` allocated above the watermark, so the evidence does not expire | **Bounded, and the bound is the interesting part.** A silent truncation costs four statements, not one, and all four must land in step — measured as a ladder in §5 Q5. The digests are **unkeyed**, so an attacker who runs all four can rewrite the chain end to end and it will verify — demonstrated, not assumed. |
+| **Audit tampering** (*writing* to the log) | **Keyed** hash chain: `entry_hash = HMAC-SHA256(chain_key, prev_hash ‖ canonical_json(payload))` under a key HKDF-derived from the master key and never stored, plus **two independent high-water marks** (`sqlite_sequence` and a trigger-guarded `audit_chain_meta`) so deleting the newest rows is caught — and `seq` allocated above the watermark, so the evidence does not expire | **Bounded, and the bound moved.** A full re-chain with the published formula used to verify; it does not now — pinned by `test_a_rewritten_chain_is_rejected_because_the_digest_is_keyed`, which asserts the forgery is internally perfect first. Two residuals remain: an attacker who holds `SCP_MASTER_KEY` derives the chain key and is back to a full rewrite; and a **tail truncation** with both watermarks reset, because those are unkeyed integers and the surviving prefix is a genuine chain — the four-statement ladder in §5 Q5. |
 | **Replay of Session A ciphertext into Session B** | AAD authentication failure | None identified. |
 | **Caller presents a session ID that is not theirs** | Sessions are **bound to the creating `user_id`**; `POST /pipeline/run` compares with `secrets.compare_digest` and answers the same `401 SESSION_EXPIRED` as an unknown session. `DELETE /sessions/{id}` requires the owner's `user_id` and returns an unconditional 204 either way. | The `user_id` is still an **asserted claim, not a proven one** — there is no real authentication at this tier. What the binding buys is that a leaked *session ID* is no longer sufficient on its own; what it does not buy is protection against a caller who simply asserts someone else's `user_id`. Real authn is the production item. |
 | **Anonymous enumeration of live session IDs** | `GET /audit` requires a `session_id`/`run_id` scope; `/health` reports a session *count*, never IDs | None identified for the enumeration path itself. This was a **live hole, not a hypothetical**: unscoped `GET /audit` published every active session ID, and `DELETE /sessions/{id}` then accepted them — full vault destruction with zero credentials. |
-| **Wrong user requests another user's document** | Per-user HKDF document keys **and** AAD binding to `doc:<user_id>:<doc_id>` — two independent legs, each pinned by its own test | Surfaced as `NOT_FOUND`, byte-identical to an absent document: same exception type, same code, same detail keys. The *content* oracle is closed. A **timing** side channel is not — see below. |
+| **Wrong user requests another user's document** | Per-user HKDF document keys **and** AAD binding to `doc:<user_id>:<doc_id>` — two independent legs, each pinned by its own test | Surfaced as `NOT_FOUND`, byte-identical to an absent document: same exception type, same code, same detail keys. The *content* oracle is closed, and the **timing** one is too — every not-found answer waits out an 8 ms floor, measured at 1.00× across four sizes. What is left is a document whose extracted text takes longer than the floor to decrypt: 1.30× at 32 MiB, leaking "exists and is very large" and nothing finer — see below. |
 | **PHI typed into the *prompt* rather than the document** | The user prompt goes through the same detector, engine and vault as the document, and is tokenized before assembly (Deviation 40) | Measured as a **live bypass before this was built**: six entity types typed into the prompt box reached the provider verbatim while the document beside them was fully tokenized. Residual: prompt spans are excluded from `PipelineResult.detections` (offsets are document-space), so the UI highlight panel shows nothing for them — the values *are* vaulted and tokenized, but a user cannot see that they were. |
 | **An uploaded document carrying instructions for the model** | The document is fenced in `<DOCUMENT>…</DOCUMENT>` and any fence tag inside either untrusted half is neutralised to `&lt;…`, so an upload cannot close the fence early and be read as top-level instruction (Deviation 41) | **This is defence against confusion, not against a determined injection, and the difference matters.** A model can still be talked into ignoring a fence; nothing here detects or blocks instruction-shaped text. What the fence guarantees is only that the *delimiter* cannot be forged. Prompt injection is **not** a claim this system makes. |
-| **A document uploaded without a `doc_category`** | `only_in_doc_categories` scopes category-specific rules; `_validate_category` rejects an *unknown* category | **Open, and it is the default.** `doc_category` is an optional form field defaulting to `None`. Measured on a real privileged brief: `legal` finds `CASE_STRATEGY` (the one entity with `action: redact`) and `CLIENT_IDENTITY`; `None` finds neither, so the litigation strategy is never redacted, never vaulted, and pass 1 has nothing to look for. The guard is written against the typo and open on the omission. Same shape as the `user_id` row: a **user-supplied lever on which security controls run.** §7 gap 4. |
+| **A document uploaded without a `doc_category`** | `only_in_doc_categories` scopes category-specific rules; an **undeclared** category now asks for the union of every category's rules rather than the unscoped subset, and `_validate_category` still rejects an *unknown* one | **Closed on the omission, with one residual worth naming.** `doc_category` is still an optional field defaulting to `None`, and that is now the *safe* value: on `fixtures/legal_memo.txt`, `None` finds **5 `CASE_STRATEGY`** spans (the one entity with `action: redact`) where it found 0 before. The residual is a **label**, not a coverage hole: under `None` the 12 client-name spans come back typed `NAME` rather than `CLIENT_IDENTITY`, because both claim the same text and overlap resolution cannot prefer the legal type without a legal category. Same tier, same strategy, same vaulting — a different word in the audit row. §7 gap 4. |
 | **Inference / re-identification** | See below — this is the interesting one | Substantial and irreducible. |
 
 ### The weakest point in this design: `user_id` is an asserted claim
@@ -1179,18 +1188,47 @@ request body.
   (`:raw` versus `:txt`), which is a one-line change and a spec deviation. It is written down here
   rather than left to be discovered, and it is the kind of thing a docstring claiming "blobs are
   not portable" would have hidden — that claim was in this codebase, and it was false.
-- **The document read path is not timing-uniform.** The response to "absent document" and "wrong
-  owner" is identical in every byte a caller can read, and not in *time*: an absent `doc_id` fails
-  immediately at `ENOENT` while a wrong-owner one is read off disk in full and *then* rejected by
-  AES-GCM. Measured on a 2.25 MB blob: **0.067 ms vs 1.199 ms, about 18×**, and the gap grows with
-  blob size. What it discloses, precisely: that a `doc_id` the caller *already holds* corresponds
-  to a stored document. Not the owner, the content, the category or any plaintext — and a `doc_id`
-  is 32 hex characters, so an attacker who cannot already name one learns nothing. It is not fixed
-  because the obvious equalisation (check the metadata table first) trades a cryptographic
-  guarantee for a bookkeeping one: isolation here is deliberately a property of key derivation, and
-  making reads conditional on a row means a lost row denies a legitimate owner a document they can
-  still perfectly well decrypt. A constant-time read closes it at the cost of full disk I/O on
-  every miss. Neither trade is obviously right at this tier.
+- **The document read path was not timing-uniform. It is now, up to a stated size.** The response
+  to "absent document" and "wrong owner" was identical in every byte a caller can read, and not in
+  *time*: an absent `doc_id` fails immediately at `ENOENT` while a wrong-owner one is read off disk
+  in full and *then* rejected by AES-GCM. Re-measured on this tree (`min` of 25 per arm, the
+  statistic a loaded machine cannot inflate), with the floor switched off and then on:
+
+  | Blob | Unpadded absent | Unpadded wrong-owner | Unpadded ratio | **Padded ratio** |
+  |---|---|---|---|---|
+  | 5.6 KB | 0.051 ms | 0.144 ms | 2.85× | **1.00×** |
+  | 2.25 MiB | 0.060 ms | 0.655 ms | 11.0× | **1.00×** |
+  | 8 MiB | 0.051 ms | 2.329 ms | 46.1× | **1.00×** |
+  | 16 MiB | 0.051 ms | 5.227 ms | 102.7× | **1.00×** |
+  | 32 MiB | 0.052 ms | 9.408 ms | 181.9× | 1.30× |
+
+  The unpadded column is linear at about **0.29 ms/MiB** and unbounded, which is why this page used
+  to quote "about 18×" from one 2.25 MB reading and leave it at that: the ratio is a property of
+  the blob you happen to measure, not of the defect. What it discloses, precisely: that a `doc_id`
+  the caller *already holds* corresponds to a stored document. Not the owner, the content, the
+  category or any plaintext — and a `doc_id` is 32 hex characters, so an attacker who cannot
+  already name one learns nothing.
+
+  **What closed it, and what it cost.** Every `StoreAuthError` — absent, wrong owner, malformed
+  `doc_id`, every reason — is held until an 8 ms floor has elapsed. The obvious equalisation (check
+  the metadata table first) was **not** taken: it trades a cryptographic guarantee for a
+  bookkeeping one, since isolation here is deliberately a property of key derivation and making
+  reads conditional on a row means a lost row denies a legitimate owner a document they can still
+  perfectly well decrypt. The floor costs an `asyncio.sleep` and **no disk I/O at all** — this
+  section previously priced it as "a full disk read on every miss", which was wrong about the
+  mechanism as well as the cost: the sleep burns no CPU and holds no thread, so a miss is cheaper
+  in resources than it was, only later. Padded arms agree to within **4.3 µs** at every size the
+  API can accept, and the floor is sized from `MAX_UPLOAD_BYTES` rather than picked, with
+  `test_the_not_found_floor_covers_the_api_upload_ceiling` asserting the linkage.
+
+  **Three residuals, stated rather than implied by the "1.00×" column.** Extracted text large
+  enough to decrypt in more than 8 ms exceeds the floor and becomes distinguishable again —
+  measured at **1.30× at 32 MiB**, which is past the 16 MiB upload cap and reachable only through
+  an extraction that expands, and which leaks "this `doc_id` exists and is very large" rather than
+  anything finer. The floor is calibrated on one machine, so slower hardware narrows the covered
+  range rather than breaking the property. And **success is deliberately not padded**: a 200 with a
+  document body already tells the owner the document is there, so padding the hit would cost every
+  legitimate read 8 ms to hide nothing.
 - **Filenames are stored in cleartext, deliberately**, and there is a real tension in it.
   `extraction.py` logs only a file's *suffix*, never its name, on the reasoning that a filename can
   itself be a personal identifier — `chen-oncology-2024.pdf` discloses a name and a probable
@@ -1278,8 +1316,8 @@ hospice plan — annotated *before* being run and never used to change a pattern
 
 | Over 366 values, none of which anything was tuned against | Tuned corpus | **Held-out** |
 |---|---|---|
-| Values **covered** by a detected span | 99% | **91%** |
-| Values covered **and correctly typed** | 99% | **90%** |
+| Values **covered** by a detected span | 99% | **93%** |
+| Values covered **and correctly typed** | 99% | **92%** |
 
 Reproduce with `pytest tests/test_detection.py -k held_out -s`; the floors are asserted, not
 commented, so a regression fails the build.
@@ -1289,30 +1327,55 @@ commented, so a regression fails the build.
 | Entity | N | Covered | Typed |
 |---|---|---|---|
 | `SETTLEMENT_TERM` | 2 | **0%** | **0%** |
-| `DATE` | 10 | **30%** | **30%** |
-| `NAME` | 58 | **81%** | **79%** |
+| `DATE` | 10 | **40%** | **40%** |
 | `MRN` | 15 | 80% | 80% |
-| `AMOUNT` | 25 | 84% | 84% |
-| `DOB` | 33 | 88% | 85% |
+| `NAME` | 58 | **83%** | **79%** |
+| `AMOUNT` | 25 | 88% | 88% |
 | `CLIENT_IDENTITY` | 13 | 92% | 92% |
-| `ACCOUNT_NUMBER` | 19 | 95% | 95% |
-| `SSN`, `TAX_ID`, `PHONE`, `EMAIL`, `ADDRESS`, `CASE_ID`, `DIAGNOSIS`, `MEDICATION`, `INSURANCE_ID`, `LAB_RESULT`, `CASE_STRATEGY`, `PRIVILEGED_MARKER` | 191 | 100% | 100% |
+| `DOB` | 33 | 97% | 94% |
+| `SSN`, `TAX_ID`, `PHONE`, `EMAIL`, `ADDRESS`, `CASE_ID`, `DIAGNOSIS`, `MEDICATION`, `INSURANCE_ID`, `LAB_RESULT`, `CASE_STRATEGY`, `PRIVILEGED_MARKER`, `ACCOUNT_NUMBER` | 210 | 100% | 100% |
 
 The `N` column sums to the 366 in the header above it. It did not until an audit pass re-ran
 the table: the 100% row read **194** over nine entities that carry **182** values between them,
 and left out `CASE_STRATEGY` (2) and `PRIVILEGED_MARKER` (2), which are also at 100% — 186 in
-total, and 191 since `INSURANCE_ID` joined the bucket. The rows summed to 374 against a declared total of 366, and the 8-value error was
+total, 191 since `INSURANCE_ID` joined the bucket, and **210** since `ACCOUNT_NUMBER` did on this
+pass. The rows summed to 374 against a declared total of 366, and the 8-value error was
 in the flattering direction, inflating the perfectly-detected bucket. Every other row reproduces
 exactly, which is what made this one worth catching; re-derive the whole table with the command
 above rather than trusting this one.
 
-**`NAME` is the weakest point of this whole submission, and it is not close.** Not because 81%
+**Four rows moved on this pass, all upward, and the cause is §7 gap 4 rather than any detection
+change.** Closing the `doc_category` fail-open means an undeclared held-out document now gets every
+category's rules instead of the unscoped subset, so `DATE` (medical-scoped) and `AMOUNT`
+(financial-scoped) become detectable in registers that declare no category at all. Both sides were
+run — the old column against `git worktree add --detach <tmp> HEAD` and the same
+`pytest tests/test_detection.py -k held_out -s` inside it — rather than read off the percentages
+this table used to print, which is the difference between a delta and a subtraction: covered went
+**334 → 340 of 366** and typed **332 → 337**, with `AMOUNT` 21→22, `DATE` 3→4, `DOB` 29→32 covered
+and 28→31 typed, and `NAME` 47→48 covered with its 46 typed unchanged.
+
+**One value moved the wrong way and it is left in the miss list rather than netted off**: a
+held-out `NAME` that used to reach the model in the clear is now masked — under a `DATE` span.
+Coverage in the right direction, type in the wrong one; it is why `NAME`'s typed column stayed at
+79% while its covered column rose, and the same command prints it by name
+(`ho_chat_log: NAME 'Priyanka Raghunathan' labelled ['DATE']`).
+
+**And running both sides caught a staleness this pass did not cause.** `ACCOUNT_NUMBER` is listed
+above at 100% and it measured 100% at `HEAD` too — the **95%** this table published was already
+wrong before any of this wave's work, as was the **90%** typed total against a `HEAD` that prints
+91%. Neither is attributable to gap 4, both are corrected here, and the reason they lasted is that
+this table's *floors* are asserted while its published percentages were not. That is a real hole
+in the guard and it is named rather than quietly patched.
+
+**`NAME` is the weakest point of this whole submission, and it is not close.** Not because 83%
 is the lowest number — it is not — but because of the count and the consequence. It is 58 of the
 366 values, so it is the largest absolute quantity of PII left in the clear, and it is the entity
 the entire pseudonymization design rests on. A missed `NAME` is invisible to **all three** egress
 passes: never vaulted, so pass 1 has nothing to look for; not in `HIGH_SEVERITY_TYPES`, so pass 2's
-re-scan cannot block it; and `_INDEPENDENT_PATTERNS` holds SSN entries only, so pass 3 has no
-opinion. Demonstrated end to end using one of the detector's own printed held-out misses:
+re-scan cannot block it; and `_INDEPENDENT_PATTERNS` now covers all four high-severity types but
+none of them is `NAME`, because a person name is not a pattern — which is the whole reason `NAME`
+rides NER. Widening pass 3 (§7 gap 5) did not touch this and was never going to.
+Demonstrated end to end using one of the detector's own printed held-out misses:
 
 ```
 POST /pipeline/run -> 200 ; egress_rescan_warnings: 0.0
@@ -1320,7 +1383,7 @@ outbound payload: "…Specimen received from Ingeborg Vasquez-Lund, seen with [P
 ```
 
 A real surname in the clear, in the same sentence as a tokenized one, with the gate reporting zero
-warnings. `SETTLEMENT_TERM` at 0% and `DATE` at 30% are smaller in volume with the same shape of
+warnings. `SETTLEMENT_TERM` at 0% and `DATE` at 40% are smaller in volume with the same shape of
 failure.
 
 **This is the honest bottom line.** Detection recall is the binding constraint (§7), and an entity
@@ -1331,7 +1394,7 @@ that measures leaks is blind to precisely the leaks that matter most.** `100/100
 therefore a statement about values the detector found, not about all PII in the document. The
 architectural answer is that the gate is fail-closed over the vault — a defence in depth that does
 not depend on recall — and the engineering answer is a clinical NER model rather than spaCy plus
-gazetteers. Neither makes 81% on `NAME` acceptable, and it is stated here rather than left for a
+gazetteers. Neither makes 83% on `NAME` acceptable, and it is stated here rather than left for a
 reviewer to find.
 
 What makes the fixes more credible than the number is that five of the six came from a
@@ -1463,10 +1526,20 @@ sample is mostly scheduler noise):
 |---|---|---|
 | Pass 1 — scan for vault originals, `O(payload × entities)` | 277 ms | 1.8 ms |
 | Pass 2 — detector re-scan of the payload | 2,759 ms | 151 ms |
+| Pass 3 — independent recognisers over the payload | **7.9 ms** | — |
 
 So **spaCy runs twice per request** — once over the document in stage 3, once over the
 assembled payload inside the gate — and those two passes are **87%** of wall time on the brief
 and **86%** on the medical note.
+
+**Pass 3's row is new because pass 3 grew, and the number is the argument for having done it.**
+It was two SSN recognisers and is six across all four blocking types (§7 gap 5); re-measured over
+the whole 83,029-character brief it is **7.9 ms median of 9** — a quarter of one percent of pass 2,
+and 0.12% of the 6.5 s end-to-end run. So the gate's only genuinely independent opinion was
+widened from one blocking type to four for a cost that does not appear in any budget. It also
+claims **no span at all** on that brief, which is the property that matters more than the
+milliseconds: a pass that blocks is a pass that can deny an ordinary document, and this one does
+not.
 
 **Pass 1's numbers here are 13x and 5x what this README used to claim** (21.3 ms and 0.36 ms),
 and the increase is a deliberate purchase rather than a regression. Each of the four compared
@@ -1561,6 +1634,14 @@ buys exactly one thing, the advisory `rescan_warnings` counter. Splitting pass 2
 always-on pattern check and an optional NER canary is the real answer, and it is a change to the
 gate's *contract* rather than a scoping tweak. Not shipped: rewriting the security centrepiece's
 blocking path deserves its own review cycle, not a footnote in a perf section.
+
+**Pass 3 is not that change, and the distinction is easy to lose now that it covers all four
+types.** Widening it (§7 gap 5) put a 7.9 ms pattern check over every blocking type *beside* pass 2,
+which is what makes the split above look nearly free — but it is an **addition**, not a
+replacement. Pass 2's spaCy run is still on the blocking path, still 2.7 s, and still the thing
+that would have to be demoted to a canary. What gap 5 changed is the argument's cost side: the
+independent limb the split would lean on now exists and is measured, so the remaining work is the
+contract decision rather than the recogniser set.
 
 Bottlenecks in order, corrected by measurement:
 
@@ -1819,7 +1900,12 @@ which is what lets a caller tell a complete answer from a truncated page, since 
 
 *The guarantees:*
 
-1. **Every event is hash-chained and append-only.** `verify_chain()` recomputes every entry hash
+1. **Every event is hash-chained under a key, and append-only.** `entry_hash =
+   HMAC-SHA256(chain_key, prev_hash ‖ canonical_json(payload))`, where `chain_key =
+   HKDF-SHA256(master_key, salt="scp-v1", info="audit-chain")` — derived on demand, never
+   persisted, and length-checked rather than assumed, because `hmac.new` accepts a zero-length key
+   without complaint and a zero-length key would make every digest publicly computable again.
+   `verify_chain()` recomputes every entry hash
    and re-checks every link, and is verified *by test* to detect an in-place `UPDATE` of every
    persisted column (each parametrised separately — a column omitted from the digest would be
    freely editable), an insert without recomputing the chain, a reorder, a middle deletion, a
@@ -1834,13 +1920,15 @@ which is what lets a caller tell a complete answer from a truncated page, since 
    second half of the very attack it exists to catch — and `AuditLogger.open()` leaked its
    connection thread whenever setup failed, so a process that opened a damaged audit DB could not
    exit. A docstring explaining why a test is impossible is how the test never gets written.
-2. **A middle deletion survives re-linking.** Delete a row, walk the survivors, recompute
-   `prev_hash`/`entry_hash` with the published formula — the digests are unkeyed, so this costs
-   nothing. Every row recomputes and every link matches; the only surviving witness is that `seq`
-   skips a number, and compacting the numbering to hide *that* is caught by the high-water mark
-   instead. `test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught` asserts both
-   halves, and asserts the attacker's own success first so it cannot pass by failing to build the
-   attack.
+2. **A middle deletion survives re-linking, and now it does not survive the key.** Delete a row,
+   walk the survivors, recompute `prev_hash`/`entry_hash` with the published formula: every link
+   still matches, and the only structural witness is that `seq` skips a number, with compacting the
+   numbering to hide *that* caught by the high-water mark instead. That was the whole defence while
+   the digest was unkeyed. It is now the *second* line — a re-link an attacker can compute is a
+   re-link under the wrong key, so `verify_chain()` refuses it on the digest before the `seq` gap
+   is ever consulted. `test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught` asserts
+   both halves and asserts the attacker's own success first, so it cannot pass by failing to build
+   the attack.
 3. **The gate provably ran before every provider call, on the same bytes.** `EGRESS_PASS` carries
    the SHA-256 of the exact released payload and `LLM_CALL` carries the same digest, so "was every
    provider call preceded by a passing gate" is a join rather than an assurance. The row also
@@ -1861,17 +1949,26 @@ which is what lets a caller tell a complete answer from a truncated page, since 
   session-credential secrecy want opposite things from one endpoint; the fix is a *separate*
   authenticated compliance API, not a query parameter on the one anonymous callers can reach. Not
   built.
-- **The chain is tamper-*evident*, not tamper-*proof*, and one partial tamper is undetectable.**
-  The digest is `sha256(prev_hash ‖ canonical_json(event))` with no secret in it, so anyone who can
-  write to the database can forge a row and recompute every subsequent hash — demonstrated against
-  this code, not hypothesised. What the chain buys is that a partial tamper (`UPDATE`, mid-chain
-  `DELETE` or `INSERT`, reorder, truncated tail) is detectable and a full rewrite means replacing
-  the whole log in one consistent pass. The exception is **appending to the tail**: read the last
-  row, take its `entry_hash` as `prev_hash`, use `seq + 1`, recompute. Every check passes, each for
-  a reason that cannot be patched from inside this process — the link genuinely is correct, the
-  `seq` genuinely is next, the digest has no secret to get wrong, and both watermarks move on their
-  own. A forged tail row is not hard to distinguish from a legitimate append, it *is* one. Pinned
-  as an accepted residual by `test_a_correctly_hashed_tail_append_is_a_known_residual`.
+- **The chain is tamper-*evident*, not tamper-*proof*, and the boundary moved rather than
+  disappeared.** This bullet used to read "the digest is `sha256(prev_hash ‖
+  canonical_json(event))` with no secret in it, so anyone who can write to the database can forge a
+  row and recompute every subsequent hash — demonstrated against this code". That was true and is
+  no longer: the digest is an HMAC under a key the database does not contain, and the identical
+  attack — edit the incriminating row, re-chain the whole log with the public formula — is
+  reproduced in full by `test_a_rewritten_chain_is_rejected_because_the_digest_is_keyed`, which
+  asserts the forgery is *internally perfect* (every link holds, every row recomputes under the
+  published formula) before asserting `verify_chain()` returns `False` in both scopes. So what a
+  DB-write compromise now buys is a log that is visibly broken, not a log that lies.
+
+  **Two things it does not buy, and neither is a detail.** An attacker who holds `SCP_MASTER_KEY`
+  derives the chain key by the same HKDF this process does and is back to an end-to-end rewrite —
+  the key is a process secret, not an auditor-held one, and moving it off-box is the same
+  production item gap 16 always named. And **appending to the tail** is still undetectable *when
+  the key is held*: read the last row, take its `entry_hash` as `prev_hash`, use `seq + 1`,
+  recompute. Every check passes for a reason that cannot be patched from inside this process — the
+  link genuinely is correct, the `seq` genuinely is next, and both watermarks move on their own. A
+  forged tail row is not hard to distinguish from a legitimate append, it *is* one. Pinned as an
+  accepted residual by `test_a_correctly_hashed_tail_append_is_a_known_residual`.
 - **A *relabelled* session is invisible to its own scope, and it is not patchable.** `DELETE`ing a
   session's rows is caught from every scope, because the structural checks are global. `UPDATE`ing
   `session_id` from `X` to `Y` erases X's history just as completely and moves nothing, so every
@@ -1885,8 +1982,13 @@ which is what lets a caller tell a complete answer from a truncated page, since 
   per-slice detail.
 
 **The exact edge of the truncation defence, as a ladder rather than a property**, because "how many
-statements does a silent truncation cost" is the only honest way to state what an unkeyed in-file
-scheme buys. Every rung is a real command against a real audit DB, and all four are pinned by
+statements does a silent truncation cost" is the only honest way to state what an in-file scheme
+buys. **This ladder is the one residual keying did not close, and that is the point of keeping it.**
+Every other rung of the tamper argument now leans on the MAC; truncation does not, because the two
+watermarks are ordinary integers with no digest over them and the *surviving prefix is a genuine
+chain* — it verifies because it is real, not because it was forged. So an attacker with DB write
+access and no key still cannot rewrite history, and still can shorten it. Every rung is a real
+command against a real audit DB, and all four are pinned by
 `test_a_silent_tail_truncation_costs_four_statements_and_all_four_are_needed`:
 
 | Attacker statements | Result |
@@ -1911,16 +2013,25 @@ after the delete, inside the window where the defence still worked. `seq` is all
 | | **T1 — has the DB**, not the app's secrets | **T2 — has the host** (env, memory, DB writes) | **T3 — has deploy rights** |
 |---|---|---|---|
 | Alter or delete an existing event | **caught** | **caught** | not caught |
-| Append a forged event at the tail | not caught | not caught | not caught |
-| Rewrite the whole chain forward | **caught** — needs the whole log replaced in one consistent pass | not caught | not caught |
+| Append a forged event at the tail | **caught** — since the digest is keyed | not caught | not caught |
+| Rewrite the whole chain forward | **caught** — the re-chain needs the key, not just the formula | not caught | not caught |
+| Truncate the tail and reset both watermarks | not caught — four statements, §5 Q5's ladder | not caught | not caught |
 | Stop events being written at all | n/a | not caught | not caught |
 
 The first row is the one that matters and it holds: **an attacker who cannot rewrite the entire
-chain cannot alter or remove any record of what happened.** They can only *add* a record of
-something that did not, and for an auditor asking "what did this system do", missing and edited
-events are the dangerous ones. Keying the digest moves T1's append row into "caught" and does
-nothing at T2, because the writer must hold the key in order to write — a different, narrower fix
-rather than a smaller version of the real one. Closing T2 requires trust to live where the writer
+chain cannot alter or remove any record of what happened.** For an auditor asking "what did this
+system do", missing and edited events are the dangerous ones.
+
+**Two of T1's cells moved when the digest was keyed, and the fourth row is new because it is what
+is left.** This table used to read "not caught" for both a forged tail append and a forward
+rewrite at T1, on the correct reasoning that an unkeyed digest needs no secret; the paragraph under
+it said keying *would* move the append row and was written as a proposal. It is shipped (§7 gap 16),
+so both cells are now caught and the proposal is deleted rather than left reading as future work.
+What keying did **not** touch is the T2 column — the writer must hold the key in order to write, so
+a host compromise is a key compromise — and the truncation row, because the two watermarks are
+plain integers with no digest over them and the surviving prefix is a real chain. That row is
+stated separately rather than folded into "alter or delete", which it would otherwise contradict.
+Closing T2 requires trust to live where the writer
 is not: an off-box append-only sink, or anchoring the head hash somewhere the app cannot rewrite.
 Anchoring is cheaper and has nowhere to land on a single-host `docker-compose`, where an anchor
 beside the database is the same attacker and the same filesystem. Neither is shipped. **If the
@@ -2196,51 +2307,135 @@ alone.
    this can be fixed"; those three are the counterexamples. The honest position: use tokenization
    when correctness of attribution matters. A real fix needs the restorer to refuse a component
    fake when the full fake matched nearby but not exactly.
-3. **The near-miss counter that is supposed to backstop the above is built from the matcher it
-   backstops.** `_count_surrogate_near_misses` calls `_compile_surrogate_pattern(fold=True)` — the
-   same function used to restore, differing only by `re.IGNORECASE`. Its docstring calls it
-   "deliberately an upper bound" on unrestored fakes; it is an upper bound only in the *case*
-   dimension and inherits every boundary rule the matcher has. Measured against the real counter,
-   with `Brightwater` as an issued fake: `NATHANIEL BRIGHTWATER` and `nathaniel brightwater` both
-   count 1 and are caught, while `The Brightwaters were contacted.` and a soft-wrapped
-   `Bright-\nwater` both count **0** with the fake still readable. This is the project's recurring
-   defect living in the one function that exists to be the safety net, and it is recorded rather
-   than fixed because a genuinely independent counter is a second matcher with different rules —
-   the thing that needs designing, not patching.
-4. **`doc_category` is an uploader-supplied field that switches security controls off by default.**
-   `CASE_STRATEGY` carries `action: redact` — the one entity forcibly destroyed regardless of
-   confidence — and is scoped `only_in_doc_categories: [legal]`. The API field is optional and
-   defaults to `None`. Measured on the shipped registry with a real privileged brief:
+3. **[CLOSED] The near-miss counter was built from the matcher it backstops.**
+   `_count_surrogate_near_misses` called `_compile_surrogate_pattern(fold=True)` — the same
+   function used to restore, differing only by `re.IGNORECASE` — so it was an upper bound only in
+   the *case* dimension and inherited every boundary rule the matcher had. The four measurements
+   that stated the gap are **unchanged and were re-verified on this tree**, because they are
+   properties of the matcher rather than of the counter: with `Brightwater` as an issued fake,
+   `NATHANIEL BRIGHTWATER` and `nathaniel brightwater` both count 1 and are caught, while
+   `The Brightwaters were contacted.` and a soft-wrapped `Bright-\nwater` both count **0** with the
+   fake still readable. What is no longer true is the *mechanism* sentence above them.
+
+   The counter is derived independently now: maximal `str.isalnum()` word runs folded into tuples
+   and looked up in a set, sharing no pattern, no boundary assertion and no escaping with the
+   thing it backstops — boundaries fall out of the tokenisation instead (`Lopez` cannot match
+   inside `Lopezes` because `lopezes` is one word). **The proof is a blinding, run against both
+   builds side by side**: kill `_compile_surrogate_pattern`'s alternation and ask each counter
+   about an upper-cased heading, a shouted surname and a quoted first line. The old build reports
+   **1/1/1 live and 0/0/0 blinded** — silent on every case it exists to catch, at exactly the
+   moment the thing it backstops has stopped working. The new one reports **1/1/1 both ways.**
+   Pinned by `test_the_near_miss_counter_survives_a_blinded_matcher`; the old column re-run from
+   `git worktree add --detach <tmp> HEAD` rather than quoted.
+
+   It is also much cheaper, which was a side effect rather than the goal: on a synthetic
+   1,000-surrogate, 90 KB response the old counter takes **~108 ms** and the new one **~6.4 ms**,
+   a 16–17× ratio stable across runs (the corpus is generated, so read the ratio and not the
+   milliseconds). That shows up in a shipped figure rather than only here — §1's 500-surrogate
+   restore benchmark moved 121.750 ms → 67.149 ms.
+
+   **What is still open is the defect this counter exists to signal**, not the counter: the
+   component-fake hybrid in item 2 above is unfixed, and a better alarm is not a repair.
+4. **[CLOSED] `doc_category` was an uploader-supplied field that switched security controls off by
+   default.** `CASE_STRATEGY` carries `action: redact` — the one entity forcibly destroyed
+   regardless of confidence — and is scoped `only_in_doc_categories: [legal]`, while the API field
+   is optional and defaults to `None`. A legal brief uploaded without a category never had its
+   litigation strategy redacted, never vaulted it, and therefore gave pass 1 nothing to scan for;
+   pass 2 ran with the same `None` and shared the blind spot by construction.
+
+   **An undeclared category now asks for the union of every category's rules** rather than the
+   unscoped subset, so absence fails closed. Measured on the shipped registry and
+   `fixtures/legal_memo.txt`:
 
    ```
-   doc_category=legal    -> 4 detections incl. CASE_STRATEGY, CLIENT_IDENTITY
-   doc_category=medical  -> 3 detections, CASE_STRATEGY absent
-   doc_category=None     -> 3 detections, CASE_STRATEGY absent   <- the default
+   doc_category=legal    -> 38 detections, CASE_STRATEGY 5, CLIENT_IDENTITY 12
+   doc_category=medical  -> 38 detections, CASE_STRATEGY 0
+   doc_category=None     -> 43 detections, CASE_STRATEGY 5   <- the default, was 0
    ```
 
-   So a legal brief uploaded without a category never has its litigation strategy redacted, never
-   vaults it, and therefore gives pass 1 nothing to scan for; pass 2 runs with the same `None` and
-   shares the blind spot by construction. `document_store.py`'s own `InvalidCategoryError`
-   docstring makes exactly the right argument — a mis-filed document "would silently lose the
-   category-scoped detection rules that make its most sensitive entities detectable at all" — and
-   then `_validate_category` opens with `if doc_category is None: return None`. The guard is
-   written against the typo and open on the omission, and omission is the default. Same shape as
-   the `user_id` gap in §3: a user-supplied lever on which controls run. Listed rather than fixed
-   because the fix is a product decision.
-5. **Pass 3 — the only genuinely independent opinion — covers one of four high-severity types.**
-   `_INDEPENDENT_PATTERNS` holds two SSN recognisers (the separated spelling, and any nine-digit
-   spelling introduced by an SSN/ITIN label) while `HIGH_SEVERITY_TYPES` is `{SSN, MRN,
-   ACCOUNT_NUMBER, TAX_ID}`. For the other three the *only* recogniser in the system is the single
-   registry pattern, consulted identically at detect time and in pass 2 — so the argument pass 3
-   was built on is answered for 25% of the blocking surface. Deviation 43 is a demonstrated
-   instance: `MRN`'s trailing `\b`, denied by one letter, was invisible to all three passes at
-   once. Scope was chosen per-*instance* rather than per-*class*.
-6. **`HIGH_SEVERITY_TYPES` does not follow its own stated membership rule.** The comment says the
-   set is "pattern-typed entities with near-zero false-positive rates". `INSURANCE_ID`
-   (`\b[A-Z]{2,6}\d{7,12}\b`) and `CASE_ID` are pattern-typed and high-specificity, are **not** in
-   the set, and are released with a warning at 1.00 confidence. Measured. The membership is
-   narrower than the rule given for it, with no reason recorded — which reads badly precisely
-   because the comment invites the question.
+   **Making the field *required* would not have closed this, and that is the part worth keeping.**
+   `general` is a valid category with no entities scoped to it, so a client forced to declare
+   something could declare the empty one and land in exactly the state the requirement was meant to
+   prevent. The unsafe value was never the *absence*; it was the *subset*.
+
+   Two costs, both measured rather than asserted. **Precision held, and it was checked against the
+   old code rather than against expectation**: the four shipped fixtures under their *declared*
+   categories give **873 spans**, and the per-entity breakdown is identical to the one the same
+   census prints from a `HEAD` worktree — 20 entity types, every count equal. Both clean corpora
+   still produce **0** detections (`test_clean_documents_produce_no_detections`,
+   `test_held_out_clean_documents_produce_no_detections`), and over-detection on the tuned corpus
+   is **4** unannotated spans against a cap of 6
+   (`test_over_detection_on_realistic_prose_stays_bounded`). **The residual is a label**: under
+   `None` the 12 client-name spans on the memo come back typed `NAME` rather than
+   `CLIENT_IDENTITY`, because both claim the same text and overlap resolution has no legal category
+   to prefer the legal type with. Same tier, same strategy, same vaulting, different word in the
+   audit row. Held-out recall moved up as a consequence — 334 → 340 of 366 covered, 332 → 337 typed
+   (§4) — with one name newly masked under a `DATE` span, which is coverage bought at the wrong
+   tier and is recorded there rather than netted off. Pinned by
+   `test_an_absent_doc_category_applies_every_category_rule` and
+   `test_every_category_scoped_entity_survives_an_undeclared_category`.
+5. **[CLOSED] Pass 3 — the only genuinely independent opinion — covered one of four high-severity
+   types.** `_INDEPENDENT_PATTERNS` held two SSN recognisers (the separated spelling, and any
+   nine-digit spelling introduced by an SSN/ITIN label) while `HIGH_SEVERITY_TYPES` is
+   `{SSN, MRN, ACCOUNT_NUMBER, TAX_ID}`. For the other three the *only* recogniser in the system
+   was the single registry pattern, consulted identically at detect time and in pass 2 — so the
+   argument pass 3 was built on was answered for 25% of the blocking surface. Deviation 43 was the
+   demonstrated instance: `MRN`'s trailing `\b`, denied by one letter, invisible to all three
+   passes at once.
+
+   It is **6 entries over all four types** now — SSN ×2, MRN, ACCOUNT_NUMBER, TAX_ID ×2 — each
+   hand-derived against `re` from what the identifier *is*, importing nothing from the registry, so
+   a one-line edit to `entities.yaml` cannot blind the gate at the moment it blinds the detector.
+   **Three cleartext leaks were live and are closed, and the reproduction is the evidence rather
+   than the claim.** `Patient MRN [4471902] …`, `Please credit account [100200300400] …` and
+   `The EIN 123456789 …` were each detected as **nothing** — re-run against a `HEAD` worktree for
+   this pass, all three `types=[]` — so they were never vaulted, pass 1 had no needle, pass 2
+   shared the miss exactly, and pass 3 had no recogniser for any of the three types. All three
+   reached the outbound payload with `EXIT=0` and an audited `EGRESS_PASS`. All three are claimed
+   and correctly typed now.
+
+   **Credit where it is due, because "pass 3 closed three leaks" would be the wrong lesson.** What
+   actually stops those documents is the *registry* widening that makes them detected, vaulted and
+   restorable — the direction this module has now taken twice is **widen the registry, never narrow
+   the gate**, since a value only the gate claims is a 422 rather than a masked value. Pass 3's
+   contribution is that the same claim now exists in a second file, in a second regex dialect,
+   reachable by no code path that reads `entities.yaml` — so a YAML edit cannot re-open all three
+   at once. The cost is **7.9 ms** over
+   the whole 83,029-character brief (median of 9) against pass 2's ~2.8 s, with **zero spans
+   claimed** on that brief — §5 Q1 carries the row. Pinned by
+   `test_pass_three_has_an_independent_opinion_on_every_type_it_blocks_on`,
+   `test_pass_three_blocks_each_high_severity_type_with_its_registry_rule_deleted` and
+   `test_pass_three_claims_no_span_in_an_ordinary_business_document`.
+
+   **One limb was refused with numbers, and the refusal is the gap that remains.** The *unlabelled*
+   MRN — a chart number in a bare table or CSV column, with no noun introducing it — gets no
+   recogniser, because nothing short of a bare `\b[0-9]{6,10}\b` rule reaches it. Re-derived here
+   against the committed adversarial corpus rather than a remembered one: over the 28 ordinary
+   business sentences in `tests/test_egress_gate.py::_PASS_THREE_NON_IDENTIFIERS`, that rule claims
+   **22 of 28** — every invoice, order, purchase order, part, SKU, asset tag, phone digit string,
+   ZIP+4, routing number, ABA, epoch, sequence and export stamp in it. As a *gate* pattern each of
+   those is a 422 on an ordinary document a reviewer might upload. So pass 3 claims the labelled
+   MRN with two self-identifying labels (`mrn`, `medical record`) rather than the registry's nine,
+   and the unlabelled one stays declared rather than half-fixed. This is the one place in §7 where
+   the honest answer was to write down a refusal instead of a closure.
+6. **[CLOSED — the comment was wrong, the set was right.]** `HIGH_SEVERITY_TYPES` did not follow
+   its own stated membership rule: the comment said "pattern-typed entities with near-zero
+   false-positive rates", while `INSURANCE_ID` (`\b[A-Z]{2,6}\d{7,12}\b`) and `CASE_ID` are
+   pattern-typed too and are **not** members. The resolution went the other way from the one this
+   entry used to imply — the sentence was corrected and **the set is unchanged** — because the
+   membership rule that actually holds is two-part: the value is a direct identifier issued to a
+   person by a government, a payer or a bank, **and** the recogniser buys its specificity from a
+   label in identifier position, a validator, or a digit grouping no other identifier uses. Both
+   candidates pass the first and fail the second, measured over sixteen ordinary non-PII strings
+   (part numbers, SKUs, firmware builds, container IDs, air waybills, Bates stamps, model numbers,
+   licence plates, GL codes, cost centres, change tickets, ISO/DIN standards, drawing revisions):
+   `INSURANCE_ID` claims **8 of 16** and `CASE_ID` **6 of 16**, so half an ordinary parts list would
+   422. `CASE_ID` has a second, independent reason: a docket number is a **public record**, so
+   refusing a payload that carries one buys no confidentiality and costs the caller their request.
+   Both stay out, both stay detected, vaulted and restorable, and a re-scan hit on either is still
+   recorded as an advisory `rescan_warnings` count. The sixteen strings are enumerated in the
+   comment above `HIGH_SEVERITY_TYPES` in `egress_gate.py`; the fourteen it names as claimed were
+   re-run against the shipped registry patterns here and all fourteen still are.
 7. **The vault serialises every session through one `asyncio.Lock` and one connection**, and its
    plaintext cache is unbounded. Five call sites (`put`, `_fetch_one`, `destroy`, `sweep_orphans`,
    `close`) take the same process-wide lock with no per-session striping, so a 251-entity brief
@@ -2322,14 +2517,33 @@ alone.
    sweeping them would corrupt unrelated words — but the floor is a policy choice, applied
    uniformly rather than per-entity.
 13. **Single-process session registry.** Redis plus KMS envelope keys for multi-node.
-14. **The document read path leaks existence through timing** — ~18× between an absent `doc_id`
-   and a wrong-owner one on a 2 MB blob. Content-identical, time-distinguishable; analysed in §3.
-   A constant-time read closes it and costs a full disk read per miss.
+14. **[CLOSED] The document read path leaked existence through timing** — unbounded and linear in
+   blob size, re-measured at 2.85× / 11.0× / 46.1× / 102.7× at 5.6 KB / 2.25 MiB / 8 MiB / 16 MiB
+   before the fix, about 0.29 ms/MiB. Every `StoreAuthError` now waits out an 8 ms floor sized from
+   `MAX_UPLOAD_BYTES`, and the two arms measure **1.00×** at all four sizes, within 4.3 µs. It does
+   **not** cost a disk read per miss — that was this register's own mis-pricing; the mechanism is
+   an `asyncio.sleep`, no I/O, no thread held. Three residuals, all in §3: extracted text that
+   takes longer than the floor to decrypt (1.30× at 32 MiB, past the upload cap, leaking only "very
+   large"), a floor calibrated on one machine, and success deliberately unpadded.
 15. **Filenames are cleartext in the metadata table.** Deliberate and argued in §3; the fix, if the
    requirement changes, is an encrypted column plus a blind index for listing.
-16. **The audit chain is unkeyed**, so it survives partial tampering but not a full rewrite by
-   someone with DB write access (§5 Q5). An off-box append-only sink or an auditor-held HMAC key is
-   the real answer; both are production infrastructure rather than a code change here.
+16. **[CLOSED] The audit chain was unkeyed**, so it survived partial tampering but not a full
+   rewrite by someone with DB write access. `entry_hash` is now
+   `HMAC-SHA256(chain_key, prev_hash ‖ canonical_json(payload))` with
+   `chain_key = HKDF-SHA256(master_key, salt="scp-v1", info="audit-chain")`, derived on demand and
+   never persisted. The attack the gap named is reproduced in full and asserted to be *internally
+   perfect* before it is caught (`test_a_rewritten_chain_is_rejected_because_the_digest_is_keyed`);
+   a log written before keying is distinguished from a tamper by its own error code
+   (`entry_hash_unkeyed_legacy`) rather than sending an operator hunting a forgery.
+
+   **Two residuals, and the second is the whole of what the off-box answer was for.** An attacker
+   who holds `SCP_MASTER_KEY` re-derives the chain key and is back to an end-to-end rewrite — the
+   key is a process secret, not an auditor-held one. And a **tail truncation** with both watermarks
+   reset is still undetectable, because `sqlite_sequence` and `audit_chain_meta.max_seq` are
+   ordinary integers with no digest over them and the surviving prefix is a genuine chain that
+   verifies because it is real. That is the four-statement ladder in §5 Q5, and it is now the only
+   in-file residual of this kind. An off-box append-only sink or an auditor-held key is still the
+   real answer to both; both are production infrastructure rather than a code change here.
 17. **The DOCX decompression-bomb guard bounds the declared size, not the transient cost.**
    Checking the archive's declared uncompressed bytes closes the ~1000× amplification a zip bomb
    needs. It does not bound what `zipfile.ZipFile()` spends parsing the central directory before
@@ -2363,38 +2577,60 @@ alone.
    (`[NAME_1a2b3c4d]`), a bare space or a `.` where a separator belongs, and a short hash — the
    last for the security reason Deviation 28 records, since the egress gate builds its skip-list
    from this grammar's stricter twin.
+26. **`SessionRegistry.belongs_to` is not timing-uniform between "no such session" and "live
+   session, wrong user".** Found while closing gap 14 and left open rather than quietly fixed, on a
+   bound rather than a shrug. Both arms return `False`; they get there differently — an unknown ID
+   raises `SessionExpiredError` inside `owner()` and is caught, while a live one falls through to
+   `secrets.compare_digest`. Measured with interleaved A/B batches of 200 calls in both orders, so
+   no ordering or warm-up artefact can produce it: unknown **1.688 µs**, live-but-wrong-user
+   **0.816 µs** — a **2.07×** ratio, gap **0.87 µs**, and the *cheaper* arm is the one that proves
+   the session exists.
+
+   **Why it is bounded rather than hand-waved.** Nothing calls this from the API today (the route
+   compares inline), and at the HTTP boundary the difference is not in the noise, it is far under
+   it: the same 401 measured end to end over the ASGI transport has medians of **313.1 µs** and
+   **312.3 µs** for the two arms with a per-request pooled stdev in the **180–240 µs** band across
+   two runs. Against a 0.87 µs mean gap that is `(σ/Δ)² ≈ 4×10⁴ to 8×10⁴` requests to resolve one
+   bit — and the write meter gives an attacker **253** requests from a full bucket and **8.00
+   req/s** sustained, measured, so that is on the order of two hours of uninterrupted probing per
+   bit against a session ID they must already hold. Publish the band, not a single stdev: it is not
+   reproducible to three figures and is quoted as a range for that reason. The fix is the same
+   shape as gap 14's — answer both arms through one path with a floor — and it is not worth an 8 ms
+   pad on a hot request path for an oracle this expensive to read.
 
 ### With one more day
 
 The list above is a register, not a plan; a reviewer asking "what would you build next" is owed
 a selection out of it rather than the whole thing again. This is the order I would actually work
 in, with what each buys and roughly what it costs. Every item named here is still open on the
-tree this README describes — which is worth saying, because several of its neighbours are not
-(gap 8's two structural debts are paid, and both halves of gap 9's composite-span defect are
-closed), and a plan that proposes finished work is not a plan.
+tree this README describes — which is worth saying, because a growing number of its neighbours are
+not. **This plan was rewritten because its own previous picks landed**: gaps 4, 5, 6, 14 and 16 are
+closed above, along with gap 3, gap 8's two structural debts and both halves of gap 9's
+composite-span defect. A plan that proposes finished work is not a plan, and re-reading it is part
+of the cost of doing the work rather than an afterthought.
 
-1. **Close the `doc_category` omission — gap 4, ~1 h.** An optional, uploader-supplied field
-   currently decides whether the one entity with `action: redact` is detected at all, and its
-   default is the unsafe value; that is the cheapest genuine *security* fix left on the list and
-   nothing else here is worth as much per hour. Two candidate fixes, and the choice is a product
-   decision: reject an unclassified upload at the API boundary, or run every category's rules
-   when the field is absent. I would ship the second — it fails closed and needs no client
-   change — and price its false positives on the four shipped fixtures before committing to it.
-2. **Widen pass 3 to the other three high-severity types, and make `HIGH_SEVERITY_TYPES` match
-   its own stated rule — gaps 5 and 6, ~3 h.** The egress gate, not the detector, is the
-   security control in this design (§3), and its only genuinely *independent* limb covers one of
-   the four types it blocks on. `MRN`, `ACCOUNT_NUMBER` and `TAX_ID` each have exactly one
-   recogniser, consulted identically at detect time and at re-scan, so a blind spot in it is
-   shared by every pass at once — which is not a hypothetical, it is Deviation 43. In the same
-   sitting: either add `INSURANCE_ID` and `CASE_ID` to the blocking set or write down why they
-   are excluded, because the comment above the set invites that question and does not answer it.
-3. **Refuse the component-fake hybrid in the restorer, and give its near-miss counter rules of
-   its own — gaps 2 and 3, ~4 h.** This is the sharpest correctness defect in the repository:
-   pseudonymization welds a fake given name onto a real patient's surname, and every counter
-   reports a clean run while it happens. The fix is a rule rather than a patch — refuse a
-   component surrogate when its full-name sibling matched *nearby but not exactly* — and it has
-   to come with a counter that is not built from `_compile_surrogate_pattern`, or the safety net
-   keeps certifying the blind spots of the thing it is meant to backstop.
+1. **Refuse the component-fake hybrid in the restorer — gap 2, ~3 h.** This is now the sharpest
+   correctness defect left in the repository: pseudonymization welds a fake given name onto a real
+   patient's surname — `Nathaniel M. Brightwater` restores to `Nathaniel M. Hammond` — and it is a
+   person who does not exist carrying a real patient's name. The fix is a rule rather than a
+   patch: refuse a component surrogate when its full-name sibling matched *nearby but not exactly*.
+   It ranks first partly because half of it is already paid — the near-miss counter that has to
+   notice this now derives its own answer instead of asking the matcher, so the alarm exists and
+   only the repair is missing. That is exactly the state in which a defect gets left forever, which
+   is the argument for taking it first rather than the argument for it being fine.
+2. **Bound the DOCX parse cost, not just the declared size — gap 17, ~2 h.** The decompression-bomb
+   guard checks the archive's *declared* uncompressed bytes, which closes the amplification a zip
+   bomb needs and does nothing about what `zipfile.ZipFile()` spends on the central directory
+   before any check can run: an archive at the 16 MB upload cap can declare **zero** uncompressed
+   bytes and still cost ~110 MB RSS. It is measured and pinned, it is anonymous-reachable, and it
+   is the only unbounded-cost item left in the register that an attacker triggers with one upload.
+   Streaming the archive or parsing it in a memory-capped subprocess is the fix.
+3. **Cap the vault's plaintext cache and stripe its lock — gap 7, ~3 h.** `self._caches` holds
+   session-lifetime **decrypted** originals with no eviction and no size cap, so a 251-entity brief
+   keeps 251 plaintext values in RAM for as long as the session lives, and an idle process holds
+   expired sessions' plaintext until it serves another session-bearing request. Five call sites
+   also take one process-wide `asyncio.Lock`, which is the scale ceiling §5 Q1 stops at. An LRU with
+   a byte budget is most of the first half; per-session striping is the second.
 4. **Extend the field-label clamp past the newline — the measured neighbour under gap 1, ~2 h.**
    A space-separated inline header vaults `David Ochoa   DOB` as a single original, so the vault
    holds a string that is not a value and the payload loses its `DOB:` label. It is bounded,
@@ -2423,13 +2659,20 @@ than naming the picks, because the biggest item on the list is one of them:
   need corpus work before any code: `ADDRESS`'s 100% recall is a corpus artifact until the
   held-out set carries street lines and postcodes, so writing the recogniser first would just
   move an unmeasured number. Annotation is a day on its own.
-- **Postgres, Redis, an off-box audit sink — gaps 13, 16 and 18.** Infrastructure rather than
-  code, and the `DocumentStore` and `KeyProvider` Protocol seams that make them cheap already
-  exist and are tested. This is a deployment decision to be taken with a requirement in hand,
-  not a day of typing against an imagined one.
-- **The constant-time document read — gap 14.** It closes an existence oracle that §3 already
-  analyses and prices, and it costs a full disk read on every miss. I would want the requirement
-  before paying that, and §3 is the argument for why it can wait.
+- **Postgres, Redis, an off-box audit sink — gaps 13 and 18, and what keying the chain left
+  behind.** Infrastructure rather than code, and the `DocumentStore` and `KeyProvider` Protocol
+  seams that make them cheap already exist and are tested. The audit half is sharper than it was
+  rather than gone: keying closed the rewrite, and the two things it could not close — a holder of
+  `SCP_MASTER_KEY`, and a tail truncation with both watermarks reset — are exactly the two an
+  auditor-held key and an append-only sink close, and neither is a change to this code. This is a
+  deployment decision to be taken with a requirement in hand, not a day of typing against an
+  imagined one.
+- **Padding `SessionRegistry.belongs_to` — gap 26.** The same shape as the document-read floor one
+  layer down, and the arithmetic says not yet: the oracle is 0.87 µs under a per-request spread two
+  orders of
+  magnitude larger, nothing on the HTTP path calls it today, and the write meter caps a probe at 8
+  requests a second. An 8 ms floor on a hot path is a real cost paid against a bit that takes hours
+  to read. It is written down with its bound so the trade can be re-taken if either half moves.
 - **The 42-file `ruff format` divergence (§1).** A large cosmetic diff with no correctness
   content, which would bury every substantive change above it in review. It is the last thing I
   would spend a reviewer's attention on.

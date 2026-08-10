@@ -18,10 +18,31 @@ Every pipeline stage writes here. Three properties are load-bearing:
    in this package writes a value -- every ``emit`` carries token IDs, entity
    *types*, counts, latencies and digests -- and the 100-run leakage harness scans
    the raw SQLite file as **bytes** against every vaulted original on every run.
-2. **Tamper evidence.** ``entry_hash = sha256(prev_hash + canonical_json(event
-   without hashes))``, chained across the whole log in ``seq`` order.
-   :meth:`AuditLogger.verify_chain` recomputes every hash and re-checks every
-   link, so an in-place ``UPDATE`` of any persisted column is detectable.
+2. **Tamper evidence, and it is keyed.** ``entry_hash = HMAC-SHA256(chain_key,
+   prev_hash + canonical_json(event without hashes))``, chained across the whole
+   log in ``seq`` order. :meth:`AuditLogger.verify_chain` recomputes every MAC and
+   re-checks every link, so an in-place ``UPDATE`` of any persisted column is
+   detectable.
+
+   **The key is what makes that a claim rather than a formality.** The digest was
+   a bare ``sha256`` until recently, and an unkeyed chain is evidence only against
+   an attacker who edits a row and stops. Anyone who can write the database can
+   also *recompute* every downstream hash with the published formula and hand back
+   a chain that verifies perfectly -- reproduced end to end in
+   ``test_a_rewritten_chain_is_rejected_because_the_digest_is_keyed``, which
+   deletes an ``EGRESS_BLOCK`` row's evidence, re-chains the log by hand, and
+   asserts the verifier now says ``False``. DB write access is exactly the threat
+   model of a stolen volume, a restored backup or a compromised store, so against
+   the reader this log exists for the unkeyed form proved nothing.
+
+   ``chain_key`` is ``HKDF(master_key, info="audit-chain")`` -- see
+   :func:`~secure_context_pipeline.crypto.keys.derive_audit_chain_key`. It is
+   **not** an off-box anchor: the app process holds it, so an attacker who reaches
+   ``SCP_MASTER_KEY`` (RCE on the app host, a leaked env file) can forge the chain
+   exactly as before. What keying buys is separating "can write the database" from
+   "can write the database *and* holds the app's master key", which were the same
+   capability an hour ago and are the two halves of every realistic store
+   compromise. :meth:`AuditLogger.verify_chain` names the rest of the residual.
 3. **Queryable, and checkably so.** :meth:`AuditLogger.query` filters by session,
    run, event type, and time range -- the compliance-reporting requirement --
    and pages, defaulting to ``limit=1000``. :meth:`AuditLogger.length` takes the
@@ -61,6 +82,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import sqlite3
@@ -72,7 +94,10 @@ from typing import Self
 
 import aiosqlite
 
-from secure_context_pipeline.errors import AuditUnavailableError, PipelineError
+from secure_context_pipeline.config import get_settings
+from secure_context_pipeline.crypto.aead import KEY_LEN
+from secure_context_pipeline.crypto.keys import derive_audit_chain_key
+from secure_context_pipeline.errors import AuditUnavailableError, ConfigError, PipelineError
 from secure_context_pipeline.models import (
     AUDIT_ACTION_KEY,
     AUDIT_ACTIONS,
@@ -106,6 +131,7 @@ __all__ = [
     "canonical_json",
     "chain_payload",
     "compute_entry_hash",
+    "default_chain_key",
 ]
 
 # --------------------------------------------------------------------------
@@ -373,9 +399,77 @@ def chain_payload(
     }
 
 
-def compute_entry_hash(prev_hash: str, payload: Mapping[str, object]) -> str:
-    """``sha256(prev_hash + canonical_json(event_without_hashes)).hexdigest()``."""
-    return hashlib.sha256((prev_hash + canonical_json(payload)).encode("utf-8")).hexdigest()
+def _chain_message(prev_hash: str, payload: Mapping[str, object]) -> bytes:
+    """The bytes both digests below are taken over. One definition, two readers."""
+    return (prev_hash + canonical_json(payload)).encode("utf-8")
+
+
+def compute_entry_hash(prev_hash: str, payload: Mapping[str, object], *, key: bytes) -> str:
+    """``HMAC-SHA256(key, prev_hash + canonical_json(event_without_hashes)).hexdigest()``.
+
+    ``key`` is :func:`default_chain_key` unless a caller supplied its own, and it is
+    **keyword-only and required** on purpose. The previous signature took only the
+    two public arguments, so every existing call site -- and any future one -- would
+    have gone on computing a perfectly valid-looking *unkeyed* digest after this
+    change, which is the one failure mode a keyed chain cannot afford to make
+    quiet. It is now a ``TypeError``.
+
+    What the key changes, stated without inflation. Recomputation-based tamper
+    evidence answers "was a row edited and left inconsistent with the rest". It
+    never answered "was this log rewritten", because the rewrite is arithmetic
+    anyone can do: edit the row, recompute its digest, recompute every digest after
+    it. Keying takes the digest out of the attacker's reach, so the same rewrite
+    now produces a chain that fails at the first edited row and at every row after
+    it.
+
+    What it does **not** change: an attacker holding the master key can still
+    produce a chain that verifies, because they can compute the same MAC we can.
+    See :meth:`AuditLogger.verify_chain` for the full residual, including the one
+    keying does not touch (tail truncation with both watermarks reset).
+    """
+    return hmac.new(key, _chain_message(prev_hash, payload), hashlib.sha256).hexdigest()
+
+
+def _legacy_unkeyed_entry_hash(prev_hash: str, payload: Mapping[str, object]) -> str:
+    """The pre-keying formula, kept for **diagnosis only** -- never for a verdict.
+
+    ``sha256(prev_hash + canonical_json(event_without_hashes))``, which is what
+    every row written before the chain was keyed carries. A log holding such rows
+    cannot be vouched for under the current key and :meth:`AuditLogger.verify_chain`
+    reports it invalid; this exists so the break it logs says
+    ``entry_hash_unkeyed_legacy`` rather than the identical-looking
+    ``entry_hash_mismatch``, which would send an operator hunting a tamper that is
+    really a pre-migration row.
+
+    **The label is a shape, not an exoneration**, and the difference matters enough
+    to say twice. An attacker who rewrites the chain with the published unkeyed
+    formula produces rows of exactly this shape -- measured: the five-row rewrite in
+    ``test_a_rewritten_chain_is_rejected_because_the_digest_is_keyed`` logs
+    ``entry_hash_unkeyed_legacy`` on every row. Nothing can separate the two cases,
+    because they are the same bytes. What the label says is "this row was written
+    without the key", which is true of a pre-migration row *and* of a forgery, and
+    both are things an operator must go and look at.
+
+    It is deliberately *not* a fallback. Accepting a row because it matches the old
+    formula would hand an attacker a downgrade: rewrite the whole log in the unkeyed
+    form, which needs no key at all, and it verifies again.
+    """
+    return hashlib.sha256(_chain_message(prev_hash, payload)).hexdigest()
+
+
+def default_chain_key() -> bytes:
+    """``HKDF(master_key, info="audit-chain")`` from process settings.
+
+    A function rather than a module constant so a process that never opens an audit
+    log never touches ``SCP_MASTER_KEY``, and so a test that rebinds the master key
+    and clears the settings cache gets the key that goes with it. ``get_settings``
+    is itself cached, so this costs one HKDF per :class:`AuditLogger`.
+
+    There is no unkeyed fallback for a missing or malformed master key: the config
+    layer already refuses to start without one, and a fallback here would be a
+    silent return to the scheme this replaced.
+    """
+    return derive_audit_chain_key(get_settings().master_key_bytes())
 
 
 class AuditLogger:
@@ -393,10 +487,28 @@ class AuditLogger:
 
         async with await AuditLogger.open(path) as audit:
             await audit.emit(event)
+
+    ``chain_key`` is the HMAC key the chain is written and verified under. It
+    defaults to :func:`default_chain_key` -- ``HKDF(master_key,
+    info="audit-chain")`` -- so no call site has to know the chain is keyed, which
+    is why keying it changed no caller. Passing one explicitly is for tests and for
+    a deployment that wants the audit key on a different rotation from the document
+    keys. A log written under one key does not verify under another, by design:
+    that *is* the property.
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, chain_key: bytes | None = None) -> None:
         self._db_path = Path(db_path)
+        # Resolved once, at construction, rather than per write: re-reading it would
+        # make a chain silently change key mid-log if settings were reloaded, and a
+        # log with two keys in it is a log nothing can verify.
+        key = default_chain_key() if chain_key is None else chain_key
+        if len(key) != KEY_LEN:
+            # Same argument as `keys._check_session_key`, at the other end of the
+            # wire: `hmac.new` accepts a zero-length key without complaint, and a
+            # zero-length key makes every entry hash publicly computable again.
+            raise ConfigError(reason="audit_chain_key_wrong_length", length=len(key))
+        self._chain_key = key
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
 
@@ -439,14 +551,17 @@ class AuditLogger:
     # -- lifecycle ---------------------------------------------------------
 
     @classmethod
-    async def open(cls, db_path: str | Path) -> Self:
+    async def open(cls, db_path: str | Path, *, chain_key: bytes | None = None) -> Self:
         """Connect, enable WAL, and create the schema if it does not exist.
+
+        ``chain_key`` defaults to :func:`default_chain_key`; see the class
+        docstring.
 
         Propagates ``sqlite3.DatabaseError`` if the file is not a database this
         process can set up -- but does not leak the connection on the way out; see
         :meth:`_connect`.
         """
-        instance = cls(db_path)
+        instance = cls(db_path, chain_key=chain_key)
         await instance._connect()
         return instance
 
@@ -703,7 +818,9 @@ class AuditLogger:
                                 token_id=event.token_id,
                                 detail=detail,
                             )
-                            entry_hash = compute_entry_hash(prev_hash, payload)
+                            entry_hash = compute_entry_hash(
+                                prev_hash, payload, key=self._chain_key
+                            )
 
                             await conn.execute(
                                 _INSERT_SQL,
@@ -881,11 +998,29 @@ class AuditLogger:
     async def verify_chain(self, session_id: str | None = None) -> bool:
         """Recompute every ``entry_hash`` in ``seq`` order and re-check every link.
 
-        Nothing here trusts a stored value to vouch for itself: each row's hash is
+        Nothing here trusts a stored value to vouch for itself: each row's MAC is
         recomputed from its own persisted columns via the same
-        :func:`chain_payload` the writer used, and compared against the stored
-        digest. ``prev_hash`` is likewise re-derived from the walk rather than read
-        back and believed.
+        :func:`chain_payload` the writer used, under the same ``chain_key``, and
+        compared against the stored digest. ``prev_hash`` is likewise re-derived
+        from the walk rather than read back and believed.
+
+        **A log written under a different key is reported invalid**, which is the
+        answer a key is for and is also the migration story. Rows written before the
+        chain was keyed carry the old ``sha256`` digest and cannot be vouched for
+        here; they fail, and the break is logged as ``entry_hash_unkeyed_legacy``
+        rather than ``entry_hash_mismatch`` so a mixed log names its own oldest
+        rows instead of reporting an undifferentiated wall of mismatches. Measured
+        on the one pre-keying file that exists -- the demo's ``data/audit.db``, 780
+        rows -- that is ``False`` with 780 ``entry_hash_unkeyed_legacy`` breaks and
+        nothing else; on a file with three legacy rows and two keyed rows appended
+        after, it is ``False`` naming exactly ``seq`` 1-3. The remedy is to delete
+        the file: sessions do not survive a restart, so a pre-keying audit log has
+        no live session to explain and no ciphertext still readable.
+
+        That label does **not** mean "safe". It means "written without the key",
+        which a forgery also is -- see :func:`_legacy_unkeyed_entry_hash`. Nothing
+        is silently accepted, and a fallback would be a downgrade the attacker gets
+        to choose.
 
         ``session_id=None`` verifies the whole log. With a ``session_id`` the walk
         still covers every row, and the two kinds of check are scoped differently
@@ -956,14 +1091,28 @@ class AuditLogger:
           allocated above the watermark, so the truncation leaves a permanent gap
           instead of being papered over by the next few ordinary events.
 
-        Like the rest of this scheme it is tamper *evidence*, not tamper proofing:
-        the digests are unkeyed, so anyone who can write to the file can rewrite the
-        whole chain and both marks. What it buys is arithmetic on the attacker's
-        side -- a silent truncation now costs a ``DELETE``, a write to
-        ``sqlite_sequence``, a ``DROP TRIGGER`` and a write to ``audit_chain_meta``,
-        all four, in step. Detecting the attacker who runs all four needs an off-box
-        anchor -- publishing the head hash, or an HMAC under a key the app host does
-        not hold -- and is listed as production work.
+        **What the key covers, and what it does not.** ``entry_hash`` is an HMAC
+        under ``chain_key``, so every column inside :func:`chain_payload` -- and the
+        link to the row before -- is out of reach of an attacker who can write the
+        database but does not hold the master key. That is the whole of the *content*
+        story: editing a row, forging a row, reordering rows, or rewriting the entire
+        chain all now fail, where before the last of those was arithmetic anyone
+        could do with the published formula.
+
+        The **watermarks are not keyed**, and that is the residual. They are two
+        plain integers in two ordinary tables, so the truncation attack survives in
+        its full form: ``DELETE`` the newest rows, lower ``sqlite_sequence``,
+        ``DROP TRIGGER audit_chain_meta_is_monotonic``, lower
+        ``audit_chain_meta.max_seq`` -- all four, in step -- and the surviving prefix
+        is a genuine, correctly-MAC'd chain that this method reports as valid.
+        Keying cannot close that one, because nothing is wrong with the rows that
+        remain; closing it needs the mark itself carried under the key (a schema
+        migration on a table with a ``CHECK (id = 1)`` and two triggers) or an
+        off-box anchor. Both are listed as production work, and the second is the
+        stronger answer anyway: this key lives in the app process, so an attacker
+        who reaches ``SCP_MASTER_KEY`` can forge everything here. Publishing the head
+        hash where the app cannot reach it is what removes *that* assumption, and
+        nothing in this file can.
 
         Returns ``False`` rather than raising: this is a health check, and the
         callers (``GET /audit/verify``, ``demo.py --verify``) report it as data.
@@ -1026,9 +1175,29 @@ class AuditLogger:
                                 ),
                                 detail=detail,
                             )
-                            if compute_entry_hash(stored_prev, payload) != stored_hash:
+                            expected_hash = compute_entry_hash(
+                                stored_prev, payload, key=self._chain_key
+                            )
+                            # Constant-time, because the value being compared is a
+                            # MAC and comparing MACs with `==` is how a timing
+                            # oracle gets built. No claim that this endpoint is
+                            # otherwise timing-safe -- the walk is O(rows) and logs
+                            # every break -- only that the primitive comparison
+                            # is not the weak link.
+                            if not hmac.compare_digest(
+                                expected_hash.encode("utf-8"), stored_hash.encode("utf-8")
+                            ):
                                 valid = False
-                                _log_break(seq, "entry_hash_mismatch")
+                                # Named separately so a mixed log reads honestly.
+                                # Both answers are False; only the diagnosis differs,
+                                # and an operator chasing "entry_hash_mismatch" on a
+                                # row that is simply older than the key deserves to
+                                # be told which it is. See `_legacy_unkeyed_entry_hash`
+                                # for why this is not a fallback.
+                                if _legacy_unkeyed_entry_hash(stored_prev, payload) == stored_hash:
+                                    _log_break(seq, "entry_hash_unkeyed_legacy")
+                                else:
+                                    _log_break(seq, "entry_hash_mismatch")
 
                     expected_prev = stored_hash
                     expected_seq = seq + 1

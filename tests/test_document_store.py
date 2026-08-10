@@ -26,6 +26,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from secure_context_pipeline.api.app import create_app
+from secure_context_pipeline.api.constants import MAX_UPLOAD_BYTES
 from secure_context_pipeline.audit import logger as audit_logger
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.crypto.aead import decrypt, doc_aad, encrypt
@@ -34,6 +35,7 @@ from secure_context_pipeline.errors import PipelineError, StoreAuthError
 from secure_context_pipeline.store import document_store, extraction
 from secure_context_pipeline.store.document_store import (
     DOC_CATEGORIES,
+    NOT_FOUND_FLOOR_S,
     RAW_SUFFIX,
     TEXT_SUFFIX,
     DocumentStore,
@@ -376,6 +378,193 @@ async def test_get_category_gives_no_oracle_either(store: EncryptedDocumentStore
 
     assert foreign.value.code == absent.value.code == "NOT_FOUND"
     assert foreign.value.detail.keys() == absent.value.detail.keys()
+
+
+# --- 3b. the TIMING half of "indistinguishable" -----------------------------
+#
+# The two tests above close the CONTENT oracle: same exception, same code, same
+# detail keys. They say nothing about how long the answer took, and the answer took
+# very different lengths of time -- an absent doc_id failed at ENOENT before a byte
+# of crypto while a wrong-owner one was read off disk in full and only then rejected
+# by AES-GCM. Measured on this machine before the floor existed, medians over 400
+# samples per arm: 2.85x at 5.6 KB, 10.4x at 2.25 MiB, 18.8x at 8 MiB, 34.3x at
+# 16 MiB, growing linearly with the blob because the cost is the decrypt.
+#
+# Section 9.1 asks for the two to be indistinguishable "so there is no existence
+# oracle". A byte-identical body on a distinguishable schedule is still an oracle,
+# so these are the other half of that requirement.
+
+#: Timing samples per arm. Enough that a real gap cannot hide in scheduler noise,
+#: small enough that the pad (8 ms each) keeps the whole section around a second.
+_TIMING_SAMPLES = 25
+
+
+def _floor_bypassed(store: EncryptedDocumentStore) -> None:
+    """Turn the floor off on this store instance, for measuring what it hides."""
+    store._not_found_floor_s = 0.0
+
+
+async def _time_not_found(call: Any, *args: Any) -> float:
+    """Seconds a single expected-``StoreAuthError`` call takes. Raises if it succeeds."""
+    started = time.perf_counter()
+    try:
+        await call(*args)
+    except StoreAuthError:
+        return time.perf_counter() - started
+    raise AssertionError(f"{call.__qualname__} unexpectedly succeeded")
+
+
+async def _sample(call: Any, *args: Any) -> list[float]:
+    for _ in range(3):  # warm the page cache and the analyzer-free paths
+        await _time_not_found(call, *args)
+    return [await _time_not_found(call, *args) for _ in range(_TIMING_SAMPLES)]
+
+
+async def test_a_wrong_owner_and_an_absent_document_are_indistinguishable_in_time(
+    store: EncryptedDocumentStore,
+) -> None:
+    """The oracle itself: enumerate stored ``doc_id``s with a stopwatch. Closed.
+
+    Compared on the **minimum** of each arm, not the mean or the median, and that
+    is the robustness argument rather than a shortcut: contention can only ever make
+    a sample slower, so the minimum is the one statistic a loaded machine cannot
+    inflate. It is also the statistic an attacker would use, for the same reason.
+
+    A 4 MiB document, because the gap this closes is proportional to blob size and a
+    few-kilobyte document makes a real 2.85x regression look like 0.1 ms of noise.
+    At 4 MiB the pre-floor arms were 0.15 ms and 1.49 ms -- a ratio no tolerance
+    below an order of magnitude can absorb.
+
+    The positive control runs first and with the floor switched off, so this test
+    fails if the *measurement* stops working, rather than passing because both arms
+    became equally unmeasurable.
+    """
+    body = b"x" * (4 * 1024 * 1024)
+    doc_id = await store.put(USER_A, FILENAME, body, "medical")
+    absent = uuid.uuid4().hex
+
+    _floor_bypassed(store)
+    bare_absent = min(await _sample(store.get_text, USER_B, absent))
+    bare_wrong = min(await _sample(store.get_text, USER_B, doc_id))
+    assert bare_wrong / bare_absent > 3.0, (
+        f"positive control failed: unpadded, the two arms measured {bare_absent * 1e3:.3f} ms "
+        f"and {bare_wrong * 1e3:.3f} ms. If they are already equal here, this test can no "
+        "longer tell a closed oracle from a broken stopwatch."
+    )
+
+    store._not_found_floor_s = NOT_FOUND_FLOOR_S
+    absent_min = min(await _sample(store.get_text, USER_B, absent))
+    wrong_min = min(await _sample(store.get_text, USER_B, doc_id))
+    ratio = wrong_min / absent_min
+    assert 0.9 <= ratio <= 1.15, (
+        f"timing oracle: absent={absent_min * 1e3:.4f} ms wrong-owner={wrong_min * 1e3:.4f} ms "
+        f"ratio={ratio:.2f}x"
+    )
+    assert abs(wrong_min - absent_min) < 0.001, "arms differ by more than a millisecond"
+
+
+@pytest.mark.parametrize(
+    ("reason", "doc_id_for"),
+    [
+        pytest.param("absent", lambda real: uuid.uuid4().hex, id="absent"),
+        pytest.param("wrong_owner", lambda real: real, id="wrong-owner"),
+        pytest.param("malformed", lambda real: "../../etc/passwd", id="malformed"),
+    ],
+)
+@pytest.mark.parametrize("method", ["get_text", "get_raw", "get_category"])
+async def test_every_not_found_reason_waits_out_the_floor(
+    store: EncryptedDocumentStore, reason: str, doc_id_for: Any, method: str
+) -> None:
+    """Not just the two arms in the finding -- every reason, on every read method.
+
+    Padding only "absent" against "wrong owner" would close the named oracle and
+    leave "malformed doc_id vs absent" open right beside it, which is the same
+    defect one input class to the left. The floor is applied per *public read*, so
+    the property to assert is that no ``StoreAuthError`` from any of the three
+    arrives early, whatever produced it.
+    """
+    real = await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+    elapsed = await _time_not_found(getattr(store, method), USER_B, doc_id_for(real))
+    assert elapsed >= NOT_FOUND_FLOOR_S, (
+        f"{method}/{reason} returned NOT_FOUND after {elapsed * 1e3:.3f} ms, "
+        f"inside the {NOT_FOUND_FLOOR_S * 1e3:.1f} ms floor"
+    )
+
+
+@pytest.mark.parametrize("prior_work_s", [0.0, 0.0053])
+async def test_the_floor_converges_on_its_deadline_rather_than_sleeping_to_it(
+    store: EncryptedDocumentStore, prior_work_s: float
+) -> None:
+    """``asyncio.sleep(remaining)`` alone leaves a signal, inverted. Pin the fix.
+
+    A single sleep wakes late by an amount that grows with how long it was asked to
+    sleep, so the arm that did the *least* work overshoots the *most*. Measured at an
+    8 ms floor: 9.028 ms after no work, 8.202 ms after 5.3 ms of it -- monotone,
+    0.83 ms wide, and readable as the same existence bit with the sign flipped.
+    ``_wait_out_floor`` sleeps to within a slack and then yields to the deadline,
+    which brings both to 8.007 ms.
+
+    Both parametrisations are asserted against the same absolute band, which is what
+    makes the assertion about *convergence* rather than about either arm on its own:
+    a plain sleep fails the ``0.0`` case at ~1.03 ms over and passes the ``0.0053``
+    one at ~0.20 ms over, so a single-value test would have been a coin flip.
+    ``min`` for the reason the test above gives -- load can only add.
+    """
+    samples = []
+    for _ in range(12):
+        started = time.perf_counter() - prior_work_s
+        await store._wait_out_floor(started)
+        samples.append(time.perf_counter() - started)
+    overshoot = min(samples) - NOT_FOUND_FLOOR_S
+    assert overshoot >= 0.0, "the floor returned EARLY, which breaks the guarantee"
+    assert overshoot < 0.0005, (
+        f"floor overshoot {overshoot * 1e3:.3f} ms after {prior_work_s * 1e3:.1f} ms of "
+        "prior work; the deadline is being slept to rather than converged on"
+    )
+
+
+async def test_a_successful_read_is_not_slowed_by_the_floor(
+    store: EncryptedDocumentStore,
+) -> None:
+    """The floor pads refusals only, and that restraint has to be asserted.
+
+    A document's owner is already distinguishable from everybody else by receiving
+    the document, so spending latency to hide a difference the response body
+    announces buys nothing and would put the floor on the hot path of every legitimate
+    read. Without this test, "pad everything" passes every other assertion in this
+    section while making the pipeline 8 ms slower per document for no security gain.
+    """
+    doc_id = await store.put(USER_A, FILENAME, SYNTHETIC_BYTES, "medical")
+    started = time.perf_counter()
+    assert await store.get_text(USER_A, doc_id) == SYNTHETIC_TEXT
+    assert time.perf_counter() - started < NOT_FOUND_FLOOR_S
+
+
+async def test_the_not_found_floor_covers_the_api_upload_ceiling(
+    store: EncryptedDocumentStore,
+) -> None:
+    """Calibration: the floor is sized from ``MAX_UPLOAD_BYTES``, so check it still is.
+
+    The floor only hides a wrong-owner read whose decrypt finishes *inside* it, so
+    the constant is only meaningful relative to the largest blob that can exist.
+    ``MAX_UPLOAD_BYTES`` is what bounds a ``.raw`` blob, and ``document_store``
+    deliberately does not import it -- the store must not depend on the HTTP layer --
+    so the linkage lives here or nowhere.
+
+    Measured against the real ceiling rather than extrapolated from a small blob,
+    because the whole failure mode being guarded is a cost that grows with size.
+    A failure here means the constant needs raising *on this hardware*; it does not
+    mean the mechanism is broken.
+    """
+    _floor_bypassed(store)
+    doc_id = await store.put(USER_A, FILENAME, b"y" * MAX_UPLOAD_BYTES, None)
+    worst = max(await _sample(store.get_raw, USER_B, doc_id))
+    assert worst < NOT_FOUND_FLOOR_S, (
+        f"a wrong-owner read of a {MAX_UPLOAD_BYTES}-byte blob costs {worst * 1e3:.2f} ms, "
+        f"which is outside the {NOT_FOUND_FLOOR_S * 1e3:.1f} ms floor -- so the largest "
+        "document the API accepts is still distinguishable from an absent one. Raise "
+        "NOT_FOUND_FLOOR_S and re-measure the table above it."
+    )
 
 
 @pytest.mark.parametrize(

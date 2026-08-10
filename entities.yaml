@@ -423,10 +423,67 @@ entities:
   # What is still not covered: a chart number in an unlabelled table or CSV column,
   # where no noun introduces it at all. Nothing short of a bare-digit rule reaches
   # that, and a bare-digit rule is the trade this whole note exists to refuse.
+  #
+  # THE SEPARATOR CLASS IS WIDENED TO '[^0-9A-Za-z]*+' FOR THE SELF-IDENTIFYING LABELS
+  # ONLY, which is why this is two branches rather than one, and the split is measured
+  # rather than tidy -- see the false positive named at the bottom of this note. The
+  # reason for widening at all is the one recorded at length above SSN. The egress gate
+  # now carries an independent MRN recogniser (`egress_gate.py`,
+  # `_INDEPENDENT_PATTERNS`), and a gate pattern is a DENIAL where a registry pattern
+  # is a detection:
+  #
+  #   detector claims it       ->  vaulted, obfuscated, RESTORABLE
+  #   only the gate claims it  ->  pass 3 blocks, 422 EGRESS_BLOCKED, demo exit 1
+  #
+  # so every spelling in the gap between the two classes is a working document the
+  # pipeline would refuse. The old class knew whitespace, colon, hash, dot, hyphen and
+  # slash and did not know the punctuation an intake form actually uses. Measured on
+  # the tree before this widening, `Record MRN<sep>4471902 on file.` at
+  # `--category medical`:
+  #
+  #   sep=', '   -> DATE@0.85     (mistyped, vaulted -- protected by accident)
+  #   sep=' ('   -> NOTHING       <-- 4471902 reached the provider VERBATIM
+  #   sep=' ['   -> NOTHING       <-- ditto
+  #   sep='='    -> NOTHING       <-- ditto
+  #   sep=' = '  -> NOTHING       <-- ditto
+  #   sep='] '   -> NOTHING       <-- ditto
+  #
+  # `Patient MRN [4471902] was reconciled against the ward list.` is the whole
+  # document, and `demo.py --file --category medical` printed it into the OUTBOUND
+  # PAYLOAD pane unchanged with EXIT=0. The class cannot cross an ASCII alphanumeric,
+  # so `Records show 8814027 encounters` stays outside it -- the run between label and
+  # digits contains letters, so there is no match to make.
+  #
+  # WHY THE SECOND BRANCH KEEPS THE OLD, NARROW CLASS. The first draft widened all
+  # nine labels at once and was measured, not assumed. It bought one false positive on
+  # the adversarial set:
+  #
+  #   'See the attached file, 20240115 is the export stamp.'  ->  MRN@0.70
+  #
+  # 'file', 'record', 'chart', 'patient', 'subject' and 'rec' are ordinary English
+  # nouns, and a comma after an ordinary noun is a clause break rather than a field
+  # separator. 'MRN' and 'medical record' are not ordinary nouns: the only thing they
+  # introduce is a chart number, which is what makes the wide class safe for them and
+  # not for the others. Splitting the pattern on that line closes the leak above and
+  # returns the adversarial set to zero new claims, so the trade is not "one leak for
+  # one false positive" -- it is the leak for nothing.
+  #
+  # The two branches are separate `patterns:` entries rather than one alternation
+  # because `\K` has to sit inside each branch and the single-pattern form was
+  # unreadable at this length; nothing in the suite requires MRN to have exactly one.
+  # A document matching both (`Medical Record Number 4471902`) yields the same span
+  # twice and overlap resolution keeps one.
+  #
+  # Measured cost of the widening, over the shipped corpora: 873-span fixture census
+  # unchanged at 873 and span-for-span identical, tuned recall 320 values unchanged,
+  # held-out recall 366 values unchanged, 0 detections on both clean corpora before and
+  # after, and 0 of 37 adversarial MRN/account/EIN-shaped-but-not documents newly
+  # claimed.
   MRN:
     category: PHI
     patterns:
-      - '(?i)\b(?:mrn|mr|medical\s+record|record|rec|chart|patient|subject|file)s?\.?[\s:#.\-/]*+(?:(?:number|num|no|ident|id|ref|#)\.?[\s:#.\-/]*+(?:(?:is|was)[\s:#.\-/]*+)?)?\K\d{6,10}\b'
+      - '(?i)\b(?:mrn|medical\s++record)s?\.?[^0-9A-Za-z]*+(?:(?:number|num|no|ident|id|ref|#)\.?[^0-9A-Za-z]*+(?:(?:is|was)[^0-9A-Za-z]*+)?)?\K\d{6,10}\b'
+      - '(?i)\b(?:mr|record|rec|chart|patient|subject|file)s?\.?[\s:#.\-/]*+(?:(?:number|num|no|ident|id|ref|#)\.?[\s:#.\-/]*+(?:(?:is|was)[\s:#.\-/]*+)?)?\K\d{6,10}\b'
     context: [medical, record, chart]
     tier: 1
 
@@ -608,7 +665,35 @@ entities:
     # The group separator is a single ' ' or '-' rather than a run, and the repeat is
     # bounded, so the second branch adds no unbounded quantifier to a pattern this
     # file has already paid to make linear.
-    patterns: ['(?i)\b(?:acct|account|a/c)s?\.?[\s:#.\-]*+(?:(?:number|num|no|ident|id|ref|#)\.?[\s:#.\-]*+(?:(?:is|was)[\s:#.\-]*+)?)?\K(?:\d{8,17}|\d{4}(?:[ -]\d{4}){2,3})\b']
+    #
+    # THE SEPARATOR CLASS IS '[^0-9A-Za-z]*+', WIDENED FROM '[\s:#.\-]*+', for the
+    # reason recorded above SSN and above MRN: the egress gate now carries an
+    # independent ACCOUNT_NUMBER recogniser, and a spelling only the GATE claims is a
+    # 422 rather than an obfuscation. The old class was the narrowest of the three in
+    # this file -- it did not even know the slash MRN's did. Measured before this
+    # widening, `Record Account<sep>100200300400 on file.` at `--category financial`,
+    # every one of these NOTHING, i.e. twelve digits on the wire verbatim:
+    #
+    #   sep=', '   sep=' ('   sep=' ['   sep='/'   sep='='   sep=' , '
+    #   sep='] '   sep=' = '  sep='? '
+    #
+    # `Please credit account [100200300400] at the receiving bank.` is the whole
+    # document, and `demo.py --file --category financial` printed it into the OUTBOUND
+    # PAYLOAD pane unchanged with EXIT=0.
+    #
+    # WHAT WAS DELIBERATELY NOT WIDENED: the LABEL set. 'routing', 'aba', 'checking'
+    # and 'savings' were considered and refused. A routing number is a *published*
+    # bank identifier -- the Federal Reserve prints the list -- so claiming it buys no
+    # privacy and costs a token in the payload; and 'checking'/'savings' in the reading
+    # that matters ('checking account', 'savings account') already carry the word this
+    # pattern anchors on. Today `Routing 021000021` types as PHONE@0.40 and is redacted
+    # rather than vaulted, which is recorded here as residual rather than fixed.
+    #
+    # Measured cost of the separator widening: 873-span fixture census unchanged at
+    # 873, tuned recall (320 values) and held-out recall (366 values) unchanged, 0
+    # detections on both clean corpora before and after, and 0 of 37 adversarial
+    # account-shaped-but-not documents newly claimed.
+    patterns: ['(?i)\b(?:acct|account|a/c)s?\.?[^0-9A-Za-z]*+(?:(?:number|num|no|ident|id|ref|#)\.?[^0-9A-Za-z]*+(?:(?:is|was)[^0-9A-Za-z]*+)?)?\K(?:\d{8,17}|\d{4}(?:[ -]\d{4}){2,3})\b']
     # "rout" is not a typo, and it is not the doc's "routing" repaired either. The
     # noun-adjunct lemma of "routing" is "routing", so the doc's own word already
     # boosts in the ACH reading; "rout" is the lemma only of the verb. "rout" is a
@@ -619,9 +704,70 @@ entities:
     context: [account, bank, rout]
     tier: 1
 
+  # THE SECOND PATTERN IS A LABEL-ANCHORED BACKSTOP, and it exists for the same reason
+  # SSN's does: the shipped rule knows ONE spelling of a nine-digit identifier and the
+  # IRS prints four. '\b\d{2}-\d{7}\b' requires the hyphen and requires it in position
+  # two, so every other way a W-9 writes an EIN was claimed by nothing at all, never
+  # vaulted, and had no needle in any egress pass. Measured on the tree before this
+  # pattern existed, `detect(..., 'financial')`:
+  #
+  #   'EIN: 12-3456789 appears on the return.'                 -> TAX_ID@1.00
+  #   'The EIN 123456789 is on the W-9 for the vendor.'         -> []
+  #   'Employer Identification Number 987654321 filed late.'    -> []
+  #   'Federal Tax ID 123456789 was verified.'                  -> []
+  #   'Taxpayer identification number 741852963 on file.'       -> []
+  #   'FEIN 12 3456789 per the payroll register.'               -> []
+  #   'EIN 12.3456789 on the notice.'                           -> []
+  #   'TIN 123456789 supplied by the payee.'                    -> []
+  #
+  # `The EIN 123456789 is recorded on the signed W-9 for the vendor.` is the whole
+  # document, and `demo.py --file --category financial` printed the nine digits into
+  # the OUTBOUND PAYLOAD pane verbatim with EXIT=0 and EGRESS_PASS.
+  #
+  # PRECISION IS THE DESIGN, and a bare '\b\d{9}\b' rule is refused here for the reason
+  # the identifier-position note above MRN gives. This asks for a TAX LABEL in
+  # identifier position -- the same grammar MRN, ACCOUNT_NUMBER, CASE_ID and the SSN
+  # backstop use -- and claims the digits only where a noun phrase naming a taxpayer
+  # identification number introduces them.
+  #
+  # 'TIN' IS THE ONE CASE-SENSITIVE LABEL, VIA '(?-i:TIN)', and that is a measured
+  # correction rather than a style choice. A W-9 prints 'Taxpayer Identification Number
+  # (TIN)', so the initialism has to be here; but 'tin' is also an ordinary English
+  # noun, and the case-insensitive spelling bought exactly one false positive on the
+  # adversarial set:
+  #
+  #   'The tin, 123456789 units were pressed at the mill.'  ->  TAX_ID@0.70
+  #
+  # The IRS label is an initialism and is always upper case; the metal never is. The
+  # scoped negative flag is supported by both engines this repo runs patterns through
+  # (`regex` here, `re` in the gate's copy), verified on both. Every other label stays
+  # case-insensitive: 'ein', 'fein' and 'taxpayer identification' are not English words
+  # in any casing.
+  #
+  # THE SPAN IS THE IDENTIFIER, NOT THE LABEL -- '\K'. Vaulting 'EIN 123456789' would
+  # leave a second, unlabelled mention of the bare digits with no pass-1 needle.
+  #
+  # THE COPULA IS ADMITTED WITHOUT A NUMBER WORD, unlike MRN and ACCOUNT_NUMBER and
+  # like SSN. MRN's note refuses it because 'chart'/'record'/'patient' are ordinary
+  # nouns and 'Records show 8814027 encounters' would become an identifier. Every label
+  # here is self-identifying -- there is no reading of 'EIN is 123456789' in which the
+  # digits are a quantity.
+  #
+  # MEASURED COST. 873-span fixture census unchanged at 873; tuned recall (320 values)
+  # and held-out recall (366 values) unchanged; 0 detections across both clean corpora
+  # before and after; and over 37 adversarial documents carrying EIN-shaped runs that
+  # are not EINs -- invoice, order, PO, part, serial, firmware, SKU, asset tag, phone,
+  # ZIP+4, routing, ABA, timestamp, epoch, sequence -- plus the four label traps
+  # written specifically against this pattern ('The tin, 123456789 units were pressed',
+  # 'Taxidermy invoice 123456789', 'Tax was 123456789 cents', 'Einstein 123456789'),
+  # this pattern adds ZERO claims. The two pre-existing false positives in that set
+  # ('Order reference 12-3456789', 'Serial 12-3456789') belong to the unlabelled first
+  # pattern and are unchanged by this one.
   TAX_ID:
     category: FIN
-    patterns: ['\b\d{2}-\d{7}\b']
+    patterns:
+      - '\b\d{2}-\d{7}\b'
+      - '(?i)\b(?:eins?|e\.i\.n\.?|feins?|(?-i:TIN)s?|employer\s++id(?:entification)?|(?:federal\s++)?tax(?:payer)?\s*+(?:id(?:entification)?|i\.d\.))[^0-9A-Za-z]*+(?:(?:number|num|nbr|no|ident|id|ref|#)\.?[^0-9A-Za-z]*+)?(?:(?:is|was)[^0-9A-Za-z]*+)?\K\d{2}[- .]?\d{7}(?![0-9])'
     context: [ein, tax, taxpayer]
     tier: 1
 

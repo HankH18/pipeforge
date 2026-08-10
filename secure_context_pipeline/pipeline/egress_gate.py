@@ -310,10 +310,42 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# Pattern-typed entities with near-zero false-positive rates. A re-scan hit on one
-# of these is treated as a real leak and blocks. NER-typed re-hits (names the fake
+# The entity types a re-scan hit BLOCKS on. NER-typed re-hits (names the fake
 # generator produced contextually) are logged as warnings instead -- blocking on
 # those would make pseudonymization unusable without improving the guarantee.
+#
+# THE COMMENT IS WHAT CHANGED HERE, NOT THE SET, and the note is worth more than the
+# edit. It used to read "pattern-typed entities with near-zero false-positive rates",
+# which is a rule this set does not follow: `INSURANCE_ID` (`\b[A-Z]{2,6}\d{7,12}\b`)
+# and `CASE_ID` are pattern-typed too and are not members. Stating a rule the
+# membership contradicts is worse than stating none, because the next reader either
+# widens the set to match the sentence or assumes an omission. Both are wrong. The
+# real rule is two-part, and both parts are load-bearing:
+#
+# 1. **The value is a direct identifier issued to a person by a government, a payer or
+#    a bank** -- the ones whose appearance in a third-party payload is the disclosure
+#    this pipeline exists to prevent.
+# 2. **The recogniser buys its specificity from a LABEL in identifier position, from a
+#    validator, or from a digit grouping no other identifier uses** -- never from
+#    "some capital letters welded to some digits". A block is a denial, so the pattern
+#    behind it has to be one an ordinary business document does not trip.
+#
+# `INSURANCE_ID` and `CASE_ID` pass (1) and fail (2), measured rather than asserted.
+# Over sixteen ordinary non-PII strings (part numbers, SKUs, firmware builds, shipping
+# container IDs, air waybills, Bates stamps, model numbers, licence plates, GL codes,
+# cost centres, change tickets, ISO/DIN standard numbers, drawing revisions):
+#
+#     INSURANCE_ID  claims  8/16   ABC12345678, XLGE9087412, FW20240115093,
+#                                  MSKU4412093, AWB12345678901, DEF00012345,
+#                                  CAT9088123, ABC1234567
+#     CASE_ID       claims  6/16   CC-2024-118, CHG-2024-4471, ISO-9001-2015,
+#                                  REV-2024-118, 12-abc-4471, DIN-1234-567
+#
+# Half of an ordinary parts list would 422. `CASE_ID` has a second, independent reason:
+# a docket number is a PUBLIC record, so refusing a payload that carries one buys no
+# confidentiality and costs the caller their request. Both stay out, both stay
+# detected, vaulted and restorable, and a re-scan hit on either is still recorded --
+# as an advisory `rescan_warnings` count rather than as a block.
 HIGH_SEVERITY_TYPES = frozenset({"SSN", "MRN", "ACCOUNT_NUMBER", "TAX_ID"})
 
 # Originals shorter than this are not scanned for. A one- or two-character value
@@ -1001,15 +1033,28 @@ class EgressGate:
         would hand an uploader a lever on the gate's input -- a strictly larger
         version of the two bypasses :meth:`_protected_spans` exists to close.
 
-        **The re-scan asks for the category-unscoped entity set** (``doc_category``
-        is ``None``): the payload is not a document and carries no category, and
-        claiming one would be guessing. The cost is that entities declared
-        ``only_in_doc_categories`` are not re-detected here -- today ``DATE``,
-        ``AMOUNT``, ``CLIENT_IDENTITY`` and ``CASE_STRATEGY``. None of them is in
-        :data:`HIGH_SEVERITY_TYPES`, so no *blocking* decision is affected, and pass 1
-        still covers every one of them that was vaulted. That last sentence is a claim
-        about a *config file* made in a *source file*, which is exactly the shape that
-        goes quietly stale, so ``test_no_high_severity_entity_is_scoped_out_of_the_rescan``
+        **The re-scan asks with no category** (``doc_category`` is ``None``): the
+        payload is not a document and carries no category, and claiming one would be
+        guessing. **That used to cost a coverage gap and no longer does**, which is
+        worth stating because this docstring asserted the opposite until the
+        ``doc_category`` fail-open was closed. It read: "the cost is that entities
+        declared ``only_in_doc_categories`` are not re-detected here -- today
+        ``DATE``, ``AMOUNT``, ``CLIENT_IDENTITY`` and ``CASE_STRATEGY``." Since
+        :meth:`Detector._scoped_types` returns the *union* of every category's rules
+        on ``None`` rather than the unscoped subset, they are. Measured on a payload
+        carrying one of each, the re-scan returns ``['AMOUNT', 'DATE', 'NAME']``: the
+        scoped types come back, and ``CLIENT_IDENTITY`` resolves to ``NAME`` because
+        both claim the same span and there is no legal category to prefer the legal
+        type with -- a label difference, not a coverage one.
+
+        The old sentence was stale in the *safe* direction (it under-claimed what
+        pass 2 sees) and is corrected rather than deleted, because a comment that
+        under-claims still teaches the next reader the wrong model of this pass.
+        None of the four is in :data:`HIGH_SEVERITY_TYPES`, so no *blocking* decision
+        turns on any of it either way, and pass 1 still covers every one of them that
+        was vaulted. That last sentence is a claim about a *config file* made in a
+        *source file*, which is exactly the shape that goes quietly stale, so
+        ``test_no_high_severity_entity_is_scoped_out_of_the_rescan``
         re-derives both sets from the shipped registry and this constant and fails the
         day someone gives a high-severity entity an ``only_in_doc_categories``.
 
@@ -2845,6 +2890,80 @@ def _composite_needles(value: str) -> tuple[str, ...]:
 #: written. Naming a guard that does not exist is worse than naming none, because it is
 #: where the next reader stops looking -- the same defect this module documents in
 #: itself twice above.)
+#:
+#: ---------------------------------------------------------------------------------
+#: **THE OTHER THREE HIGH-SEVERITY TYPES, AND WHY THEY WERE MISSING.**
+#:
+#: Everything above argued the case for ``SSN`` and then shipped ``SSN`` alone, while
+#: :data:`HIGH_SEVERITY_TYPES` named four types a pass-2 re-hit *blocks* on. For the
+#: other three the only recogniser in the whole system was the single registry pattern,
+#: consulted identically at detect time and again in pass 2 -- so "defence in depth" was
+#: two layers sharing one brain, and the argument this constant was built on was
+#: answered for 25% of the blocking surface. That is not hypothetical: it is the exact
+#: shape of the cleartext SSN leak the notes above record, and it was open for
+#: ``MRN``, ``ACCOUNT_NUMBER`` and ``TAX_ID`` at the same time. Reproduced first, on
+#: the shipped ``demo.py --file`` with the mock provider, ORIGINAL DOCUMENT beside
+#: OUTBOUND PAYLOAD, all three ``EXIT=0`` with ``EGRESS_PASS`` audited::
+#:
+#:     Patient MRN [4471902] was reconciled ...   -> Patient MRN [4471902] was ...
+#:     Please credit account [100200300400] ...   -> Please credit account [1002...
+#:     The EIN 123456789 is recorded on the ...   -> The EIN 123456789 is record...
+#:
+#: **Each new entry is derived from the requirement, not from the registry.** None of
+#: them imports ``entities.yaml``; each is hand-written here against ``re`` from what
+#: the identifier *is* -- a medical record number is a 6-10 digit chart number
+#: introduced by a noun phrase naming a medical record; a US bank account number is an
+#: 8-17 digit run (or four 4-digit groups) introduced by a noun phrase naming an
+#: account; an EIN is nine digits, canonically ``NN-NNNNNNN``, either standing alone in
+#: that grouping or introduced by a noun phrase naming a taxpayer identification
+#: number. That the label vocabularies then *overlap* the registry's is not a failure
+#: of independence -- there is only one English noun phrase for "account number" -- and
+#: it is not what independence buys. What it buys is stated above and is unchanged: a
+#: one-line edit to a YAML file cannot blind the gate at the same moment it blinds the
+#: detector, because these five patterns live in a different file, in a different regex
+#: dialect, and are reached by no code path that reads the registry.
+#:
+#: **Containment is preserved for every new entry, and it cost registry widenings.**
+#: The invariant (``test_detection.py::test_every_egress_gate_pattern_is_contained_by_
+#: the_registry`` and its ``_vaultable_not_merely_blockable`` sibling, both parametrized
+#: over this tuple) is that every span any entry here would block, the registry claims
+#: too, with the same span, at or above ``threshold_obfuscate``. Three widenings in
+#: ``entities.yaml`` were needed to keep it, each measured in the note above its entry:
+#:
+#: * ``MRN`` separator class ``[\s:#.\-/]*+`` -> ``[^0-9A-Za-z]*+``, for the two
+#:   self-identifying labels only -- widening all nine bought a false positive on
+#:   ``'See the attached file, 20240115 is the export stamp.'`` and the split removes it
+#: * ``ACCOUNT_NUMBER`` separator class ``[\s:#.\-]*+`` -> ``[^0-9A-Za-z]*+``
+#: * ``TAX_ID`` gains a label-anchored branch for the spellings that are not
+#:   ``NN-NNNNNNN``. Its ``TIN`` label is case-sensitive in both copies, because ``tin``
+#:   is an English noun and the case-insensitive spelling claimed
+#:   ``'The tin, 123456789 units were pressed at the mill.'``
+#:
+#: The direction is the one this module has fixed twice already: **widen the registry,
+#: never narrow the gate.** Every string in each gap was a document the gate would have
+#: refused (422, ``demo.py --file`` exit 1) and the detector could have vaulted.
+#:
+#: **What each entry deliberately does NOT claim.**
+#:
+#: * ``MRN`` is the one refusal. The registry's own note calls out the residual -- "a
+#:   chart number in an unlabelled table or CSV column, where no noun introduces it at
+#:   all" -- and nothing short of a bare ``\b[0-9]{6,10}\b`` rule reaches it. Measured
+#:   on the 37-document adversarial set: a bare 6-10 digit rule claims **20 of 37**,
+#:   including every invoice number, order number, part number, ZIP+4, timestamp and
+#:   epoch in it. As a *gate* pattern each of those is a 422 on an ordinary document,
+#:   so the unlabelled MRN stays refused and is declared rather than half-fixed. The
+#:   labelled MRN is claimed, with the two self-identifying labels only (``mrn``,
+#:   ``medical record``) rather than the registry's nine -- ``record``, ``chart``,
+#:   ``patient``, ``subject``, ``file`` are ordinary nouns, and a *denial* wants a
+#:   tighter grip on the label than a *detection* does.
+#: * ``ACCOUNT_NUMBER`` claims ``account``/``acct``/``a/c`` and not ``routing``/``aba``.
+#:   A routing number is published by the Federal Reserve; blocking on one is a denial
+#:   with no privacy benefit.
+#: * ``TAX_ID`` carries the unlabelled ``NN-NNNNNNN`` grouping because the registry has
+#:   always claimed exactly that shape unconditionally, so the copy adds no denial the
+#:   pipeline did not already make -- it only makes the claim survive an edit to the
+#:   config. The bare nine-digit run with no label anywhere near it is refused here for
+#:   the same reason it is refused for ``SSN``.
 _INDEPENDENT_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("SSN", re.compile(r"\b(?P<v>[0-9]{3}[-. ][0-9]{2}[-. ][0-9]{4})\b")),
     (
@@ -2854,6 +2973,50 @@ _INDEPENDENT_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             r"[^0-9A-Za-z]{0,24}(?:(?:number|num|nbr|no|id|#)\.?[^0-9A-Za-z]{0,24})?"
             r"(?:(?:is|was)[^0-9A-Za-z]{0,24})?"
             r"(?P<v>[0-9]{3}[-. ]?[0-9]{2}[-. ]?[0-9]{4})(?![0-9])",
+            re.IGNORECASE,
+        ),
+    ),
+    # MRN -- labelled only, and only the two labels that name a medical record and
+    # nothing else. The copula is nested inside the number-word group on purpose: it
+    # mirrors the registry, whose note measured that a free-standing "is" turns
+    # "Records show 8814027 encounters" into an identifier.
+    (
+        "MRN",
+        re.compile(
+            r"\b(?:mrn|medical\s+record)s?\.?[^0-9A-Za-z]{0,24}"
+            r"(?:(?:number|num|no|ident|id|ref|#)\.?[^0-9A-Za-z]{0,24}"
+            r"(?:(?:is|was)[^0-9A-Za-z]{0,24})?)?"
+            r"(?P<v>[0-9]{6,10})\b",
+            re.IGNORECASE,
+        ),
+    ),
+    # ACCOUNT_NUMBER -- the 8-17 digit run and the four-group card/IBAN-style spelling,
+    # both introduced by an account noun phrase. Copula nested, as for MRN.
+    (
+        "ACCOUNT_NUMBER",
+        re.compile(
+            r"\b(?:acct|account|a/c)s?\.?[^0-9A-Za-z]{0,24}"
+            r"(?:(?:number|num|no|ident|id|ref|#)\.?[^0-9A-Za-z]{0,24}"
+            r"(?:(?:is|was)[^0-9A-Za-z]{0,24})?)?"
+            r"(?P<v>[0-9]{8,17}|[0-9]{4}(?:[ -][0-9]{4}){2,3})\b",
+            re.IGNORECASE,
+        ),
+    ),
+    # TAX_ID -- the canonical IRS grouping standing alone, ...
+    ("TAX_ID", re.compile(r"\b(?P<v>[0-9]{2}-[0-9]{7})\b")),
+    # ... and any nine-digit spelling a taxpayer-identification noun phrase introduces.
+    # Free-standing copula, as for SSN and unlike MRN: every label here is
+    # self-identifying, so there is no reading of "EIN is 123456789" in which the
+    # digits are a quantity.
+    (
+        "TAX_ID",
+        re.compile(
+            r"\b(?:eins?|e\.i\.n\.?|feins?|(?-i:TIN)s?|employer\s+id(?:entification)?"
+            r"|(?:federal\s+)?tax(?:payer)?\s*(?:id(?:entification)?|i\.d\.))"
+            r"[^0-9A-Za-z]{0,24}"
+            r"(?:(?:number|num|nbr|no|ident|id|ref|#)\.?[^0-9A-Za-z]{0,24})?"
+            r"(?:(?:is|was)[^0-9A-Za-z]{0,24})?"
+            r"(?P<v>[0-9]{2}[- .]?[0-9]{7})\b",
             re.IGNORECASE,
         ),
     ),

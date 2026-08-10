@@ -49,6 +49,7 @@ from secure_context_pipeline.deobfuscation.restorer import (
     _canonical_by_shape,
     _compile_salvage_pattern,
     _compile_surrogate_pattern,
+    _count_surrogate_near_misses,
     _minted_id_spans,
 )
 from secure_context_pipeline.errors import ConfigError, PipelineError, VaultMissError
@@ -2874,6 +2875,127 @@ async def test_a_pluralised_fake_is_not_counted_and_the_docstring_no_longer_says
     assert plural.text == "The Lopezes met."
     assert plural.surrogates_suspected_unrestored == 0
     assert shouted.surrogates_suspected_unrestored == 1
+
+
+#: The three survivals the near-miss counter exists to report, as
+#: ``(label, answer_text, issued_surrogates)``. Each one reaches the user AS THE
+#: FAKE with ``restored_count`` 0 and nothing else in the result saying so.
+_NEAR_MISS_CASES = (
+    ("an upper-cased heading", "PATIENT: CHRISTINE TAYLOR.", ["Christine Taylor"]),
+    ("a shouted surname", "THE LOPEZ FILE.", ["Lopez"]),
+    (
+        "a first line quoted out of a wrapped fake",
+        "The report names Duane Ingram as the filer.",
+        ["Duane Ingram\n    Date"],
+    ),
+)
+
+
+def test_the_near_miss_counter_survives_a_blinded_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backstop must not be built from the thing it backstops. Proved by mutation.
+
+    `_count_surrogate_near_misses` exists to catch fakes the main matcher *almost*
+    matched -- i.e. to be right where the matcher is wrong. It used to be
+    `_compile_surrogate_pattern(..., fold=True)`: the same alternation, the same
+    `LEFT_GUARD`/`RIGHT_GUARD`, the same whitespace flexing, compiled
+    case-insensitively. A backstop with that construction is blind in exactly the
+    places the matcher is blind, and it was: emptying the matcher's alternation
+    (`ordered = []`, one line, in a throwaway tree) took the counter to **0 on all
+    three cases below** -- every survival it exists to report, silent, with the
+    matcher broken and the suite otherwise green.
+
+    This blinds the matcher and everything it is built from, in-process, and demands
+    the counts anyway. It fails the moment anyone reconnects the two: import
+    `_compile_surrogate_pattern` back into the counter and this goes to zero the way
+    the throwaway tree did.
+
+    It deliberately blinds *more* than the one function -- the guards, the escaper,
+    the predicates -- because "does not call `_compile_surrogate_pattern`" is a
+    weaker property than "does not depend on the matcher's rules", and the second is
+    the one worth having.
+    """
+    import secure_context_pipeline.deobfuscation.restorer as module
+
+    def blinded_pattern(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the near-miss counter used the matcher it backstops")
+
+    monkeypatch.setattr(module, "_compile_surrogate_pattern", blinded_pattern)
+    monkeypatch.setattr(module, "_canonical_by_shape", blinded_pattern)
+    monkeypatch.setattr(module, "_escape_ws_flexible", blinded_pattern)
+    monkeypatch.setattr(module, "guards_left", blinded_pattern)
+    monkeypatch.setattr(module, "guards_right", blinded_pattern)
+    # Not callables: a rule reused as a string is reused just as completely. Both
+    # are regex assertions, so a blinded value that is still valid regex would let a
+    # borrowed guard keep working; `(?<!` is deliberately unbalanced.
+    monkeypatch.setattr(module, "LEFT_GUARD", "(?<!")
+    monkeypatch.setattr(module, "RIGHT_GUARD", "(?!")
+
+    for label, text, surrogates in _NEAR_MISS_CASES:
+        assert _count_surrogate_near_misses(text, surrogates, spliced=()) == 1, label
+
+
+def test_the_near_miss_counter_reports_the_same_cases_the_matcher_misses() -> None:
+    """Independence is only worth having if the two still agree on the answer.
+
+    The counter is derived apart from the matcher; that makes it useless if it also
+    *answers differently* on the ordinary cases. So both directions are pinned in one
+    place: it fires on each survival, and it stays silent on the two shapes the
+    module has measured and documented as NOT near misses -- a pluralised surname
+    (`Lopezes` is one word and is not `Lopez`) and a fake the matcher restored.
+    """
+    for label, text, surrogates in _NEAR_MISS_CASES:
+        assert _count_surrogate_near_misses(text, surrogates, spliced=()) == 1, label
+
+    assert _count_surrogate_near_misses("The Lopezes met.", ["Lopez"], spliced=()) == 0
+    # Wholly inside a span the surrogate pass wrote: a restored original legitimately
+    # contains another entity's fake, and counting it would be noise on a clean run.
+    text = "Karen Vance and Maria Torres signed off."
+    inside = (text.index("Maria Torres"), text.index("Maria Torres") + len("Maria Torres"))
+    assert _count_surrogate_near_misses(text, ["Torres"], spliced=(inside,)) == 0
+    assert _count_surrogate_near_misses(text, ["Torres"], spliced=()) == 1, (
+        "premise: it is the splice doing the excusing, not the absence of a match"
+    )
+
+
+def test_the_near_miss_counter_sees_survivals_the_matcher_cannot_express() -> None:
+    """Two documented places the mechanisms disagree, both in the safe direction.
+
+    Independence is only worth the code if it *buys* something, and these are the
+    two cases measured against the old folded-alternation counter where it read 0
+    and the fake was still on the reader's screen:
+
+    * **Re-punctuation.** The matcher is a regex over the fake's literal characters,
+      so a phone-number pseudonym the model reformatted stops matching. The counter
+      compares word tuples, so punctuation never enters the question.
+    * **A case fold that changes length.** ``re.IGNORECASE`` does not fold the German
+      sharp s: measured, the folded alternation for ``Straße 1`` matches
+      ``straße 1`` and does **not** match ``STRASSE 1``. Folding per word with
+      ``str.casefold`` does, and per-word folding is also what lets it, since the
+      old scan had to abandon NFKC entirely whenever the fold moved the text's
+      offsets out from under ``spliced``.
+
+    Pinned as properties rather than left as side effects, because they are the
+    clearest evidence the two are not the same code wearing two names.
+    """
+    fake = "(415) 555-0123"
+    reformatted = "Call the office at 415 555 0123 for the record."
+    matcher = _compile_surrogate_pattern([fake])
+    assert matcher is not None, "premise: the fake compiles"
+    assert matcher.search(reformatted) is None, "premise: the matcher cannot see it"
+    assert _count_surrogate_near_misses(reformatted, [fake], spliced=()) == 1
+
+    sharp_s = "Straße 1"
+    shouted = "Delivered to STRASSE 1 today."
+    folded = re.compile(_compile_surrogate_pattern([sharp_s]).pattern, re.IGNORECASE)  # type: ignore[union-attr]
+    assert folded.search("Delivered to straße 1 today.") is not None, (
+        "premise: the old folded build did catch the ordinary lowercase form"
+    )
+    assert folded.search(shouted) is None, (
+        "premise: and did NOT catch this one -- re.IGNORECASE has no sharp-s rule"
+    )
+    assert _count_surrogate_near_misses(shouted, [sharp_s], spliced=()) == 1
 
 
 async def test_the_near_miss_count_is_an_upper_bound_and_says_so(

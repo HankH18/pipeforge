@@ -119,6 +119,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import coverage
 from coverage.python import PythonFileReporter
@@ -1881,31 +1882,77 @@ def test_the_next_day_plan_proposes_only_work_that_is_still_open() -> None:
             "as already paid"
         )
 
-    # The binding half. Pass 3 is the gate's only independent limb; the plan's
-    # second item says it covers one of the four blocking types, and that is a
-    # property of two constants rather than of this page.
+    # No proposal may cite a gap the register itself marks [CLOSED]. This is the
+    # general form of the two hand-written openness probes that used to sit below,
+    # and it covers every entry rather than the two gap numbers they could see.
+    closed = {number for number, entry in entries.items() if "[CLOSED]" in entry}
+    assert closed, (
+        "section 7's register marks nothing [CLOSED], so this check cannot bind. If every gap "
+        "really is open, delete this assertion deliberately rather than letting it pass vacuously"
+    )
+    for number in sorted(cited):
+        assert number not in closed, (
+            f"the next-day plan proposes gap {number}, which the register above it marks [CLOSED]"
+        )
+
+    # -- the two code-derived probes, rewritten when the gaps they watched closed --
+    #
+    # TEST OBSOLETE BY A DELIBERATE, CITED CHANGE -- not "too strict", and recorded
+    # here because a test edit with no written justification is indistinguishable
+    # from reward hacking later. These two assertions read:
+    #
+    #     assert independent < HIGH_SEVERITY_TYPES
+    #     assert len(independent) == 1 and len(HIGH_SEVERITY_TYPES) == 4
+    #     assert _validate_category(None) is None
+    #
+    # They were tripwires by design: the docstring above says "if another change
+    # closes them, this test goes red on the sentence that is now wrong". Section 7
+    # gaps 4 and 5 were then closed on purpose -- pass 3 went from two SSN
+    # recognisers to six across all four blocking types, and an undeclared
+    # doc_category went from the unscoped subset to every category's rules -- so the
+    # tripwires fired as built, and the first one's own message named the required
+    # response: "rewrite it and this assertion together".
+    #
+    # They are REPLACED, not relaxed, by the same properties read the other way
+    # round, so the coupling survives the rewrite: what used to redden when a gap
+    # closed now reddens if the closure is ever undone while section 7 still claims
+    # it. Both directions are covered where one was.
     from secure_context_pipeline.pipeline.egress_gate import (
         _INDEPENDENT_PATTERNS,
         HIGH_SEVERITY_TYPES,
     )
 
     independent = {entity_type for entity_type, _ in _INDEPENDENT_PATTERNS}
-    assert independent < HIGH_SEVERITY_TYPES, (
-        "pass 3 now covers every high-severity type, so the next-day plan's second item is "
-        "proposing work that is already done -- rewrite it and this assertion together"
-    )
-    assert len(independent) == 1 and len(HIGH_SEVERITY_TYPES) == 4, (
-        f"pass 3 covers {sorted(independent)} of {sorted(HIGH_SEVERITY_TYPES)}; the plan and "
-        "section 7 gap 5 both describe it as one of four"
+    assert independent == HIGH_SEVERITY_TYPES, (
+        f"pass 3 has an independent recogniser for {sorted(independent)} while the gate blocks "
+        f"on {sorted(HIGH_SEVERITY_TYPES)}. Section 7 gap 5 is marked [CLOSED] on exactly the "
+        "claim that those two sets are equal, so either pass 3 narrowed or the register is wrong"
     )
 
-    # And the plan's first item, the same way: the omission it proposes to close
-    # is a live default, not a historical one.
-    from secure_context_pipeline.store.document_store import _validate_category
+    # The plan's old first item was gap 4, and its openness probe was
+    # `_validate_category(None) is None`. That proxy was WRONG independently of any
+    # of this, which is the finding worth keeping: gap 4 was closed in the
+    # DETECTOR, `_validate_category(None)` still returns None by design (an absent
+    # category is not an *invalid* one), and this line therefore stayed green
+    # straight through the fix it was supposed to notice. The replacement asserts
+    # the property the fix actually established, off the real method body.
+    from secure_context_pipeline.detection.detector import Detector
+    from secure_context_pipeline.detection.registry import load_registry
+    from secure_context_pipeline.models import DOC_CATEGORIES
 
-    assert _validate_category(None) is None, (
-        "an absent doc_category is no longer waved through, so the next-day plan's first "
-        "item is proposing a fix that has landed"
+    registry = load_registry(REPO_ROOT / "entities.yaml")
+    undeclared = set(Detector._scoped_types(SimpleNamespace(_registry=registry), None))
+    for category in DOC_CATEGORIES:
+        missing = set(registry.types_for_doc(category)) - undeclared
+        assert not missing, (
+            f"an undeclared doc_category scopes out {sorted(missing)}, which '{category}' "
+            "declares. Section 7 gap 4 is marked [CLOSED] on the claim that an absent category "
+            "asks for the union of every declared one"
+        )
+    scoped = {name for name, spec in registry.entities.items() if spec.only_in_doc_categories}
+    assert scoped and scoped <= undeclared, (
+        f"the category-scoped entities are {sorted(scoped)} and an undeclared category reaches "
+        f"{sorted(scoped & undeclared)}; the omission gap 4 records is open again"
     )
 
 

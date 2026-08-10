@@ -23,7 +23,7 @@ import string
 import sys
 import time
 import unicodedata
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2034,6 +2034,37 @@ def _registry_ssn_pattern() -> Any:
     return regex.compile(spec[0])
 
 
+def _labelled_ssn_entry() -> re.Pattern[str]:
+    """Pass 3's label-anchored SSN recogniser, found by what it claims.
+
+    **This replaces a positional lookup, at that lookup's own instruction.** The two
+    tests below used to read ``_INDEPENDENT_PATTERNS[1][1]`` behind the guard
+    ``assert [name for name, _ in _INDEPENDENT_PATTERNS] == ["SSN", "SSN"]``, whose
+    message said the index "must be re-derived rather than re-indexed blindly" if the
+    list changed shape. It has: pass 3 now carries ``MRN``, ``ACCOUNT_NUMBER`` and
+    ``TAX_ID`` entries beside the two SSN ones. This is that re-derivation.
+
+    It is strictly stronger than the guard it replaces, in the direction that matters.
+    The old form pinned the list's *shape* and then trusted position, so a reordering
+    of two SSN entries would have silently pointed these tests at the unlabelled rule
+    and they would have gone on passing against the wrong pattern. This finds the entry
+    by the property the tests actually need -- the labelled rule is the one that claims
+    a BARE nine-digit run once an SSN noun phrase introduces it, which the unlabelled
+    delimited rule cannot -- and fails if the number of entries with that property is
+    anything other than one.
+    """
+    labelled = [
+        pattern
+        for entity_type, pattern in _INDEPENDENT_PATTERNS
+        if entity_type == "SSN" and pattern.search("Member SSN 123456789 on file.")
+    ]
+    assert len(labelled) == 1, (
+        f"expected exactly one label-anchored SSN entry in _INDEPENDENT_PATTERNS, found "
+        f"{len(labelled)}; these tests are about that entry and cannot pick one for you"
+    )
+    return labelled[0]
+
+
 def test_every_labelled_ssn_the_gate_claims_the_registry_claims_too() -> None:
     """The gate's labelled SSN rule must be a SUBSET of the registry's, span for span.
 
@@ -2071,13 +2102,7 @@ def test_every_labelled_ssn_the_gate_claims_the_registry_claims_too() -> None:
     protects, and the invariant would be satisfied on paper while still blocking.
     """
     registry_pattern = _registry_ssn_pattern()
-    # The label-anchored entry is the second one; the first is the unlabelled
-    # delimited rule, which is deliberately NOT registry-backed (README Deviation 58).
-    assert [name for name, _ in _INDEPENDENT_PATTERNS] == ["SSN", "SSN"], (
-        "pass 3's pattern list changed shape; this test indexes the label-anchored "
-        "entry positionally and must be re-derived rather than re-indexed blindly"
-    )
-    gate_labelled = _INDEPENDENT_PATTERNS[1][1]
+    gate_labelled = _labelled_ssn_entry()
 
     missed: list[tuple[str, str, tuple[int, int]]] = []
     span_mismatch: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
@@ -2127,7 +2152,7 @@ def test_the_registry_ssn_separator_class_is_not_narrower_than_the_gates() -> No
     import regex
 
     registry_pattern = _registry_ssn_pattern()
-    gate_labelled = _INDEPENDENT_PATTERNS[1][1]
+    gate_labelled = _labelled_ssn_entry()
 
     gate_class = regex.compile(r"[^0-9A-Za-z]")
     assert "[^0-9A-Za-z]" in gate_labelled.pattern, (
@@ -2257,6 +2282,272 @@ async def test_the_space_separator_costs_pass_three_nothing_pass_two_did_not_alr
     with pytest.raises(EgressBlockedError) as exc:
         await _real_gate(real_detector, real_settings, set()).check(table_row, SESSION)
     assert exc.value.detail["reason"] == "detector_rescan"
+
+
+# ---------------------------------------------------------------------------
+# Pass 3, the other three high-severity types
+# ---------------------------------------------------------------------------
+# Everything above this line is about ``SSN``, which is what pass 3 covered while
+# ``HIGH_SEVERITY_TYPES`` named four types. For ``MRN``, ``ACCOUNT_NUMBER`` and
+# ``TAX_ID`` the only recogniser in the system was the single registry pattern,
+# consulted at detect time and again by pass 2 -- two layers, one brain. Reproduced
+# on the shipped ``demo.py --file`` before the repair, all three ``EXIT=0`` with
+# ``EGRESS_PASS`` audited and the identifier in the OUTBOUND PAYLOAD pane verbatim:
+#
+#     Patient MRN [4471902] was reconciled against the ward list.   (medical)
+#     Please credit account [100200300400] at the receiving bank.   (financial)
+#     The EIN 123456789 is recorded on the signed W-9 for the vendor. (financial)
+#
+# All three are now detected, vaulted, tokenized and restored -- the better outcome,
+# not merely blocked. The tests below hold the two halves of that separately: the
+# registry half (``test_the_shipped_detector_claims_...``) and the gate half, which
+# runs against a registry edited to remove the rule and is the only thing that proves
+# "detection is config, the gate is the guarantee" for these three types.
+
+
+@pytest.fixture
+def deregistered_detector(real_settings: Settings) -> Callable[[str], Detector]:
+    """The shipped detector with ONE entity's ``patterns:`` deleted, by name.
+
+    The same construction as :func:`unbackstopped_detector` and for the same reason:
+    the premise a pass-3 test needs is "a real recogniser says nothing about this
+    string", and a ``FakeDetector`` would let the test invent that premise instead of
+    measuring it. Everything else is the shipped thing -- real registry, real
+    Presidio recognizers, real spaCy.
+
+    Parametrized by entity type because pass 3 now has four types to isolate, and
+    because *this fixture is the registry edit the layering claim is about*: if a
+    one-line change to ``entities.yaml`` could switch the gate off, the gate is not a
+    second opinion. Applying that edit deliberately is how the claim gets tested
+    rather than asserted.
+    """
+
+    def build(entity_type: str) -> Detector:
+        shipped = load_registry(REGISTRY_PATH)
+        assert shipped.entities[entity_type].patterns, (
+            f"entities.yaml no longer carries a {entity_type} pattern; this fixture is "
+            "supposed to REMOVE one, and removing nothing would make the pass-3 test "
+            "using it pass for the wrong reason"
+        )
+        entities = dict(shipped.entities)
+        entities[entity_type] = entities[entity_type].model_copy(update={"patterns": ()})
+        return Detector(shipped.model_copy(update={"entities": entities}), real_settings)
+
+    return build
+
+
+#: One payload per non-SSN high-severity type, each the document that reached the
+#: provider in the clear before pass 3 grew an opinion about it, plus the category the
+#: registry scopes the type to.
+_PASS_THREE_TYPE_CASES = [
+    pytest.param(
+        "MRN",
+        "Patient MRN [4471902] was reconciled against the ward list.",
+        "4471902",
+        "medical",
+        id="mrn-labelled-bracketed",
+    ),
+    pytest.param(
+        "ACCOUNT_NUMBER",
+        "Please credit account [100200300400] at the receiving bank.",
+        "100200300400",
+        "financial",
+        id="account-labelled-bracketed",
+    ),
+    pytest.param(
+        "TAX_ID",
+        "The EIN 123456789 is recorded on the signed W-9 for the vendor.",
+        "123456789",
+        "financial",
+        id="taxid-labelled-bare-nine-digits",
+    ),
+]
+
+
+@pytest.mark.parametrize(("entity_type", "payload", "value", "category"), _PASS_THREE_TYPE_CASES)
+async def test_pass_three_blocks_each_high_severity_type_with_its_registry_rule_deleted(
+    deregistered_detector: Callable[[str], Detector],
+    real_settings: Settings,
+    entity_type: str,
+    payload: str,
+    value: str,
+    category: str,
+) -> None:
+    """The independence claim, per type, with the config half switched off.
+
+    This is the assertion that makes "detection is best-effort, the gate is the
+    guarantee" a property of the code rather than a sentence in a docstring, for the
+    three types that had no such property at all. Delete ``entities.yaml``'s rule for
+    the type -- which is exactly what a careless edit to a YAML file does -- and the
+    value is still not allowed out of the process.
+
+    The premise is measured rather than assumed: the de-registered detector must find
+    nothing high-severity here first, so a block can only be pass 3. If the registry
+    ever grows a *second* rule that claims the same value, this goes red on the premise
+    rather than passing vacuously through pass 2.
+
+    ``category`` is unused by the gate -- pass 2 calls ``detect(payload, None)`` -- and
+    is carried in the parametrize list because it is what the *repair* half of this
+    pair asserts, and splitting the two apart is how the pair drifts.
+    """
+    detector = deregistered_detector(entity_type)
+    found = [
+        det
+        for det in await detector.detect(payload, None)
+        if det.entity_type in HIGH_SEVERITY_TYPES and det.score >= real_settings.threshold_obfuscate
+    ]
+    assert not found, (
+        f"premise gone: the de-registered detector still finds {entity_type} here, so "
+        f"this payload no longer isolates pass 3 -- {found}"
+    )
+
+    with pytest.raises(EgressBlockedError) as exc:
+        await _real_gate(detector, real_settings, set()).check(payload, SESSION)
+    assert exc.value.detail["reason"] == "independent_pattern"
+    assert exc.value.detail["entity_types"] == entity_type
+    assert value not in str(exc.value.detail), "the block leaked the value it refused"
+
+
+@pytest.mark.parametrize(("entity_type", "payload", "value", "category"), _PASS_THREE_TYPE_CASES)
+async def test_the_shipped_detector_claims_each_pass_three_type_so_it_vaults_not_blocks(
+    real_detector: Detector,
+    real_settings: Settings,
+    entity_type: str,
+    payload: str,
+    value: str,
+    category: str,
+) -> None:
+    """The other half: the shipped registry claims these, so the gate never has to.
+
+    Blocking is the fallback, not the outcome. Every value pass 3 claims must also be
+    one the *detector* claims, at the same span, at or above ``threshold_obfuscate`` --
+    otherwise the repair converts a leak into a 422 on a reviewer's own document, which
+    is the failure this module has already shipped twice. So this asserts the good
+    outcome directly: detected, spanned on the identifier and not the label, and inside
+    the band that vaults rather than the one that redacts irreversibly.
+
+    Measured before the registry widenings that made it pass -- ``detect()`` returned
+    ``[]`` for all three, and ``demo.py --file`` printed each identifier into the
+    OUTBOUND PAYLOAD pane verbatim with ``EXIT=0``.
+    """
+    hits = [det for det in await real_detector.detect(payload, category) if det.text == value]
+    assert [det.entity_type for det in hits] == [entity_type], (
+        f"the registry no longer claims {value!r} as {entity_type}; it is now a pass-3 "
+        f"block instead of a vaulted span -- 422 EGRESS_BLOCKED, demo exit 1. Widen "
+        f"entities.yaml -> {entity_type}.patterns; do NOT narrow the gate"
+    )
+    assert hits[0].score >= real_settings.threshold_obfuscate, (
+        f"{value!r} is detected but below the obfuscate band, so it is redacted rather "
+        "than vaulted -- irreversible, and with no pass-1 needle for a second mention"
+    )
+
+
+def test_pass_three_has_an_independent_opinion_on_every_type_it_blocks_on() -> None:
+    """The gap itself, as a property of two constants rather than of a README line.
+
+    ``HIGH_SEVERITY_TYPES`` is the set a pass-2 re-hit *blocks* on. Pass 2 re-runs the
+    same ``Detector`` that ran at detect time, so for any member with no entry in
+    ``_INDEPENDENT_PATTERNS`` the whole gate has exactly one opinion about that type,
+    formed once and consulted twice -- which is the shape of every cleartext leak this
+    module documents. It held for three of the four types for as long as pass 3 carried
+    ``SSN`` alone.
+
+    Adding a type to ``HIGH_SEVERITY_TYPES`` without giving pass 3 a recogniser for it
+    turns this red, which is the direction the omission actually arrives from.
+    """
+    from secure_context_pipeline.pipeline.egress_gate import _INDEPENDENT_PATTERNS
+
+    covered = {entity_type for entity_type, _ in _INDEPENDENT_PATTERNS}
+    uncovered = sorted(HIGH_SEVERITY_TYPES - covered)
+    assert not uncovered, (
+        f"pass 3 has no independent recogniser for {uncovered}, so for those types the "
+        "gate's 'defence in depth' is two layers sharing one brain: pass 1 has no "
+        "needle for a value the detector missed and pass 2 re-asks the detector that "
+        "missed it"
+    )
+    stray = sorted(covered - HIGH_SEVERITY_TYPES)
+    assert not stray, (
+        f"pass 3 blocks on {stray}, which pass 2 does not treat as high severity; the "
+        "two constants disagree about what a leak is"
+    )
+
+
+#: MRN-shaped, account-shaped and EIN-shaped digit runs that are none of those things.
+#: A gate-only claim on any of these is a 422 on an ordinary business document, which
+#: is the failure mode a fail-closed pass has and it is louder than the one it prevents.
+_PASS_THREE_NON_IDENTIFIERS = [
+    # invoice / order / purchase order
+    "Invoice 4471902 was reconciled against the ledger.",
+    "Invoice, 100200300400 posted to the clearing account journal.",
+    "Order reference 12-3456789 was cancelled by the buyer.",
+    "Purchase order 987654321 was raised by procurement.",
+    "PO [100200300400] covers the quarterly hardware refresh.",
+    # part / SKU / serial / firmware / asset
+    "Part number 100200300400 supersedes the older casing.",
+    "Serial 12-3456789 is stamped on the underside of the unit.",
+    "Firmware build 20240115093 shipped to the fleet overnight.",
+    "SKU 88123456 sold out in the eastern region.",
+    "Asset tag 4471902 was scanned at the loading bay.",
+    # phone digit strings
+    "Call 4155550123 for the duty desk after six.",
+    "Fax the sheet to 4155550199 before the close of business.",
+    # ZIP+4
+    "Mail the packet to 940255551 as printed on the label.",
+    "ZIP+4 on the envelope reads 021440123 for the depot.",
+    # routing / ABA -- public bank identifiers, deliberately not claimed
+    "The routing prefix 021000021 is published by the Federal Reserve.",
+    "ABA 011000015 is a public bank identifier, not an account.",
+    # timestamps / epochs / counters
+    "Timestamp 20240115093000 marks the start of the export.",
+    "Epoch 1705312200 is when the job began.",
+    "Sequence 00012345 was skipped by the batch writer.",
+    # label words in a NON-identifier reading -- the traps the widenings could trip
+    "Records show 8814027 encounters were logged last year.",
+    "The chart shows 1250000 units dispensed across the trust.",
+    "See the attached file, 20240115 is the export stamp.",
+    "On account of 12345678 shipments the depot was expanded.",
+    "Accounting for 100200300400 microseconds of drift is routine.",
+    "The tin, 123456789 units were pressed at the mill.",
+    "Taxidermy invoice 123456789 was settled in cash.",
+    "Tax was 123456789 cents in aggregate across the group.",
+    "Einstein 123456789 is the catalogue number of the print.",
+]
+
+
+@pytest.mark.parametrize("benign", _PASS_THREE_NON_IDENTIFIERS)
+def test_pass_three_claims_no_span_in_an_ordinary_business_document(benign: str) -> None:
+    """The precision half, asserted at the PATTERNS so a green here means something.
+
+    Written against ``_INDEPENDENT_PATTERNS`` directly rather than through
+    ``gate.check`` on purpose. Going through the gate would let a *detection* rescue a
+    bad pattern -- the value gets vaulted, the span becomes protected, and the probe
+    passes while the pattern is still wrong. This asks the patterns what they claim
+    with no protected spans at all, which is the question the widenings actually risk.
+
+    Two of these strings ARE claimed by the registry (``12-3456789`` twice, by the
+    unlabelled ``\\b\\d{2}-\\d{7}\\b`` TAX_ID rule that predates this work) and are
+    therefore vaulted rather than blocked; the gate mirroring that rule is the point of
+    the mirror, so they are still listed. What must not happen is a gate claim on any
+    of the rest.
+    """
+    from secure_context_pipeline.pipeline.egress_gate import _INDEPENDENT_PATTERNS
+
+    pre_existing_taxid_shape = re.search(r"\b\d{2}-\d{7}\b", benign) is not None
+    claims = [
+        f"{entity_type}:{match.group('v')!r}"
+        for entity_type, pattern in _INDEPENDENT_PATTERNS
+        for match in pattern.finditer(benign)
+    ]
+    if pre_existing_taxid_shape:
+        assert all(claim.startswith("TAX_ID:") for claim in claims), (
+            f"a pattern other than the unlabelled TAX_ID rule claims a span here: {claims}"
+        )
+        return
+    assert not claims, (
+        f"pass 3 claims {claims} in an ordinary business document. If the detector does "
+        "not also claim it, this is a 422 EGRESS_BLOCKED and demo.py --file exit 1 on a "
+        "reviewer's own file"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -64,6 +64,8 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -119,6 +121,69 @@ _DB_FILENAME = "documents.db"
 #: layer and is interpolated into a filesystem path, so anything that is not
 #: exactly 32 lowercase hex characters is rejected before it can touch the disk.
 _DOC_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+#: **No ``StoreAuthError`` from this store is delivered sooner than this many seconds
+#: after the call that produced it began.** Section 9.1 requires a wrong-owner fetch
+#: and an absent document to be indistinguishable, "so there is no existence oracle",
+#: and the *response* has always satisfied that -- same exception, same code, same
+#: detail keys, byte-identical body. The *timing* did not, and a byte-identical body
+#: delivered on a distinguishable schedule is still an oracle.
+#:
+#: Where the difference came from: an absent ``doc_id`` fails at ``ENOENT`` before a
+#: single byte of crypto, while a present one is read off disk in full and only then
+#: rejected by AES-GCM. Measured on this machine over 400 samples per arm, medians:
+#:
+#: ===============  ==============  ==============  ========
+#: blob size        absent          wrong owner     ratio
+#: ===============  ==============  ==============  ========
+#: 5.6 KB           0.058 ms        0.167 ms        2.85x
+#: 2.25 MiB         0.065 ms        0.680 ms        10.4x
+#: 8 MiB            0.154 ms        2.895 ms        18.8x
+#: 16 MiB           0.154 ms        5.263 ms        34.3x
+#: ===============  ==============  ==============  ========
+#:
+#: The cost is linear in blob size at ~0.31 ms/MiB, so the gap has no upper bound in
+#: the ratio -- it grows with the document.
+#:
+#: **The floor is sized from the API's own upload ceiling, not picked.**
+#: ``api.constants.MAX_UPLOAD_BYTES`` is 16 MiB, so 16 MiB is the largest ``.raw``
+#: blob the service will ever hold and 5.26 ms is the most a wrong-owner read of one
+#: can cost. 8 ms sits above that with margin, which makes every document the API
+#: will accept fall *under* the floor and therefore indistinguishable from an absent
+#: one. Deliberately not imported from ``api.constants``: this package's store must
+#: not depend on its HTTP layer, and a store used behind a different front end keeps
+#: a floor that is a property of the store. The linkage is asserted instead, by
+#: ``tests/test_document_store.py::test_the_not_found_floor_covers_the_api_upload_ceiling``.
+#:
+#: **The residual, stated exactly.** ``.txt`` blobs are extracted text and are *not*
+#: bounded by the upload ceiling -- ``extraction.MAX_DOCX_UNCOMPRESSED_BYTES`` allows
+#: a DOCX to expand to 128 MiB. A document whose extracted text exceeds roughly
+#: 25 MiB decrypts in more than 8 ms, exceeds the floor, and is once again
+#: distinguishable from an absent ``doc_id``. What leaks in that case is "a document
+#: exists here and its text is very large", not its owner, category or any byte of
+#: content. Closing that too would mean a floor sized for 128 MiB (~40 ms on every
+#: miss) or making the read conditional on the metadata row, which trades a
+#: cryptographic isolation guarantee for a bookkeeping one; neither is worth it at
+#: this tier and both are worse than the bound written here.
+#:
+#: **A second residual: the floor is calibrated on this machine.** Hardware slower
+#: than ~2x this box would push a 16 MiB decrypt past 8 ms. The tests assert the
+#: *property* (arms indistinguishable) at a size the floor covers everywhere, not
+#: this constant, so a slower machine narrows the covered range rather than going
+#: red on a number it cannot meet.
+#:
+#: The mechanism is ``asyncio.sleep``, which burns no CPU and holds no thread -- so
+#: this is strictly cheaper than the "full disk read on every miss" the README's
+#: section 3 priced this fix at. Sleeping can only ever finish *late* under load,
+#: never early, so the floor is a true lower bound on the observable delay.
+NOT_FOUND_FLOOR_S = 0.008
+
+#: How close to the floor a single ``asyncio.sleep`` is asked to get before
+#: :meth:`EncryptedDocumentStore._wait_out_floor` finishes the last stretch by
+#: yielding. Sized just above the ~1.0 ms late-wake this loop was measured to add;
+#: see that method for the measurement and for why a value that is too small
+#: degrades gracefully instead of breaking the floor.
+_FLOOR_SLACK_S = 0.0015
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -312,6 +377,89 @@ class EncryptedDocumentStore:
         self._db: aiosqlite.Connection | None = None
         self._open_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        #: Instance-level so a test can shorten it. See :data:`NOT_FOUND_FLOOR_S`
+        #: for what it is and why 8 ms; the suite would otherwise spend the floor
+        #: on every one of its many deliberate not-found assertions.
+        self._not_found_floor_s = NOT_FOUND_FLOOR_S
+
+    # -- uniform not-found --------------------------------------------------
+
+    @asynccontextmanager
+    async def _uniform_not_found(self) -> AsyncIterator[None]:
+        """Hold any ``StoreAuthError`` until :data:`NOT_FOUND_FLOOR_S` has elapsed.
+
+        Wrapped around the *public* read methods rather than around
+        :meth:`_read_blob`, and that placement is the whole correctness argument:
+        the observable quantity is how long the **call** took, so the clock has to
+        start where the caller's call starts. Padding inside ``_read_blob`` would
+        leave ``get_text``'s own ``UnicodeDecodeError`` branch -- which raises the
+        same ``StoreAuthError`` *after* ``_read_blob`` returned successfully --
+        outside the floor, and that branch is reachable only on a corrupt store,
+        which is exactly the kind of path that gets forgotten and then measured.
+
+        Every reason is covered, not merely the two the oracle was about:
+        malformed ``doc_id`` (rejected before touching the filesystem), absent blob,
+        wrong owner, and undecodable plaintext all leave through here. The
+        alternative -- padding only the two arms named in the finding -- would close
+        one oracle and leave "malformed vs absent" open beside it.
+
+        Only ``StoreAuthError`` is padded. A success is not: the owner of a document
+        is already distinguishable from a non-owner by getting a ``200`` with the
+        document in it, so spending latency to hide a difference the response body
+        announces buys nothing. ``DocumentStoreUnavailableError`` is not padded
+        either -- it is a server fault with its own distinguishable body and it
+        carries no per-``doc_id`` information.
+        """
+        started = time.perf_counter()
+        try:
+            yield
+        except StoreAuthError:
+            await self._wait_out_floor(started)
+            raise
+
+    async def _wait_out_floor(self, started: float) -> None:
+        """Block until ``started + floor``, converging on the deadline rather than sleeping to it.
+
+        **A bare ``asyncio.sleep(remaining)`` is not enough, measured.** It wakes
+        *late* by an amount that grows with how long it was asked to sleep, so the
+        arm that did the least work -- the absent ``doc_id``, which sleeps the
+        longest -- overshoots the most and stays the slowest. With a single sleep,
+        400 samples per arm at an 8 ms floor:
+
+        ===================  ==========
+        work before the pad  median
+        ===================  ==========
+        0 ms (absent)        9.028 ms
+        0.7 ms (2.25 MiB)    8.917 ms
+        2.9 ms (8 MiB)       8.572 ms
+        5.3 ms (16 MiB)      8.202 ms
+        ===================  ==========
+
+        Still a monotone signal, 0.83 ms wide, and inverted rather than removed --
+        an attacker gets the same bit with the sign flipped. Sleeping to within
+        :data:`_FLOOR_SLACK_S` and then yielding in a loop until the deadline
+        actually passes collapses that to **8.0071 / 8.0068 / 8.0067 / 8.0063 ms**,
+        a 0.8 *micro*second spread across arms whose real work differs by 5.3 ms.
+
+        The slack is a tightness knob, not a correctness one: too small and the
+        sleep simply overshoots the deadline, the loop body never runs, and the
+        behaviour degrades to the table above -- never to something early. The cost
+        is up to ``_FLOOR_SLACK_S`` of scheduler churn per not-found. It is
+        ``asyncio.sleep(0)``, not a busy-wait: every iteration yields to the event
+        loop, so other requests continue to run through it, and it is bounded and
+        on a failure path that sits behind the API's request meter.
+        """
+        deadline = started + self._not_found_floor_s
+        bulk = deadline - time.perf_counter() - _FLOOR_SLACK_S
+        if bulk > 0:
+            await asyncio.sleep(bulk)
+        # ASYNC110 reads this as busy-polling for a condition another task will set
+        # and prescribes `asyncio.Event`. The condition here is a monotonic clock,
+        # which no task sets and no event can be waited on for; an `Event` would wait
+        # forever. The loop terminates because `deadline` is fixed and
+        # `perf_counter` is monotonic, and it yields on every iteration.
+        while time.perf_counter() < deadline:  # noqa: ASYNC110 -- clock deadline, not an event
+            await asyncio.sleep(0)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -554,9 +702,13 @@ class EncryptedDocumentStore:
 
         Raises:
             StoreAuthError: absent, not this user's, or failing authentication --
-                the three are deliberately indistinguishable.
+                the three are deliberately indistinguishable, in the response *and*
+                in the time it takes to arrive (:meth:`_uniform_not_found`).
         """
-        return await self._read_blob(user_id, doc_id, self._raw_path(doc_id), scope="document_raw")
+        async with self._uniform_not_found():
+            return await self._read_blob(
+                user_id, doc_id, self._raw_path(doc_id), scope="document_raw"
+            )
 
     async def get_text(self, user_id: str, doc_id: str) -> str:
         """The extracted text.
@@ -564,16 +716,18 @@ class EncryptedDocumentStore:
         Raises:
             StoreAuthError: absent, not this user's, or failing authentication.
         """
-        plaintext = await self._read_blob(
-            user_id, doc_id, self._text_path(doc_id), scope="document_text"
-        )
-        try:
-            return plaintext.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            # Unreachable via put(): GCM already authenticated these exact bytes
-            # as the utf-8 we wrote. Mapped to the same error anyway so a corrupt
-            # store can never become a distinguishable response.
-            raise StoreAuthError(doc_id=_safe_doc_id(doc_id)) from exc
+        async with self._uniform_not_found():
+            plaintext = await self._read_blob(
+                user_id, doc_id, self._text_path(doc_id), scope="document_text"
+            )
+            try:
+                return plaintext.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                # Unreachable via put(): GCM already authenticated these exact bytes
+                # as the utf-8 we wrote. Mapped to the same error anyway so a corrupt
+                # store can never become a distinguishable response -- and raised
+                # inside the floor, so it is not distinguishable by clock either.
+                raise StoreAuthError(doc_id=_safe_doc_id(doc_id)) from exc
 
     async def _read_blob(self, user_id: str, doc_id: str, path: Path, *, scope: str) -> bytes:
         if not _DOC_ID_RE.match(doc_id):
@@ -612,21 +766,30 @@ class EncryptedDocumentStore:
             StoreAuthError: no such document *for this user*.
             DocumentStoreUnavailableError: the metadata database is unreadable.
         """
-        if not _DOC_ID_RE.match(doc_id):
-            raise StoreAuthError(doc_id=_safe_doc_id(doc_id))
-        db = await self._connection()
-        try:
-            async with db.execute(
-                "SELECT doc_category FROM documents WHERE doc_id = ? AND user_id = ?",
-                (doc_id, user_id),
-            ) as cursor:
-                row = await cursor.fetchone()
-        except _UNREADABLE as exc:
-            raise self._unavailable(exc, operation="get_category") from exc
-        if row is None:
-            raise StoreAuthError(doc_id=_safe_doc_id(doc_id))
-        category = row["doc_category"]
-        return None if category is None else str(category)
+        # Under the same floor as the blob reads. This query is *already* uniform --
+        # ``WHERE doc_id = ? AND user_id = ?`` is one index probe whether or not it
+        # hits, measured at 1.00x over 300 samples per arm -- so the floor buys no
+        # ratio here today. It is applied anyway because "no StoreAuthError from this
+        # store arrives early" is a property of the store, and leaving one read path
+        # outside it makes the guarantee something a reader has to re-derive per
+        # method. It also stops the route from becoming an oracle by composition:
+        # ``GET /documents/{doc_id}/text`` calls this immediately after ``get_text``.
+        async with self._uniform_not_found():
+            if not _DOC_ID_RE.match(doc_id):
+                raise StoreAuthError(doc_id=_safe_doc_id(doc_id))
+            db = await self._connection()
+            try:
+                async with db.execute(
+                    "SELECT doc_category FROM documents WHERE doc_id = ? AND user_id = ?",
+                    (doc_id, user_id),
+                ) as cursor:
+                    row = await cursor.fetchone()
+            except _UNREADABLE as exc:
+                raise self._unavailable(exc, operation="get_category") from exc
+            if row is None:
+                raise StoreAuthError(doc_id=_safe_doc_id(doc_id))
+            category = row["doc_category"]
+            return None if category is None else str(category)
 
     # -- recovery -----------------------------------------------------------
 

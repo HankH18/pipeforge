@@ -942,6 +942,10 @@ class Detector:
     async def detect(self, text: str, doc_category: str | None = None) -> list[Detection]:
         """Detect every registry entity allowed in ``doc_category``.
 
+        ``doc_category=None`` means "no category was declared", and it is
+        **fail-closed**: every category's rules apply, not none of them. See
+        :meth:`_scoped_types` for the measurement that made that the default.
+
         Offsets on the returned detections are absolute into ``text``. Output is
         sorted by start and strictly non-overlapping. Everything below the redact
         floor is dropped here; the engine decides obfuscate-vs-redact from ``score``.
@@ -1050,19 +1054,79 @@ class Detector:
                 result.end = _restore_offset(breaks, result.end)
         return results
 
+    def _scoped_types(self, doc_category: str | None) -> tuple[str, ...]:
+        """Registry entity names in scope for ``doc_category``. **Fail-closed on ``None``.**
+
+        A *declared* category narrows the registry: ``AMOUNT`` is financial-only,
+        ``DATE`` medical-only, ``CLIENT_IDENTITY`` and ``CASE_STRATEGY`` legal-only,
+        and outside their category those rules are noise. **No** category narrows
+        nothing -- every category's rules apply.
+
+        That asymmetry is the whole point and it used to run the other way.
+        ``EntitySpec.allowed_in(None)`` is ``False`` for a scoped entity, so
+        ``types_for_doc(None)`` returned only the *unscoped* entities and an
+        unclassified document was scanned with the four strongest, most specific
+        rules in the registry switched off. ``doc_category`` arrives on a
+        ``multipart/form-data`` field that is **optional**, so that state was one
+        omitted form field away, on the uploader's side of the trust boundary.
+        Measured on the shipped ``fixtures/legal_memo.txt`` before this change:
+
+        ===================  ==========  =============  ===============
+        ``doc_category``     detections  CASE_STRATEGY  CLIENT_IDENTITY
+        ===================  ==========  =============  ===============
+        ``legal``            38          yes            yes
+        ``None`` (default)   33          **no**         **no**
+        ===================  ==========  =============  ===============
+
+        ``CASE_STRATEGY`` carries ``action: redact`` -- the only entity the engine
+        destroys irreversibly regardless of confidence, i.e. the highest-protection
+        class the system has. Omitting one form field disabled it on an
+        attorney-work-product memo. Detection is best-effort and the engine bands on
+        confidence afterwards, so over-detection is the recoverable direction here
+        and under-detection is not; an unknown category must therefore buy *more*
+        rules, never fewer.
+
+        The declared-category behaviour is byte-for-byte unchanged, which is what
+        keeps the precision of a correctly filed document exactly where it was
+        measured. What this does **not** fix is a *wrong* category -- filing a legal
+        brief as ``medical`` still disables ``CASE_STRATEGY`` -- and that is why
+        making the field mandatory is not an alternative to this change: a required
+        field the uploader fills in wrongly fails open in precisely the same way,
+        and ``general`` is a valid category that scopes out all four. See
+        ``tests/test_detection.py::test_an_absent_doc_category_applies_every_category_rule``.
+        """
+        if doc_category is None:
+            return tuple(self._registry.entities)
+        return self._registry.types_for_doc(doc_category)
+
+    def _allowed_in(self, spec: EntitySpec, doc_category: str | None) -> bool:
+        """Per-span form of :meth:`_scoped_types`. Same rule, same reason.
+
+        Both exist because scoping is enforced twice on purpose: once by narrowing
+        the recogniser request (cheap, keeps unused recognisers off the hot path)
+        and once per returned span (correct, because a built-in recogniser reports
+        one Presidio type that several registry entities claim). They must agree, or
+        an entity is requested and then dropped -- so this is the only other place
+        ``allowed_in`` may be consulted from, and ``None`` means the same thing in
+        both.
+        """
+        return doc_category is None or spec.allowed_in(doc_category)
+
     def _entities_for(self, doc_category: str | None) -> tuple[str, ...]:
         """Recognizer selectors for this document: built-in names plus registry names.
 
         Restricting the request is how ``only_in_doc_categories`` is enforced at the
         recognizer level -- ``AMOUNT``'s recognizer is never even run outside a
         financial document -- and it keeps irrelevant built-ins off the hot path.
+        With no category declared the request is the whole registry; see
+        :meth:`_scoped_types`.
         """
         cached = self._entity_cache.get(doc_category)
         if cached is not None:
             return cached
 
         requested: list[str] = []
-        for name in self._registry.types_for_doc(doc_category):
+        for name in self._scoped_types(doc_category):
             spec = self._registry.spec(name)
             if spec.presidio and spec.presidio not in requested:
                 requested.append(spec.presidio)
@@ -1095,17 +1159,45 @@ class Detector:
         doc_category: str | None,
         window_start: int,
     ) -> str | None:
-        """Best claimant for a built-in hit, scored with one particular window."""
+        """Best claimant for a built-in hit, scored with one particular window.
+
+        **The specificity bonus is evidence, so it needs the evidence.** A scoped
+        entity scores +1 because being restricted to *this* document's category
+        makes it the more specific claim -- ``CLIENT_IDENTITY`` over ``NAME`` in a
+        legal document, ``DATE`` over nothing in a medical one. With no category
+        declared, :meth:`_scoped_types` admits every claimant, and the +1 would then
+        be paid for a restriction that nothing has confirmed: every ``PERSON`` in an
+        unclassified document would be typed ``CLIENT_IDENTITY`` on the strength of
+        an assumption the uploader never made.
+
+        **Measured, with the ungated bonus patched back in:** across the 24
+        corpus documents that carry no ``doc_category``, all 35 ``NAME`` spans become
+        ``CLIENT_IDENTITY`` and none remain ``NAME``. Both recall tables sit
+        completely still through that -- 317/317/320 tuned and 340/337/366 held-out,
+        unchanged -- because ``tests/test_detection.py::LABEL_ALIASES`` accepts either
+        label for a ``PERSON`` truth value. So the corpus is structurally blind to
+        this and the only thing that can hold it is
+        ``test_the_specificity_bonus_needs_a_declared_category``, which drives this
+        method directly. Do not conclude from a green recall table that the gate on
+        the bonus is unnecessary; the table cannot see it.
+
+        With the bonus gated, an undeclared category leaves the claimants competing
+        on context alone, tie-broken by declaration order -- which is why ``NAME``
+        (declared first) and ``DOB`` (``requires_context``) keep their spans while
+        ``DATE``, previously unrepresented, now claims the bare dates ``DOB``
+        declines.
+        """
         best: str | None = None
         best_key: tuple[int, int] | None = None
         for name in claimants:
             spec = self._registry.spec(name)
-            if not spec.allowed_in(doc_category):
+            if not self._allowed_in(spec, doc_category):
                 continue
             has_context = self._has_context(spec, text, end, window_start)
             if spec.requires_context and not has_context:
                 continue
-            score = (2 if has_context else 0) + (1 if spec.only_in_doc_categories else 0)
+            scoped = doc_category is not None and bool(spec.only_in_doc_categories)
+            score = (2 if has_context else 0) + (1 if scoped else 0)
             key = (-score, self._declaration_order[name])
             if best_key is None or key < best_key:
                 best, best_key = name, key
@@ -1178,7 +1270,7 @@ class Detector:
             return None
 
         spec = self._registry.spec(entity_type)
-        if not spec.allowed_in(doc_category):
+        if not self._allowed_in(spec, doc_category):
             return None
 
         # A temporal value only functions as an IDENTIFIER when it carries a numeral.

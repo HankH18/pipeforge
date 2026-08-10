@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import importlib
 import itertools
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -33,6 +35,7 @@ from secure_context_pipeline.audit.logger import (
     ACTION_KEY,
     DEOBFUSCATE,
     DETECT,
+    EGRESS_BLOCK,
     EGRESS_PASS,
     EVENT_ACTIONS,
     EVENT_TYPES,
@@ -42,13 +45,17 @@ from secure_context_pipeline.audit.logger import (
     SESSION_CREATE,
     VAULT_MISS,
     AuditLogger,
+    _legacy_unkeyed_entry_hash,
     canonical_json,
     chain_payload,
     compute_entry_hash,
+    default_chain_key,
 )
+from secure_context_pipeline.crypto.keys import _hkdf, derive_audit_chain_key
 from secure_context_pipeline.errors import (
     UNREADABLE_AUDIT_REMEDY,
     AuditUnavailableError,
+    ConfigError,
     PipelineError,
 )
 from secure_context_pipeline.models import (
@@ -67,6 +74,23 @@ async def audit(tmp_path: Path) -> AsyncIterator[AuditLogger]:
         yield log
     finally:
         await log.close()
+
+
+def stolen_chain_key() -> bytes:
+    """The key the fixture's logger writes under -- i.e. an attacker who has the master key.
+
+    Several tamper tests below forge a *self-consistent* chain and assert
+    ``verify_chain`` catches it anyway. Since the chain was keyed those forgeries
+    need the key, and handing it over is deliberate rather than a workaround: it
+    makes each of those tests strictly stronger than it was. They used to say "a
+    re-chained log is caught"; they now say "a re-chained log is caught **even when
+    the attacker holds the master key**", which is the only version of the claim
+    that survives after the key removes the easy forgeries.
+
+    ``default_chain_key`` reads process settings, exactly as ``AuditLogger`` does, so
+    this is the same key without the logger having to expose it.
+    """
+    return default_chain_key()
 
 
 def make_event(
@@ -335,7 +359,7 @@ async def test_verify_chain_recomputes_rather_than_trusting_the_stored_hash(
         token_id=rows[1].token_id,
         detail=json.loads(forged_detail),
     )
-    forged_hash = compute_entry_hash(rows[0].entry_hash or "", payload)
+    forged_hash = compute_entry_hash(rows[0].entry_hash or "", payload, key=stolen_chain_key())
 
     async with aiosqlite.connect(tmp_path / "audit.db") as conn:
         await conn.execute(
@@ -380,39 +404,42 @@ async def test_an_inserted_row_breaks_the_chain(audit: AuditLogger, tmp_path: Pa
 async def test_a_correctly_hashed_tail_append_is_a_known_residual(
     audit: AuditLogger, tmp_path: Path
 ) -> None:
-    """A competently forged tail append verifies True. That is the accepted limit.
+    """A competently forged tail append verifies True **for an attacker with the key**.
 
     This test asserts the *opposite* of what the neighbouring tamper tests assert,
     on purpose. It is here so the boundary of the tamper-evidence claim is a fact
     the suite states rather than a sentence in the README that nothing checks.
 
     The forgery: read the tail row, take its ``entry_hash`` as ``prev_hash``,
-    allocate ``seq = tail + 1``, and compute ``entry_hash`` with the same public
-    :func:`compute_entry_hash` the writer uses. Every check in ``verify_chain``
-    then passes, and none of them can do otherwise:
+    allocate ``seq = tail + 1``, and compute ``entry_hash`` with
+    :func:`compute_entry_hash` **under the chain key**. Every check in
+    ``verify_chain`` then passes, and none of them can do otherwise:
 
     * the link check passes -- ``prev_hash`` genuinely is the previous row's hash;
     * the ``seq`` continuity check passes -- the row is the next number;
-    * the content hash recomputes correctly -- the digest formula holds no secret;
+    * the content MAC recomputes correctly -- the attacker computed it with our key;
     * both watermarks agree -- ``sqlite_sequence`` is bumped by the ``INSERT``
       itself, and ``audit_chain_meta``'s trigger forbids only a *decrease*.
 
-    So the forged row is indistinguishable from a legitimate one, and it is
-    indistinguishable *in principle*: an unkeyed hash chain whose every piece of
-    state is held by the writer cannot separate "the application appended this"
-    from "someone with the same file access appended this". No additional check
-    inside this process closes it, which is why this is pinned as a residual rather
-    than filed as a bug.
+    **The precondition is new and it is the point.** Until the chain was keyed
+    (README section 7 gap 16) this forgery needed nothing but file access, because
+    the digest formula was published and held no secret. It now needs
+    ``SCP_MASTER_KEY`` as well, which is asserted below rather than asserted about:
+    the same append computed *without* the key is rejected. So the residual is no
+    longer "anyone who can write the file can append history", it is "anyone who can
+    write the file **and** holds the app's master key can append history" -- the
+    difference between a stolen volume and a compromised host.
+
+    What is still true of the narrowed residual: no check inside this process can
+    close it, because a row minted with our key by someone else is our key's output.
+    Closing it needs an anchor outside the writer's reach -- an off-box append-only
+    sink, or a MAC key the auditor holds and the application host does not. Both are
+    listed in README section 5 Q5 as production work, and neither is shipped here.
 
     Note what this is not. Truncation, mid-chain ``INSERT``, reorder, ``UPDATE`` of
     any persisted column, replay at a new ``seq``, a forged genesis, and deleting a
-    session's rows are all caught, each by its own test above. The gap is
-    specifically **appending**, and its practical shape is narrow but real: an
-    attacker cannot alter or remove a record of what happened, only add a record of
-    something that did not. Closing it needs an anchor outside the writer's reach --
-    an off-box append-only sink, or an HMAC key the auditor holds and the
-    application host does not. Both are listed in README section 5 Q5 as production
-    work, and neither is shipped here.
+    session's rows are all caught, each by its own test above -- and every one of
+    those is now caught for a *keyless* attacker at the first row they touch.
     """
     for i in range(3):
         await audit.emit(make_event(ts=7000.0 + i, detail={"i": i}))
@@ -427,19 +454,17 @@ async def test_a_correctly_hashed_tail_append_is_a_known_residual(
         tail = await cursor.fetchone()
         assert tail is not None
         seq, prev = int(tail["seq"]) + 1, str(tail["entry_hash"])
-        entry_hash = compute_entry_hash(
-            prev,
-            chain_payload(
-                seq=seq,
-                ts=9999.0,
-                session_id="sess-1",
-                run_id="run-1",
-                event_type=DETECT,
-                entity_type=None,
-                token_id=None,
-                detail=forged,
-            ),
+        forged_payload = chain_payload(
+            seq=seq,
+            ts=9999.0,
+            session_id="sess-1",
+            run_id="run-1",
+            event_type=DETECT,
+            entity_type=None,
+            token_id=None,
+            detail=forged,
         )
+        entry_hash = compute_entry_hash(prev, forged_payload, key=stolen_chain_key())
         await conn.execute(
             "INSERT INTO audit_events"
             " (seq, ts, session_id, run_id, event_type, entity_type, token_id,"
@@ -458,6 +483,252 @@ async def test_a_correctly_hashed_tail_append_is_a_known_residual(
     # And it really is a forgery: the fabricated row is readable as a genuine event.
     rows = await audit.query()
     assert [dict(event.detail) for event in rows][-1] == forged
+
+    # THE PRECONDITION, asserted rather than described: the same append attempted
+    # WITHOUT the key produces a different digest, so the attacker who has file
+    # access and nothing else cannot mint the row this test just minted. Before the
+    # chain was keyed there was no such precondition -- the formula was public --
+    # and this assertion is what stops that quietly coming back.
+    keyless = _legacy_unkeyed_entry_hash(prev, forged_payload)
+    assert keyless != entry_hash
+    async with aiosqlite.connect(tmp_path / "audit.db") as conn:
+        await conn.execute(
+            "UPDATE audit_events SET entry_hash = ? WHERE seq = ?", (keyless, seq)
+        )
+        await conn.commit()
+    assert await audit.verify_chain() is False, (
+        "an append forged without the chain key must be rejected"
+    )
+
+
+async def test_a_rewritten_chain_is_rejected_because_the_digest_is_keyed(
+    audit: AuditLogger, tmp_path: Path
+) -> None:
+    """The attack the whole tamper-evidence claim rested on not existing.
+
+    Every other tamper test here edits a row and leaves the chain inconsistent. That
+    is not what an attacker does. An attacker who can write the database edits the
+    row **and then recomputes every hash after it**, and until the chain was keyed
+    they could: the formula was published in this module's own docstring and needed
+    no secret. Reproduced before the fix, verbatim -- five rows, the ``EGRESS_BLOCK``
+    at ``seq`` 3 rewritten into a routine ``DETECT``, the whole log re-chained with
+    ``sha256(prev_hash + canonical_json(payload))``::
+
+        verify_chain()             -> True
+        verify_chain('sess-victim')-> True
+
+    The record of a blocked egress was gone and the log said it was intact. Against
+    a store compromise -- which is precisely when an auditor needs this -- an unkeyed
+    chain proved nothing.
+
+    So the rewrite is performed here in full, with the *public* algorithm and no
+    access to the key, and it is asserted to be internally perfect first: every link
+    holds, every row recomputes under the published formula. That premise is what
+    makes the failure below attributable to the key and to nothing else.
+    """
+    for i in range(5):
+        await audit.emit(
+            make_event(
+                ts=1_700_000_000.0 + i,
+                session_id="sess-victim",
+                event_type=EGRESS_BLOCK if i == 2 else DETECT,
+                token_id=f"tok{i:05d}",
+                detail={"count": i, "note": "incriminating" if i == 2 else "routine"},
+            )
+        )
+    assert await audit.verify_chain() is True, "premise: a clean log verifies"
+
+    def rows_of(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute("SELECT * FROM audit_events ORDER BY seq ASC")]
+
+    db = tmp_path / "audit.db"
+    with sqlite3.connect(db) as conn:
+        rows = rows_of(conn)
+        assert rows[2]["event_type"] == EGRESS_BLOCK, "premise: the row to erase is there"
+
+        # The edit: the incriminating event becomes a routine one.
+        rows[2]["event_type"] = DETECT
+        rows[2]["detail"] = canonical_json(
+            {"action": EVENT_ACTIONS[DETECT], "count": 2, "note": "routine"}
+        )
+
+        # The repair: re-chain the ENTIRE log with the published formula. No key.
+        prev = GENESIS_HASH
+        for row in rows:
+            payload = chain_payload(
+                seq=int(row["seq"]),
+                ts=float(row["ts"]),
+                session_id=str(row["session_id"]),
+                run_id=row["run_id"],
+                event_type=str(row["event_type"]),
+                entity_type=row["entity_type"],
+                token_id=row["token_id"],
+                detail=json.loads(str(row["detail"])),
+            )
+            row["prev_hash"] = prev
+            row["entry_hash"] = _legacy_unkeyed_entry_hash(prev, payload)
+            prev = str(row["entry_hash"])
+            conn.execute(
+                "UPDATE audit_events SET event_type = ?, detail = ?, prev_hash = ?,"
+                " entry_hash = ? WHERE seq = ?",
+                (
+                    row["event_type"],
+                    row["detail"],
+                    row["prev_hash"],
+                    row["entry_hash"],
+                    row["seq"],
+                ),
+            )
+
+    # PREMISE: the forgery succeeded on its own terms. This is the state that
+    # returned True before the chain was keyed, so if this block ever stops holding
+    # the assertions below stop proving anything.
+    with sqlite3.connect(db) as conn:
+        forged = rows_of(conn)
+    assert all(row["event_type"] == DETECT for row in forged), "the block event is erased"
+    expected_prev = GENESIS_HASH
+    for row in forged:
+        assert row["prev_hash"] == expected_prev, "premise: every link holds"
+        payload = chain_payload(
+            seq=int(row["seq"]),
+            ts=float(row["ts"]),
+            session_id=str(row["session_id"]),
+            run_id=row["run_id"],
+            event_type=str(row["event_type"]),
+            entity_type=row["entity_type"],
+            token_id=row["token_id"],
+            detail=json.loads(str(row["detail"])),
+        )
+        assert _legacy_unkeyed_entry_hash(expected_prev, payload) == row["entry_hash"], (
+            "premise: every row recomputes under the PUBLIC formula"
+        )
+        expected_prev = str(row["entry_hash"])
+
+    # ... and it is caught anyway, in both scopes, because the digest is a MAC.
+    assert await audit.verify_chain() is False
+    assert await audit.verify_chain("sess-victim") is False
+
+
+async def test_a_pre_keying_log_fails_and_says_which(
+    audit: AuditLogger, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The migration, and it must fail *honestly* rather than confusingly.
+
+    Rows written before the chain was keyed carry a plain ``sha256`` digest. They
+    cannot be vouched for under the key and must not be: accepting them would be a
+    downgrade an attacker can choose, since writing the unkeyed form needs no key.
+    They are therefore reported invalid -- but with their own break reason, so a
+    mixed log names its oldest rows instead of returning an undifferentiated wall of
+    ``entry_hash_mismatch``.
+
+    The label says "written without the key", which a forgery also is. It is a shape,
+    not an exoneration, and
+    ``test_a_rewritten_chain_is_rejected_because_the_digest_is_keyed`` produces the
+    same label from an attack -- deliberately, because the two are the same bytes and
+    no code can separate them.
+    """
+    for i in range(5):
+        await audit.emit(make_event(ts=1_700_000_000.0 + i, detail={"count": i}))
+
+    # Rewrite the first three rows in the pre-keying form, as an old file holds them,
+    # leaving rows 4 and 5 keyed -- the shape of a redeployed app appending to a log
+    # it inherited.
+    db = tmp_path / "audit.db"
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute("SELECT * FROM audit_events ORDER BY seq ASC")]
+        prev = GENESIS_HASH
+        for row in rows[:3]:
+            payload = chain_payload(
+                seq=int(row["seq"]),
+                ts=float(row["ts"]),
+                session_id=str(row["session_id"]),
+                run_id=row["run_id"],
+                event_type=str(row["event_type"]),
+                entity_type=row["entity_type"],
+                token_id=row["token_id"],
+                detail=json.loads(str(row["detail"])),
+            )
+            legacy = _legacy_unkeyed_entry_hash(prev, payload)
+            conn.execute(
+                "UPDATE audit_events SET prev_hash = ?, entry_hash = ? WHERE seq = ?",
+                (prev, legacy, row["seq"]),
+            )
+            prev = legacy
+        # Row 4 keeps its keyed digest but must chain onto row 3's new one, or the
+        # failure would be a link break rather than the digest question under test.
+        conn.execute("UPDATE audit_events SET prev_hash = ? WHERE seq = 4", (prev,))
+        payload4 = chain_payload(
+            seq=4,
+            ts=float(rows[3]["ts"]),
+            session_id=str(rows[3]["session_id"]),
+            run_id=rows[3]["run_id"],
+            event_type=str(rows[3]["event_type"]),
+            entity_type=rows[3]["entity_type"],
+            token_id=rows[3]["token_id"],
+            detail=json.loads(str(rows[3]["detail"])),
+        )
+        rehashed = compute_entry_hash(prev, payload4, key=stolen_chain_key())
+        conn.execute(
+            "UPDATE audit_events SET entry_hash = ? WHERE seq = 4", (rehashed,)
+        )
+        conn.execute("UPDATE audit_events SET prev_hash = ? WHERE seq = 5", (rehashed,))
+        payload5 = chain_payload(
+            seq=5,
+            ts=float(rows[4]["ts"]),
+            session_id=str(rows[4]["session_id"]),
+            run_id=rows[4]["run_id"],
+            event_type=str(rows[4]["event_type"]),
+            entity_type=rows[4]["entity_type"],
+            token_id=rows[4]["token_id"],
+            detail=json.loads(str(rows[4]["detail"])),
+        )
+        conn.execute(
+            "UPDATE audit_events SET entry_hash = ? WHERE seq = 5",
+            (compute_entry_hash(rehashed, payload5, key=stolen_chain_key()),),
+        )
+
+    with caplog.at_level(logging.WARNING, logger=logger_module.__name__):
+        assert await audit.verify_chain() is False
+
+    breaks = [
+        (record.audit_seq, record.chain_break)  # type: ignore[attr-defined]
+        for record in caplog.records
+        if hasattr(record, "chain_break")
+    ]
+    assert breaks == [
+        (1, "entry_hash_unkeyed_legacy"),
+        (2, "entry_hash_unkeyed_legacy"),
+        (3, "entry_hash_unkeyed_legacy"),
+    ], (
+        "a mixed log must name exactly its pre-keying rows: the two keyed rows are "
+        "clean and the three legacy ones are diagnosed, not lumped in with tampering"
+    )
+
+
+async def test_a_log_written_under_a_different_key_does_not_verify(tmp_path: Path) -> None:
+    """The property a key has, stated as itself rather than inferred from an attack.
+
+    Two loggers, two keys, one file. The second cannot vouch for what the first
+    wrote, and that is not a bug to be smoothed over -- it is the entire mechanism.
+    A regression that ignored ``chain_key`` and hashed unkeyed would make both of
+    these verify, which is why the negative assertion is the one that matters.
+    """
+    db = tmp_path / "audit.db"
+    first = await AuditLogger.open(db, chain_key=bytes(range(32)))
+    try:
+        for i in range(3):
+            await first.emit(make_event(ts=5000.0 + i, detail={"count": i}))
+        assert await first.verify_chain() is True, "premise: its own key verifies"
+    finally:
+        await first.close()
+
+    second = await AuditLogger.open(db, chain_key=bytes(range(1, 33)))
+    try:
+        assert await second.verify_chain() is False
+    finally:
+        await second.close()
 
 
 async def test_reordering_two_rows_breaks_the_chain(audit: AuditLogger, tmp_path: Path) -> None:
@@ -1058,6 +1329,7 @@ async def test_forging_a_new_genesis_row_breaks_the_chain(
             seq=1, ts=1.0, session_id="attacker", run_id=None,
             event_type=DETECT, entity_type=None, token_id=None, detail={},
         ),
+        key=stolen_chain_key(),
     )
     async with aiosqlite.connect(tmp_path / "audit.db") as conn:
         # Shift via a disjoint range: a row-by-row +1 collides with the UNIQUE seq.
@@ -1133,6 +1405,7 @@ async def test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught(
                         token_id=row["token_id"],
                         detail=json.loads(row["detail"]),
                     ),
+                    key=stolen_chain_key(),
                 )
                 await conn.execute(
                     "INSERT INTO audit_events (seq, ts, session_id, run_id, event_type,"
@@ -1167,6 +1440,7 @@ async def test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught(
                 entity_type=row["entity_type"], token_id=row["token_id"],
                 detail=json.loads(row["detail"]),
             ),
+            key=stolen_chain_key(),
         )
         assert recomputed == row["entry_hash"], "premise: every row's own hash recomputes"
         expected_prev = row["entry_hash"]
@@ -2482,8 +2756,9 @@ async def test_operations_on_a_closed_logger_raise(tmp_path: Path) -> None:
 # it is checking.
 # ---------------------------------------------------------------------------
 
-#: `sha256(prev_hash + canonical_json(event_without_hashes))`, computed by hand from
-#: the build doc's section 9.8 formula and pasted here as literals.
+#: `HMAC-SHA256(key, prev_hash + canonical_json(event_without_hashes))`, computed
+#: **outside Python** -- `openssl dgst -sha256 -mac HMAC -macopt hexkey:...` fed the
+#: canonical message on stdin -- and pasted here as literals.
 #:
 #: Every other hash assertion in this file builds its expectation by calling
 #: `compute_entry_hash`/`chain_payload` -- the same functions under test -- so the
@@ -2497,13 +2772,35 @@ async def test_operations_on_a_closed_logger_raise(tmp_path: Path) -> None:
 #: These literals are the fixed point that cannot move with the code. If this test
 #: fails, either the hash construction changed (and every previously published chain
 #: is now unverifiable, which is a decision, not a refactor) or something is wrong.
-_GENESIS_HASH = "ac56c5d58eed16433b8f0246c624febbf49b2b678c0e9df12641479fe241a062"
-_SECOND_HASH = "f72105f8937439d0cec68297d7962f9afbce80d6ce2147bf4ca57a4f2e37846e"
+#:
+#: They were replaced once, and that is the decision the paragraph above anticipates:
+#: the chain was keyed (README section 7 gap 16), so the pre-keying vectors
+#: `ac56c5d5...` / `f72105f8...` -- plain `sha256` over the same two messages -- no
+#: longer describe what the writer writes. They survive here as
+#: `test_the_unkeyed_formula_is_no_longer_what_the_writer_writes`, which asserts the
+#: *old* digests are now absent, so the migration is pinned in both directions
+#: rather than quietly forgotten.
+_CHAIN_KEY = bytes(range(32))
+_GENESIS_HASH = "d908d4c89a9ded4a0caac9ff272a867811a43d9ae6933b51e7f7d1853d97a89b"
+_SECOND_HASH = "0b707319d8450a813407973223d12c850db271c1a1c9cf23af8acb45b841c74c"
+
+#: The pre-keying literals, kept as the thing that must NOT be produced.
+_LEGACY_GENESIS_HASH = "ac56c5d58eed16433b8f0246c624febbf49b2b678c0e9df12641479fe241a062"
+_LEGACY_SECOND_HASH = "f72105f8937439d0cec68297d7962f9afbce80d6ce2147bf4ca57a4f2e37846e"
+
+#: `HKDF-SHA256(ikm=_GOLDEN_MASTER_KEY, salt=b"scp-v1", info=b"audit-chain")`,
+#: computed by a hand-written RFC 5869 extract/expand over stdlib `hmac` -- i.e. not
+#: by `cryptography`'s `HKDF`, which is what the implementation calls. Pins the
+#: `info` label as well as the construction: change `b"audit-chain"` to anything
+#: else and this literal stops matching, which matters because a silently different
+#: label is a silently different key and every prior chain becomes unverifiable.
+_GOLDEN_MASTER_KEY = bytes(range(32, 64))
+_GOLDEN_AUDIT_CHAIN_KEY = "26a94a2881d0fde8681974b82af7316b9d52e8c2535656a1875c29e07435767f"
 
 
-def test_the_entry_hash_matches_a_hand_computed_golden_vector() -> None:
-    """Pins the published formula against literals, not against itself."""
-    payload = chain_payload(
+def _golden_payloads() -> tuple[dict[str, object], dict[str, object]]:
+    """The two events the golden vectors above were computed over."""
+    first = chain_payload(
         seq=1,
         ts=1700000000.5,
         session_id="sess-golden",
@@ -2513,8 +2810,6 @@ def test_the_entry_hash_matches_a_hand_computed_golden_vector() -> None:
         token_id=None,
         detail={"payload_chars": 42, "reason": "ok"},
     )
-    assert compute_entry_hash("", payload) == _GENESIS_HASH
-
     second = chain_payload(
         seq=2,
         ts=1700000000.5,
@@ -2525,9 +2820,95 @@ def test_the_entry_hash_matches_a_hand_computed_golden_vector() -> None:
         token_id=None,
         detail={"payload_chars": 42, "reason": "ok"},
     )
+    return first, second
+
+
+def test_the_entry_hash_matches_a_hand_computed_golden_vector() -> None:
+    """Pins the published formula against literals, not against itself."""
+    payload, second = _golden_payloads()
+    assert compute_entry_hash("", payload, key=_CHAIN_KEY) == _GENESIS_HASH
+
     # The link itself: the second digest is a function of the FIRST one. This is the
     # assertion that dies when `prev_hash +` is deleted.
-    assert compute_entry_hash(_GENESIS_HASH, second) == _SECOND_HASH
+    assert compute_entry_hash(_GENESIS_HASH, second, key=_CHAIN_KEY) == _SECOND_HASH
+
+
+def test_the_entry_hash_is_a_function_of_the_key() -> None:
+    """A digest that ignores the key is the scheme this replaced, wearing an argument.
+
+    The golden vector above pins one key's output and would stay green if the key
+    were accepted and dropped on the floor -- `hmac.new(key, ...)` swapped back for
+    `hashlib.sha256(...)` fails it, but so does any *other* wrong construction, so it
+    cannot say which. This says the specific thing: two keys, same message, two
+    digests, and neither of them the unkeyed one.
+    """
+    payload, _ = _golden_payloads()
+    other = bytes(range(1, 33))
+
+    # The load-bearing form. Written first as `!= _GENESIS_HASH`, which was green
+    # under a `hashlib.sha256(message)` mutation that ignored `key` entirely -- the
+    # exact regression this test is named for -- because the unkeyed digest is also
+    # not the golden literal. Two keys against each other is the only comparison a
+    # key-dropping implementation cannot satisfy.
+    assert compute_entry_hash("", payload, key=other) != compute_entry_hash(
+        "", payload, key=_CHAIN_KEY
+    )
+    assert compute_entry_hash("", payload, key=other) == compute_entry_hash(
+        "", payload, key=other
+    ), "premise: the digest is deterministic, so the difference above is the key"
+
+
+def test_the_unkeyed_formula_is_no_longer_what_the_writer_writes() -> None:
+    """The migration, pinned from the other side: the old digests must not come back.
+
+    `ac56c5d5...` is `sha256("" + canonical_json(payload))` -- the formula this
+    project shipped until the chain was keyed, and the one an attacker with database
+    write access can compute for themselves. A regression that dropped the key would
+    reproduce it exactly, and would look like a passing suite everywhere else,
+    because every other hash assertion in this file supplies whatever key the
+    implementation asks for.
+    """
+    payload, second = _golden_payloads()
+
+    assert hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest() == (
+        _LEGACY_GENESIS_HASH
+    ), "premise: the legacy literal really is the plain sha256 of this message"
+
+    assert compute_entry_hash("", payload, key=_CHAIN_KEY) != _LEGACY_GENESIS_HASH
+    assert compute_entry_hash(_GENESIS_HASH, second, key=_CHAIN_KEY) != _LEGACY_SECOND_HASH
+
+
+def test_the_audit_chain_key_matches_a_hand_computed_hkdf_vector() -> None:
+    """Pins the derivation and its `info` label against an independent RFC 5869 run.
+
+    Two things could change the key without changing any behaviour the rest of this
+    file can see: the `info` label, and the salt. Either one silently invalidates
+    every chain written before it, which is the same class of event as changing the
+    digest formula -- so it gets the same treatment, a literal computed somewhere
+    else.
+    """
+    assert derive_audit_chain_key(_GOLDEN_MASTER_KEY).hex() == _GOLDEN_AUDIT_CHAIN_KEY
+
+    # And it is domain-separated from the key the same master key produces for
+    # documents: one leaked document key must not be a licence to rewrite history.
+    assert derive_audit_chain_key(_GOLDEN_MASTER_KEY) != _hkdf(
+        _GOLDEN_MASTER_KEY, b"doc:" + b"sess-golden"
+    )
+
+
+def test_a_short_or_empty_chain_key_is_refused_rather_than_used(tmp_path: Path) -> None:
+    """`hmac.new(b"", ...)` is a publicly computable function, so the length is checked.
+
+    An empty key is accepted without complaint by `hmac`, and a chain under one is
+    exactly the unkeyed chain that was the defect -- reachable through a misread env
+    var or a provider that returned `b""`. It has to fail closed at construction,
+    before a single row is written under it.
+    """
+    for bad in (b"", bytes(31), bytes(33)):
+        with pytest.raises(ConfigError) as excinfo:
+            AuditLogger(tmp_path / "never-written.db", chain_key=bad)
+        assert excinfo.value.detail["reason"] == "audit_chain_key_wrong_length"
+    assert not (tmp_path / "never-written.db").exists()
 
 
 def test_the_chain_covers_prev_hash_and_seq_behaviourally() -> None:
@@ -2548,11 +2929,11 @@ def test_the_chain_covers_prev_hash_and_seq_behaviourally() -> None:
         token_id=None,
         detail={"n": 1},
     )
-    first = compute_entry_hash("", chain_payload(seq=1, **base))
+    first = compute_entry_hash("", chain_payload(seq=1, **base), key=_CHAIN_KEY)
     # Same event content, different predecessor -> must be a different digest.
-    assert compute_entry_hash("deadbeef", chain_payload(seq=1, **base)) != first
+    assert compute_entry_hash("deadbeef", chain_payload(seq=1, **base), key=_CHAIN_KEY) != first
     # Same event content and predecessor, different position -> likewise.
-    assert compute_entry_hash("", chain_payload(seq=2, **base)) != first
+    assert compute_entry_hash("", chain_payload(seq=2, **base), key=_CHAIN_KEY) != first
 
 
 # ---------------------------------------------------------------------------
@@ -2965,6 +3346,7 @@ async def test_the_action_is_inside_the_hash_chain_not_beside_it(audit: AuditLog
             token_id=row.token_id,
             detail=dict(row.detail),
         ),
+        key=stolen_chain_key(),
     )
     assert recomputed == row.entry_hash
     # And the same digest is NOT reachable from the detail the caller passed in.
@@ -2982,6 +3364,7 @@ async def test_the_action_is_inside_the_hash_chain_not_beside_it(audit: AuditLog
                 token_id=row.token_id,
                 detail=without_action,
             ),
+            key=stolen_chain_key(),
         )
         != row.entry_hash
     )
