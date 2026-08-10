@@ -60,3 +60,4 @@ wire_dump*.txt
 # repo runs `git add -A`, so "untracked" is one careless commit away from "tracked".
 .claude/
 .hypothesis/
+.gstack/

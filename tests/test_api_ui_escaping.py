@@ -1127,3 +1127,217 @@ def test_panels_2_and_3_name_the_provider_where_the_payload_is_read() -> None:
         assert named and panel not in named.group(1), (
             f"#{panel} is inside #{heading}, so the region's accessible name now carries it"
         )
+
+
+# ---------------------------------------------------------------------------
+# style.css -- the panel geometry a reviewer's own laptop width decides
+#
+# Static, for the reason the contrast block above gives: these run on a machine
+# with no browser. What they cannot do is compute layout, so each one pins the
+# DECLARATION whose removal or return reproduces a defect that was measured in a
+# real engine, and the measurement is recorded in the docstring rather than
+# re-derived here. The alternative -- asserting a pixel count -- would need a
+# browser in the test environment and would pin one machine's font metrics.
+# ---------------------------------------------------------------------------
+
+
+def _decl(block: str, prop: str) -> str | None:
+    """The value of one declaration in a rule body, or ``None`` if it is absent.
+
+    A property is read as a WHOLE token, and this is not fussiness. The first draft of
+    the tests below asked ``"flex" in block`` and ``"wrap" in block``, and both are
+    answered by the very mutations they exist to catch: ``display: block; flex-wrap:
+    wrap`` contains "flex", and ``flex-wrap: nowrap`` contains "wrap". Sabotaged in
+    exactly those two ways, the checks stayed green -- a substring standing in for a
+    value, which is the shape of false green this suite has been bitten by before.
+    """
+    match = re.search(r"(?:^|[;{\s])" + re.escape(prop) + r"\s*:\s*([^;]+)", block)
+    return match.group(1).strip() if match else None
+
+
+def test_the_panel_counter_cannot_escape_its_heading() -> None:
+    """`.count` must not float, because `.body` under it is a block formatting context.
+
+    Panel 1 is the reviewer's own document with its PII highlighted -- the thing the
+    demo exists to show -- and at three of the five widths a laptop actually reports it
+    collapsed to a strip a few characters wide. Measured in Chrome 151 headless against
+    a live server, ``fixtures/medical_note.txt`` as ``medical``, tokenization, reading
+    ``#p1``'s width against the ``.panel`` around it:
+
+        1366 -> 665/667    1440 -> 44/704    1512 -> 80/740
+        1600 -> 124/784    1920 -> 942/944
+
+    ``#p1.scrollHeight`` read 16 155px at 1440 inside a box ``.body`` caps at 300.
+    1366 and 1920 are clean, which is why it shipped: the two widths anybody checks
+    first are the two the bug does not touch, and 1440/1512/1600 -- the stock MacBook
+    among them -- are the band that it does.
+
+    Three facts produce it, and this test pins all three because removing any one
+    removes the defect:
+
+    * ``app.js`` writes a SENTENCE into ``#c1`` ("2826 chars · 52 spans masked ·
+      detector returned 54, so at least 2 of them were not masked"), which shrink-to-fits
+      to 650px against a 702px panel.
+    * ``float: right`` on that sentence means it cannot share the heading's line, so it
+      drops -- and a float does not grow the block containing it, so it hangs below the
+      ``h2`` and into the panel body. Measured at 1440: ``#c1`` spans y816..834 and
+      ``#p1`` begins at 823.
+    * ``.body`` is ``overflow: auto``, i.e. a block formatting context, and a BFC must
+      shrink to avoid an intruding float. 702 less 650 is the 44.
+
+    Proved by mutation in the live page and reverted each time: ``#c1.style.cssFloat =
+    'none'`` moved ``#p1`` 44 -> 702, restoring the float returned it to 44, and
+    ``#p1.style.overflow = 'visible'`` also returned 702.
+
+    The fix is a flex heading, not ``clear: both``, and the difference is structural
+    rather than cosmetic: a flex item that wraps GROWS its container, a float that drops
+    does not -- so the counter can no longer leave the ``h2`` at any width, and there is
+    nothing left for ``.body`` to shrink away from. Re-measured at 400, 600, 820, 1366,
+    1400, 1440, 1480, 1512, 1550, 1600, 1680, 1728, 1800 and 1920: ``#p1`` and ``#p3``
+    are each their parent's width less the 2px border at every one.
+    """
+    css = STYLE_CSS.read_text(encoding="utf-8")
+
+    count = _block(css, ".count")
+    assert "float" not in count, (
+        "`.count` floats again. `app.js` writes a 650px sentence into `#c1`, so at a "
+        "702px panel the float drops out of the `h2` and `.body`'s block formatting "
+        "context shrinks to avoid it -- measured, panel 1 goes to 44px at 1440. "
+        f"Declarations: {count.strip()!r}"
+    )
+
+    # The replacement, and it has to BE there -- dropping the float alone would leave
+    # the counter as an inline box that simply wraps to a second line, which is fine,
+    # but nothing would then keep it out of the way of a long provider note. The flex
+    # row is what gives the heading three slots and pushes the counter to the end.
+    heading = _block(css, ".panel h2")
+    assert _decl(heading, "display") == "flex", (
+        f"`.panel h2` no longer establishes a flex row, so the counter is back to being "
+        f"an out-of-flow or inline box in a block heading: {heading.strip()!r}"
+    )
+    assert _decl(heading, "flex-wrap") == "wrap", (
+        "`.panel h2` must WRAP -- the counter sentence does not fit beside the title at "
+        "any width below about 1800, and a flex row that cannot wrap would overflow the "
+        f"panel instead: {heading.strip()!r}"
+    )
+    # The auto margin is what puts the counter at the END of the heading rather than
+    # immediately after the title. Without it the layout is still correct and still
+    # cannot collapse the panel, but panels 2 and 3 read "3 · Raw LLM response 4231
+    # chars answered by the provider..." with the counter wedged mid-sentence.
+    assert _decl(_block(css, ".panel h2 .count"), "margin-left") == "auto", (
+        "`.panel h2 .count` no longer pushes the counter to the end of the heading"
+    )
+
+    # The other half of the interaction, asserted so that a future change which drops
+    # the scrolling panel cannot quietly make the float look safe again. `.body` being
+    # a BFC is deliberate -- each panel scrolls its own payload -- and it is exactly
+    # what made an escaping float lethal.
+    body = _block(css, ".body")
+    assert "overflow: auto" in body, (
+        "`.body` no longer scrolls. That is a real change to the panels, and it also "
+        "removes the block formatting context that made a floated counter collapse "
+        f"them -- so this test would stop protecting anything: {body.strip()!r}"
+    )
+
+
+def test_no_badge_can_push_the_page_wider_than_the_viewport() -> None:
+    """`white-space: nowrap` on a run-written badge is a floor on the page's width.
+
+    Measured in Chrome 151 headless at a 400px viewport after a
+    ``fixtures/medical_note.txt`` run: ``document.documentElement.scrollWidth`` 506
+    against ``clientWidth`` 400, with ``#session-badge`` laid out 448px wide (71px past
+    the right edge) and ``#verify-badge`` ending at x=506. ``body`` carries
+    ``overflow-x: hidden``, so there is no scrollbar to reach either -- and
+    ``#session-badge`` is the element naming the live session id, which is the one
+    string a reviewer would quote back.
+
+    Two independent causes, both pinned here because fixing either alone leaves the
+    page overflowing:
+
+    * the badge itself could not wrap, so its text set a minimum width;
+    * ``.audit h2`` is a flex ROW that could not wrap, so ``#verify-badge`` was pushed
+      past the edge while its own box was only 131px wide.
+
+    Re-measured at 400, 600, 820, 1366 and 1920 after: ``scrollWidth == clientWidth`` at
+    every one, and no element anywhere on the page extends past it.
+    """
+    css = STYLE_CSS.read_text(encoding="utf-8")
+
+    badge = _block(css, ".badge")
+    assert _decl(badge, "white-space") != "nowrap", (
+        "`.badge` cannot wrap again. Its text is rewritten by a run, so at a 400px "
+        "viewport `#session-badge` measured 448px and 71px of it sat past an edge "
+        f"`overflow-x: hidden` gives no way to scroll to: {badge.strip()!r}"
+    )
+    assert _decl(badge, "max-width") == "100%", (
+        "a session id is one unbroken token, so `normal` wrapping has nowhere to break "
+        f"it; `max-width` is what bounds it: {badge.strip()!r}"
+    )
+
+    audit_heading = _block(css, ".audit h2")
+    assert _decl(audit_heading, "flex-wrap") == "wrap", (
+        "`.audit h2` is a flex row carrying four items and it must wrap, or a narrow "
+        "viewport has nowhere to put `#verify-badge` -- measured, it ended at x=506 in "
+        f"a 400px viewport while its own box was 131px: {audit_heading.strip()!r}"
+    )
+
+
+def test_the_page_puts_its_panels_above_the_fold_on_a_laptop() -> None:
+    """Standing prose is folded, not deleted -- and the fold is what it is for.
+
+    Measured in Chrome 151 headless at 1440x900 after a run, the top of ``main.panels``
+    sat at y=792 on a 900px viewport, so a reviewer being walked through this page saw
+    the header, three bars of controls, a red LIVE REVIEW block and ten lines of legend
+    prose, and had to scroll before any part of the four panels appeared. The stack:
+
+        header 23 · controls 127 · run bar 125 · LIVE REVIEW 141 · banner 56
+        stats 84 · stats-key legend 116 · highlight legend 44   ->  panels at 792
+
+    The three blocks of standing prose a reviewer reads once (125 + 141 + 116) are 382px
+    of that. Each is now behind a ``<details class="more">``. Re-measured, same viewport
+    and same run: panels top 792 -> 587, with panel 1's heading, its counter and 263px
+    of its body on screen.
+
+    Asserted as "folded", never as "shorter": the text is the page's evidence and this
+    test exists to stop a future tightening from deleting it. The LIVE REVIEW copy in
+    particular is held to the letter by
+    ``test_the_live_review_strip_does_not_promise_a_row_the_tail_does_not_show``, which
+    reads the same strip -- and which is why nothing here may introduce a ``<span>``
+    inside it.
+    """
+    markup = _markup()
+
+    folds = re.findall(r'<details class="more">', markup)
+    assert len(folds) == 3, (
+        f"expected the three standing-prose blocks (the run bar, the LIVE REVIEW strip "
+        f"and the stats-strip key) to be folded; found {len(folds)}"
+    )
+    # A fold with no summary is a block a reviewer cannot open.
+    assert markup.count("</summary>") >= 3, "a `.more` disclosure with no <summary>"
+
+    # THE CONSTRAINT THAT MAKES THE FOLD SAFE. `_STRIP` is non-greedy, so a <span>
+    # anywhere inside the LIVE REVIEW strip truncates the capture and every assertion
+    # the other test makes about this copy would then be reading half a sentence --
+    # passing on text it never saw. The fold is built from <details>/<summary>/<b>/<code>
+    # for exactly this reason, and this is the line that keeps it that way.
+    strip = _STRIP.search(markup)
+    assert strip, "the LIVE REVIEW strip is gone"
+    assert "<details" in strip.group(1), "the LIVE REVIEW strip is no longer folded"
+    # Anchored on the LAST thing in the strip, which is the whole point. The first
+    # version of this line asked for "existed=1" and a sabotage run proved it useless:
+    # a <span> injected two sentences later truncates the capture at ITS closing tag,
+    # and every required string -- "existed=1", "VAULT_DESTROY", "LAST row", "scroll",
+    # 598, 600 -- sits before that point, so the check and the neighbouring test both
+    # stayed green while reading a fragment. The closing `</details>` is the last markup
+    # inside the strip, so requiring it is the only form of this assertion that proves
+    # the capture reached the end.
+    assert "</details>" in strip.group(1), (
+        "`_STRIP` is non-greedy, so this capture ends at the first `</span>` inside the "
+        "LIVE REVIEW strip rather than at the strip's own. Something in there opens a "
+        "<span> -- every check that reads this copy, here and in "
+        "test_the_live_review_strip_does_not_promise_a_row_the_tail_does_not_show, is "
+        "now reading a fragment and passing on text it never saw."
+    )
+    assert "not a gap" in _flat(strip.group(1)), (
+        "the strip's closing sentence is missing from the capture"
+    )

@@ -63,6 +63,16 @@ data/
 **/.git/
 **/.gitignore
 **/.claude/
+# `.gstack/` was in `.gitignore` and not here, which is the wrong half to have. Git
+# ignoring it means it is UNTRACKED, and the `.gitignore` block above says in its own
+# words that untracked agent tooling is one careless `git add -A` from being shipped
+# -- but the build context is uploaded from the WORKING TREE, where untracked and
+# tracked look identical. So the file that governs what the daemon sees is exactly the
+# one where an agent directory must not be missing. Swept the two files against each
+# other line by line: this was the only pattern present in one and absent from the
+# other. Nothing else on disk is agent or editor state (`.claude`, `.codegraph`,
+# `.hypothesis`, `.DS_Store` are all already covered in both).
+**/.gstack/
 # 49 MB of code index and 648 KB of Hypothesis state. The image is unaffected -- the
 # Dockerfile COPYs named paths, never `COPY . .` -- but every build ships them to the
 # daemon as context, and they become a real leak the day someone widens a COPY line.

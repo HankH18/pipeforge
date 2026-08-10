@@ -100,7 +100,22 @@ details.guard[open] > summary { border-color: var(--err); color: #ffd7d3; }
   border-right-color: transparent; border-radius: 50%; animation: sp .7s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg); } }
 
-.badge { border: 1px solid var(--line); border-radius: 10px; padding: 2px 8px; font-size: 11px; white-space: nowrap; }
+/* `white-space: nowrap` was here, and on a badge whose text a RUN rewrites it is a
+   floor on the page's width rather than a nicety. Measured in Chrome 151 headless at a
+   400px viewport after a medical_note.txt run: `scrollWidth` 506 against `clientWidth`
+   400, with `#session-badge` laid out 448px wide -- 71px of it past the right edge --
+   and `body` carries `overflow-x: hidden`, so there is no scrollbar to reach it. The
+   badge is the element that names the live session id, so what is unreachable is the
+   one string a reviewer would quote.
+   Dropping the declaration is the whole fix and it is not a loosening: `normal` wraps
+   only when the line does not fit, which at every width from 600 up is never -- the
+   badges measured identical there before and after. `max-width: 100%` is what stops a
+   single unbroken token (a session id) doing the same thing again, and
+   `overflow-wrap: anywhere` is what lets that token break, since it contains no spaces
+   for `normal` to break at. Re-measured at 400: scrollWidth 400 == clientWidth, and no
+   element on the page extends past it. */
+.badge { border: 1px solid var(--line); border-radius: 10px; padding: 2px 8px; font-size: 11px;
+  max-width: 100%; overflow-wrap: anywhere; }
 .badge.ok { border-color: var(--ok); color: var(--ok); }
 .badge.err { border-color: var(--err); color: var(--err); }
 .badge.muted, .muted { color: var(--dim); }
@@ -126,14 +141,114 @@ details.guard[open] > summary { border-color: var(--err); color: #ffd7d3; }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; font-size: 11px; color: var(--dim); }
 .legend i { display: inline-block; width: 10px; height: 10px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; }
 
+/* NOTHING THIS PAGE BUILT WAS ABOVE THE FOLD.
+   Measured in Chrome 151 headless at 1440x900 after a medical_note.txt run, the top of
+   `main.panels` sat at y=792 on a 900px viewport -- so a reviewer being walked through
+   this page met the header, three bars of controls, a red LIVE REVIEW block and ten
+   lines of legend prose, and had to scroll before any part of the four panels appeared.
+   The stack, block by block, and what each cost:
+
+       header 23 · controls 127 · run bar 125 · LIVE REVIEW 141 · banner 56
+       stats 84 · stats-key legend 116 · highlight legend 44   ->  panels at 792
+
+   Three of those are standing prose a reviewer reads once (run bar 125, LIVE REVIEW 141,
+   stats-key legend 116) and together they are 382px, or nearly half the fold. They are
+   FOLDED and not cut: every sentence is still in the markup and still in the DOM, so
+   nothing the page claimed it claims any less, and the checks that read this copy read
+   the same strings. What each `<details>` leaves outside itself is the part that has to
+   be on screen unread -- what the button does, and the three presses of the LIVE REVIEW
+   script.
+
+   `<details>` rather than a class this file toggles, for the reason `details.guard`
+   already gives two hundred lines up: it is native two-state markup that needs no
+   JavaScript, works with the keyboard, and is announced by a screen reader as the
+   expander it is. The disclosure TRIANGLE is kept here, which is the exact opposite of
+   the choice `.guard` makes -- `.guard` hides it because that control must read as a
+   button, and these must read as expanders, which is what the triangle says.
+
+   `color: inherit` because these sit in three different voices: `--dim` in the run bar,
+   `--err` inside the red LIVE REVIEW strip, `--dim` again in the legend. A fixed colour
+   would either wash out in the red strip or import the red into the other two. Opacity
+   carries the "secondary" cue instead, and it composes with all three.
+
+   Re-measured after, same viewport and same run: panels top 792 -> 458, and the whole of
+   panel 1 -- heading, counter and all 300px of its body -- is above 900. */
+details.more > summary { cursor: pointer; color: inherit; opacity: .8; }
+details.more > summary:hover, details.more[open] > summary { opacity: 1; }
+details.more[open] > summary { margin-bottom: 4px; }
+/* The stats-strip key's own keys were direct children of `.legend`, which is the flex
+   row that wrapped them. Inside a disclosure the flex container has to be a child of the
+   <details>, so this is that container -- same wrapping row, one level down. */
+.legend .keys { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+
 .panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 @media (max-width: 900px) { .panels { grid-template-columns: minmax(0, 1fr); } }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
-.count { float: right; color: var(--dim); font-weight: normal; }
+/* THE PANEL COUNTER IS LAID OUT IN FLOW, AND IT HAS TO BE.
+   `.count` was `float: right`, and at three of the five widths a reviewer's laptop
+   actually reports that collapsed panel 1 to a strip of about forty pixels.
+
+   Measured in Chrome 151 headless against 127.0.0.1:8096, medical_note.txt as
+   `medical`, tokenization -- `#p1` width against the width of the `.panel` around it:
+
+       1366 -> 665 / 667      1440 ->  44 / 704      1512 ->  80 / 740
+       1600 -> 124 / 784      1920 -> 942 / 944
+
+   `#p1`'s own `scrollHeight` reads 16 155px at 1440 against a box `.body` caps at
+   300 -- 2 826 characters of a medical note reflowed into a column four characters
+   wide. 1366 and 1920 are clean, which is exactly why this shipped: the two widths
+   anybody tests first are the two the bug does not touch, and the stock MacBook
+   width sits in the middle of the band that it does.
+
+   The mechanism, in three parts, each measured in the page rather than reasoned:
+
+   * `#c1` is not a counter. `app.js` writes a SENTENCE into it -- "2826 chars ·
+     52 spans masked · detector returned 54, so at least 2 of them were not masked"
+     -- which shrink-to-fits to 650px. The heading's own title takes 123. At a 702px
+     panel content box the float cannot fit beside the title, so it drops to a second
+     line; a float does not grow the block that contains it, so it hangs BELOW the
+     `h2`'s border and into the panel body. Measured at 1440: `#c1` spans y 816..834,
+     `#p1` starts at 823 -- an 11px intrusion.
+   * `.body` is `overflow: auto`, which makes it a block formatting context, and a
+     BFC must shrink to avoid an intruding float. 702 less the float's 650 is what
+     the 44 is.
+   * Proof, run in the live page at 1440 and reverted each time: setting
+     `#c1.style.cssFloat='none'` moved `#p1` 44 -> 702; restoring the float returned
+     it to 44. `#p1.style.overflow='visible'` also returned 702, confirming the BFC
+     as the other half.
+
+   `clear: both` on `.body` fixes the number and leaves the cause -- the sentence
+   still hangs out of the heading, now over the divider rule with the body pushed
+   down under it. A flex row is the structure the content actually is: a heading,
+   an optional provider note, and a counter pushed to the end. The difference that
+   matters is not cosmetic -- **a flex item that wraps grows its container, and a
+   float that drops does not**. So the counter can no longer leave the `h2` box at
+   any width, and `.body` has nothing left to shrink away from. Re-measured across
+   1366/1440/1512/1600/1920 and 400/600/820, `#p1` is its parent's width less the
+   2px border at every one of them.
+
+   `.audit h2` is untouched and already flex; `#audit-run` is a `.count` inside it,
+   where `float` has been a no-op all along (floats do not apply to flex items),
+   so dropping the declaration changes nothing there. `margin-left: auto` is scoped
+   to `.panel h2` for that reason -- `.audit h2 button` already owns that trick, and
+   a second auto margin in the same row would split the free space instead of
+   pushing the counter to the end.
+
+   `tests/test_api_ui_escaping.py::test_the_panel_counter_cannot_escape_its_heading`
+   forbids the declaration by name and requires the replacement. */
+.panel h2 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.panel h2 .count { margin-left: auto; }
+.count { color: var(--dim); font-weight: normal; }
 /* "Which provider", said in panels 2 and 3 rather than only in the health badge three
-   quarters of a 1550px page away. Not `.count` and not floated: `#c2`/`#c3` float right
-   and are rewritten every run, and a provider label that shares their box would be
-   pushed off the end of the heading by a long counter. Normal weight and `--dim` so the
+   quarters of a 1550px page away. A separate element from `.count` rather than words
+   inside it: `#c2`/`#c3` are rewritten by `app.js` on every run, so a provider label
+   sharing their box would be erased by the next run, and a long counter would push it
+   off the end of the heading. (This note used to add "and not floated", describing
+   `#c2`/`#c3` as floats -- true when it was written and not since: the float is what
+   collapsed panel 1 at three common laptop widths, and the panel headings are flex
+   rows now. See the note on `.panel h2`. The reason the label is its own element is
+   unchanged, which is why only the mechanism is corrected here.) Normal weight and
+   `--dim` so the
    heading's own words still lead; `<b>mock</b>` inside it is the one word that has to be
    read, and `b` is bolder than the surrounding text without spending a colour that means
    something else on this page (green is a clean safety counter, red is a non-zero one). */
@@ -195,7 +310,14 @@ mark.tok:not(.unres), i.tok {
 }
 
 .audit { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
-.audit h2 { display: flex; align-items: center; gap: 10px; }
+/* The other half of the 400px overflow. This heading is a flex ROW carrying four items
+   -- "Audit tail", the run-id counter, the Verify chain button and the chain badge --
+   and a flex row that cannot wrap has no way to answer a viewport narrower than its
+   contents: measured at 400px, `#verify-badge` ended at x=506 while its own box was
+   only 131 wide, i.e. the badge was not too big, the row simply had nowhere to put it.
+   `flex-wrap: wrap` is inert at every width where the row already fits (re-measured
+   identical at 600, 820, 1366 and 1920) and is the whole fix below that. */
+.audit h2 { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .audit h2 button { margin-left: auto; }
 .tablewrap { max-height: 260px; overflow: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 11px; }

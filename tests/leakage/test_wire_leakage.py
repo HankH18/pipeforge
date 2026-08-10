@@ -36,6 +36,48 @@ accented original is ``\\u00e9``-escaped in the raw bytes and a naive substring 
 them reads clean on a payload that provably carries the value. Re-serializing is what
 brings the escaped form back into the same alphabet as the needle; keeping the raw bytes
 is what catches anything the JSON round-trip would smooth away.
+
+**What the six generated cases above are evidence OF, and what they are not.** They are
+evidence of the *obfuscator*: on an ordinary document the engine replaces every detected
+value, so the request body is clean before the :class:`~...pipeline.egress_gate.EgressGate`
+is ever consulted, and the gate's verdict is not load-bearing for any of them. That was
+measured, not assumed. Forcing ``EgressGate._scan_originals`` -- the whole of pass 1 -- to
+``return 0`` reddened ``tests/test_egress_gate.py`` (178 failed, 160 passed) and nine tests
+in :mod:`tests.leakage.test_leakage_harness`, and left **this file entirely green**. A test
+file carrying the network-inspection requirement that cannot see the last line of defence
+die is a green whose name overstates its evidence, which is the exact defect class this
+project spent its audit closing.
+
+:func:`test_the_gate_bound_case_is_a_real_counterfactual` and its two siblings close it.
+They run the same document **twice**, and the only difference between the two runs is
+whether the gate knows the planted value:
+
+* ``ZXQQ-KLM-RSTV-WYNP`` is a value the shipped registry genuinely does not recognise
+  (:func:`tests.leakage.test_leakage_harness.test_planted_value_is_invisible_to_the_detector`
+  asserts that blindness in every document category), so the engine leaves it in place and
+  it rides into the payload untouched. Pass 2 re-scans with the same blind detector and
+  pass 3's independent recognisers do not know the shape either -- measured, by the same
+  sabotage: with pass 1 dead, nothing else blocked it.
+* **Control run** -- the value is in the document and *not* in the vault. The gate has
+  nothing to match, the request goes out, and the plant is on the wire **byte-for-byte**.
+  That is the counterfactual made real rather than argued: obfuscation demonstrably does
+  not remove this value.
+* **Gate-bound run** -- byte-identical document, and the value is seeded into the vault
+  through ``SessionVault.note_unrestorable``, the shipped path the engine itself uses for
+  a redact-band detection that gets no token and no row. Pass 1 now has a needle, and the
+  request never reaches the transport at all.
+
+So the delta between the two runs, measured at ``request.content``, *is* the gate. Kill
+pass 1 and the gate-bound run becomes the control run: a body appears on the wire carrying
+a vaulted original, and both of the sibling tests go red for that reason. Proven by
+re-running the same ``return 0`` sabotage after the fix -- see the commit message.
+
+This is deliberately **not** a copy of
+:func:`tests.leakage.test_leakage_harness.test_unknown_shape_value_blocks_egress_and_the_call_never_fires`.
+That test asserts at the ``provider.complete(...)`` call boundary -- it counts calls that
+did not happen. This one asserts at the serialized HTTP body, and adds the half the harness
+has no way to state: a *positive* measurement, in bytes, of what the wire looks like when
+the gate is not the thing keeping it clean.
 """
 
 from __future__ import annotations
@@ -56,6 +98,7 @@ from secure_context_pipeline.config import Settings
 from secure_context_pipeline.deobfuscation.restorer import Restorer
 from secure_context_pipeline.detection.detector import Detector
 from secure_context_pipeline.detection.registry import EntityRegistry, load_registry
+from secure_context_pipeline.errors import EgressBlockedError
 from secure_context_pipeline.llm.anthropic_provider import AnthropicProvider
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
@@ -67,7 +110,9 @@ from secure_context_pipeline.vault.session_vault import SessionVault
 from tests.leakage.test_leakage_harness import (
     DOC_CATEGORY,
     KINDS,
+    PLANT_TEMPLATE,
     STRATEGIES,
+    UNKNOWN_SHAPE_VALUE,
     USER_ID,
     find_in_bytes,
     find_in_text,
@@ -98,6 +143,15 @@ WIRE_CASES: tuple[tuple[str, str, int], ...] = tuple(
 )
 
 PROMPT = "Summarise this record and list the key parties, dates and figures."
+
+#: The gate-bound pair. One document, one ``doc_id``, two sessions -- so the two runs
+#: differ in exactly one respect and the wire can be read as a difference. ``financial``
+#: and ``tokenization`` are arbitrary among the six above; the plant is invisible to the
+#: detector in every category, which
+#: ``test_planted_value_is_invisible_to_the_detector`` asserts rather than assumes.
+GATE_CASE_KIND = "financial"
+GATE_CASE_STRATEGY = "tokenization"
+GATE_CASE_SEED = 70_100
 
 
 def _message_json() -> dict[str, Any]:
@@ -399,3 +453,234 @@ def test_the_request_body_is_the_obfuscated_document_not_the_original(
                 f"{label} request {index}: the raw source document is present verbatim "
                 "in the outbound request body"
             )
+
+
+# ---------------------------------------------------------------------------
+# The gate binding: one document, two runs, and the wire read as the difference
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def gate_bound_run(
+    wire_registry: EntityRegistry,
+    wire_settings: Settings,
+    wire_detector: Detector,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Any:
+    """Run one planted document twice, differing only in what the vault knows.
+
+    Both runs share a single ``doc_id``, so "the same document" is an identity rather
+    than a claim about two ``generate`` calls agreeing. Between them the only change is
+    one ``note_unrestorable`` -- the shipped, synchronous, cache-only path the engine
+    uses for a redact-band detection that gets no token and no row, so the seeding is a
+    real pipeline mechanism and not a test-only hole punched in the vault.
+
+    Exceptions are *recorded* rather than allowed to propagate: which run raised, and
+    with what reason code, is the measurement, and a fixture that died on it would turn
+    a legible assertion failure into a collection error.
+    """
+    root = tmp_path_factory.mktemp("wire-gate-db")
+    audit = await AuditLogger.open(root / "audit.db")
+    store = await EncryptedDocumentStore.open(wire_settings)
+    sessions = SessionRegistry(wire_settings)
+    vault = await SessionVault.open(root / "vault.db", sessions)
+    capture = WireCapture()
+
+    document = generator.generate(GATE_CASE_SEED, GATE_CASE_KIND) + PLANT_TEMPLATE.format(
+        UNKNOWN_SHAPE_VALUE
+    )
+    runs: dict[str, dict[str, Any]] = {}
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(capture.handler)) as http_client:
+        provider = AnthropicProvider(wire_settings, http_client=http_client)
+        orchestrator = PipelineOrchestrator(
+            store=store,
+            detector=wire_detector,
+            engine=ObfuscationEngine(
+                registry=wire_registry,
+                vault=vault,
+                session_registry=sessions,
+                settings=wire_settings,
+                audit=audit,
+            ),
+            injector=ContextInjector(),
+            gate=EgressGate(
+                vault=vault, detector=wire_detector, settings=wire_settings, audit=audit
+            ),
+            provider=provider,
+            restorer=Restorer(vault=vault, settings=wire_settings, audit=audit),
+            vault=vault,
+            settings=wire_settings,
+            audit=audit,
+        )
+        try:
+            doc_id = await store.put(
+                USER_ID,
+                f"plant-{GATE_CASE_SEED}.txt",
+                document.encode("utf-8"),
+                DOC_CATEGORY[GATE_CASE_KIND],
+            )
+            for name, seed_the_vault in (("control", False), ("gated", True)):
+                session_id, _expires = await sessions.create(f"wire-{name}")
+                if seed_the_vault:
+                    vault.note_unrestorable(session_id, UNKNOWN_SHAPE_VALUE)
+                before = len(capture.bodies)
+                blocked: EgressBlockedError | None = None
+                try:
+                    await orchestrator.run(session_id, USER_ID, doc_id, PROMPT, GATE_CASE_STRATEGY)
+                except EgressBlockedError as exc:
+                    blocked = exc
+                runs[name] = {
+                    "session_id": session_id,
+                    "bodies": capture.bodies[before:],
+                    "originals": vault.originals_for_session(session_id),
+                    "blocked": blocked,
+                }
+        finally:
+            await vault.close()
+            await store.close()
+            await audit.close()
+
+    yield {"document": document, "runs": runs}
+
+
+def test_the_gate_bound_case_is_a_real_counterfactual(gate_bound_run: dict[str, Any]) -> None:
+    """The control: with the gate uninterested, the plant is on the wire in bytes.
+
+    Everything the two sibling tests below claim rests on this one, because "no original
+    on the wire" is satisfied for free by a value that was never going to be there. The
+    control run puts the *identical* document through the *identical* pipeline with only
+    one thing missing -- the vault does not know the planted value -- and the request
+    that results carries ``ZXQQ-KLM-RSTV-WYNP`` byte-for-byte.
+
+    That is the measurement the six generated cases cannot make. On those, the engine
+    replaced every value before the gate was consulted, so their green says nothing about
+    whether the gate is alive. Here the engine demonstrably does *not* replace it: the
+    registry has no recogniser for the shape, so obfuscation is not what keeps it off the
+    wire in the gated run, and by elimination the gate is.
+
+    Asserted both ways round on purpose. ``in body`` is the flat byte test, and
+    :func:`find_in_bytes` is the same scanner the claim is stated in -- if the two ever
+    disagree here, the scanner has a hole and every clean result in this file is worth
+    less than it looks.
+    """
+    control = gate_bound_run["runs"]["control"]
+    document = gate_bound_run["document"]
+    needle = frozenset({UNKNOWN_SHAPE_VALUE})
+
+    assert UNKNOWN_SHAPE_VALUE in document, (
+        "the planted value is not in the source document, so both runs are about a value "
+        "that was never in play"
+    )
+    assert control["blocked"] is None, (
+        "the control run was blocked at the gate: "
+        f"{control['blocked'].detail if control['blocked'] else None}. The control exists "
+        "to show the payload carries the plant when the vault does not know it, and a "
+        "blocked control means it never got to show that"
+    )
+    assert UNKNOWN_SHAPE_VALUE not in control["originals"], (
+        "the control session's vault already holds the planted value, so the two runs no "
+        "longer differ in the one respect this pair is built on"
+    )
+    assert control["bodies"], "the control run made no HTTP request, so there is no wire to read"
+
+    carriers = [
+        index
+        for index, body in enumerate(control["bodies"])
+        if UNKNOWN_SHAPE_VALUE.encode("utf-8") in body
+    ]
+    assert carriers, (
+        f"the planted value is absent from all {len(control['bodies'])} control request "
+        "body/bodies. Something other than the gate is removing it -- most likely a "
+        "registry change that made the shape detectable -- and the pair below has stopped "
+        "measuring the gate"
+    )
+    for index in carriers:
+        body = control["bodies"][index]
+        decoded, reserialized = _body_views(body)
+        for form, hits in (
+            ("raw bytes", find_in_bytes(needle, body)),
+            ("decoded", find_in_text(needle, decoded)),
+            ("re-serialized", find_in_text(needle, reserialized)),
+        ):
+            assert hits, (
+                f"control request {index}: the planted value is in the raw bytes but the "
+                f"[{form}] scanner does not report it. The scanner has a blind spot, and "
+                "every clean result in this file was produced by that scanner"
+            )
+
+
+def test_the_vaulted_plant_never_reaches_the_wire(gate_bound_run: dict[str, Any]) -> None:
+    """**The claim, bound to the gate.** The same document, with the vault told.
+
+    One ``note_unrestorable`` is the whole difference from the control. The detector is
+    still blind to the value, so pass 2 cannot see it; pass 3's independent recognisers
+    do not know the shape either. Only pass 1 -- ``EgressGate._scan_originals``, the
+    byte-exact scan of the payload against the session's originals -- can stop it.
+
+    Scanned in the same three forms as
+    :func:`test_no_original_reaches_the_serialized_request_body`, over every body the
+    gated run produced. On a healthy gate that list is empty and this is a statement about
+    nothing, which is why :func:`test_the_gate_is_what_kept_it_off_the_wire` asserts the
+    emptiness separately and this one asserts the content. With pass 1 dead the list is
+    not empty: a request appears carrying a value the vault holds, and this test reports
+    it as bytes on the wire rather than as a call that should not have happened.
+    """
+    gated = gate_bound_run["runs"]["gated"]
+    assert UNKNOWN_SHAPE_VALUE in gated["originals"], (
+        "`note_unrestorable` did not put the planted value into the gated session's "
+        "originals, so pass 1 was never given a needle and this test proves nothing"
+    )
+
+    findings: list[str] = []
+    for index, body in enumerate(gated["bodies"]):
+        decoded, reserialized = _body_views(body)
+        for form, hits in (
+            ("raw bytes", find_in_bytes(gated["originals"], body)),
+            ("decoded", find_in_text(gated["originals"], decoded)),
+            ("re-serialized", find_in_text(gated["originals"], reserialized)),
+        ):
+            findings.extend(f"gated request {index} [{form}]: {mask(value)}" for value in hits)
+
+    assert not findings, (
+        f"{len(findings)} vaulted original(s) are in the literal bytes of an outbound LLM "
+        f"request: {findings}. The engine cannot have removed this value -- the detector "
+        "does not recognise it -- so the egress gate was the only thing standing between "
+        "it and the network, and it is on the network"
+    )
+
+
+def test_the_gate_is_what_kept_it_off_the_wire(gate_bound_run: dict[str, Any]) -> None:
+    """The delta, stated at the transport: control sends, gated does not.
+
+    Three things, and each rules out a different way the pair could look right while
+    measuring nothing: the gated run raised, it raised for the **pass-1 reason** rather
+    than for a detector re-hit that would have made the plant irrelevant, and no request
+    reached the transport at all. The last is the network-inspection requirement in its
+    strongest form -- there is no body to inspect, because there was no request.
+
+    ``reason == "vault_original"`` is load-bearing. Blocking for ``detector_rescan`` or
+    ``independent_pattern`` would mean some *other* limb caught the planted value, and
+    the pair would then be evidence about that limb rather than about pass 1.
+    """
+    control, gated = gate_bound_run["runs"]["control"], gate_bound_run["runs"]["gated"]
+
+    assert gated["blocked"] is not None, (
+        "the gated run completed. A value the vault holds and the detector cannot see "
+        f"went through the whole pipeline, and {len(gated['bodies'])} request(s) reached "
+        "the transport -- pass 1 of the egress gate is not doing anything"
+    )
+    assert gated["blocked"].detail["reason"] == "vault_original", (
+        f"the gated run was blocked for {gated['blocked'].detail['reason']!r}, not by "
+        "pass 1. Some other limb is catching the plant, so this pair no longer measures "
+        "the original-value scan"
+    )
+    assert not gated["bodies"], (
+        f"{len(gated['bodies'])} request(s) reached the transport on a blocked run: the "
+        "gate raised but the payload had already gone out, so the block is a report "
+        "rather than a barrier"
+    )
+    assert control["bodies"] and not gated["bodies"], (
+        f"the pair does not differ on the wire ({len(control['bodies'])} control "
+        f"request(s), {len(gated['bodies'])} gated). The difference IS the measurement"
+    )

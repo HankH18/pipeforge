@@ -1750,19 +1750,34 @@
     return new Blob([text], { type: 'text/plain' });
   }
 
-  // Returns the document id rather than only writing it to `S`, so a run can hold
-  // its own copy across the awaits that follow.
-  async function ensureDoc(uid, cat) {
-    // ONE upload path for both controls. The preset does not get a shortcut into the
-    // store: it fetches the bytes the server ships and hands them to the same
-    // multipart POST /documents the picker feeds, with the same `user_id` and the
-    // same `doc_category`, so "chose the preset" and "found the same file on disk"
-    // are indistinguishable to everything downstream -- extraction, the category
-    // gating in entities.yaml, detection, the gate. A preset that called some
-    // server-side "load fixture and store it" route would be a second ingestion path
-    // to keep in step, and the demo's whole claim is about what the ONE path does.
-    // Pinned end to end by
-    // test_a_preset_run_and_a_hand_picked_run_of_one_fixture_detect_identically.
+  // The two refusals that decide whether a click is a RUN AT ALL, lifted out of
+  // `ensureDoc` so they can be asked BEFORE anything irreversible happens.
+  //
+  // They used to live only inside `ensureDoc`, which `run` calls after it has already
+  // minted a session -- so on a cold page the very first click of Run with nothing
+  // armed did this, measured against the live API with the network log open:
+  //
+  //     POST /sessions            201   (a real session, a real key, a SESSION_CREATE row)
+  //     ...then NO_FILE, in the browser, having sent nothing else
+  //
+  // A refused click burned a session key. That is wrong three ways at once and the
+  // third is the one that costs a reviewer: the page had "never held a session" before
+  // the click and has held one after it, so `run`'s own mint condition
+  // (`!S.sessionId && !S.lastSessionId`) is now false, the badge reads "auto-created by
+  // Run", and the SESSION_CREATE row is in the audit tail dated to a run that never
+  // happened. `tests/test_ui_behaviour.py` already asserted "a refused run must not
+  // reach the network" and passed throughout, because its fixture seeds
+  // `UI.S.sessionId` before every scenario -- so the assertion was true of every state
+  // EXCEPT the cold start, which is the reviewer's first click.
+  //
+  // Split rather than duplicated: `ensureDoc` calls this too, so there is exactly one
+  // copy of each sentence and one place either refusal can change. `ensureDoc` keeps
+  // calling it because it is the function that actually needs `armed` to be there --
+  // this is a preflight, not a substitute for the guard at the point of use.
+  //
+  // Returns the armed descriptor and the picked File, which `ensureDoc` needs anyway,
+  // so the check and the read are one pass over `S.armed` rather than two.
+  function preflightDoc(cat) {
     const armed = S.armed;
     const f = armed && armed.kind === 'file' ? $('file').files[0] : null;
     if (!armed || (armed.kind === 'file' && !f)) {
@@ -1785,6 +1800,28 @@
         'financial or general) -- it decides which rule sets run, and an uncategorised ' +
         'document is scanned without the category-scoped ones.' };
     }
+    return { armed: armed, file: f };
+  }
+
+  // Returns the document id rather than only writing it to `S`, so a run can hold
+  // its own copy across the awaits that follow.
+  async function ensureDoc(uid, cat) {
+    // ONE upload path for both controls. The preset does not get a shortcut into the
+    // store: it fetches the bytes the server ships and hands them to the same
+    // multipart POST /documents the picker feeds, with the same `user_id` and the
+    // same `doc_category`, so "chose the preset" and "found the same file on disk"
+    // are indistinguishable to everything downstream -- extraction, the category
+    // gating in entities.yaml, detection, the gate. A preset that called some
+    // server-side "load fixture and store it" route would be a second ingestion path
+    // to keep in step, and the demo's whole claim is about what the ONE path does.
+    // Pinned end to end by
+    // test_a_preset_run_and_a_hand_picked_run_of_one_fixture_detect_identically.
+    // Both refusals, and the read of `S.armed` they are about, in one call. See
+    // `preflightDoc`: `run` asks the same question before it mints anything, and this
+    // is the guard at the point of use rather than a second copy of it.
+    const pre = preflightDoc(cat);
+    const armed = pre.armed;
+    const f = pre.file;
     // The cache key names the SOURCE as well as the document, so arming the preset for
     // medical_note.txt and then picking a file of your own that happens to be called
     // medical_note.txt cannot be served the previous upload -- a preset has no size and
@@ -2073,6 +2110,29 @@
     // is exactly what the SESSION_EXPIRED sentence tells them to do, and a button
     // that quietly changes behaviour on the second press is worse than one that does
     // not.
+    // ---- a click that is not a run is refused BEFORE anything is minted ----
+    //
+    // Read here rather than after the mint, which is where it used to be read, because
+    // the mint below is the irreversible step and this is the question that decides
+    // whether to take it. See `preflightDoc` for the measurement: a cold page, nothing
+    // armed, one click of Run issued `POST /sessions` 201 and THEN refused NO_FILE, so
+    // a refusal minted a session key, wrote a SESSION_CREATE row, and consumed the
+    // page's one-time "never held a session" state -- all for a run that never ran.
+    //
+    // The two steps in the catch are exactly what the try/catch below does for these
+    // same two codes, in the same order and for the same reasons: `resetRun` first, so
+    // a refusal is not read as a verdict on the run still painted behind it, then the
+    // sentence naming the missing input. No audit reload, because nothing reached the
+    // network -- the catch below makes that same exemption for these same two codes by
+    // name, and this path now genuinely issues zero requests rather than one.
+    const cat = $('category').value;
+    try {
+      preflightDoc(cat);
+    } catch (e) {
+      resetRun();
+      showError(e);
+      return;
+    }
     const minted = !S.sessionId && !S.lastSessionId;
     if (minted) {
       await createSession(MINT_BY_RUN);
@@ -2086,9 +2146,11 @@
     const uid = userId();
     const sid = S.sessionId || S.lastSessionId;
     const strategy = $('strategy').value;
-    // Captured here for the same reason `strategy` is, and read twice: once to scope
-    // the upload, once to name the rule sets the run did not use.
-    const cat = $('category').value;
+    // `cat` is captured for the same reason `strategy` is, and is read three times:
+    // once by the preflight above, once to scope the upload, once to name the rule
+    // sets the run did not use. It is declared with the preflight rather than here
+    // because the preflight is the first of those three reads -- one capture, taken at
+    // the earliest point that needs it, is what stops the three disagreeing.
     // The category the DOCUMENT declares, as opposed to the one the run was given. Only
     // the bundled presets have one; see `renderScope`.
     const declared = S.armed && S.armed.kind === 'preset' ? (S.armed.cat || null) : null;

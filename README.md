@@ -56,6 +56,18 @@ third is a plain NER recall miss on a person name, which is the case that shows 
 cannot backstop a detection miss. All three are measured and pinned in the same *Leakage harness*
 section below, under *A fifth / sixth / seventh limit*.
 
+**Detector-side Unicode respelling belongs on that earlier list too, and it is named separately
+because calling it "recall" undersells how ordinary it is.** A value written in a spelling the
+patterns do not match is never detected, so it is never vaulted and the gate is never given it —
+measured on the shipped registry, where `Member SSN 123-45-6789` scores `SSN@0.70` while the same
+number carrying one zero-width space, respelled in fullwidth digits (`ＳＳＮ：１２３－４５－６７８９`), or
+in Arabic-Indic digits (`٥٥٥-٥٥-٥٥٥٥`) each score **nothing**, in every document category. The
+asymmetry is the point: `EgressGate._scan_originals` already folds all three — it strips
+default-ignorables and rewrites every Unicode decimal digit in its ASCII spelling — so the gate
+would catch these *if a vault row existed*. Fullwidth digits in particular are ordinary output
+from a CJK word processor rather than an attack, which is what separates this from an NER miss on
+an unusual name. Closing it is a detection-side normalisation pass, not a gate change.
+
 **Three shapes that were open and undeclared are now closed**, all found by adversarial review
 rather than by the harness, and all reproduced end to end before being fixed: any alteration of a
 multi-word original's interior separator (`Marguerite<U+200B>Vandenberg` reached the provider,
@@ -143,15 +155,17 @@ SCP_UID=$(id -u) SCP_GID=$(id -g) docker compose up --build
 ```
 
 This is the one setup step that differs by host, and it is worth a sentence because
-the failure is a crash loop rather than an error. `data/` is gitignored, so a fresh
-clone does not have it; the Linux daemon then creates the bind-mount source as
-`root:root`, and a **bind mount masks the directory it covers** — so the image's
-build-time `chown` of `/app/data` to uid 10001 does not apply to what is actually
-mounted there. The first SQLite open (the audit log) fails with `unable to open
-database file`, startup aborts, and `restart: unless-stopped` retries it forever.
-It is invisible on macOS and Docker Desktop, where the file-sharing layer remaps
-ownership to the calling user — which is exactly why it survived this long: every
-local run here was clean.
+the failure is a permission error rather than an obvious one. `data/` is gitignored,
+so a fresh clone does not have it; the Linux daemon then creates the bind-mount
+source as `root:root`, and a **bind mount masks the directory it covers** — so the
+image's build-time `chown` of `/app/data` to uid 10001 does not apply to what is
+actually mounted there. The first SQLite open (the audit log) fails with `unable to
+open database file` and startup aborts. It is invisible on macOS and Docker Desktop,
+where the file-sharing layer remaps ownership to the calling user — which is exactly
+why it survived this long: every local run here was clean. The restart policy is
+`on-failure:3` rather than `unless-stopped` so that a startup failure retries three
+times and then **stops**, instead of replaying its own logs until the reviewer
+scrolls away.
 
 The spaCy `en_core_web_lg` model (425 MB on disk, `du -sh` on the installed package) is baked in
 at **build** time, not fetched at runtime. That is deliberate: the premise of this system is that
@@ -166,10 +180,47 @@ the observed startup time.)
 preference. The bare `env_file: .env` form makes the file mandatory at **parse** time, so on a
 fresh clone — which has no `.env`, because `.env` is gitignored — `docker compose up --build`
 died before building anything, with an error naming a missing file rather than the missing key
-behind it. Compose now starts without it and the application fails on its own terms:
-`ConfigError(reason='master_key_missing', hint='set_SCP_MASTER_KEY_see_env_example')`. Measured
-both ways in a fresh clone: `docker compose config` exits **1** with the old form and **0** with
-the shipped one, and still resolves the file when it is present.
+behind it. Measured both ways in a fresh clone: `docker compose config` exits **1** with the old
+form and **0** with the shipped one, and still resolves the file when it is present.
+
+**What a reviewer who forgets the key actually saw.** Fixing the parse error only moved the
+failure: compose started the container, `Settings` refused on its own terms — correctly — and the
+reason arrived at the *bottom* of a 45-line traceback (starlette → `contextlib` → six repeated
+`fastapi/routing.py merged_lifespan` frames → pydantic-settings), ending in `ConfigError:
+CONFIG_ERROR(reason='master_key_missing', hint='set_SCP_MASTER_KEY_see_env_example')` — after
+which `restart: unless-stopped` replayed the whole thing. Measured in a fresh clone with no
+`.env`: **RestartCount 12** in four minutes, still climbing. The information was there; it was 44
+lines below where a reader stops.
+
+The check now runs *in front of* the application, as the first statement of the service's
+`command`, and the whole of what a fresh clone with no `.env` prints is nine lines that say what
+to do:
+
+```
+app-1  | === NOT STARTED: SCP_MASTER_KEY is missing ========================
+app-1  |   It is the base64 32-byte key every document, vault row and audit
+app-1  |   entry is encrypted under. No default, no fallback -- starting
+app-1  |   without one would mean writing plaintext. From the repo root:
+app-1  |     cp .env.example .env
+app-1  |     python3 -c "import secrets,base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
+...
+app-1  | exited with code 78
+```
+
+No traceback, `docker compose up` exits **1** (`--exit-code-from app` gives **78**, `EX_CONFIG`),
+and `RestartCount` stops at **3** instead of climbing — 36 log lines in total, against an
+unbounded scroll. With a `.env` present the check `exec`s straight through, so there is no wrapper
+process left behind: PID 1 in the running container is `uvicorn … --no-access-log` itself,
+`app-1` reports `Up (healthy)`, and `/health` returns `model_loaded: true`.
+
+**Restating the `uvicorn` argv in compose is the cost of that, and it is bounded by a test rather
+than by care.** A compose `command:` replaces the image's `CMD` outright, and that `CMD` carries
+`--no-access-log`, which is a disclosure control rather than tidiness (see *Log-stream hygiene*).
+`test_log_stream_hygiene.py::test_compose_does_not_override_the_command_and_drop_the_flag`
+already asserted that any override at that indent must carry the flag — it went red on the first
+version of this change, which is exactly what it is for. None of this weakens the fail-closed
+rule: `Settings` still raises and the API still cannot boot without a key, pinned by the config
+tests rather than by compose. The check only decides which line the reviewer reads first.
 
 **How the image was checked for secrets and for host artefacts is in
 [Docker image, verified](#docker-image-verified) below** — after the demo flags, because it is
@@ -226,9 +277,9 @@ that produces it — re-derive rather than trust, which is what checklist step 5
 #### The numbers this repository prints
 
 ```
-2972 passed, 1 skipped       # full suite WITH node on PATH, as `pytest -q` printed it.
+2980 passed, 1 skipped       # full suite WITH node on PATH, as `pytest -q` printed it.
                              #   The skip is the real-network LLM smoke test.
-                             #   2973 collected: 166 leakage + 9 bench + rest unit + integration
+                             #   2981 collected: 169 leakage + 9 bench + rest unit + integration
 mypy                         # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 98% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
@@ -294,10 +345,10 @@ this document and not that file.
 
 **Coverage above is the package only** (`--cov=secure_context_pipeline`), which is the gate
 `pyproject.toml` configures. Measured across the whole repository — package, tests, `demo.py` and
-`fixtures/` — it is **98%** of **26,834** statements: **26,172** for the package plus `tests/`
-plus `fixtures/`, and `demo.py`'s **662** on top of that. It is published as its two addends
+`fixtures/` — it is **98%** of **26,971** statements: **26,281** for the package plus `tests/`
+plus `fixtures/`, and `demo.py`'s **690** on top of that. It is published as its two addends
 because `demo.py` has to be measured separately: the demo tests load it by *file path* under a
-synthetic module name, so `--cov=demo` warns `module-not-imported` and silently drops all 662 of
+synthetic module name, so `--cov=demo` warns `module-not-imported` and silently drops all 690 of
 its statements. Every published number here is pinned **exactly** rather than banded, which is an
 argued position: a band on the fastest-moving figure was found holding an 81-statement error, and
 a replay of nineteen commits showed it bought exactly one green run, because the collected-test
@@ -314,7 +365,7 @@ subsequent write on a transient fault. `demo.py` was the sharpest case of execut
 fully executed by `tests/test_demo_flows.py`, but its twenty graded assertions were checked only by
 *name*, so fifteen of the twenty ledger entries — including the fail-closed section's own control —
 could each be replaced with the literal `True` and every test still passed. Each has a test that
-falsifies exactly one condition now. That file is now 55 tests.
+falsifies exactly one condition now. That file is now 56 tests.
 
 #### Leakage harness — 100 runs, zero leaks
 
@@ -436,6 +487,33 @@ in CI now rather than only by `demo.py --real --dump-wire`.
 captures the **serialized request body** and scans those bytes against the vault. Measured: **178
 vaulted originals across 6 real SDK requests, 23,334 bytes of captured body, 0 hits**. It needs no
 API key and no network, because the transport is what is replaced, not the client.
+
+**Those six cases were evidence of the obfuscator, not of the gate, and that was measured rather
+than suspected.** On an ordinary document the engine replaces every detected value, so the body is
+already clean when the gate is consulted and the gate's verdict is not load-bearing for any of
+them. Forcing `EgressGate._scan_originals` — the whole of pass 1 — to `return 0` reddened
+`tests/test_egress_gate.py` (**178 failed, 160 passed**) and nine tests in the harness, and left
+this file **entirely green, 4 passed**. A file carrying the network-inspection requirement that
+cannot see the last line of defence die is a green whose name overstates its evidence — the same
+defect class as the harness's own blind spot above.
+
+It is closed by running one document **twice**, differing only in what the vault knows.
+`ZXQQ-KLM-RSTV-WYNP` is a value the shipped registry does not recognise, so the engine leaves it
+in the payload and the detector-driven passes 2 and 3 cannot see it either. In the **control** run
+the vault has never heard of it and the request goes out carrying it *byte-for-byte* — the
+counterfactual made real rather than argued. In the **gate-bound** run the identical `doc_id` is
+sent with the value seeded through `SessionVault.note_unrestorable`, the shipped path the engine
+uses for a redact-band detection that gets no token, and pass 1 stops the request before it
+reaches the transport at all. The delta between the two runs, read at `request.content`, *is* the
+gate: `::test_the_gate_bound_case_is_a_real_counterfactual` holds the control,
+`::test_the_vaulted_plant_never_reaches_the_wire` scans any body that escapes, and
+`::test_the_gate_is_what_kept_it_off_the_wire` pins the block reason as `vault_original`. Re-run
+with the same `return 0` sabotage the two named last go **red**, reporting the planted value in
+the raw bytes of an outbound request.
+
+This does not contradict the "three passes had to be silenced" measurement below: that one is
+about a *detected* value, which passes 2 and 3 also catch. The plant is the case where only pass 1
+can act, which is what makes it the probe that binds this file to the gate.
 
 The other half of the same question — *are the bytes you hashed the bytes you sent?* — is pinned
 three ways: `test_egress_gate.py::test_payload_sha256_is_the_digest_of_the_scanned_bytes` asserts
@@ -2673,7 +2751,8 @@ If the second one prints `.env`, the file is in history and a rewrite (`git filt
 required before submission — deleting it in a later commit is not enough.
 
 **3 — Docker path.** `docker-compose.yml` declares `env_file` as optional, so compose starts
-without a `.env` and the app then refuses with `master_key_missing`. Give it one:
+without a `.env`; the container then refuses with a `NOT STARTED: SCP_MASTER_KEY is missing`
+message, exits 78 and stops after three attempts. Give it a key:
 
 ```bash
 cp .env.example .env
@@ -2715,7 +2794,7 @@ ledger too.
 pytest -q            # expect WITH node: the pass count §1 pastes, and 1 skipped (the real-network
                      #   LLM smoke test). That pass count is written down in exactly one place --
                      #   §1 -- so this step cannot drift out of agreement with it, which is what
-                     #   it did. Without node: 119 skipped -- tests/test_ui_behaviour.py goes
+                     #   it did. Without node: 120 skipped -- tests/test_ui_behaviour.py goes
                      #   with it, and §1's app.js execution-test claim is uncovered on your run.
 pytest -m leakage -q # expect: 100/100 runs clean, 0 leaks
 pytest -m bench -q   # expect: the seven measurements §1 tabulates, all inside budget

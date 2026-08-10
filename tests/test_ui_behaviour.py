@@ -2292,6 +2292,84 @@ emit(out);
     assert out["requests"] == 0, "a refused run must not reach the network"
 
 
+def test_a_refused_first_run_does_not_burn_a_session_key(tmp_path: Path) -> None:
+    """The cold-start half of "a refused run must not reach the network".
+
+    ``test_a_run_with_nothing_to_run_on_is_refused_before_any_request`` above asserts
+    exactly that and has passed throughout -- because ``RUN_SETUP`` seeds
+    ``UI.S.sessionId`` before every scenario it runs. So the claim was true of every
+    state EXCEPT the one a reviewer is in on their first click: a page that has never
+    held a session, which is the only state in which ``run`` mints one.
+
+    In that state it was false. Measured in Chrome 151 against a live server, fresh
+    page, nothing armed, one click of Run, network log open::
+
+        POST /sessions   201     <- a real session, a real key, a SESSION_CREATE row
+        ...then NO_FILE, in the browser, having sent nothing else
+
+    ``run`` minted the session BEFORE calling ``ensureDoc``, which is where both
+    refusals lived. The cost is not only the wasted key. ``run`` mints only when
+    ``!S.sessionId && !S.lastSessionId`` -- a once-per-page condition -- so the refused
+    click consumed it: the badge changed to "auto-created by Run", ``/health`` counted
+    another active session, and a SESSION_CREATE row entered the audit tail dated to a
+    run that never happened, on the page whose whole subject is the lifecycle of that
+    key.
+
+    The fix is ``preflightDoc``, asked before the mint rather than after it. Verified
+    the same way afterwards: zero requests of any kind, ``/health``'s
+    ``active_sessions`` unchanged across the click, the badge still reading "no session
+    yet", and then -- with a document armed -- ``POST /sessions`` firing exactly as
+    before, so mint-by-run is intact rather than disabled.
+
+    This scenario deliberately does NOT use ``RUN_SETUP``: seeding a session is the
+    thing that hid the defect.
+    """
+    body = """
+const out = {};
+respond((path, init) => {
+  if (path === '/sessions') return { status: 200, body: { session_id: 's-new' } };
+  return { status: 200, body: {} };
+});
+// A page that has never held a session, which is the only state that mints one.
+UI.S.sessionId = null;
+UI.S.lastSessionId = null;
+el('prompt').value = 'Summarise';
+el('category').value = 'legal';
+// ...and nothing armed. This is a fresh page with a prompt typed in.
+await UI.run();
+out.banner = el('banner').innerHTML;
+out.requests = calls.map((c) => c.method + ' ' + c.path);
+out.sessionId = UI.S.sessionId;
+
+// The other direction, in the same page state: arming a document must still mint.
+// A "fix" that simply stopped minting would pass every assertion above.
+el('file').files = [{ name: 'note.txt', size: 3, lastModified: 11 }];
+fire('file', 'change');
+await UI.run();
+out.mintedAfterArming = calls.filter((c) => c.path === '/sessions').length;
+out.sessionIdAfter = UI.S.sessionId;
+emit(out);
+"""
+    out = _run(tmp_path, body)
+    assert out["requests"] == [], (
+        f"a refused first run reached the network: {out['requests']} -- a click that "
+        f"cannot run must not mint the session key the page only mints once"
+    )
+    assert out["sessionId"] is None, (
+        "the refused click left a session id behind, so the page's one-time "
+        "'never held a session' state is spent and the badge now claims a session was "
+        "auto-created by a run that never ran"
+    )
+    assert out["banner"].startswith("<b>NO_FILE</b>"), out["banner"]
+    # Mint-by-run still works, which is the behaviour the preflight must not have cost.
+    assert out["mintedAfterArming"] == 1, (
+        f"arming a document and running no longer mints a session "
+        f"({out['mintedAfterArming']} POST /sessions) -- the preflight was supposed to "
+        f"reorder the mint, not remove it"
+    )
+    assert out["sessionIdAfter"] == "s-new"
+
+
 def test_choosing_a_different_file_invalidates_the_upload_cache(tmp_path: Path) -> None:
     """The other half of the upload cache: picking a new file must force a new upload.
 

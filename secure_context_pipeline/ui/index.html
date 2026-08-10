@@ -324,16 +324,26 @@
        swept as a sibling of the panel 2 and 3 labels below. It points at those labels
        rather than repeating the switch a third time: the belief a reviewer has to not
        form is "a real model saw that payload", and the payload is read on the panels. -->
+  <!-- FOLDED, NOT CUT. Measured at 1440x900 after a medical_note.txt run, this block was
+       125px of the 792px that sat above `main.panels` -- so a reviewer on a laptop met the
+       header, three bars of controls and ten lines of prose, and had to scroll before one
+       pixel of the four panels the demo exists to show was on screen. Every word below is
+       still here and still in the DOM (so the checks that read this file read the same
+       text); what changed is that the paragraph a reviewer reads ONCE now opens on demand
+       instead of costing four lines on every load. The first sentence stays out of the
+       disclosure because it is the one that says what the button does. -->
   <span class="hint">Uploads the armed document, detects and obfuscates it, sends only the
     obfuscated payload to the provider named on panels 2 and 3, and restores the answer into
-    panel 4. Nothing here is destructive and it can be repeated. If this page has never held
+    panel 4. Nothing here is destructive and it can be repeated.
+    <details class="more"><summary>the rest, and what the second button is
+      for</summary>If this page has never held
     a session, this is also what creates one.
     <b>The second button</b> repeats that same run against the same live session with one
     extra sentence appended to the prompt, carrying a correctly-shaped token this session
     never issued &mdash; which is what a model inventing a placeholder looks like. It is the
     build doc&rsquo;s vault-miss demonstration: a real <code>VAULT_MISS</code> row, a real
     <code>[UNRESOLVED_ENTITY]</code> in panel 4, and the hatched legend key lit. The prompt
-    box is rewritten in full first, so you read exactly what was sent.</span>
+    box is rewritten in full first, so you read exactly what was sent.</details></span>
 </section>
 
 <section class="controls danger" id="review-pair" aria-label="destructive controls">
@@ -397,8 +407,25 @@
        with exactly nine rows fully visible. The counts move with `entities.yaml`, so
        `tests/test_api_ui_escaping.py` asserts this number and the two travel together.
        -->
+  <!-- FOLDED, AND NOTHING IS RETRACTED. This strip was 141px of the 792px above the
+       panels at 1440x900 -- the single largest block of prose on a page whose own panels
+       were entirely below the fold. The SEQUENCE is what a reviewer needs on screen (it
+       is the script they are about to follow), so it stays visible and now reads as three
+       presses; the paragraph explaining what each press proves, which is read once, moves
+       behind the disclosure. Every sentence, every number and every code name is
+       unchanged and still in the DOM.
+
+       No <span> may appear between this element's start tag and its end tag.
+       `test_api_ui_escaping._STRIP` is `<span class="tag">(.*?)</span>` and it is
+       NON-GREEDY, so a nested <span> would truncate the capture and the checks that hold
+       this copy honest -- it must name VAULT_DESTROY, place it as the LAST row, send the
+       reader to scroll for it, and quote both the 598- and 600-row counts -- would then
+       be reading half a sentence. <details>, <summary>, <b> and <code> are not <span>,
+       which is why the fold is built from those. -->
   <span class="tag">LIVE REVIEW &mdash; irreversible erasure: press <b>Run</b> above, then
-    <b>Destroy session</b> here, then <b>Run</b> above again &mdash; the second run is refused
+    <b>Destroy session</b> here, then <b>Run</b> above again.
+    <details class="more"><summary>what the three presses prove, and where to look for
+      it</summary>The second run is refused
     with SESSION_EXPIRED before the vault is consulted, and VAULT_DESTROY is written as the
     LAST row of the session. The audit tail below opens at row 1 and shows nine at a time
     (598 rows for one large-brief run at the default <b>tokenization</b>, 600 once
@@ -408,7 +435,7 @@
     <b>Do the vault-miss demonstration first</b>, with <b>Restore again with an unissued
     token</b> above: it needs the session this erases, and it is the one that writes
     <code>VAULT_MISS</code>. This sequence writes none &mdash; the refusal happens before the
-    vault is reached, which is the erasure being stronger than a miss, not a gap.</span>
+    vault is reached, which is the erasure being stronger than a miss, not a gap.</details></span>
   <!-- Two steps, and NOT a `confirm()` dialog. One click on the single red button erased
        the session outright -- next to copy that calls the erasure irreversible -- so a
        reviewer exploring the controls destroyed their own demo, and the recovery is a
@@ -466,6 +493,18 @@
      page's CSP is `style-src 'self'`, so no new rule can be declared from here, and the
      stylesheet is not this change's to edit. -->
 <section class="legend" aria-label="stats strip key">
+  <!-- FOLDED. 116px of the 792px above the panels at 1440x900, and the second-largest
+       block of standing prose on the page. This key explains a strip that is three rows
+       up and is read once; the panels below it are the demo. The <section> and its
+       `aria-label` are unchanged -- it is still the named landmark OUTSIDE #stats that
+       `resetRun` cannot wipe, which is the property the note above and
+       `test_the_page_carries_a_key_to_the_stats_strip_that_a_run_cannot_wipe` are about,
+       and a <details> does not move it. Every key, every word and every <i> swatch is
+       still in the DOM; `<div class="keys">` is only what keeps them a wrapping row once
+       the disclosure is open, since the flex container is now the <details>'s child
+       rather than the section itself. -->
+  <details class="more"><summary>key to the stats strip above &mdash; what the colours
+    mean</summary><div class="keys">
   <span class="key"><i class="badge ok"></i>green &mdash; a safety counter reading its clean
     value of 0</span>
   <!-- Swept as a sibling of the LIVE REVIEW strip's retracted promise, and it is the same
@@ -496,6 +535,7 @@
   <span class="key muted">plain with no tooltip &mdash; a counter this page has no note for:
     the API started reporting it after this build, and it is shown rather than dropped</span>
   <span class="key muted">hover any counter for what it actually counts</span>
+  </div></details>
 </section>
 
 <section class="legend" aria-label="highlight legend">

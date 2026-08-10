@@ -760,6 +760,49 @@ def load_settings(provider: Literal["mock", "anthropic"]) -> tuple[Settings, boo
     return Settings(llm_provider=provider), True
 
 
+#: A throwaway master key for the probe below. All-zero and never used to encrypt
+#: anything: the probe ``Settings`` is read for one field and discarded. It is here
+#: only because ``Settings`` validates the master key at construction, so a probe
+#: built on a machine with no ``SCP_MASTER_KEY`` would raise before the field this
+#: function wants could be read.
+_PROBE_MASTER_KEY: Final = base64.b64encode(bytes(32)).decode("ascii")
+
+
+def anthropic_key_is_configured() -> bool:
+    """Can the *application* see an Anthropic key -- not merely: is one exported?
+
+    ``--real``'s guard used to be ``os.environ.get("ANTHROPIC_API_KEY")``, and that
+    is a narrower question than the one the run actually asks. ``Settings`` carries
+    ``model_config = SettingsConfigDict(env_file=".env", ...)``, so a key written to
+    ``.env`` populates ``settings.anthropic_api_key`` and ``--real`` works. The
+    environment check could not see it. The result was a demo that refused a
+    configuration it fully supports, and refused it with a message whose own second
+    line said ``(or add it to .env)``. Measured with a key in ``.env`` and nowhere
+    else: ``error: --real needs ANTHROPIC_API_KEY in the environment``, exit 2 --
+    and, after this change, the same invocation authenticates with the key the file
+    supplied, which is what the provider's HTTP status reports back.
+
+    So the guard asks ``Settings``. Same class, same env prefix, same
+    ``validation_alias=AliasChoices("ANTHROPIC_API_KEY")``, same dotenv file, same
+    precedence -- there is no second copy of the resolution rules to drift.
+
+    ``llm_provider="mock"`` on the probe is deliberate: the ``anthropic`` value trips
+    ``ConfigError(reason="anthropic_selected_without_api_key")`` in a model validator,
+    so a probe built that way would raise on exactly the case this function must be
+    able to answer ``False`` for. The environment is checked first so the common
+    ``export`` path never constructs anything, and any ``ConfigError`` from the probe
+    (a malformed ``.env``, an unreadable one) is reported as "no key", which leaves
+    the run refusing rather than half-starting.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    try:
+        probe = Settings(llm_provider="mock", master_key=_PROBE_MASTER_KEY)
+    except ConfigError:
+        return False
+    return bool(probe.anthropic_api_key)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
@@ -1099,19 +1142,74 @@ class DestroyProbe:
     source: str
 
 
+def minted_token_ids(result: PipelineResult) -> frozenset[str]:
+    """The token IDs **this run issued**, read off the run's own detections.
+
+    Every obfuscated span carries the surrogate the engine minted for it, so this
+    set is the demo-side spelling of ``{token.token_id for token in tokens}`` --
+    the value ``PipelineOrchestrator`` itself passes to ``Restorer.restore`` as
+    ``issued``. Measured equal to the audit log's ``OBFUSCATE`` rows for the run
+    on both the shipped fixture (24 ids) and a reviewer document (2 ids).
+
+    **It replaces ``extract_token_ids(result.obfuscated_payload)``, which was never
+    the same set.** The payload is what went *out*, and token-shaped text can be in
+    it without this run having minted it:
+
+    * ``ContextInjector`` writes the literal ``[PHI_NAME_1a2b3c4d]`` into the system
+      prompt as an example of what a placeholder looks like
+      (``pipeline/context_injector.py``). So ``1a2b3c4d`` has been in the
+      payload-derived set of **every run the demo has ever done**, including
+      ``fixtures/medical_note.txt`` -- measured: ``payload EXTRA (not ours):
+      ['1a2b3c4d']``.
+    * A reviewer document containing an excerpt of an earlier run -- a plausible
+      thing to paste in under ``--file`` -- contributes its own fakes. Measured on
+      one: ``['00000000', '1a2b3c4d', 'deadbeef']``.
+
+    Both consequences were live. The set is handed to ``restore`` as ``issued``,
+    which is the gate that stops the restorer looking up eight hex characters the
+    model invented; a set wider than the run widens that gate, which is the incident
+    ``restorer.py``'s module docstring records. And ``build_probe`` selected out of
+    it, so ``sorted(...)[0]`` could pick a token the vault has never heard of --
+    ``VaultMissError``, an exit-1 demo, on 11 of 15 runs of one such document.
+    """
+    return frozenset(
+        token_id
+        for span in result.detections
+        if span.surrogate
+        for token_id in extract_token_ids(span.surrogate)
+    )
+
+
 def build_probe(outcomes: list[RunOutcome]) -> DestroyProbe | None:
-    """Pick a run whose raw response still forces a vault lookup on restore."""
+    """Pick a run whose raw response still forces a vault lookup on restore.
+
+    The candidate token is drawn from ``response ids AND this run's minted ids``,
+    never from the response alone. A response can echo a token this run did not
+    mint -- the mock reflects whatever token-shaped text is in the payload, and a
+    ``--file`` document quoting an earlier run puts fakes there -- and such a token
+    resolves to nothing, so choosing it turns the destruction demonstration into a
+    ``VaultMissError`` before any destruction happens. See :func:`minted_token_ids`.
+
+    One residual is out of reach from outside and is recorded rather than fixed: a
+    reviewer document that happens to contain a token whose eight-hex id *equals*
+    one this run mints would make the restorer substitute a real original where the
+    model never asked for one. Token ids are HMAC-derived per session over a
+    per-run key, so an uploader cannot steer one; the intersection above cannot
+    distinguish that collision, and nothing at this layer can.
+    """
     for outcome in outcomes:
-        token_ids = extract_token_ids(outcome.result.raw_llm_response)
-        if token_ids:
+        minted = minted_token_ids(outcome.result)
+        echoed = extract_token_ids(outcome.result.raw_llm_response) & minted
+        if echoed:
             return DestroyProbe(
-                token_id=sorted(token_ids)[0],
+                token_id=sorted(echoed)[0],
                 surrogate=None,
                 text=outcome.result.raw_llm_response,
                 strategy=outcome.result.strategy,
                 surrogate_map=None,
-                minted=frozenset(extract_token_ids(outcome.result.obfuscated_payload)),
-                source=f"{len(token_ids)} token(s) in the {outcome.result.strategy} response",
+                minted=minted,
+                source=f"{len(echoed)} of this run's own token(s) echoed in the "
+                       f"{outcome.result.strategy} response",
             )
     # No tokens anywhere: pseudonyms only. An empty mapped value is the
     # restorer's documented "look it up in the vault" fallback, so the lookup
@@ -1125,10 +1223,40 @@ def build_probe(outcomes: list[RunOutcome]) -> DestroyProbe | None:
                     text=outcome.result.raw_llm_response,
                     strategy=outcome.result.strategy,
                     surrogate_map={span.surrogate: ""},
-                    minted=frozenset(extract_token_ids(outcome.result.obfuscated_payload)),
+                    minted=minted_token_ids(outcome.result),
                     source=f"pseudonym echoed in the {outcome.result.strategy} response",
                 )
     return None
+
+
+async def ensure_session_destroyed(harness: Harness, session_id: str, *, source: str) -> bool:
+    """Pop the key, delete the vault rows, record ``VAULT_DESTROY``. Safe to call twice.
+
+    The key first, then the rows -- the same order as the API's logout path. Popping
+    the key is the actual erasure: every surviving ciphertext is AES-GCM under a key
+    derived from it, so once it is gone no write that slips in behind this call can
+    derive a vault key and resurrect the session.
+
+    ``sessions.destroy`` reports whether a key was there to pop, which makes this
+    naturally idempotent: the second caller finds nothing, emits no duplicate
+    ``VAULT_DESTROY``, and returns ``False``. That is what lets ``run_demo`` call it
+    on every exit path without the happy path auditing the destruction twice.
+
+    Returns whether this call is the one that destroyed a live session.
+    """
+    existed = await harness.sessions.destroy(session_id)
+    await harness.vault.destroy(session_id)
+    if not existed:
+        return False
+    await harness.audit.emit(
+        AuditEvent(
+            ts=time.time(),
+            session_id=session_id,
+            event_type=VAULT_DESTROY,
+            detail={"existed": 1, "source": source},
+        )
+    )
+    return True
 
 
 async def demonstrate_destruction(
@@ -1154,36 +1282,45 @@ async def demonstrate_destruction(
         return
 
     kv("probe", probe.source)
-    before = await harness.restorer.restore(
-        session_id,
-        probe.text,
-        strategy=probe.strategy,
-        surrogates=probe.surrogate_map,
-        issued=probe.minted,
-    )
-    if probe.token_id is not None:
-        original = await harness.vault.get_by_token(session_id, probe.token_id)
-        kv("vault", f"token {probe.token_id} -> resolved, {len(original)} chars (value withheld)")
-    checks.record(
-        "restoration WORKS before destruction (control for the next check)",
-        before.restored_count > 0,
-        f"{before.restored_count} occurrence(s) restored from the vault",
-    )
-
-    # The key first, then the rows -- the same order as the API's logout path.
-    # Popping the key is the actual erasure: every surviving ciphertext is
-    # AES-GCM under a key derived from it, so once it is gone no write that
-    # slips in behind this call can derive a vault key and resurrect the session.
-    existed = await harness.sessions.destroy(session_id)
-    await harness.vault.destroy(session_id)
-    await harness.audit.emit(
-        AuditEvent(
-            ts=time.time(),
-            session_id=session_id,
-            event_type=VAULT_DESTROY,
-            detail={"existed": int(existed), "source": "demo"},
+    # The pre-destroy phase is wrapped so that DESTRUCTION IS UNCONDITIONAL. It used
+    # to be reachable only by falling off the end of a successful restore, so a
+    # `PipelineError` here -- `VaultMissError` on a probe token the vault does not
+    # hold was the shipped way to get one -- propagated to `run_demo`, which caught
+    # it, printed the audit tail and returned. The session key was never popped and
+    # no VAULT_DESTROY was ever written: the one guarantee this section exists to
+    # demonstrate was silently skipped by the failure of the setup for demonstrating
+    # it. A failed control is recorded as a failed control; it is not a reason to
+    # leave a live session key in memory.
+    try:
+        before = await harness.restorer.restore(
+            session_id,
+            probe.text,
+            strategy=probe.strategy,
+            surrogates=probe.surrogate_map,
+            issued=probe.minted,
         )
-    )
+        if probe.token_id is not None:
+            original = await harness.vault.get_by_token(session_id, probe.token_id)
+            kv("vault",
+               f"token {probe.token_id} -> resolved, {len(original)} chars (value withheld)")
+        checks.record(
+            "restoration WORKS before destruction (control for the next check)",
+            before.restored_count > 0,
+            f"{before.restored_count} occurrence(s) restored from the vault",
+        )
+    except PipelineError as exc:
+        # Recorded, not raised, and recorded under the SAME name as the success
+        # path so the ledger keeps exactly two rows however this goes.
+        checks.record(
+            "restoration WORKS before destruction (control for the next check)",
+            False,
+            f"the pre-destroy restore raised {exc.code}",
+        )
+        print(red("  pre-destroy restore failed:"))
+        wrapped("    ", repr(exc), style=red)
+    finally:
+        await ensure_session_destroyed(harness, session_id, source="demo")
+
     kv("destroyed", "session key popped, vault rows deleted, caches dropped")
     print()
 
@@ -1449,11 +1586,27 @@ async def run_demo(args: argparse.Namespace) -> int:
         wrapped("  pipeline error: ", repr(exc), style=red)
         checks.record("pipeline completed without error", False, exc.code)
         if session_id:
+            # Destroyed BEFORE the tail is printed, so the VAULT_DESTROY appears in
+            # the tail the reviewer reads rather than after it. A run that dies
+            # anywhere between section 1 and section 7 used to end with the session
+            # key still live in memory and no destruction row in the log -- the demo
+            # asserting cryptographic erasure while not performing it. Idempotent,
+            # so the normal path (already destroyed in section 7) writes nothing.
+            with contextlib.suppress(PipelineError):
+                if await ensure_session_destroyed(harness, session_id, source="demo-error-path"):
+                    print(dim("  session destroyed on the error path: key popped, rows deleted"))
             try:
                 await print_audit_tail(harness, checks, session_id)
             except PipelineError:  # pragma: no cover -- audit is already broken
                 pass
     finally:
+        # Last resort for an exception that is not a PipelineError (a bug in this
+        # file, KeyboardInterrupt, a cancellation): the key still must not outlive
+        # the process holding it. Suppressed because a teardown that raises here
+        # would mask the original failure.
+        if session_id:
+            with contextlib.suppress(Exception):
+                await ensure_session_destroyed(harness, session_id, source="demo-teardown")
         await harness.close()
         if http_client is not None:
             await http_client.aclose()
@@ -1522,10 +1675,14 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --dump-wire captures a live HTTP request, so it requires --real.",
               file=sys.stderr)
         return EXIT_USAGE
-    if args.real and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("error: --real needs ANTHROPIC_API_KEY in the environment.\n"
-              "       export ANTHROPIC_API_KEY=sk-ant-...   (or add it to .env)\n"
-              "       Without it, run `python demo.py` -- the mock provider needs no network.",
+    if args.real and not anthropic_key_is_configured():
+        print("error: --real needs an Anthropic API key, and neither the environment\n"
+              "       nor .env has one. Either is fine -- the run reads both:\n"
+              "         export ANTHROPIC_API_KEY=sk-ant-...\n"
+              "         echo 'ANTHROPIC_API_KEY=sk-ant-...' >> .env\n"
+              "       .env is read relative to the current directory, so run this from\n"
+              "       the repository root. Without a key, run `python demo.py` -- the\n"
+              "       mock provider needs no network.",
               file=sys.stderr)
         return EXIT_USAGE
     if args.file:

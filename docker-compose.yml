@@ -8,9 +8,8 @@ services:
     # up --build` died before building anything with `env file ... not found`. That
     # is the first command a reviewer runs, and the error names a missing file
     # rather than the missing key behind it. Compose now starts without the file and
-    # the application fails on its own terms instead: `Settings` raises
-    # `ConfigError(reason='master_key_missing', hint='set_SCP_MASTER_KEY_see_env_example')`,
-    # which says what to do. With a `.env` present nothing changes.
+    # the application fails on its own terms instead. With a `.env` present nothing
+    # changes.
     env_file:
       - path: .env
         required: false
@@ -22,10 +21,10 @@ services:
     # applies to what is actually mounted there. On Linux the daemon creates a
     # missing host ./data as root:root 0755, uid 10001 cannot write it, and the
     # FIRST sqlite open (the audit log) fails with "unable to open database file";
-    # `restart: unless-stopped` then turns that into a crash loop. A fresh clone has
-    # no ./data -- it is gitignored -- so this is the default path for a reviewer on
-    # Linux, and it is invisible on macOS and Docker Desktop, where virtiofs/gRPC-FUSE
-    # remap ownership to the calling user.
+    # an unbounded restart policy then turns that into a crash loop. A fresh clone
+    # has no ./data -- it is gitignored -- so this is the default path for a reviewer
+    # on Linux, and it is invisible on macOS and Docker Desktop, where
+    # virtiofs/gRPC-FUSE remap ownership to the calling user.
     #
     # Overriding the uid is what makes the mount writable without a sudo chown:
     #   SCP_UID=$(id -u) SCP_GID=$(id -g) docker compose up --build
@@ -36,4 +35,44 @@ services:
       - ./data:/app/data
     environment:
       SCP_DATA_DIR: /app/data
-    restart: unless-stopped
+    # A configuration gate in front of the application, and the reason it is here
+    # rather than in the app is that the FIRST command a reviewer runs is
+    # `docker compose up --build` on a fresh clone, which has no `.env`.
+    #
+    # What that used to produce, measured in a fresh clone: 45 lines of traceback
+    # (starlette.routing.lifespan -> contextlib -> six repeated fastapi/routing.py
+    # merged_lifespan frames -> pydantic_settings -> config.py) ending in the one
+    # line that matters, `ConfigError: CONFIG_ERROR(reason='master_key_missing',
+    # hint='set_SCP_MASTER_KEY_see_env_example')` -- and then the restart policy
+    # replayed the whole thing. RestartCount reached 12 in four minutes. The
+    # information was there; it was 44 lines below where a reader stops.
+    #
+    # This does NOT weaken the fail-closed rule. `Settings` still refuses to
+    # construct without a master key and `get_settings()` still raises -- pinned by
+    # the config tests, not by this file. The check only decides which line the
+    # reviewer reads first, and on the happy path it `exec`s straight through, so
+    # there is no wrapper process between the container and uvicorn.
+    #
+    # ONE PHYSICAL LINE, and that is a requirement rather than a style choice:
+    # `test_log_stream_hygiene.py::test_compose_does_not_override_the_command_and_
+    # drop_the_flag` asserts that any `command:`/`entrypoint:` key at this indent
+    # carries `--no-access-log`, because a compose override REPLACES the image CMD
+    # outright and the flag is a disclosure control (uvicorn's access log writes
+    # `DELETE /sessions/<id>?user_id=<user>` verbatim -- both halves of an
+    # irreversible-erasure credential pair; see the Dockerfile). A block scalar
+    # would put the flag on a continuation line where that test cannot see it. The
+    # cost of restating the argv here is that the other four uvicorn arguments can
+    # drift from the Dockerfile's CMD unnoticed; the one that matters cannot, and
+    # that asymmetry is exactly what the test was written to hold.
+    #
+    # `$$` escapes compose's own interpolation so the container's shell expands
+    # SCP_MASTER_KEY, not the reviewer's host environment.
+    command: ["/bin/sh", "-c", "if [ -n \"$${SCP_MASTER_KEY:-}\" ]; then exec uvicorn secure_context_pipeline.api.app:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log; fi; { echo '=== NOT STARTED: SCP_MASTER_KEY is missing ========================'; echo '  It is the base64 32-byte key every document, vault row and audit'; echo '  entry is encrypted under. No default, no fallback -- starting'; echo '  without one would mean writing plaintext. From the repo root:'; echo '    cp .env.example .env'; echo '    python3 -c \"import secrets,base64; print(base64.b64encode(secrets.token_bytes(32)).decode())\"'; echo '  Paste it after SCP_MASTER_KEY= in .env and re-run. Any fresh key'; echo '  works; a lost key makes everything written under it unreadable.'; echo '=================================================================='; } >&2; exit 78"]
+    # BOUNDED, and that is the whole difference from `unless-stopped`. Docker has no
+    # policy that distinguishes "crashed" from "misconfigured", so an unbounded one
+    # answers every startup failure the same way: replay it forever. `on-failure:3`
+    # still absorbs the transient case a restart policy is actually for (a slow
+    # volume, a daemon hiccup) and then stops with the last lines still on screen.
+    # The Linux bind-mount permission failure above is the misconfiguration this
+    # bounds that the key check above cannot see, because it is about the host.
+    restart: on-failure:3

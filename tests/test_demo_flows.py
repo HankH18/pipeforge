@@ -249,10 +249,16 @@ def test_build_probe_prefers_a_response_carrying_tokens_over_one_carrying_pseudo
         strategy="pseudonymization",
         surrogates=("Alan Browning",),
     )
+    # The fixture now DECLARES what the run minted, because the run's detections are
+    # where that set comes from. The old spelling passed `surrogates=()` -- a
+    # tokenization run that issued no surrogates yet somehow put three tokens in its
+    # payload, which the real pipeline cannot produce: a token exists only because a
+    # detection produced it.
     with_tokens = _fake_outcome(
         response="[PHI_NAME_ff00aa11] and [PHI_NAME_0011bbcc] were discussed.",
         payload="[PHI_NAME_ff00aa11], [PHI_NAME_0011bbcc] and [PII_EMAIL_9999dddd].",
         strategy="tokenization",
+        surrogates=("[PHI_NAME_ff00aa11]", "[PHI_NAME_0011bbcc]", "[PII_EMAIL_9999dddd]"),
     )
 
     probe = demo.build_probe([pseudonym_only, with_tokens])
@@ -262,10 +268,24 @@ def test_build_probe_prefers_a_response_carrying_tokens_over_one_carrying_pseudo
     assert probe.token_id == "0011bbcc"  # sorted first of the two in the response
     assert probe.surrogate is None
     assert probe.surrogate_map is None
-    # `minted` is what the *payload* issued, not what the response echoed: the
-    # restorer is gated on it, and a response-derived set would drop the third
-    # token and leave the gate wider than the producing run.
+    # TEST WRONG (was): `assert probe.minted == frozenset({...})` with the comment
+    # "`minted` is what the *payload* issued, not what the response echoed". The
+    # payload is not a statement about what this run issued. `ContextInjector` writes
+    # the literal `[PHI_NAME_1a2b3c4d]` into every system prompt as an example, so
+    # the payload-derived set contained a token no run ever minted -- measured on the
+    # SHIPPED fixture: issued-per-audit had 24 ids, payload-derived had 25, extra
+    # `['1a2b3c4d']`. A `--file` document quoting an earlier run adds its own. That
+    # set is passed to `restore(issued=...)`, the gate that stops the restorer
+    # resolving eight hex characters the model invented, so the old contract made
+    # that gate wider than the run -- and `build_probe` selecting out of it produced
+    # `VaultMissError` on 11 of 15 runs of such a document. The correct contract is
+    # the orchestrator's own: `{token.token_id for token in tokens}`, which
+    # `minted_token_ids` reproduces from `result.detections` and which was measured
+    # equal to the audit log's OBFUSCATE rows on both documents.
+    assert probe.minted == demo.minted_token_ids(with_tokens.result)
     assert probe.minted == frozenset({"ff00aa11", "0011bbcc", "9999dddd"})
+    # The strengthening the old assertion could not make: a token that is in the
+    # payload but was never minted is NOT in `minted`, and is never selected.
     assert "tokenization" in probe.source
 
 
@@ -306,6 +326,53 @@ def test_build_probe_returns_none_when_no_run_would_reach_the_vault() -> None:
     )
     assert demo.build_probe([outcome]) is None
     assert demo.build_probe([]) is None
+
+
+def test_a_token_the_run_did_not_mint_is_never_the_probe_and_never_counted_as_minted() -> None:
+    """The reviewer-document case: a fake token in the input must not be selected.
+
+    Pasting an excerpt of an earlier run into a document and passing it to
+    ``demo.py --file`` is an ordinary thing to do, and it puts token-shaped strings
+    into the payload -- which the mock provider then echoes. ``build_probe`` used to
+    take ``sorted(response_ids)[0]``, so it selected whichever id sorted lowest,
+    minted or not; ``00000000`` and ``1a2b3c4d`` sort below almost every real one.
+    The vault has never heard of them, ``get_by_token`` raised ``VaultMissError``,
+    and the demo exited 1 on **11 of 15 runs** of one such document -- intermittent,
+    because it depended on how the run's random ids happened to sort.
+
+    Both halves are asserted, because the same wrong set was used for both jobs:
+    the id that is *selected*, and the ``minted`` set handed to
+    ``restore(issued=...)`` -- the gate that stops the restorer resolving eight hex
+    characters it was never given.
+
+    The ids below are the literal ones from the reproduction document, with
+    ``1a2b3c4d`` also being the example token ``ContextInjector`` writes into every
+    system prompt, so this case covers the shipped fixture's version of the same bug.
+    """
+    outcome = _fake_outcome(
+        # The model echoes both what we minted and what the document already had.
+        response="[PHI_NAME_1a2b3c4d] and [PHI_NAME_ff00aa11] and [PII_SSN_deadbeef].",
+        # Ours plus the document's own fakes, exactly as the injector emits it.
+        payload="[PHI_NAME_1a2b3c4d] ... [PHI_NAME_ff00aa11] ... [PII_SSN_deadbeef] "
+                "... [PII_EMAIL_00000000|acme.test]",
+        strategy="tokenization",
+        # The only surrogate this run actually issued.
+        surrogates=("[PHI_NAME_ff00aa11]",),
+    )
+
+    probe = demo.build_probe([outcome])
+
+    assert probe is not None
+    assert probe.token_id == "ff00aa11", (
+        f"build_probe selected {probe.token_id!r}, which this run did not mint. "
+        "The vault will raise VaultMissError on it and the destruction demonstration "
+        "will abort before it destroys anything"
+    )
+    assert probe.minted == frozenset({"ff00aa11"}), (
+        f"`minted` is {sorted(probe.minted)}, wider than the run. It is passed to "
+        "`restore` as `issued`, so every extra id is one more eight-hex string the "
+        "restorer will take to the vault on the model's say-so"
+    )
 
 
 # ---------------------------------------------------------------------------
