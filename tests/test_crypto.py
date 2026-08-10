@@ -770,8 +770,21 @@ def test_token_id_rejects_an_unrepresentable_counter(counter: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Deterministic, not random. These were `secrets.token_bytes(31)`/`(33)`, drawn at
+# *collection* time, which cost two things. A failure was not reproducible -- the
+# case that failed no longer existed on the next run -- and the parametrize IDs
+# differed between processes, so the suite could not be collected in parallel at
+# all (`pytest -n auto` aborts: "Different tests were collected between gw0 and
+# gw1"). The property under test is that a key of the wrong *length* is refused,
+# which does not depend on the bytes, so fixing them costs no coverage. The
+# content is still non-trivial rather than all-zero, so a length check that
+# happened to special-case null bytes would still be caught.
+_WRONG_LENGTH_SOURCE = hashlib.sha256(b"scp-test:degenerate-session-key").digest()
+
 @pytest.mark.parametrize(
-    "bad_key", [b"", b"short", secrets.token_bytes(31), secrets.token_bytes(33)]
+    "bad_key",
+    [b"", b"short", _WRONG_LENGTH_SOURCE[:31], _WRONG_LENGTH_SOURCE + b"\x5a"],
+    ids=["empty", "short", "31-bytes", "33-bytes"],
 )
 def test_hmac_derivations_reject_a_degenerate_session_key(bad_key: bytes) -> None:
     """A zero-length key silently turns every token ID into a *public* function.

@@ -2,7 +2,18 @@ services:
   app:
     build: .
     image: secure-context-pipeline:1.0.0
-    env_file: .env
+    # `required: false`, and that is a fix rather than a preference. The bare
+    # `env_file: .env` form makes the file mandatory at PARSE time, so on a fresh
+    # clone -- which has no `.env`, because `.env` is gitignored -- `docker compose
+    # up --build` died before building anything with `env file ... not found`. That
+    # is the first command a reviewer runs, and the error names a missing file
+    # rather than the missing key behind it. Compose now starts without the file and
+    # the application fails on its own terms instead: `Settings` raises
+    # `ConfigError(reason='master_key_missing', hint='set_SCP_MASTER_KEY_see_env_example')`,
+    # which says what to do. With a `.env` present nothing changes.
+    env_file:
+      - path: .env
+        required: false
     ports:
       - "8000:8000"
     # Who the container writes as. The image builds a uid 10001 and chowns /app to

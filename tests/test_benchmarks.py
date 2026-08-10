@@ -993,13 +993,31 @@ def _row_named_by(rows: list[Measurement], sentence: str) -> str | None:
     sentence that has already been fixed. Returns ``None`` on a tie, which is the
     honest answer and the reason the table check beside this one is the binding
     half.
+
+    **TEST WRONG, corrected here: the membership test was ``word in lowered``, a
+    SUBSTRING test, and it made this matcher unusable on any README.** The evidence
+    is the probe in :func:`check_tightest_benchmark_prose`, which builds a sentence
+    naming ``rows[0]`` in full and requires the matcher to identify it. On this
+    module's row set that probe failed for every possible README, because
+    ``full pipeline, 12k-word brief (mock provider)`` contributes the label words
+    ``k`` and ``word``, and ``"k" in "...tightest benchmark in the module."`` and
+    ``"word" in "...2000 words..."`` are both true as substrings. The full-pipeline
+    row therefore tied the row the sentence actually names, 2-2, and the tie
+    returned ``None``.
+
+    The replacement is a whole-word test against the sentence's own tokens, which is
+    strictly *narrower* than what it replaces -- every match it makes, the substring
+    test also made -- so it cannot manufacture an identification the old rule would
+    have refused. What it removes is exactly the class of accidental hit that broke
+    the instrument: ``k`` inside ``benchmark``, ``word`` inside ``words``, ``token``
+    inside ``tokenization``.
     """
-    lowered = sentence.lower()
+    tokens = set(re.findall(r"[a-z]+", sentence.lower()))
     scores = {
         row.name: sum(
             1
             for word in set(re.findall(r"[a-z]+", normalise_bench_label(row.name)))
-            if word not in _LABEL_STOPWORDS and word in lowered
+            if word not in _LABEL_STOPWORDS and word in tokens
         )
         for row in rows
     }

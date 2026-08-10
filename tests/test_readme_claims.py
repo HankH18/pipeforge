@@ -920,14 +920,15 @@ def test_the_pasted_leakage_tally_is_one_the_readme_says_it_observed() -> None:
         "does not belong in a block headed 'output from this repository, not an estimate' -- "
         "paste a line a run actually printed and add its value to the list"
     )
-    # 2981 until this wave; 2966 now. The literal is updated rather than relaxed,
-    # and it is updated only because the harness was RE-RUN: five consecutive
-    # executions of `pytest -m leakage` on this tree printed 2966 and nothing else,
-    # and section 1 records the move as a finding (what the detector plants or finds
-    # changed) instead of absorbing it. A band here would have swallowed exactly that
-    # signal, which is the whole reason this assertion is a literal.
-    assert originals == 2966, (
-        f"the originals tally is {originals}, not the 2966 that came back identical on all five "
+    # 2981, then 2966, and 3066 now. The literal is updated rather than relaxed, and
+    # only ever after the protocol this comment prescribes has actually been run:
+    # the harness was RE-RUN four consecutive times on this tree and printed 3066
+    # every time, and section 1 records the move as a finding (with the SSN registry
+    # backstop of Deviation 71 named as the candidate cause) instead of absorbing it.
+    # A band here would have swallowed exactly that signal, which is the whole reason
+    # this assertion is a literal.
+    assert originals == 3066, (
+        f"the originals tally is {originals}, not the 3066 that came back identical on all four "
         "runs measured for this pass. Unlike the surrogate count this one is deterministic, so a "
         "change here is a change in what the detector plants or finds, and is a finding rather "
         "than an edit -- re-run `pytest -m leakage` and record the move in section 1 before "

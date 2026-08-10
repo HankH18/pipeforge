@@ -14,8 +14,9 @@ than a name and occasionally invites the model to comment on the token. The
 pipeline's answer is the token contract in the system prompt (build doc section
 9.5.2), not a friendlier surrogate.
 
-**Hints are off here by default.** The build doc pins the shipped format to the
-literal ``[PHI_NAME_a3f2]`` shape, so a class-annotated token is opt-in via
+**Hints are off here by default.** The build doc's worked example of the shipped
+format is a bare category/type/hash triple with nothing after the hash, so a
+class-annotated token is opt-in via
 ``StrategyContext.options["hints"] = True``; with hints on, a per-entity
 ``hint: true`` in ``entities.yaml`` (Tier-3 gazetteer entities) emits
 ``[PHI_MEDICATION_2f4a1b3c|oral-antidiabetic]``. Entities without ``hint: true``
