@@ -825,7 +825,19 @@ UI_DIR = INDEX_HTML.parent
 #: ``<link rel="icon" ... href="...">``, however the two attributes are ordered.
 _ICON = re.compile(r'<link\s+rel="icon"[^>]*\shref="([^"]+)"')
 #: The whole ``<details class="guard">`` element, contents included.
-_GUARD = re.compile(r"<details class=\"guard\">(.*?)</details>", re.S)
+#:
+#: A LOCATOR, not an assertion, and it is written to tolerate further attributes on
+#: purpose. It matched the exact string ``<details class="guard">`` and therefore went
+#: blind the moment the element grew an ``id`` -- which it had to, so ``createSession``
+#: could close the gate after committing (an open ``.guard-body`` is ``position:
+#: absolute`` and was measured covering ``#strategy``, with ``elementFromPoint`` at the
+#: select's centre returning ``SPAN.hint``). A locator that fails on an unrelated
+#: attribute reports "the guard around Create session is gone" when the guard is
+#: present and working, which is a false negative pointing at the wrong file. Nothing
+#: the tests below assert is relaxed by this: they still require the ``<summary>``, the
+#: ordering, and the consequence printed before the commit button, and if the element
+#: really does disappear the ``assert inside`` on the search result still fails.
+_GUARD = re.compile(r"<details class=\"guard\"[^>]*>(.*?)</details>", re.S)
 #: The red LIVE REVIEW strip's own text, comments already stripped by the caller.
 _STRIP = re.compile(r"<span class=\"tag\">(.*?)</span>", re.S)
 
@@ -1050,7 +1062,34 @@ def test_the_live_review_strip_does_not_promise_a_row_the_tail_does_not_show() -
         )
     assert "LAST row" in text, "nothing tells the reader where in the tail the row is"
     assert "scroll" in text.lower(), "nothing tells the reader the row needs scrolling to"
-    assert "349" in text, "the copy does not say how far -- the number is what sets the expectation"
+    # TEST WRONG (the number, not the rule). The rule this line encodes -- the copy must
+    # state HOW FAR, because the number is what makes the scroll an expectation rather
+    # than a surprise -- is right and is unchanged. The number it pinned was not: "349"
+    # described no tail this build produces, and pinning a false measurement is the same
+    # class of defect as the promise the rest of this test forbids.
+    #
+    # Re-measured in Chrome against the running API, driving the strip's own script (arm
+    # legal_brief_large.txt as `legal`, tokenization, Run, Destroy session, Confirm) and
+    # counting `#audit-body tr` off the live DOM:
+    #   * 598 run-scoped rows right after Run -- 1 DETECT, 251 OBFUSCATE, 64 REDACT,
+    #     28 STRIP, 1 EGRESS_PASS, 1 LLM_CALL, 252 DEOBFUSCATE;
+    #   * 600 session-scoped after Confirm (`loadAudit` is called with no run id there),
+    #     those 598 plus SESSION_CREATE and VAULT_DESTROY -- and the destroy row really
+    #     is last: `740 VAULT_DESTROY {"existed":1,"source":"api_logout"}`.
+    # 349 is neither, and 346 (598 less DEOBFUSCATE) is not it either.
+    #
+    # BOTH numbers are now required, which is strictly more than the single one this
+    # asserted: the strip quotes the run-scoped count a reviewer meets first AND the
+    # session-scoped count they are being sent to scroll through, and getting either
+    # wrong is the defect this line exists to catch. These counts move with
+    # `entities.yaml`, so a rescoped entity fails here rather than leaving the copy
+    # quietly wrong again -- which is the whole point of pinning a number at all.
+    assert "598" in text, "the copy does not say how far -- the run-scoped count is missing"
+    assert "600" in text, (
+        "the copy does not give the count for the tail this sentence is about: after "
+        "Destroy session the tail is session-scoped, which is 600, not the 598 the "
+        "reviewer saw a moment earlier"
+    )
 
 
 def test_panels_2_and_3_name_the_provider_where_the_payload_is_read() -> None:

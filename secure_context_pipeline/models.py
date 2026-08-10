@@ -167,7 +167,86 @@ from secure_context_pipeline.errors import MAX_DETAIL_VALUE_LEN
 #: backstop either. A typo in `category:` raises; this one did not.
 DOC_CATEGORIES: frozenset[str] = frozenset({"medical", "legal", "financial", "general"})
 
+#: ``detail['action']`` per audit event type -- the fifth of the five fields core
+#: requirement 7 names for an obfuscation or de-obfuscation event ("timestamp,
+#: session ID, entity type, token (not original value), and **action**").
+#:
+#: It lives on the *record* rather than in the writer, and that placement is the
+#: whole design. The engine's ``OBFUSCATE`` rows carried no ``action`` key while
+#: ``restorer.py``'s per-entity ``DEOBFUSCATE`` rows carried ``'restore'`` --
+#: measured on a two-run session: ``OBFUSCATE 0/8``, ``DEOBFUSCATE 8/10``, and
+#: ``DETECT``/``EGRESS_PASS``/``LLM_CALL`` 0 of everything. "``event_type`` *is* the
+#: action" is a defensible reading; it is not a defensible *asymmetry*, because a
+#: compliance reader diffing the two halves of the round trip cannot tell a
+#: deliberate reading from a missing write on a field the requirement names.
+#:
+#: **Applied by the writer** (``AuditLogger.emit_many``), not by this model, and the
+#: placement was decided by measurement rather than taste. Stamping it in
+#: ``AuditEvent`` looked better -- the writer would stay a pure conduit -- and it
+#: silently broke the compliance-critical direction: :func:`_row_to_event` rebuilds
+#: an ``AuditEvent`` from a stored row, so a row written *before* this field existed,
+#: or one forged by hand, came back out of ``query()`` carrying an ``action`` that is
+#: **not in the database**. A reader recomputing the published hash formula over that
+#: output would get a mismatch on an untampered row, and the tamper-evidence tool
+#: would be disagreeing with itself. Storage is the authority; the writer is the only
+#: place that may add to it, and it does so before the digest is taken so the field
+#: is inside the chain rather than beside it.
+#:
+#: Applying it there rather than at each emitter is what makes it hold: "nine call
+#: sites all remember the same key" is precisely the property that was already false.
+#:
+#: An emitter that names its own ``action`` keeps it (``setdefault``, not assignment).
+#: Note what that does and does not buy today: ``restorer.py`` writes ``'restore'``,
+#: which is what this map holds for ``DEOBFUSCATE``, so its per-entity rows and the
+#: stage row beside them carry the *same* action -- the field does not tell those two
+#: apart, and a comment claiming it did would be describing the state before the
+#: default existed. The rule is kept for the case the field exists for: an emitter
+#: saying something narrower than its event type (a partial restore, a replay, a
+#: compensating write).
+#:
+#: The keys are the ``audit/logger.py`` event-type vocabulary. They are spelled out
+#: here because that module imports *this* one, and the duplication is made
+#: checkable rather than hoped for: ``logger.py`` asserts at import that its
+#: ``EVENT_TYPES`` and these keys are the same set, so a thirteenth event type is a
+#: hard import failure until somebody decides what its action is called.
+AUDIT_ACTIONS: Mapping[str, str] = MappingProxyType(
+    {
+        "SESSION_CREATE": "create_session",
+        "DETECT": "detect",
+        "OBFUSCATE": "obfuscate",
+        "REDACT": "redact",
+        "STRIP": "strip",
+        "EGRESS_PASS": "egress_allow",
+        "EGRESS_BLOCK": "egress_block",
+        "LLM_CALL": "llm_call",
+        # NOT "restore", and the difference is load-bearing rather than cosmetic.
+        # ``DEOBFUSCATE`` is the one event type written in two shapes: a per-entity
+        # itemisation (one row per restored token ID, which names its own action --
+        # ``restorer.RESTORE_ACTION == "restore"``) and a *stage* row summarising the
+        # whole restore (counts, outcome, latency, both columns NULL). Only the
+        # itemisation rows say "restore", and that is the sole thing separating the
+        # two when a reader filters the log by event type.
+        #
+        # Defaulting the stage row to "restore" as well collapsed that discriminator:
+        # the stage row was then indistinguishable from an entity row, and seven
+        # tests in ``test_deobfuscation.py`` -- which filter exactly that way --
+        # started counting it as an entity. Giving the stage row a label of its own
+        # satisfies requirement 7 on *both* shapes (neither is left without an
+        # action) while making the distinction explicit instead of resting on one
+        # shape having no action at all, which is what it rested on before.
+        "DEOBFUSCATE": "restore_stage",
+        "VAULT_MISS": "vault_miss",
+        "VAULT_DESTROY": "destroy_vault",
+        "SESSION_EXPIRE": "expire_session",
+    }
+)
+
+#: The ``detail`` key :data:`AUDIT_ACTIONS` fills.
+AUDIT_ACTION_KEY = "action"
+
 __all__ = [
+    "AUDIT_ACTIONS",
+    "AUDIT_ACTION_KEY",
     "DOC_CATEGORIES",
     "MASK",
     "MAX_AUDIT_LABEL_LEN",
@@ -532,7 +611,53 @@ class PipelineResult(_MaskedRepr):
     restored_text: str
     obfuscated_payload: str
     raw_llm_response: str
+    #: What the caller **asked for** -- the per-request ``strategy`` override, or the
+    #: configured default. It is not a claim about what went on the wire; see
+    #: :attr:`emitted_strategy`, which is.
     strategy: str
+    #: What ``obfuscated_payload`` **actually carries**, classified from the
+    #: surrogate records this run emitted rather than echoed from the request.
+    #:
+    #: The two come apart, and the response used to have no way to say so. Session
+    #: determinism is a hard requirement -- the vault keys a record by
+    #: ``(entity_type, normalize(original))`` for the life of the session and has no
+    #: strategy dimension, so a value another call already mapped keeps the surrogate
+    #: it was first given (``ObfuscationEngine._resolve_groups``; deleting that reuse
+    #: is not the fix, it is a different and worse bug). Tokenize a document and then
+    #: re-run the same session under ``pseudonymization`` and every surrogate on the
+    #: wire is a bracketed token while ``strategy`` says ``pseudonymization``.
+    #: Measured: ``result.strategy == "pseudonymization"`` with ``"[PII_NAME_" in
+    #: result.obfuscated_payload`` -> ``True``. The vault behaviour is correct; the
+    #: *result object* was the thing that lied, and the UI's ``RUN_OK_STRATEGY_DRIFT``
+    #: banner was the only place the contradiction was visible.
+    #:
+    #: A **composition**, in a closed vocabulary, not a verdict:
+    #:
+    #: ``none``
+    #:     this run vaulted nothing, so the payload carries no surrogates of either
+    #:     kind and no statement about composition is available.
+    #: ``tokenization``
+    #:     every surrogate is a bracketed ``[CATEGORY_TYPE_hash8]`` token.
+    #: ``pseudonymization``
+    #:     every surrogate is a realistic fake value.
+    #: ``mixed``
+    #:     both shapes are present.
+    #:
+    #: ``mixed`` is the **correct** output of an ordinary pseudonymization run and is
+    #: not a fault: ``PseudonymizationStrategy.make_surrogate`` emits a fake for the
+    #: identifier and temporal tiers and a plain token for the content tier by
+    #: design. That is precisely why this reports the composition and leaves the
+    #: verdict to the reader -- ``strategy == "tokenization"`` beside
+    #: ``emitted_strategy in {"pseudonymization", "mixed"}`` is a contradiction
+    #: (tokenization cannot mint a fake at all), and ``strategy ==
+    #: "pseudonymization"`` beside ``emitted_strategy == "tokenization"`` is the
+    #: drift above. Every other pairing is an ordinary run.
+    #:
+    #: Derived from the same merged token list as ``stats["tokens_issued"]`` and
+    #: ``stats["pseudonyms_issued"]``, by
+    #: :func:`~secure_context_pipeline.pipeline.orchestrator._emitted_strategy`, so
+    #: this field and the counts the UI banner reads cannot disagree.
+    emitted_strategy: str
     detections: list[SpanOut] = Field(default_factory=list)
     stats: dict[str, float] = Field(default_factory=dict)
     audit_seq: list[int] = Field(default_factory=list)

@@ -1135,9 +1135,29 @@ emit({
     # hovers is not on the page, so it is in the counter now; the tooltip keeps the
     # arithmetic. Strictly more is pinned here than before: both numbers, and the
     # relationship between them.
+    # TEST WRONG: it pinned a claim the code cannot support, in the very scenario it
+    # builds. `C1_DETECTED` is handed two integers and nothing else, and "neither set
+    # contains the other" is a statement about set MEMBERSHIP. It happens to be true of
+    # the medical_note measurement quoted in this docstring (54 detected, 3 dropped at
+    # the enforceability floor, 1 swept in, 52 masked) -- but that fact came from
+    # reading the engine, not from the numbers, and the page prints the sentence on
+    # every run from the counts alone. Here the reply is 2 masked against 3 detected,
+    # and from 2 and 3 there is no way to rule out the masked spans being 2 OF the 3:
+    # the assertion required the page to state, as fact, something underivable and
+    # possibly false. Measured in Chrome on legal_brief_large.txt it printed "detector
+    # returned 739, neither set contains the other" beside "739 spans masked", where it
+    # reads as a flat self-contradiction.
+    #
+    # The replacement is the same shape of check -- exact equality on the whole counter
+    # -- against a clause DERIVED from the two numbers, and it is the arithmetic that is
+    # actually available: a surplus of masked spans proves that many were not
+    # detections (the residual sweep), a deficit proves that many detections were not
+    # masked, and equal counts prove nothing about the sets and now say so. Everything
+    # else this test pinned is untouched: both numbers still appear, each still names
+    # its own set, and "N of M" is still forbidden below.
     assert out["c1"] == (
         "13 chars " + MID + " 2 spans masked " + MID +
-        " detector returned 3, neither set contains the other"
+        " detector returned 3, so at least 1 of them was not masked"
     )
     # ...and points at the other number, by name, with the reason they differ.
     tip = out["c1title"]
@@ -1489,10 +1509,25 @@ emit({{
 
     # Panel 1's header prints both span counts and the relationship that holds between
     # them, and the strip's chip says which set its number is -- both on screen.
-    assert out["c1"].endswith(
-        f"{masked} spans masked {MID} detector returned {detected}, "
-        "neither set contains the other"
-    ), out["c1"]
+    # Same verdict and same reasoning as the other site of this string (see the block at
+    # `test_the_two_span_counts_on_the_page_are_each_labelled_for_what_they_count`): the
+    # clause is now derived from the two counts instead of asserted over them. This one
+    # runs against the REAL pipeline, so the branch it exercises depends on what the
+    # engine actually did -- which is the point, and why the expectation is computed
+    # from the same two numbers the page is given rather than hard-coded.
+    if masked > detected:
+        tail = (f"detector returned {detected}, so at least {masked - detected} masked "
+                f"{'span was' if masked - detected == 1 else 'spans were'} not among them")
+    elif masked < detected:
+        tail = (f"detector returned {detected}, so at least {detected - masked} of them "
+                f"{'was' if detected - masked == 1 else 'were'} not masked")
+    else:
+        tail = (f"detector returned {detected} — the same count, which does not make "
+                f"them the same spans")
+    assert out["c1"].endswith(f"{masked} spans masked {MID} {tail}"), out["c1"]
+    # The claim that was there before must not come back by any route, including the
+    # equal-count branch where it is at its most obviously unearned.
+    assert "neither set contains the other" not in out["c1"], out["c1"]
     assert f"{masked} of {detected}" not in out["c1"], out["c1"]
     chips = {m.group("key"): m.group("value") for m in _CHIP.finditer(out["stats"])}
     assert chips["entities_detected"] == f"{detected} {MID} before policy", chips
@@ -3090,10 +3125,44 @@ def test_the_live_review_callout_names_the_erasure_not_a_vault_miss() -> None:
     # Everything the page puts in front of a user: rendered text plus every attribute
     # value (titles, aria names). HTML comments are excluded on purpose -- the comment
     # at the callout quotes the retracted claim in order to explain why it is gone.
-    body = next(n for n in elements if n["tag"] == "body")
-    shown = _flat(body["text"] + " " + " ".join(v for n in elements for v in n["attrs"].values()))
-    assert "vault-miss" not in shown.lower(), "the retracted vault-miss claim is back"
-    assert "VAULT_MISS" not in shown, "no VAULT_MISS is reachable from a destroyed session"
+    # TEST WRONG, and specifically the SCOPE of the ban -- the rule behind it is kept
+    # and tightened. These two lines banned the substrings "vault-miss" and "VAULT_MISS"
+    # from the WHOLE PAGE, which was a sound proxy for the real rule ("this callout must
+    # not sell its sequence as a vault-miss demo") only for as long as the page had no
+    # flow that could produce one. It now has one: the run bar carries "Restore again
+    # with an unissued token", which re-sends the same document and the same LIVE
+    # session through the same POST /pipeline/run with a correctly-shaped token id this
+    # session never minted. Driven in Chrome, that press measured `vault_misses 1`,
+    # `unresolved_fabricated 1`, `[UNRESOLVED_ENTITY]` in panel 4 and a real hash-chained
+    # row `VAULT_MISS {"category":"PII","classification":"fabricated","reason":
+    # "token_not_in_vault","stage":"deobfuscate"}` at seq 107. A page-wide ban on the
+    # word therefore forbids the page from naming, truthfully, the one thing build doc
+    # section 9.10 asks it to demonstrate -- it had become a rule against honesty.
+    #
+    # The regression it was written for is unchanged and is now asserted DIRECTLY on the
+    # callout rather than through a page-wide proxy, which is strictly more precise: the
+    # old form would have passed a callout re-labelled "vault-miss demonstration" as
+    # long as somebody also deleted the words elsewhere, and would have failed a page
+    # that told the truth. Re-measured on the same run: the destroy sequence itself
+    # still writes ZERO VAULT_MISS rows (600 session-scoped rows, none of them one), so
+    # the claim being forbidden is still false and the ban still bites.
+    # So the rule is asserted as a rule. A vault miss may be mentioned here in exactly
+    # two ways, and if it is mentioned at all BOTH have to be present: the callout must
+    # say that its own three steps produce none, and it must name the control that does,
+    # so no reader can be left attributing the miss to this sequence. A regression that
+    # re-labels these steps "the vault-miss demo" cannot satisfy either clause without
+    # ceasing to make the false claim, which is what the old page-wide ban was reaching
+    # for -- and unlike that ban, this cannot be satisfied by deleting the word from
+    # somewhere else on the page, and does not fire on a page that is telling the truth.
+    if "vault-miss" in callout.lower() or "VAULT_MISS" in callout:
+        assert "writes none" in callout.lower(), (
+            "the callout mentions a vault miss without saying that THIS sequence "
+            f"produces none: {callout}"
+        )
+        assert "restore again with an unissued token" in callout.lower(), (
+            "the callout mentions a vault miss without naming the control that "
+            f"actually produces one, so the claim reads as being about these steps: {callout}"
+        )
     assert "SESSION_EXPIRED" in callout, callout
     assert "VAULT_DESTROY" in callout, callout
     # The markup and the banner app.js raises at step 2 have to tell one story.
@@ -4940,3 +5009,352 @@ def test_the_stats_key_covers_every_chip_the_strip_can_emit() -> None:
     assert classes == {"stat", "stat muted", "stat badge ok", "stat badge err"}, classes
     for phrase in ("green", "red", "plain", "dim"):
         assert phrase in text, f"the key does not name the {phrase} state: {text}"
+
+
+# ---------------------------------------------------------------------------
+# Build doc section 9.10: the vault-miss demonstration, and the four smaller
+# defects fixed alongside it. Every scenario below was reproduced in Chrome
+# against a container built from this tree before the fix it pins.
+# ---------------------------------------------------------------------------
+
+#: A reply shaped like a real one for the vault-miss control: the payload opens with
+#: the injected instructions -- which really do carry a token-shaped DOCUMENTATION
+#: EXAMPLE -- and only then reaches the <DOCUMENT> fence and the token this run
+#: actually minted. Both halves are load-bearing; see the test below.
+MISS_SETUP = """
+const RESULT = {
+  run_id: 'r-1', strategy: 'tokenization',
+  detections: [{ start: 0, end: 3, category: 'PII', entity_type: 'PERSON',
+                 action: 'OBFUSCATED', score: 0.9, surrogate: '[PII_NAME_aaaaaaa0]' }],
+  obfuscated_payload:
+    'Use placeholders like [PHI_NAME_1a2b3c4d] verbatim.\\n<DOCUMENT>\\n' +
+    '[PII_NAME_aaaaaaa0] met Carl.\\n</DOCUMENT>',
+  raw_llm_response: '[PII_NAME_aaaaaaa0] met Carl.',
+  restored_text: 'Bob met Carl.',
+  stats: { total_ms: 5.5, vault_misses: 0 },
+};
+let MISSES = 0;
+respond((path, init) => {
+  const m = (init && init.method) || 'GET';
+  if (m === 'POST' && path === '/documents') return { status: 200, body: { doc_id: 'doc-1' } };
+  if (path.indexOf('/documents/doc-1/text') === 0) {
+    return { status: 200, body: { text: 'Bob met Carl.', chars: 13 } };
+  }
+  if (path === '/pipeline/run') {
+    const body = JSON.parse(init.body);
+    const reply = JSON.parse(JSON.stringify(RESULT));
+    reply.stats.vault_misses = MISSES;
+    reply.sent_prompt = body.prompt;
+    return { status: 200, body: reply };
+  }
+  if (path.indexOf('/audit') === 0) return { status: 200, body: { events: [] } };
+  return { status: 200, body: {} };
+});
+UI.S.sessionId = 'sess-1';
+el('prompt').value = 'Summarise';
+el('category').value = 'legal';
+el('file').files = [{ name: 'note.txt', size: 3, lastModified: 11 }];
+fire('file', 'change');
+"""
+
+
+def test_the_vault_miss_demo_perturbs_a_token_the_run_minted_not_the_prompt_example(
+    tmp_path: Path,
+) -> None:
+    """The fabricated token must be derived from a token this session actually issued.
+
+    Build doc section 9.10 asks for a live vault-miss demonstration. ``restoreAgain``
+    builds one by taking a token of the previous run and advancing one hex digit of its
+    ID, then telling the reviewer -- in the banner -- that the result is "the same
+    grammar as X from the previous run, with one hex digit of the id changed". That
+    sentence is only true if X was really minted.
+
+    The first implementation scanned ``obfuscated_payload`` from offset 0 for the token
+    grammar and took the first hit. ``context_injector`` opens every payload with
+    instructions containing a token-shaped **documentation example**, so the first hit
+    was that literal on every run: driven in Chrome, the banner named
+    ``[PHI_NAME_1a2b3c4d]`` -- a string in the prompt template that no session has ever
+    issued -- as the real token it was derived from. ``renderMarks`` carries a comment
+    about being bitten by the identical literal.
+
+    So the tokens are read out of ``result.detections``, which is the record of what the
+    engine masked, and cross-checked for presence in the payload past the fence. This
+    reply reproduces both halves: the example before the fence, the minted token after.
+    """
+    out = _run(
+        tmp_path,
+        MISS_SETUP
+        + """
+await UI.run();
+calls.length = 0;
+fire('btn-miss', 'click');
+await settle();
+emit({
+  sent: calls.filter((c) => c.path === '/pipeline/run').map((c) => JSON.parse(c.body).prompt),
+  prompt: el('prompt').value,
+  banner: el('banner').innerHTML,
+});
+""",
+    )
+    assert len(out["sent"]) == 1, out["sent"]
+    sent = out["sent"][0]
+    # The reviewer's own prompt survives, and the fabricated tokens are appended to it.
+    assert sent.startswith("Summarise "), sent
+    # Derived from the MINTED token: same category and type, one hex digit different.
+    # TWO of them, and the count is not incidental -- the mock renders each echoed token
+    # under a mutation class taken round-robin from five and one of those five drops the
+    # brackets, which `restorer._restore_tokens` deliberately declines to call a miss
+    # (README Deviation 49). One token therefore demonstrated the path only four presses
+    # in five; observed live, one press measured `vault_misses 1` and the next measured
+    # 0. Two adjacent tokens take consecutive classes, exactly one of which drops
+    # brackets, so at least one always arrives in the shape that produces a real miss.
+    fabricated = re.findall(r"\[PII_NAME_([0-9a-f]{8})\]", sent)
+    assert len(fabricated) == 2, f"expected two fabricated tokens, got {fabricated}: {sent}"
+    assert len(set(fabricated)) == 2, f"the two tokens are the same: {fabricated}"
+    for got in fabricated:
+        assert got != "aaaaaaa0", "the token was not perturbed at all"
+        differences = sum(a != b for a, b in zip("aaaaaaa0", got, strict=True))
+        assert differences == 1, (got, "exactly one hex digit may change")
+    # ...and NOT from the documentation example in the instructions, which is what the
+    # payload scan picked and which was never issued by anything.
+    assert "PHI_NAME" not in sent, (
+        f"the demo perturbed the prompt template's documentation example: {sent}"
+    )
+    # The box shows exactly what was sent -- the page's claim that a reviewer can read
+    # the real string rather than take the banner's word for it.
+    assert out["prompt"] == sent, (out["prompt"], sent)
+
+
+def test_the_vault_miss_demo_claims_a_miss_only_when_the_run_reports_one(
+    tmp_path: Path,
+) -> None:
+    """The banner reports what the pipeline measured, never what the press intended.
+
+    The control appends a token the vault cannot resolve, but whether a miss actually
+    happens is the *provider's* decision: the fabricated token has to come back in the
+    answer for the restorer to meet it. A provider that does not echo its input produces
+    no miss, and a banner that announced one anyway would be exactly the class of defect
+    this demo exists to disprove -- the page asserting something the panels do not show.
+    Same rule ``destroySession`` follows for the erasure: claim it only on the branch
+    where the log proves it.
+    """
+    out = _run(
+        tmp_path,
+        MISS_SETUP
+        + """
+await UI.run();
+MISSES = 1;
+fire('btn-miss', 'click');
+await settle();
+const hit = el('banner').innerHTML;
+MISSES = 0;
+fire('btn-miss', 'click');
+await settle();
+emit({ hit: hit, missed: el('banner').innerHTML, cls: el('banner').className });
+""",
+    )
+    assert "VAULT_MISS_DEMO" in out["hit"], out["hit"]
+    assert "VAULT_MISS_DEMO_NO_MISS" not in out["hit"], out["hit"]
+    assert "vault_misses 1" in out["hit"], out["hit"]
+    # The honest branch: no miss measured, so no miss claimed, and it says so in the
+    # loudest colour rather than quietly downgrading to a plain RUN_OK.
+    assert "VAULT_MISS_DEMO_NO_MISS" in out["missed"], out["missed"]
+    assert "did NOT" in out["missed"], out["missed"]
+    assert out["cls"] == "banner err", out["cls"]
+
+
+def test_the_vault_miss_demo_needs_a_live_session_and_says_why(tmp_path: Path) -> None:
+    """A destroyed session cannot produce a vault miss, and the refusal is the lesson.
+
+    ``/pipeline/run`` calls ``_require_session`` before the orchestrator, and
+    ``SessionRegistry.key`` raises for a destroyed session before ``SessionVault`` could
+    answer "miss" at all -- so the scripted destroy sequence writes ``VAULT_DESTROY`` and
+    zero ``VAULT_MISS`` (measured: 600 session-scoped rows on the large brief, none of
+    them a miss). The control therefore refuses locally rather than issuing a request
+    that could only 401, and the refusal explains the architecture instead of just
+    declining.
+    """
+    out = _run(
+        tmp_path,
+        MISS_SETUP
+        + """
+await UI.run();
+UI.S.lastSessionId = UI.S.sessionId;
+UI.S.sessionId = null;
+calls.length = 0;
+fire('btn-miss', 'click');
+await settle();
+emit({ banner: el('banner').innerHTML, requests: calls.map((c) => c.path) });
+""",
+    )
+    assert "NO_LIVE_SESSION" in out["banner"], out["banner"]
+    assert "before the vault is ever consulted" in out["banner"], out["banner"]
+    assert out["requests"] == [], (
+        "the refusal issued a request that could only be refused: "
+        f"{out['requests']}"
+    )
+
+
+def test_the_health_badge_recovers_when_the_api_answers_again(tmp_path: Path) -> None:
+    """The badge was a one-way latch, and the recovery is where it mattered most.
+
+    ``markUnreachable`` moves the header badge to ``health: unreachable`` on a network
+    failure. Nothing moved it back: reproduced in Chrome by stopping the container,
+    pressing Run (badge goes ``badge err``), starting it again and pressing Create
+    session -- which answered 200 and minted a session -- with the header still reading
+    ``health: unreachable``. Only a reload cleared it, and the recovery is exactly the
+    moment a reviewer is deciding whether the failure they just watched was the
+    pipeline's fault or their laptop's.
+
+    The re-poll hangs off the arrival of a reply, not off a 2xx: a 401 is as complete a
+    refutation of "unreachable" as a 200, and that is the case driven here.
+    """
+    out = _run(
+        tmp_path,
+        """
+respond(() => { throw new Error('connection refused'); });
+await UI.health();
+const dead = { text: el('health').textContent, cls: el('health').className };
+respond((path) => {
+  if (path === '/health') {
+    return { status: 200, body: { status: 'ok', llm_provider: 'mock',
+                                  llm_model: 'm', spacy_model: 's' } };
+  }
+  return { status: 401, body: { code: 'SESSION_EXPIRED' } };
+});
+UI.S.sessionId = 'sess-1';
+await UI.loadAudit();
+await settle();
+emit({ dead: dead, text: el('health').textContent, cls: el('health').className });
+""",
+    )
+    assert out["dead"] == {"text": "health: unreachable", "cls": "badge err"}, out["dead"]
+    assert out["cls"] == "badge ok", out["cls"]
+    assert out["text"] == "ok " + MID + " mock/m " + MID + " s", out["text"]
+
+
+def test_committing_the_create_session_gate_closes_it(tmp_path: Path) -> None:
+    """An open ``<details>`` guard hangs over the control row underneath it.
+
+    ``.guard-body`` is ``position: absolute`` -- it has to be, or opening the gate shoves
+    the controls beside it sideways -- and ``<details>`` has no auto-close, so pressing
+    the button inside left the panel open for the rest of the demo. Measured in Chrome at
+    1550px with the session committed: ``details.open`` true, ``.guard-body`` at
+    [212,87,330,212], ``#strategy`` at [373,142,160,27] underneath it, and
+    ``document.elementFromPoint`` at the select's own centre returning ``SPAN.hint``
+    instead of the select. The strategy toggle is what decides whether panels 2 and 3
+    show bracketed tokens or realistic fakes, so a reviewer following the obvious order
+    clicked a dead control.
+
+    Closed on the press rather than on success, so a mint that FAILS also hands the
+    controls back -- which is the case driven here.
+    """
+    out = _run(
+        tmp_path,
+        """
+respond((path) => {
+  if (path === '/sessions') return { status: 500, body: { code: 'BOOM' } };
+  return { status: 200, body: { events: [] } };
+});
+el('guard-session').open = true;
+await UI.createSession();
+const failed = el('guard-session').open;
+respond((path, init) => {
+  const m = (init && init.method) || 'GET';
+  if (m === 'POST' && path === '/sessions') {
+    return { status: 200, body: { session_id: 's'.repeat(32), expires_at: 1 } };
+  }
+  return { status: 200, body: { events: [] } };
+});
+el('guard-session').open = true;
+await UI.createSession();
+emit({ afterFailure: failed, afterSuccess: el('guard-session').open });
+""",
+    )
+    assert out["afterFailure"] is False, "a failed mint left the guard over the controls"
+    assert out["afterSuccess"] is False, "a committed mint left the guard over the controls"
+
+
+def test_a_missing_prompt_clears_the_previous_run_like_the_other_preflights(
+    tmp_path: Path,
+) -> None:
+    """A red refusal must not sit over a complete, successful, earlier run.
+
+    ``resetRun`` runs inside ``run``'s ``try``, so ``NO_FILE`` and ``NO_CATEGORY`` blank
+    the panels before they banner. The empty-prompt check returned *above* it and left
+    everything up. Measured in Chrome after a successful medical_note.txt run, emptying
+    the prompt box and pressing Run: a red ``NO_PROMPT`` banner over panel 1 holding
+    2 826 characters of the document, panel 2 holding 4 262, panel 4 holding 2 278
+    including its ``[UNRESOLVED_ENTITY]`` mark, a populated stats strip and ``#audit-run``
+    still naming the previous run -- every one of them the earlier run's, under a banner
+    that reads as this click's verdict.
+    """
+    out = _run(
+        tmp_path,
+        RUN_SETUP.replace("PIPELINE_REPLY(RESULT)", "{ status: 200, body: RESULT }")
+        + """
+await UI.run();
+const before = { p1: el('p1').innerHTML.length, p4: el('p4').innerHTML.length };
+el('prompt').value = '   ';
+calls.length = 0;
+await UI.run();
+emit({
+  before: before, banner: el('banner').innerHTML,
+  panels: ['p1', 'p2', 'p3', 'p4'].map((p) => el(p).innerHTML),
+  counters: ['c1', 'c2', 'c3', 'c4'].map((c) => el(c).textContent),
+  stats: el('stats').innerHTML, auditRun: el('audit-run').textContent,
+  requests: calls.map((c) => c.path),
+});
+""",
+    )
+    assert out["before"]["p1"] > 0 and out["before"]["p4"] > 0, out["before"]
+    assert "NO_PROMPT" in out["banner"], out["banner"]
+    assert out["panels"] == ["—", "—", "—", "—"], out["panels"]
+    assert out["counters"] == ["", "", "", ""], out["counters"]
+    assert out["stats"] == "", out["stats"]
+    assert out["auditRun"] == "", out["auditRun"]
+    # Still a refusal of the CLICK: nothing was uploaded and no run id exists, so it
+    # must not go near the network -- the property the other two preflights have.
+    assert out["requests"] == [], out["requests"]
+
+
+def test_the_prompt_box_carries_the_servers_own_ceiling(tmp_path: Path) -> None:
+    """A 422 that arrives after the upload, for a limit nothing on the page mentioned.
+
+    ``#prompt`` had no ``maxlength``, so a long paste was accepted by the box, carried
+    through ``POST /documents``, and refused only at ``POST /pipeline/run`` with
+    ``VALIDATION_ERROR`` naming ``body.prompt``. Mirrored from the Python constant here
+    -- the same arrangement ``FIELD_LIMITS`` and ``SCOPED_RULES`` have -- so moving the
+    ceiling in ``api/schemas.py`` fails this test rather than leaving the attribute
+    quietly wrong.
+    """
+    _, by_id = _page()
+    assert by_id["prompt"]["attrs"].get("maxlength") == str(MAX_PROMPT_CHARS), (
+        by_id["prompt"]["attrs"]
+    )
+
+
+def test_the_pseudonym_tooltip_gets_its_article_right(tmp_path: Path) -> None:
+    """"a ADDRESS" on the surface whose job is to say a convincing value is a fake.
+
+    The tooltip hard-coded "a", and the entity types are registry constants, so
+    pseudonymization printed "a ADDRESS", "a AMOUNT" and "a EMAIL" -- measured verbatim
+    off a live medical_note.txt run. Decided on the letter rather than from a list, so a
+    type added to ``entities.yaml`` later gets the right article without anyone
+    remembering to extend a table.
+    """
+    out = _run(
+        tmp_path,
+        """
+const dets = [
+  { start: 0, end: 1, category: 'PII', entity_type: 'ADDRESS', action: 'PSEUDO',
+    score: 0.9, surrogate: 'Aa' },
+  { start: 0, end: 1, category: 'PII', entity_type: 'NAME', action: 'PSEUDO',
+    score: 0.9, surrogate: 'Bb' },
+];
+emit({ html: UI.renderMarks('Aa and Bb', dets, 0) });
+""",
+    )
+    assert "standing in for an ADDRESS" in out["html"], out["html"]
+    assert "standing in for a NAME" in out["html"], out["html"]
+    assert "for a ADDRESS" not in out["html"], out["html"]

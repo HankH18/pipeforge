@@ -17,6 +17,7 @@ import os
 import secrets
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import anthropic
@@ -30,6 +31,8 @@ from secure_context_pipeline.llm import mock_provider
 from secure_context_pipeline.llm.anthropic_provider import (
     ANTHROPIC_LOGGER_NAME,
     EFFORT,
+    FALLBACK_BETA,
+    FALLBACKS,
     MAX_ATTEMPTS,
     MAX_BACKOFF_S,
     AnthropicProvider,
@@ -201,8 +204,20 @@ class FakeMessages:
 
 
 class FakeClient:
+    """Stand-in for ``anthropic.AsyncAnthropic``.
+
+    ``beta.messages`` and ``messages`` are the **same recorder object**, deliberately.
+    The provider calls ``client.beta.messages.create`` (it needs ``betas`` /
+    ``fallbacks``, which the first-party surface does not accept -- see the provider's
+    module docstring), and every assertion in this file reads ``fake.messages.calls``.
+    Aliasing rather than adding a second recorder keeps those assertions reading the
+    calls that were actually made instead of an empty list that would pass a
+    ``not in`` check for free.
+    """
+
     def __init__(self, script: list[Any]) -> None:
         self.messages = FakeMessages(script)
+        self.beta = SimpleNamespace(messages=self.messages)
         self.max_retries = 0
 
 
@@ -800,7 +815,18 @@ async def test_wire_level_request_body_through_the_real_sdk(
         )
 
     body = captured["body"]
-    assert captured["url"] == "https://api.anthropic.com/v1/messages"
+    # SUPERSEDED CONTRACT, recorded rather than quietly moved. This asserted
+    # ".../v1/messages" while the provider used `client.messages.create`. It is now
+    # `client.beta.messages.create`, which the SDK routes to "?beta=true", because
+    # that is the only surface carrying `betas`/`fallbacks` -- the server-side
+    # refusal fallback the demo's medical/legal/financial fixtures need on a model
+    # with elevated cybersecurity safeguards. Measured on anthropic==0.120.2:
+    # `client.messages.create` accepts neither parameter, the SDK's own
+    # `BetaRefusalFallbackMiddleware` passes non-beta requests through untouched,
+    # and `Message.model_validate` of a fallback-served body raises 35 validation
+    # errors where `BetaMessage.model_validate` accepts it. Still an exact equality,
+    # not a `startswith` -- the old assertion was not loosened, it was re-aimed.
+    assert captured["url"] == "https://api.anthropic.com/v1/messages?beta=true"
     assert body["output_config"] == {"effort": EFFORT}
     assert body["max_tokens"] == 16000
     assert body["model"] == "claude-opus-5"
@@ -854,7 +880,17 @@ async def test_wire_level_request_carries_the_expected_headers_and_no_streaming(
         await provider.complete("SYS", "USER", model="claude-opus-5")
 
     assert seen["method"] == "POST"
-    assert seen["url"] == "https://api.anthropic.com/v1/messages"
+    # SUPERSEDED CONTRACT -- same justification as
+    # `test_wire_level_request_body_through_the_real_sdk`, recorded there in full:
+    # the provider moved to `client.beta.messages.create` for the server-side
+    # refusal fallback, and the SDK routes that surface to "?beta=true".
+    assert seen["url"] == "https://api.anthropic.com/v1/messages?beta=true"
+    # The requirement this test's docstring actually names -- "the key never in the
+    # URL or a query string" -- asserted directly rather than left implied by the
+    # exact-URL equality above. The query string now exists, so "there is no query
+    # string" is no longer a proxy for it: the whole query is enumerated, so a later
+    # change that smuggles anything else in there fails here.
+    assert dict(httpx.URL(seen["url"]).params) == {"beta": "true"}
     assert seen["headers"]["x-api-key"] == FAKE_API_KEY
     assert seen["headers"]["anthropic-version"]
     assert seen["headers"]["content-type"].startswith("application/json")
@@ -960,6 +996,155 @@ async def test_wire_level_refusal_is_surfaced_without_its_content(
             await provider.complete_detailed("s", "u", model="claude-opus-5")
 
     assert calls == 1, "a refusal is a decision, not a transient failure"
+    assert sleep_recorder == []
+    error = excinfo.value
+    assert error.detail["category"] == "cyber"
+    assert error.detail["stop_reason"] == "refusal"
+    rendered = f"{error}{error!r}"
+    assert "SECRET PARTIAL" not in rendered
+    assert "explanation" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Refusal fallbacks -- the parameter, the header, and both ends of the chain
+#
+# This cannot be checked against the live API (the suite opens no sockets), so the
+# proof is the *serialized request* and a simulated response of each shape, driven
+# through the genuine SDK over `httpx.MockTransport`.
+# ---------------------------------------------------------------------------
+
+
+def _fallback_block(
+    *, from_model: str = "claude-opus-5", to_model: str = "claude-opus-4-8"
+) -> dict[str, Any]:
+    """The block the API prepends where one model's output gave way to the next."""
+    return {
+        "type": "fallback",
+        "from": {"model": from_model},
+        "to": {"model": to_model},
+        "trigger": {"type": "refusal", "category": "cyber"},
+    }
+
+
+async def test_wire_level_request_declares_a_server_side_refusal_fallback(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    """The fallback is *declared on the request*, or it does not exist.
+
+    The configured model carries elevated cybersecurity safeguards and the shipped
+    fixtures are medical, legal and financial records -- the band where a benign
+    request can be declined. Without these two the API has no instruction to route
+    a decline anywhere, so the run ends. Asserted on the bytes the SDK put on the
+    wire rather than on the kwargs we handed it: ``fallbacks`` has a scalar and an
+    array form gated by *different* beta headers, and pairing either header with the
+    other form is a 400 -- a mismatch a kwargs-level check cannot see.
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_message_json())
+
+    settings = settings_factory(llm_provider="anthropic")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = AnthropicProvider(settings, http_client=http_client)
+        await provider.complete("SYS", "USER", model="claude-opus-5")
+
+    assert seen["body"]["fallbacks"] == FALLBACKS == "default"
+    assert seen["headers"]["anthropic-beta"] == FALLBACK_BETA
+    assert FALLBACK_BETA == "server-side-fallback-2026-07-01", (
+        "the scalar `fallbacks: \"default\"` form is gated by the -07-01 header; the "
+        "-06-01 header gates the array form and pairing them crosswise is a 400"
+    )
+    # The rest of the request must still be valid for this model family.
+    for banned in ("temperature", "top_p", "top_k", "thinking"):
+        assert banned not in seen["body"], banned
+
+
+async def test_wire_level_a_declined_request_is_recovered_by_the_fallback(
+    settings_factory: Callable[..., Settings],
+    sleep_recorder: list[float],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A decline that the chain recovered returns an answer, and says whose.
+
+    This is the whole point of the parameter: one HTTP request, one response, and
+    the substitute model's text -- no client-side retry, so the "a refusal is a
+    decision, not a transient failure" rule above is untouched (``calls == 1``).
+
+    The ``fallback`` content block is what makes the substitution visible, and it is
+    logged: a demo that silently answered from a different model than the configured
+    one would otherwise be indistinguishable from one that never tripped a
+    classifier, and the substitute bills at its own rates.
+    """
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json=_message_json(
+                model="claude-opus-4-8",
+                content=[
+                    _fallback_block(),
+                    {"type": "text", "text": "the substitute answered"},
+                ],
+            ),
+        )
+
+    caplog.set_level(logging.WARNING, logger="secure_context_pipeline.llm.anthropic_provider")
+    settings = settings_factory(llm_provider="anthropic")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = AnthropicProvider(settings, http_client=http_client)
+        response = await provider.complete_detailed("s", "u", model="claude-opus-5")
+
+    assert response.text == "the substitute answered"
+    assert response.model == "claude-opus-4-8", "the SERVING model, not the requested one"
+    assert calls == 1, "the fallback is server-side: one request, one response"
+    assert sleep_recorder == [], "a decline is not a transient failure and is not backed off"
+    assert "LLM_FALLBACK" in caplog.text
+    assert "claude-opus-4-8" in caplog.text
+
+
+async def test_wire_level_a_chain_that_declines_end_to_end_is_still_terminal(
+    settings_factory: Callable[..., Settings], sleep_recorder: list[float]
+) -> None:
+    """The fallback softens the common case; it does not delete the terminal one.
+
+    ``stop_reason == "refusal"`` on the response we are holding means every model in
+    the chain declined -- the API already tried the substitute inside this call. So
+    there is nothing left to try and no degraded answer to return, and the same
+    :class:`LLMRefusalError` is raised, still carrying the category and still
+    carrying neither the partial content nor the explanation.
+    """
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json=_message_json(
+                model="claude-opus-4-8",
+                stop_reason="refusal",
+                stop_details={
+                    "type": "refusal",
+                    "category": "cyber",
+                    "explanation": "a long explanation naming SECRET PARTIAL",
+                },
+                content=[_fallback_block(), {"type": "text", "text": "SECRET PARTIAL"}],
+            ),
+        )
+
+    settings = settings_factory(llm_provider="anthropic")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        provider = AnthropicProvider(settings, http_client=http_client)
+        with pytest.raises(LLMRefusalError) as excinfo:
+            await provider.complete_detailed("s", "u", model="claude-opus-5")
+
+    assert calls == 1
     assert sleep_recorder == []
     error = excinfo.value
     assert error.detail["category"] == "cyber"

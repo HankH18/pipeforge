@@ -28,6 +28,27 @@ those are the types the pipeline already keeps free of *content* (``SpanOut`` ha
 offsets but no ``text`` field; ``AuditEvent``'s only free-text field, ``detail``,
 is bounded at 64 characters per entry and its label columns at 128), and
 duplicating them would create a second schema that could drift into leaking.
+
+That re-use is what makes ``POST /pipeline/run``'s documented body the model itself
+(``routes/pipeline.py`` sets ``response_model=PipelineResult``), so a field added
+there **is** a field added to this API. One is worth naming here because it is the
+only pair on the response whose halves can contradict each other:
+
+* ``strategy`` -- what the caller **requested** (body field or configured default).
+* ``emitted_strategy`` -- the surrogate composition the payload the provider
+  received **actually carries**: ``none`` / ``tokenization`` / ``pseudonymization``
+  / ``mixed``.
+
+They diverge legitimately, because session determinism outranks a per-request
+override: a value an earlier call in the same session already mapped keeps the
+surrogate it was first given. Before ``emitted_strategy`` existed the response
+asserted the request as though it were the outcome -- a run that asked for
+``pseudonymization`` in a session that had already tokenised reported
+``strategy: "pseudonymization"`` while shipping bracketed tokens, and only the
+bundled UI's ``RUN_OK_STRATEGY_DRIFT`` banner said otherwise. Neither field is
+content, and neither is caller-supplied text: ``strategy`` is validated against the
+strategy registry by :data:`StrategyName` before the orchestrator sees it, and
+``emitted_strategy`` is a label this process derives from its own token records.
 """
 
 from __future__ import annotations

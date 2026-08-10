@@ -42,9 +42,15 @@ defect class this repository keeps finding in itself.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Interpreter droppings, which are not suite files no matter what the walk finds.
+# A deny-list of junk rather than an allow-list of suffixes, so a fixture, a
+# corpus or a golden file added under tests/ is checked the day it lands.
+NOT_A_SUITE_FILE = frozenset({".DS_Store"})
 
 # The single rule that is anchored on purpose. `data/` must remove ./data (the
 # encrypted store, the vault, the audit chain) and must NOT remove
@@ -155,3 +161,75 @@ def test_the_data_rule_stays_anchored_so_the_gazetteers_still_ship() -> None:
         "`**/data/` also removes secure_context_pipeline/detection/data/, and "
         "`load_registry` refuses to start without the gazetteers it names"
     )
+
+
+def test_every_file_this_suite_runs_from_is_in_the_repository() -> None:
+    """The suite a stranger runs is the tracked one, not the one on this disk.
+
+    The sibling of the gazetteer incident, one directory over. ``tests/`` is not
+    copied into the image, so
+    ``test_api.py::test_every_runtime_asset_the_registry_needs_actually_reaches_the_image``
+    -- which derives its list from the Dockerfile's ``COPY`` sources -- cannot
+    reach it, and nothing else asked. That gap has already cost this repository
+    once: an untracked test file, recorded in ``test_ui_behaviour.py`` as the
+    second time "green here, absent from a clone" was paid for.
+
+    The failure is silent in exactly the way the first one was. An ignored or
+    never-added test file runs locally, passes locally, and leaves ``git status``
+    clean, while the clone a reviewer takes runs a smaller suite that also passes
+    -- so the missing coverage announces itself nowhere. ``README`` counters make
+    it worse rather than better: ``test_readme_claims.py`` derives its test
+    tallies by walking ``tests/`` on disk, so a file that never left this machine
+    is counted in the published numbers.
+
+    One direction only, on purpose: on disk must be in the index. The reverse (in
+    the index, absent from disk) is an ordinary mid-edit deletion and is not this
+    repository's problem to police.
+    """
+    tracked = _git_ls_files("tests")
+    if tracked is None:  # no working tree -- a tarball or a wheel has no index to ask
+        return
+
+    on_disk = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in (REPO_ROOT / "tests").rglob("*")
+        if path.is_file()
+        and path.suffix != ".pyc"
+        and "__pycache__" not in path.parts
+        and path.name not in NOT_A_SUITE_FILE
+    }
+    assert on_disk, "no suite file found on disk at all; the walk is wrong"
+    assert tracked, "git tracks nothing under tests/; the query is wrong, not the repo"
+    missing = sorted(on_disk - tracked)
+    assert not missing, (
+        f"these files are part of the suite on this machine and are absent from the "
+        f"repository: {missing}. A clone runs a smaller suite than this one and passes, "
+        f"so the coverage they add exists nowhere but here. `git add` them, or delete "
+        f"them if they were scratch -- and check `git check-ignore -v` on them first, "
+        f"because an unanchored ignore rule is how this happened the last two times"
+    )
+
+
+def _git_ls_files(pathspec: str) -> frozenset[str] | None:
+    """git's index under ``pathspec``, or ``None`` when there is no tree to ask.
+
+    Shelling out rather than reading ``.gitignore``: a hand-written matcher would
+    be written from the same misreading of git's grammar that untracked the
+    gazetteers, which makes it a checker that shares the blind spot of the thing
+    it checks. ``-z`` so a name needing quoting cannot be misread as two names.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        return None
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "-z", "--", pathspec],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - no git binary
+        return None
+    if completed.returncode != 0:  # pragma: no cover - not a working tree
+        return None
+    return frozenset(filter(None, completed.stdout.decode("utf-8", "replace").split("\0")))

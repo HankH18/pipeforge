@@ -73,11 +73,17 @@ from secure_context_pipeline.models import (
     EntityCategory,
 )
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
+from secure_context_pipeline.pipeline import orchestrator as orchestrator_module
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import EgressGate, EgressReport
 from secure_context_pipeline.pipeline.orchestrator import PipelineOrchestrator
 from secure_context_pipeline.store.document_store import RAW_SUFFIX, EncryptedDocumentStore
-from secure_context_pipeline.surrogates import STRICT_TOKEN_RE, TOKEN_RE
+from secure_context_pipeline.surrogates import (
+    HINT_RE,
+    MAX_HINT_LEN,
+    STRICT_TOKEN_RE,
+    TOKEN_RE,
+)
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
 
@@ -311,7 +317,21 @@ async def make_harness(
         clock: MutableClock | None = None,
         strategy: str = "tokenization",
         seamed_gate: bool = False,
+        without_ssn_backstop: bool = False,
     ) -> Harness:
+        """``without_ssn_backstop`` deletes ONE registry field and rebuilds the detector.
+
+        It is the registry that shipped before ``entities.yaml`` grew ``SSN.patterns``,
+        and it exists so an integration test can still ask "does the egress gate hold
+        when detection does not?" now that detection claims the same values. Detection
+        is configuration and the gate is the guarantee; this flag *is* the
+        configuration edit, applied deliberately, so the claim is measured rather than
+        asserted. Everything else about the detector is the real thing -- a
+        ``FakeDetector`` would let the test invent the premise it needs.
+
+        It costs a second spaCy pipeline, which is why it is off by default and why
+        exactly one test asks for it.
+        """
         nonlocal counter
         counter += 1
         root = tmp_path / f"h{counter}"
@@ -323,6 +343,18 @@ async def make_harness(
             llm_provider="mock",
             strategy=strategy,  # type: ignore[arg-type]
         )
+        in_use, detector_in_use = registry, detector
+        if without_ssn_backstop:
+            assert registry.entities["SSN"].patterns, (
+                "entities.yaml no longer carries an SSN backstop; this flag is supposed "
+                "to REMOVE one, and removing nothing makes the test that uses it pass "
+                "for the wrong reason"
+            )
+            entities = dict(registry.entities)
+            entities["SSN"] = entities["SSN"].model_copy(update={"patterns": ()})
+            in_use = registry.model_copy(update={"entities": entities})
+            detector_in_use = Detector(in_use, settings)
+
         audit = await AuditLogger.open(root / "audit.db")
         store = await EncryptedDocumentStore.open(settings)
         sessions = (
@@ -332,7 +364,7 @@ async def make_harness(
         )
         vault = await SessionVault.open(root / "vault.db", sessions)
         engine = ObfuscationEngine(
-            registry=registry,
+            registry=in_use,
             vault=vault,
             session_registry=sessions,
             settings=settings,
@@ -344,12 +376,14 @@ async def make_harness(
         # object and nothing between it and the orchestrator, so the seam cannot
         # change what any of them measure. Only the test that needs to drive the
         # build-vs-gate interleaving asks for it. See :class:`SeamedGate`.
-        real_gate = EgressGate(vault=vault, detector=detector, settings=settings, audit=audit)
+        real_gate = EgressGate(
+            vault=vault, detector=detector_in_use, settings=settings, audit=audit
+        )
         gate: Any = SeamedGate(real_gate) if seamed_gate else real_gate
         harness = Harness(
             settings=settings,
-            registry=registry,
-            detector=detector,
+            registry=in_use,
+            detector=detector_in_use,
             store=store,
             sessions=sessions,
             vault=vault,
@@ -360,7 +394,7 @@ async def make_harness(
             gate=gate,
             orchestrator=PipelineOrchestrator(
                 store=store,
-                detector=detector,
+                detector=detector_in_use,
                 engine=engine,
                 injector=ContextInjector(),
                 gate=gate,
@@ -1309,10 +1343,23 @@ async def test_an_ssn_the_detector_scores_at_zero_never_reaches_the_provider(
     this pipeline in the clear with all passes silent. Pass 3 is the only thing in
     the process that has an opinion the detector did not supply.
 
-    The premise is asserted from the vault rather than assumed: nothing at all was
+    The premise is asserted from the vault rather than assumed: nothing at all is
     vaulted from this document, so a block here cannot be pass 1.
+
+    **THE HARNESS DROPPED ONE REGISTRY FIELD AND THE ASSERTIONS DID NOT MOVE.** This
+    test used to run on the shipped registry, because the shipped detector genuinely
+    found nothing here. That is no longer true and it stopped being true on purpose:
+    ``entities.yaml`` now carries an ``SSN.patterns`` backstop, because the *bare*
+    spelling of the same nine digits -- ``Member SSN 123456789`` -- was matched by
+    pass 3's delimiter-requiring pattern not at all and reached the provider verbatim.
+    Detection is the repair; this test is about what holds when detection does not, so
+    it now runs against the pre-repair registry via ``without_ssn_backstop`` and
+    asserts exactly what it always asserted.
+
+    ``test_an_invalidated_ssn_is_vaulted_by_the_shipped_registry`` below is the other
+    half, on the shipped configuration, so neither layer can regress behind the other.
     """
-    harness: Harness = await make_harness()
+    harness: Harness = await make_harness(without_ssn_backstop=True)
     document = "STATEMENT\n\nMember SSN 123-45-6789 verified against records.\n"
 
     doc_id = await harness.upload(document, "financial", "example_ssn.txt")
@@ -1326,6 +1373,55 @@ async def test_an_ssn_the_detector_scores_at_zero_never_reaches_the_provider(
         "premise gone: the detector now vaults something from this document, so the "
         "block could be pass 1 and this test no longer isolates pass 3"
     )
+
+
+@pytest.mark.parametrize(
+    "ssn",
+    [
+        pytest.param("123456789", id="bare-canonical-example"),
+        pytest.param("123-45-6789", id="canonical-example"),
+        pytest.param("123 45 6789", id="canonical-example-with-spaces"),
+        pytest.param("123-45.6789", id="mismatched-delimiters"),
+        pytest.param("987-65-4320", id="second-published-example"),
+        pytest.param("000-12-3456", id="never-issued-area-000"),
+        pytest.param("666-12-3456", id="never-issued-area-666"),
+    ],
+)
+async def test_an_invalidated_ssn_is_vaulted_by_the_shipped_registry(
+    make_harness: HarnessFactory, ssn: str
+) -> None:
+    """The repair, end to end on the shipped configuration.
+
+    The test above proves the gate holds with detection removed. This one proves the
+    shipped pipeline does better than hold: the value is *detected*, so it is vaulted
+    and obfuscated and the run completes, instead of being refused. Both outcomes keep
+    the digits off the wire; only one of them leaves the document usable, and only one
+    of them gives pass 1 a needle for a second, unlabelled mention of the same number
+    later in the file.
+
+    Refusing was not a neutral choice either. ``demo.py --file`` exited **1** on every
+    delimited spelling in this list before the backstop existed, so a reviewer who
+    typed the most common placeholder SSN into their own test document met a red
+    pipeline; all seven exit 0 now.
+    """
+    harness: Harness = await make_harness()
+    document = f"STATEMENT\n\nMember SSN {ssn} verified against records.\n"
+
+    doc_id = await harness.upload(document, "financial", "example_ssn.txt")
+    session_id, _expires_at = await harness.sessions.create("test-user")
+    result = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+
+    assert harness.provider.calls == 1, "the run was refused rather than protected"
+    assert ssn in harness.vault.originals_for_session(session_id), (
+        "the SSN was not vaulted, so pass 1 has no needle for a second mention of it"
+    )
+    assert ssn not in result.obfuscated_payload
+    assert "".join(ch for ch in ssn if ch.isdigit()) not in result.obfuscated_payload, (
+        "the digits reached the provider in some other grouping"
+    )
+    assert ssn in result.restored_text, "a vaulted value must restore into the answer"
 
 
 async def test_a_realistic_ssn_is_obfuscated_rather_than_blocked(
@@ -2429,4 +2525,225 @@ async def test_no_release_survives_an_audit_write_that_failed_before_it(
     # Still one call -- the control's. The second run released nothing.
     assert harness.provider.calls == 1, (
         f"{failing_event} could not be recorded and the payload was sent anyway"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The class hint the model strands, and the strategy the log reports
+# ---------------------------------------------------------------------------
+
+#: A Tier-3 annotated token exactly as ``format_surrogate`` writes one.
+#: Deliberately NOT ``STRICT_TOKEN_RE``: the production hint map is derived from that
+#: pattern, and a test that shares the regex it checks proves only that the regex is
+#: self-consistent. This is spelled out from the emitter's documented shape instead.
+ANNOTATED_TOKEN_RE = re.compile(r"\[([A-Z]+_[A-Z0-9_]+_[0-9a-f]{8})\|([a-z0-9-]{1,24})\]")
+
+#: A document whose Tier-3 gazetteer entities carry class hints under
+#: pseudonymization -- the configuration the demo runs and the browser shows.
+HINTED_DOCUMENT = (
+    "Clinical note.\n\n"
+    "Patient Marguerite Vandenberg reports chest pain and asthma.\n"
+    "Follow-up scheduled with Dr. Alan Reed.\n"
+)
+
+
+class BracketStrippingProvider:
+    """A model that drops BOTH brackets off the first annotated token it is shown.
+
+    Core requirement 6's "grammatically modified form", in the one shape that strands
+    the class hint: ``[PHI_DIAGNOSIS_ff7cf4b8|cardiovascular]`` comes back as
+    ``PHI_DIAGNOSIS_ff7cf4b8|cardiovascular``. ``TOKEN_RE`` reads a hint only when a
+    closer follows it, so the hash restores and the ``|cardiovascular`` stays welded
+    to the restored original.
+
+    The mutation is applied to a token read out of the *payload this run built*, so
+    the test cannot pass by asserting about a token nobody issued.
+    """
+
+    name = "bracket-stripper"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.emitted_token: str | None = None
+        self.stranded: str | None = None
+
+    async def complete(self, system: str, user: str, *, model: str, timeout_s: float = 60.0) -> str:
+        return (await self.complete_detailed(system, user, model=model, timeout_s=timeout_s)).text
+
+    async def complete_detailed(
+        self, system: str, user: str, *, model: str, timeout_s: float = 60.0
+    ) -> LLMResponse:
+        self.calls += 1
+        match = ANNOTATED_TOKEN_RE.search(document_section(user))
+        if match is None:
+            answer = "The document carried no annotated token."
+        else:
+            self.emitted_token = match.group(0)
+            self.stranded = f"{match.group(1)}|{match.group(2)}"
+            answer = f"- The closing section mentions {self.stranded}.\n"
+        await asyncio.sleep(0)
+        return LLMResponse(
+            text=answer,
+            input_tokens=estimate_tokens(system) + estimate_tokens(user),
+            output_tokens=estimate_tokens(answer),
+            model=model,
+        )
+
+
+async def test_a_class_hint_the_model_stranded_does_not_reach_the_user(
+    make_harness: HarnessFactory,
+) -> None:
+    """The orchestrator passes ``hints``, so the suffix goes with the token.
+
+    Measured before the fix, through this same pipeline in pseudonymization mode:
+    panel 4 read ``- The closing section mentions chest pain|cardiovascular.`` while
+    the bracketed spelling of the same token restored cleanly. Not a leak -- the hint
+    is a string this process minted out of a gazetteer class column -- but visible
+    debris welded to a patient's diagnosis in the deliverable a reviewer reads.
+
+    ``Restorer.restore`` has taken ``hints`` since the mop-up was made bounded, and
+    its docstring names this exact string; the orchestrator passed ``surrogates`` and
+    ``issued`` and not that. README Deviation 70 recorded the gap in as many words.
+
+    The two halves are asserted separately on purpose: the value must be BACK (a fix
+    that deleted the sentence would satisfy "no pipe" and destroy the answer), and
+    the stranded suffix must be GONE.
+    """
+    provider = BracketStrippingProvider()
+    harness: Harness = await make_harness(provider=provider, strategy="pseudonymization")
+    doc_id = await harness.upload(HINTED_DOCUMENT, "medical", "hinted.txt")
+    session_id, _ = await harness.sessions.create(USER_ID)
+
+    result = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "pseudonymization"
+    )
+
+    assert provider.emitted_token is not None, (
+        "premise: this run put an annotated Tier-3 token in the payload"
+    )
+    assert provider.stranded is not None
+    hint = provider.emitted_token.split("|", 1)[1].rstrip("]")
+
+    # The token itself is gone -- the ordinary guarantee, restated so a fix that
+    # merely stopped restoring cannot pass.
+    assert provider.stranded not in result.restored_text
+    # The original is back, so nothing was deleted along with the suffix.
+    originals = harness.vault.originals_for_session(session_id)
+    assert any(original in result.restored_text for original in originals), (
+        f"nothing was restored at all: {result.restored_text!r}"
+    )
+    # And the hint went with it.
+    assert f"|{hint}" not in result.restored_text, (
+        f"the class hint is still welded to the restored value: {result.restored_text!r}"
+    )
+    assert "|" not in result.restored_text, result.restored_text
+
+
+async def test_the_audit_log_records_the_composition_restored_not_the_one_requested(
+    make_harness: HarnessFactory,
+) -> None:
+    """Run 1 tokenizes, run 2 asks to pseudonymize the same session. The log follows.
+
+    Vault reuse is the documented, required behaviour and is not what changes here:
+    run 2 legitimately splices run 1's hash tokens. What changed is that every
+    ``OBFUSCATE`` and ``DEOBFUSCATE`` row recorded ``strategy: pseudonymization`` --
+    the REQUEST -- for a run that emitted nothing but tokens, so a compliance reader
+    reconstructing what was sent got a false answer from the log while
+    ``PipelineResult.emitted_strategy`` beside it was already correct.
+
+    The expected value is taken from the response object, which a different mechanism
+    produces than the rows do, and cross-checked against the run's own surrogates by
+    a bracket test rather than by the production regex. A row that echoed ``strategy``
+    under a second key fails the inequality; a row hardcoded to ``tokenization`` fails
+    the first run's half.
+    """
+    harness: Harness = await make_harness()
+    doc_id = await harness.upload(HINTED_DOCUMENT, "medical", "drift.txt")
+    session_id, _ = await harness.sessions.create(USER_ID)
+
+    first = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "tokenization"
+    )
+    second = await harness.orchestrator.run(
+        session_id, USER_ID, doc_id, PROMPT, "pseudonymization"
+    )
+
+    reused = {d.surrogate for d in second.detections if d.surrogate}
+    assert reused, "premise: run 2 put surrogates on the wire"
+    assert _unbracketed(reused) == 0, (
+        "premise: every surrogate run 2 emitted is a bracketed token, not a pseudonym"
+    )
+    assert second.strategy == "pseudonymization"
+    assert second.emitted_strategy == "tokenization"
+
+    for result, expected in ((first, "tokenization"), (second, "tokenization")):
+        rows = [
+            row
+            for row in await harness.audit.query(run_id=result.run_id, limit=1000)
+            if row.event_type in {OBFUSCATE, DEOBFUSCATE}
+        ]
+        assert rows, f"no obfuscate/deobfuscate rows for run {result.run_id}"
+        for row in rows:
+            assert row.detail["emitted_strategy"] == expected, (
+                f"{row.event_type} row reports the wrong composition: {dict(row.detail)}"
+            )
+            # The request is still there. Dropping it would lose a fact, and on run 2
+            # the two must be visibly different or the row says nothing new.
+            assert row.detail["strategy"] == result.strategy, dict(row.detail)
+        if result is second:
+            assert all(row.detail["strategy"] != row.detail["emitted_strategy"] for row in rows), (
+                "run 2 requested pseudonymization and emitted tokens; a row where the "
+                "two agree is echoing the request under a second key"
+            )
+
+
+async def test_the_hint_map_the_orchestrator_builds_is_bounded_by_the_emitters_grammar(
+    make_harness: HarnessFactory,
+) -> None:
+    """The map authorises a deletion from the user's answer, so its reach is checked.
+
+    ``_consume_emitted_hint`` will remove ``|`` plus whatever this map names for a
+    token ID. That is safe only because the map is *derived from the surrogates this
+    run emitted* rather than guessed at, so the bound is asserted here against real
+    records rather than trusted to the docstring:
+
+    * every value is a substring of the surrogate it came from, after the pipe;
+    * every value satisfies ``HINT_RE`` -- ``[a-z0-9-]{1,24}``, the same gate
+      ``format_surrogate`` puts a hint through before it can reach a payload -- so
+      the longest deletion any run can authorise is 25 characters;
+    * a record with no hint, and a pseudonym record, contribute nothing at all.
+
+    Built from a real obfuscation of a Tier-3 document, not from hand-made records:
+    a bound that only holds for the records a test invented is not a bound.
+    """
+    harness: Harness = await make_harness(strategy="pseudonymization")
+    session_id, _ = await harness.sessions.create(USER_ID)
+    detections = await harness.detector.detect(HINTED_DOCUMENT, "medical")
+    obf = await harness.engine.obfuscate(
+        session_id, HINTED_DOCUMENT, detections, strategy="pseudonymization"
+    )
+    assert obf.tokens, "premise: the run vaulted something"
+
+    hints = orchestrator_module._emitted_hint_map(obf.tokens)
+    assert hints, "premise: this document produced at least one annotated Tier-3 token"
+
+    by_id = {token.token_id: token.surrogate for token in obf.tokens}
+    for token_id, hint in hints.items():
+        surrogate = by_id[token_id]
+        assert surrogate.endswith(f"|{hint}]"), (
+            f"the map named {hint!r} for a token whose surrogate is {surrogate!r}"
+        )
+        assert HINT_RE.fullmatch(hint), hint
+        assert len(hint) <= MAX_HINT_LEN
+    assert len(f"|{max(hints.values(), key=len)}") <= MAX_HINT_LEN + 1
+
+    # Nothing is invented for the records that carry no hint -- pseudonyms have no
+    # token grammar at all, and an un-annotated token has no group to read.
+    unannotated = [
+        token.token_id
+        for token in obf.tokens
+        if "|" not in token.surrogate and token.token_id not in hints
+    ]
+    assert len(hints) + len(unannotated) == len({token.token_id for token in obf.tokens}), (
+        "the map claimed a hint for a surrogate that does not carry one"
     )

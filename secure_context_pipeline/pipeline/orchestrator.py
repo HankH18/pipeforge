@@ -255,6 +255,10 @@ class PipelineOrchestrator:
         #     for. See :func:`_pseudonyms_issued` -- this is the run reporting on its
         #     own output shape rather than echoing ``chosen``.
         stats["pseudonyms_issued"] = float(_pseudonyms_issued(tokens))
+        # ... and the same fact as a label the response can carry, so an HTTP client
+        # does not have to re-derive "did I get what I asked for?" from two floats.
+        # See :func:`_emitted_strategy`.
+        emitted = _emitted_strategy(tokens)
 
         # 4d. Distinct originals must own distinct surrogates, checked here rather
         #     than trusted. See :func:`_assert_surrogates_are_distinct`.
@@ -383,6 +387,27 @@ class PipelineOrchestrator:
             # every production miss is recorded as `indeterminate`, which is honest
             # but useless to an auditor asking whether the vault lost data.
             issued={token.token_id for token in tokens},
+            # The class hint this run wrote after the pipe, per token ID, recovered
+            # from the records themselves (:func:`_emitted_hint_map`). It exists for
+            # one shape: a Tier-3 annotated token the model stripped BOTH brackets
+            # from, which `TOKEN_RE` restores while leaving the hint welded to the
+            # value -- `chest pain|cardiovascular` in panel 4 of the demo. The
+            # parameter has been on `Restorer.restore` since the mop-up was made
+            # bounded; this call site is what was missing, so the debris shipped.
+            #
+            # Passing it is safe *because* it is derived here: `_consume_emitted_hint`
+            # will only ever delete `|` plus the exact bytes this map names for that
+            # exact token ID, so the deletion is bounded by what this run emitted
+            # rather than by a guess about which lowercase runs look hint-shaped.
+            hints=_emitted_hint_map(tokens),
+            # What the payload actually carried, alongside `strategy` (what the
+            # caller asked for). The vault has no strategy dimension, so a session's
+            # second run splices whatever the first minted; without this the
+            # DEOBFUSCATE rows record `pseudonymization` for a run that restored
+            # nothing but hash tokens. Same classifier, same records, same predicate
+            # as `stats["pseudonyms_issued"]` and `PipelineResult.emitted_strategy`
+            # -- one derivation, so the response and the log cannot disagree.
+            emitted_strategy=emitted,
             run_id=run_id,
         )
         stats["restore_ms"] = _ms(mark)
@@ -402,6 +427,7 @@ class PipelineOrchestrator:
                 # side: see :func:`_pseudonyms_issued` for why one line cannot be
                 # trusted to imply the other. Counts only -- never a surrogate.
                 "strategy": chosen,
+                "emitted_strategy": emitted,
                 "tokens_issued": int(stats["tokens_issued"]),
                 "pseudonyms_issued": int(stats["pseudonyms_issued"]),
                 "total_ms": round(stats["total_ms"], 1),
@@ -413,6 +439,10 @@ class PipelineOrchestrator:
             obfuscated_payload=payload.serialized,
             raw_llm_response=llm.text,
             strategy=chosen,
+            # The request beside the outcome. ``chosen`` is what was asked for and
+            # ``emitted`` is what ``obfuscated_payload`` carries; a response that
+            # printed only the first reported a request as though it were a result.
+            emitted_strategy=emitted,
             # DOCUMENT spans only, and ``prompt_obf.spans`` is deliberately not
             # merged in. ``SpanOut`` offsets are documented as offsets into the
             # original document and the UI uses them to highlight it; a prompt span
@@ -926,6 +956,36 @@ def _is_pseudonym(surrogate: str) -> bool:
     return bool(surrogate) and STRICT_TOKEN_RE.fullmatch(surrogate) is None
 
 
+def _emitted_hint_map(tokens: Sequence[TokenRecord]) -> dict[str, str]:
+    """``token_id -> the class hint this run wrote after the pipe``, from the RECORDS.
+
+    The argument :meth:`~secure_context_pipeline.deobfuscation.restorer.Restorer
+    .restore` takes as ``hints``, and the reason it can be supplied honestly: the
+    surrogate string on each record *is* the token this run put on the wire, so the
+    hint is read back out of it rather than guessed at. Parsed with
+    :data:`~secure_context_pipeline.surrogates.STRICT_TOKEN_RE` -- the emitter's own
+    grammar, not the tolerant matcher -- because the question here is "what did WE
+    write", and a pseudonym (no match) or an un-annotated token (no group 4) simply
+    contributes nothing.
+
+    That derivation is what bounds the deletion the map authorises. ``restore`` will
+    remove ``|`` plus these exact bytes and only where they follow that exact token
+    ID, so the worst a wrong entry could do is delete a string this process itself
+    minted out of a gazetteer class column -- never a word the model wrote. See
+    :func:`~secure_context_pipeline.deobfuscation.restorer._consume_emitted_hint`
+    for the three further bounds it applies on top.
+    """
+    hints: dict[str, str] = {}
+    for token in tokens:
+        emitted = STRICT_TOKEN_RE.fullmatch(token.surrogate)
+        if emitted is None:
+            continue
+        hint = emitted.group(4)
+        if hint:
+            hints[token.token_id] = hint
+    return hints
+
+
 def _pseudonyms_issued(tokens: Sequence[TokenRecord]) -> int:
     """How many of this run's surrogates are pseudonyms, from the RECORDS.
 
@@ -939,26 +999,59 @@ def _pseudonyms_issued(tokens: Sequence[TokenRecord]) -> int:
     ``pseudonymization``. Nothing else in the response contradicted that, so the
     only honest signal was invisible.
 
-    Reported as a **count alongside** ``tokens_issued`` rather than as an
-    ``effective_strategy`` label, for three reasons:
+    Reported as a **count alongside** ``tokens_issued``, because ``stats`` is the
+    run's self-report and the UI renders every key it finds (``ui/app.js`` orders a
+    known prefix and appends the rest), so a count lands on the reviewer's screen
+    next to the banner with no schema change. So ``pseudonyms_issued == 0`` beside
+    ``tokens_issued == 52`` on a run that asked for pseudonymization is the report
+    the response was missing. This changes only what the run says about itself --
+    nothing about what it emits.
 
-    * No single label is true. Pseudonymization is *legitimately* mixed at the
-      record level -- ``PseudonymizationStrategy.make_surrogate`` emits a fake for
-      the identifier and temporal tiers and a ``plain_token`` for the content tier
-      -- so an ordinary, correct run would be relabelled "mixed" and the label
-      would carry no information.
-    * ``PipelineResult.strategy`` is documented as a value from a closed literal
-      set (``tests/test_models.py``), so it is the wrong field to widen, and adding
-      a new field means editing the response model.
-    * ``stats`` is the run's self-report and the UI renders every key it finds
-      (``ui/app.js`` orders a known prefix and appends the rest), so a count lands
-      on the reviewer's screen next to the banner with no schema change.
+    **This docstring used to argue that a count was the whole answer and that no
+    labelled field should exist. That conclusion is retracted**, and the retraction
+    is recorded rather than deleted because the argument was half right and the
+    half that was wrong shipped a response that reported a request as an outcome.
+    Two reasons were given:
 
-    So ``pseudonyms_issued == 0`` beside ``tokens_issued == 52`` on a run that asked
-    for pseudonymization is the report the response was missing. This changes only
-    what the run says about itself -- nothing about what it emits.
+    * *"No single label is true -- an ordinary pseudonymization run is legitimately
+      mixed, so the label would carry no information."* True of a label that tries
+      to name a **strategy**. :func:`_emitted_strategy` names a **composition**, in
+      a vocabulary that has ``mixed`` in it and documents it as the correct output
+      of an ordinary run, so the case that made a strategy label vacuous is a
+      first-class value rather than a smeared one.
+    * *"Adding a new field means editing the response model."* It does, and that
+      was a cost, not an argument. A count on ``stats`` is a float a client has to
+      know to compare against another float; an HTTP client asking "did this run
+      emit what I asked for?" was left to re-derive the answer, which is how the UI
+      ended up as the only place the contradiction was visible.
     """
     return sum(1 for token in tokens if _is_pseudonym(token.surrogate))
+
+
+def _emitted_strategy(tokens: Sequence[TokenRecord]) -> str:
+    """Classify the surrogate composition this run actually put on the wire.
+
+    The value of :attr:`~secure_context_pipeline.models.PipelineResult.emitted_strategy`,
+    whose docstring carries the vocabulary and the reading rules. Derived from the
+    *same* merged token list as ``tokens_issued`` and ``pseudonyms_issued`` and
+    through the *same* shape predicate (:func:`_is_pseudonym`) the pseudonym restore
+    map uses, for the reason that predicate exists at all: a second copy of the shape
+    test is a second place for the report and the payload to disagree, and a
+    disagreement here is exactly the class of defect this field exposes.
+
+    ``tokens`` is one record per distinct vaulted value present in the payload --
+    document and prompt merged, sweep additions included -- so "no tokens" really
+    does mean "no surrogates of either kind", not "we did not look".
+    """
+    total = len(tokens)
+    if total == 0:
+        return "none"
+    fakes = _pseudonyms_issued(tokens)
+    if fakes == 0:
+        return "tokenization"
+    if fakes == total:
+        return "pseudonymization"
+    return "mixed"
 
 
 def _assert_surrogates_are_distinct(

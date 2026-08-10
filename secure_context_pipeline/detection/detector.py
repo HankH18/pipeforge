@@ -26,7 +26,7 @@ import threading
 import time
 from bisect import bisect_right
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Final
 
 from presidio_analyzer import AnalyzerEngine, EntityRecognizer
 from presidio_analyzer.nlp_engine import NlpEngineProvider
@@ -641,6 +641,126 @@ _FIELD_LINE_RE = re.compile(r"[ \t]*[A-Za-z][A-Za-z .,/#&'()-]{0,40}?:")
 #: The same shape matched at the start of the *next* field's label.
 _NEXT_LABEL_RE = re.compile(r"[A-Za-z][A-Za-z .,/#&'()-]{0,40}?:")
 
+#: Bracket pairs for :func:`_trim_to_the_delimited_value`. Quotes are deliberately
+#: absent: the same character opens and closes them, so "unmatched" is undecidable
+#: for a span that begins with one -- ``"Bob`` and ``Bob"`` are the same evidence --
+#: and a rule that cannot tell them apart would trim a real quoted value as often as
+#: a stray delimiter.
+_BRACKET_PAIRS: Final[tuple[tuple[str, str], ...]] = (
+    ("(", ")"),
+    ("[", "]"),
+    ("{", "}"),
+    ("<", ">"),
+)
+
+#: A field LABEL glued to an all-digit value by one non-alphanumeric character, with
+#: no space anywhere: ``SSN/287931653``, ``MRN#4471902``, ``S.S.N.:412337891``.
+#:
+#: Every clause is load-bearing and each one refuses a shape that looks similar.
+#:
+#: * ``[A-Za-z][A-Za-z.]*`` -- ONE word, letters and dots only. Dots are in because
+#:   real charts write ``D.O.B.`` and ``S.S.N.``; digits are out because a run
+#:   carrying one is a value, not a label (the same reasoning as
+#:   :data:`_FIELD_LABEL_TAIL_RE`); spaces are out because a multi-word prefix is
+#:   where a *name* would live (``Priyanka Raghunathan/385229014``) and this rule
+#:   must never be the thing that discards one.
+#: * ``[:/#=|;,?]`` -- exactly one separator, from an enumerated class of punctuation
+#:   that *introduces* a value. Whitespace is out, and that exclusion is the one
+#:   clause here with a leak behind it rather than a preference. spaCy types a word
+#:   followed by a space and a nine-digit run as ONE ``PERSON``, and it does so
+#:   whether or not the word is a name -- measured, ``detect(..., 'financial')``::
+#:
+#:       'Intake summary. Employee 987.65.4320 was verified.'
+#:                       -> PERSON (16,36) 'Employee 987.65.4320'   a label
+#:       'Record Marcus 221-55-0084 today.'
+#:                       -> PERSON (7,25)  'Marcus 221-55-0084'     a NAME
+#:
+#:   Nothing in the text tells those two apart, so a rule that trimmed the first
+#:   would send ``Marcus`` to the provider in the clear. The union in
+#:   :func:`resolve_overlaps` is what keeps the second one covered, and the price of
+#:   keeping it is that the first one vaults its label too. That residual is declared
+#:   rather than traded away: ``test_a_space_separated_prefix_is_never_trimmed``.
+#:   ``March 4 2024`` and ``Admitted: 2024-03-04`` are outside this rule for the
+#:   same clause.
+#:   **Hyphen and dot are out because they JOIN the parts of an identifier**, and
+#:   that is not a stylistic preference -- it was measured. The first spelling of this
+#:   class was ``[^0-9A-Za-z\s]``, any non-alphanumeric, and it moved three spans of
+#:   the 873-span fixture census: ``HPS-307984``, ``NWC-046202`` and ``CRL-285746``
+#:   in ``legal_brief_large.txt`` lost their prefixes and vaulted as bare digits, so
+#:   the splice would have left ``HPS-`` standing in the clear beside the mask. Every
+#:   identifier shape this registry recognises uses one or both of those two
+#:   characters internally (``412-33-7891``, ``24-ARB-00912``, ``447.21.9930``); none
+#:   uses a colon, slash, hash or pipe internally.
+#: * the lookahead -- the remainder of the span must be a digit run to its end, with
+#:   at least three digits. An identifier, in other words. ``Email
+#:   awhitlock@mailer.example`` and ``221B Baker Street`` cannot satisfy it.
+_GLUED_LABEL_PREFIX_RE = re.compile(
+    r"\A[A-Za-z][A-Za-z.]*[:/#=|;,?](?=[0-9]{3}[0-9.\- ]*\Z)"
+)
+
+
+def _trim_to_the_delimited_value(text: str, start: int, end: int) -> tuple[int, int]:
+    """``(start, end)`` with boundary characters that belong to the DELIMITER removed.
+
+    A span carries two independent claims: a *type* ("these characters are an SSN")
+    and an *extent* ("these characters"). A general-purpose recogniser is evidence
+    for the first and, at the edges, routinely wrong about the second -- it hands
+    back a span that begins one character inside a bracket pair, or that swallows the
+    field label introducing the value. Measured on the shipped pipeline, 150 random
+    nine-digit values per spelling, ``detect(..., 'financial')``::
+
+        'SSN [075839143]'   PHONE_NUMBER (4,14) '[075839143'   <- swallows the '['
+        'SSN/601238743'     LOCATION     (0,13) 'SSN/60123...' <- swallows the label
+        'Ref [021000021]'   PHONE_NUMBER (4,14) '[021000021'   <- no SSN rule involved
+
+    The third row is why this is a *producer* rule and not a fix inside
+    :func:`resolve_overlaps`. There is only one candidate in that document, so no
+    overlap is resolved and nothing merges: the bad extent is what the recogniser
+    returned. What overlap resolution does is *propagate* it -- the union of a
+    correct span and a junk-edged one is junk-edged, so the surviving detection ends
+    up with the pattern's label on the model's boundary. Repairing the boundary where
+    it is produced fixes both the merged and the unmerged case with one rule, and
+    leaves the deliberate ranking policy in :func:`resolve_overlaps` untouched.
+
+    **Why the extent matters as much as the type.** The span is what gets vaulted, so
+    a span with a stray ``[`` in it puts ``'[075839143'`` in the vault as the
+    "original". Two things break. Pass 1 of the egress gate scans the payload for
+    vaulted originals, so a second, correctly written mention of the same nine digits
+    elsewhere in the document has no needle -- exactly the hole the ``\\K`` reset in
+    ``entities.yaml`` exists to prevent, reintroduced from the other end. And under
+    pseudonymization the surrogate is spliced over the protected span while the gate
+    re-scans a *different* span, so the two merely overlap and the run blocks with
+    ``detector_rescan``. That was measured at ~2% of runs on glued spellings.
+
+    Both rules are boundary-only and neither can remove a letter or a digit that is
+    part of the value: rule 1 removes a bracket character and nothing else, and rule 2
+    removes a single label word that is glued to an all-digit run by punctuation.
+
+    Applied to ``presidio:``-backed spans only -- the same scope as the field-label
+    trim above, and for the same reason. A ``patterns:`` or ``gazetteer:`` entity
+    states its own extent exactly (``CASE_STRATEGY`` is a bounded sentence, ``MRN``
+    uses ``\\K`` to exclude its label), so trimming those would be second-guessing an
+    auditable claim with a heuristic.
+    """
+    label = _GLUED_LABEL_PREFIX_RE.match(text[start:end])
+    if label is not None:
+        start += label.end()
+    # A bracket at a boundary whose partner is outside the span is a delimiter the
+    # recogniser cut in half, never part of the value. The loop re-checks because
+    # trimming one edge can expose another (``[[075839143``), and it terminates
+    # because every iteration shortens the span by one character.
+    while start < end:
+        for opener, closer in _BRACKET_PAIRS:
+            if text[start] == opener and closer not in text[start + 1 : end]:
+                start += 1
+                break
+            if text[end - 1] == closer and opener not in text[start : end - 1]:
+                end -= 1
+                break
+        else:
+            break
+    return start, end
+
 
 def _context_window_start(text: str, start: int) -> int:
     """Where the backward context window for a span at ``start`` begins.
@@ -1127,6 +1247,13 @@ class Detector:
             if newline != -1 and _is_field_label_tail(text, start, newline, end):
                 end = newline
             end = start + len(text[start:end].rstrip())
+            if start >= end:
+                return None
+            # The same judgement as the trim above, applied at the OTHER end and to
+            # delimiters rather than to line breaks -- see
+            # ``_trim_to_the_delimited_value`` for the measurement and for why this
+            # belongs here rather than in ``resolve_overlaps``.
+            start, end = _trim_to_the_delimited_value(text, start, end)
             if start >= end:
                 return None
 

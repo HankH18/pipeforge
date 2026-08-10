@@ -82,6 +82,34 @@ the suite stays green is the README being correct, which is the property this fi
 exists to enforce. Nothing was weakened to get there and nothing was deleted; the
 one assertion that had been loosened was tightened back, and it keeps the
 full-precision correction the banded version reported.
+
+**FACT CHECKS AND SHAPE CHECKS, named.** An audit of this file found several
+assertions reading as coverage while being incapable of failing on the defect
+their names describe, and the docstrings did not distinguish the two kinds. They
+do now, and the register is here so the distinction is visible without reading
+thirty docstrings:
+
+*Fact checks* -- the expected value comes from the tree, so the README can be
+wrong on its own: the statement totals, the two ``mypy`` file counts, the E501
+per-file counts, the fixture sizes, the HTTP surface table, the tier table, the
+formatter divergence, the deviation-row count, the ``api/app.py`` line count, the
+demo-flows count, the age-error rate, the varied-fixture clause, the Core 6
+mangling classes, the section 10 test citations, the two skip figures in the
+section 11 checklist, and the two stale-disclosure rigs at the bottom of this
+file, which run the tests and query git respectively.
+
+*Shape checks* -- both sides live in the README, so they catch an authoring slip
+and nothing else. A shape check cannot notice that the page and the tree have both
+moved. These are: the E501 arithmetic, the ``mypy`` error composition, the
+whole-repository ``parts + demo == total``, the fixture-block addends, the live
+traversal split, the boundary-count agreement, the bottleneck-list cross
+references, the next-day plan's hour sum, and the surrogate-tally membership test.
+Each says so in its own docstring; none of them is deleted, because an authoring
+slip is a real defect and this file has caught four of them.
+
+*Neither, and it matters* -- ``passed + skipped == collected`` in
+:func:`test_the_pasted_suite_result_accounts_for_every_test_pytest_collects` binds
+the arithmetic and NOT the word "passed"; see its docstring.
 """
 
 from __future__ import annotations
@@ -313,10 +341,32 @@ def test_the_checklist_carves_no_exception_out_of_the_result_section_1_pastes() 
     section 1's block names and explains, which is red on this tree" against a
     fully green suite and a section 1 that names no such assertion.
 
-    A test cannot run the suite from inside the suite, so this is a tripwire on
-    the vocabulary a carve-out needs rather than a proof that the suite is green;
-    the proof is the reviewer's own run. It bites on the exact shape that was
-    wrong: an exception taken out of the result section 1 reports.
+    A test cannot run the suite from inside the suite, so the first half of this is
+    a tripwire on the vocabulary a carve-out needs rather than a proof that the
+    suite is green; the proof is the reviewer's own run. It bites on the exact
+    shape that was wrong: an exception taken out of the result section 1 reports.
+
+    **The vocabulary half is a tripwire and a rephrase walks past it**, which is
+    worth saying rather than leaving to be discovered: ``red|stale|minus|except``
+    catches "minus the one stale assertion ... which is red on this tree" and
+    catches nothing about "with the single documented exclusion below". It is kept
+    because it is free and because the four words are the ones a carve-out reaches
+    for first, not because it is a proof.
+
+    **The two skip figures are now fact checks**, and they are the half of this
+    step that can be derived. The checklist tells a reviewer to expect a specific
+    number of skips with ``node`` installed and a different one without, and both
+    are properties of the tree:
+
+    * the guaranteed skip is the ``real_llm`` opt-in -- ``tests/conftest.py`` skips
+      those items unless ``--real-llm`` is passed, so the pasted figure cannot be
+      below that count. A lower bound rather than an equality, because
+      ``tests/test_ui_behaviour.py`` skips itself when ``node`` is absent and the
+      leakage harness has a runtime skip of its own; asserting equality would make
+      this test a report on the reviewer's toolchain.
+    * the without-node figure is exact arithmetic on two collections -- every test
+      in ``tests/test_ui_behaviour.py`` plus the ``real_llm`` item -- which is the
+      composition the sentence itself states.
     """
     text = readme_text()
     start = text.index("pytest -q            #")
@@ -329,6 +379,28 @@ def test_the_checklist_carves_no_exception_out_of_the_result_section_1_pastes() 
         "either statement alone."
     )
     assert "1 skipped" in step, "the checklist no longer states the skip a reviewer will see"
+
+    real_llm, _total = collect("-m", "real_llm")
+    assert real_llm >= 1, (
+        "no test carries the `real_llm` marker any more, so the skip the checklist "
+        "promises a reviewer has no cause; the checklist and section 1 both need rewriting"
+    )
+    claimed_skipped = as_int(one_match(r"(\d+) skipped \(the real-network", flat(step)).group(1))
+    assert claimed_skipped >= real_llm, (
+        f"the checklist promises {claimed_skipped} skipped and the `real_llm` marker alone "
+        f"selects {real_llm} tests, every one of which is skipped without --real-llm"
+    )
+
+    ui_tests = collect_count("tests/test_ui_behaviour.py")
+    without_node = as_int(
+        one_match(r"Without node: (\d+) skipped", flat(readme_text())).group(1)
+    )
+    assert without_node == ui_tests + real_llm, (
+        f"the checklist says a reviewer without `node` sees {without_node} skipped; "
+        f"tests/test_ui_behaviour.py collects {ui_tests} tests and the real_llm marker "
+        f"selects {real_llm}, so the figure is {ui_tests + real_llm}. This number was "
+        "pasted once and never re-derived, which is the defect the whole file is for"
+    )
 
 
 def collect(*marker: str) -> tuple[int, int]:
@@ -351,6 +423,26 @@ def collect(*marker: str) -> tuple[int, int]:
     assert result.returncode == 0, result.stdout[-2000:]
     selected, total = one_match(r"(\d+)/(\d+) tests collected", result.stdout).groups()
     return int(selected), int(total)
+
+
+def collect_count(*target: str) -> int:
+    """How many tests ``pytest`` collects from ``target``, undeselected.
+
+    Separate from :func:`collect` because the two output shapes differ: a marker
+    expression prints ``N/M tests collected (K deselected)`` and a bare path prints
+    ``N tests collected``. One regex over both would match the first number of
+    either and silently mean different things.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", *target],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout[-2000:]
+    return int(one_match(r"(?m)^(\d+) tests collected", result.stdout).group(1))
 
 
 def test_the_pasted_suite_result_accounts_for_every_test_pytest_collects() -> None:
@@ -376,6 +468,28 @@ def test_the_pasted_suite_result_accounts_for_every_test_pytest_collects() -> No
     fails the comparison it was written for -- and because it moves on every
     commit that adds a test, banding the statement total beside it could never
     have kept this block green.
+
+    **What ``passed + skipped == collected`` does NOT bind, said plainly because the
+    paragraph above reads as though it does.** It is an accounting identity over
+    *collection*. The word "passed" is not attached to anything passing: if 200
+    tests went red tomorrow, ``2693 + 1 == 2694`` still holds and this test stays
+    green. The docstring above already conceded this in passing ("a reviewer's
+    failing run breaks this too") -- which is a claim about the reviewer's run, not
+    about this one -- and a concession in prose is not a guard.
+
+    Three things actually bind the greenness, and none of them is here:
+
+    * :func:`test_no_test_the_readme_calls_red_actually_passes` runs any test the
+      page names as failing and requires it to fail;
+    * :func:`test_the_readme_does_not_disclose_a_failing_test_while_the_suite_is_green`
+      catches the pasted ``N failed`` spelling of the same disclosure;
+    * the reviewer's own ``pytest -q``, which section 11 step 5 exists to produce.
+
+    The residual hole is a suite that is quietly red while the README says nothing
+    at all, and closing it needs a run of the suite from inside the suite, which is
+    not a thing a test can do. That is a real limit, stated rather than papered
+    over -- the honest reading of a green mark here is "the pasted arithmetic is
+    self-consistent with what pytest collects", and nothing wider.
     """
     text = flat(readme_text())
     passed, skipped = (
@@ -759,6 +873,29 @@ def test_the_pasted_leakage_tally_is_one_the_readme_says_it_observed() -> None:
     the tree now prints 2966, and the assertion below carries the current value
     with the argument for changing it. The history is left as written because it
     is the reason the surrogate tally is graded the way it is.
+
+    **Both halves of this test are weaker than they look, and here is which.**
+
+    * The surrogate tally is checked against **a restatement of itself elsewhere in
+      the same README**. That is a consistency check, not a fact check: if someone
+      pastes a fabricated line into the block and adds the same fabrication to the
+      list below it, this passes. It is still worth having -- the defect it caught
+      was a number that appeared in *neither* place -- but the module docstring's
+      rule ("a claim that can only be checked against its own restatement is not
+      checked") applies to it, and it is listed as an exception to that rule rather
+      than pretending to satisfy it. What has been added is that the four observed
+      values must be **distinct**, because a list that restates one number four
+      times satisfies membership while demonstrating none of the variability the
+      paragraph's whole argument rests on.
+    * ``originals == 2966`` is a **literal in this file**, not a re-derivation. It
+      is deliberately a literal -- the paragraph above argues that a change here is
+      a finding about the detector rather than an edit -- but the honest description
+      is "two numbers that must be typed to match", and if both are typed wrong
+      together nothing notices. Re-deriving it means running the 100-run harness:
+      100 full pipeline executions through spaCy, which is `tests/leakage/` itself.
+      That is the same cost this file refuses to pay for ``missed``/``branches``,
+      and for the same reason, so the literal stays and the limitation is named
+      instead of implied.
     """
     text = flat(readme_text())
     pasted = as_int(one_match(r"(\d+) surrogates round-tripped", text).group(1))
@@ -771,6 +908,12 @@ def test_the_pasted_leakage_tally_is_one_the_readme_says_it_observed() -> None:
     ]
 
     assert "100/100 runs clean, 0 leaks" in text, "the load-bearing result has moved or changed"
+    assert len(set(observed)) == len(observed), (
+        f"the paragraph lists {observed} as four separate observations and they are not "
+        "four distinct values. The argument the paragraph makes is that this tally "
+        "reproduces on no run, so a repeated value is either a transcription slip or "
+        "evidence against the argument -- either way it is not four observations"
+    )
     assert pasted in observed, (
         f"the pasted block reports {pasted} surrogates round-tripped, which is not one of the "
         f"{observed} the paragraph below says it observed. A tally that reproduces on no run "
@@ -789,6 +932,63 @@ def test_the_pasted_leakage_tally_is_one_the_readme_says_it_observed() -> None:
         "change here is a change in what the detector plants or finds, and is a finding rather "
         "than an edit -- re-run `pytest -m leakage` and record the move in section 1 before "
         "touching this number"
+    )
+
+
+def test_the_benchmark_tables_budget_column_states_the_budgets_the_suite_asserts() -> None:
+    """The one column of section 1's benchmark table that is a constant, not a sample.
+
+    FACT CHECK. The table's own prose says it: "the only number this page asserts is
+    the budget, because the budget is the only one a test enforces." Nothing checked
+    that. ``BUDGET_OBFUSCATE_S``, ``BUDGET_VAULT_P99_MS``, ``BUDGET_RESTORE_MS`` and
+    ``BUDGET_PIPELINE_S`` are four floats in ``tests/test_benchmarks.py``, and the
+    README publishes them as a column beside seven rows of timings that move with
+    the machine -- so the column is the part of that table a reader can rely on, and
+    it was the part with no guard.
+
+    Both directions, because both are silent failures: a budget widened in the code
+    and not on the page overstates the claim, and a budget on the page the suite
+    does not assert is a promise nothing keeps.
+
+    Deliberately separate from
+    ``test_benchmarks.py::test_the_readme_benchmark_table_is_the_one_this_run_measured``,
+    which checks the same column against the same constants but only after paying
+    for a full benchmark run. This one costs an import, so ``pytest
+    tests/test_readme_claims.py`` on its own still catches a budget that moved. The
+    table *parser* is shared with that module and that is fine: the parser is not
+    the thing under audit, the README's cells are, and both checks read the same
+    cells to ask different questions.
+    """
+    from tests.test_benchmarks import (
+        BUDGET_OBFUSCATE_S,
+        BUDGET_PIPELINE_S,
+        BUDGET_RESTORE_MS,
+        BUDGET_VAULT_P99_MS,
+        parse_readme_bench_table,
+    )
+
+    asserted = {
+        BUDGET_OBFUSCATE_S,
+        BUDGET_PIPELINE_S,
+        BUDGET_RESTORE_MS / 1000.0,
+        BUDGET_VAULT_P99_MS / 1000.0,
+    }
+    rows = parse_readme_bench_table(readme_text())
+    published = {row.budget_s for row in rows}
+
+    unbacked = sorted(published - asserted)
+    assert not unbacked, (
+        f"section 1's benchmark table publishes budgets of {unbacked} seconds that no "
+        f"constant in tests/test_benchmarks.py asserts; the suite asserts {sorted(asserted)}"
+    )
+    unpublished = sorted(asserted - published)
+    assert not unpublished, (
+        f"tests/test_benchmarks.py asserts budgets of {unpublished} seconds that section 1's "
+        "table has no row for. A budget the suite enforces and the page does not state is a "
+        "guarantee the reviewer is never told about"
+    )
+    assert len(rows) >= len(asserted), (
+        f"the table has {len(rows)} rows for {len(asserted)} distinct budgets"
     )
 
 
@@ -1177,11 +1377,29 @@ def test_the_bottleneck_list_uses_the_numbers_its_own_measurement_table_states()
     pass_2 = as_int(one_match(r"\| Pass 2 [^|]*\| ([\d,]+) ms \|", text).group(1))
     end_to_end_ms = end_to_end_s * 1000
 
-    # EXACT on the cross-references, BANDED only where the README rounds. The bench
-    # figures are a pasted measurement, not a re-derivation, so nothing here drifts
-    # under a later commit: every assertion reads two places in this one file and
-    # compares them. The two tolerances (<1 point, <0.1 point) are the rounding the
-    # prose itself applies -- "~43%" and "4.3%" -- not slack.
+    # EXACT on the cross-references, BANDED only where the README rounds. The two
+    # tolerances (<1 point, <0.1 point) are the rounding the prose itself applies --
+    # "~43%" and "4.3%" -- not slack.
+    #
+    # **SHAPE CHECK, and this is the sentence that named the whole problem.** It used
+    # to read "the bench figures are a pasted measurement, not a re-derivation, so
+    # nothing here drifts under a later commit", offered as a *reassurance*. Read
+    # again it is the defect: every assertion below reads two places in this one file
+    # and compares them, so the Q1 stage table can be wrong by any factor at all and
+    # this stays green as long as the bullet under it quotes the same wrong numbers.
+    # That is exactly what happened to the section 1 benchmark table, which nothing
+    # bound until `tests/test_benchmarks.py::
+    # test_the_readme_benchmark_table_is_the_one_this_run_measured` was written: it
+    # published a warm restore at 93.3x headroom while the module measured it in
+    # single digits.
+    #
+    # This one stays a shape check, deliberately and not by omission. The Q1 stage
+    # table is a *profile* -- per-stage millisecond splits of one instrumented run --
+    # and re-deriving it here would mean re-running the pipeline under instrumentation
+    # inside this module, which is the eight-minute cost this file declines everywhere
+    # else. The bench table was different: those numbers already get measured on every
+    # run, so binding them cost nothing. Where a re-derivation is free, take it; where
+    # it is not, say the check is internal.
     share, share_ms, share_s = one_match(
         r"~(\d+)% of end-to-end wall time \(([\d,]+) ms of the ([\d.]+) s above", text
     ).groups()
@@ -1994,6 +2212,25 @@ def test_the_readme_does_not_disclose_a_failing_test_while_the_suite_is_green() 
     any future "expect N passed, M failed" is caught the moment the failure it
     describes is fixed. Which is the moment it becomes a lie, and also exactly the
     moment everyone's attention has moved on.
+
+    **What it does not catch, measured rather than supposed.** This test is ONE
+    REGEX -- ``\\d+ passed, \\d+ failed, \\d+ skipped`` -- and on the tree this
+    paragraph was written for it had **0** matches, while the prose spelling of the
+    same defect had **1**: a Deviations row asserting a named test was "**red on
+    this tree**" when that test passed, beside a claim that a tracked file was
+    "**untracked**" when ``git ls-files`` listed it. This guard was green the whole
+    time. That is the third recurrence of this defect class in this project, and
+    each recurrence used different words, which is the actual lesson: a disclosure
+    can be stale in any spelling, and a tripwire on one spelling only ever catches
+    the spelling that was already fixed.
+
+    So it is kept -- the pasted-summary form is real and cheap to check -- and the
+    two rigs below check the *fact* instead of the phrasing:
+    :func:`test_no_test_the_readme_calls_red_actually_passes` runs the tests the
+    page names as failing, and
+    :func:`test_no_path_the_readme_calls_untracked_is_actually_tracked` asks git
+    about the paths it names as absent. Those two are fact checks; this one is a
+    shape check, and saying which is which is the point.
     """
     text = flat(readme_text())
 
@@ -2007,3 +2244,286 @@ def test_the_readme_does_not_disclose_a_failing_test_while_the_suite_is_green() 
         "fix that made it stale -- a reviewer who trusts it will discount a real "
         "regression as the one they were told to expect."
     )
+
+
+# -- stale disclosures, checked against the tree rather than against a spelling --
+#
+# Three times now this project has shipped a README sentence that disclosed a
+# defect which no longer existed. Each time the sentence was written honestly, the
+# defect was then fixed, and the sentence stayed. Each time the guard that existed
+# was a tripwire on the *previous* spelling and stayed green.
+#
+# So the unit of checking here is a CLAIM, not a line and not a phrase: the README
+# is cut into blocks (paragraph, table row, list item), a present-tense claim of
+# brokenness is located inside one, and the subject of that claim -- a backticked
+# test identifier, a backticked path -- is taken from the text immediately around
+# it. Then the tree is asked. The two rigs below share that machinery and differ
+# only in what they ask.
+
+#: How far from the claim phrase its subject may sit, in characters, inside the
+#: same block. Derived, not guessed: on the tree these were written for, the true
+#: claim's subject sat 1 and 88 characters before its phrase, and the nearest
+#: false-positive subject -- four test names in a long paragraph whose "stays
+#: broken" is about a *value* -- sat 503. Anything from ~120 to ~450 separates the
+#: two; 200/120 is the middle of that gap rather than either edge of it.
+_CLAIM_LOOKBEHIND = 200
+_CLAIM_LOOKAHEAD = 120
+
+#: Present-tense assertions that something is failing NOW. Deliberately excludes
+#: the conditional and past forms this document is full of and should stay full of:
+#: "goes red", "would go red", "turns red rather than unnoticed" are descriptions
+#: of a guard working, and "they were untracked" is a record of a fixed defect.
+#: Only a claim about the CURRENT tree can be stale, so only those are collected.
+_RED_CLAIM = re.compile(
+    r"\b(?:is|are)\s+(?:\*\*)?(?:still\s+|currently\s+)?(?:\*\*)?(?:red|failing|broken)\b"
+    r"|\b(?:remains?|stays?)\s+(?:\*\*)?(?:red|failing|broken)\b"
+    r"|\b(?:still|currently)\s+(?:\*\*)?(?:red|failing|fails|failed|broken)\b"
+    r"|\b(?:red|failing|fails|failed|broken)\s+(?:\*\*\s*)?on this tree\b"
+    r"|\bknown\s+(?:failure|to\s+fail)\b"
+    r"|\bexpected?\s+(?:it\s+)?to\s+fail\b"
+    r"|\b\d+\s+failed\b",
+    re.IGNORECASE,
+)
+
+#: The same, for a claim that something is not in git.
+_UNTRACKED_CLAIM = re.compile(
+    r"\b(?:is|are|remains?|stays?)\s+(?:\*\*)?(?:still\s+)?(?:\*\*)?"
+    r"(?:untracked|uncommitted"
+    r"|not\s+(?:\*\*)?(?:tracked|committed|in\s+git|under\s+version\s+control))\b"
+    r"|\b(?:still|currently)\s+(?:\*\*)?(?:untracked|uncommitted)\b",
+    re.IGNORECASE,
+)
+
+#: A backticked test identifier, with or without a file prefix:
+#: ``test_x``, ``test_file.py::test_x``, ``tests/leakage/test_h.py::test_x``.
+_TEST_IDENT = re.compile(r"`([\w/]*\.py)?(?:::)?(test_\w+)`")
+
+#: A backticked path: anything with a ``/`` or a dot in it. Wider than it needs to
+#: be on purpose -- a non-path caught here is discarded by git, whereas a path
+#: missed here is a claim nobody checks.
+_PATH_IDENT = re.compile(r"`([A-Za-z0-9_][A-Za-z0-9_./-]*[/.][A-Za-z0-9_./-]*)`")
+
+
+def readme_claim_units(text: str) -> list[str]:
+    """The README cut into the blocks a single claim can live in.
+
+    Paragraph, table row, list item -- whitespace-collapsed, so a claim survives
+    the hard wrap. Sentence splitting was tried first and is wrong here: this
+    document writes ``i.e.`` mid-sentence and cites ``file.py::test_name``, so a
+    split on ``.`` cuts claims off from their own subjects. A line split is wrong
+    for the same reason at 100 columns.
+    """
+    units: list[str] = []
+    for block in re.split(r"\n\s*\n", text):
+        stripped = block.lstrip()
+        if stripped.startswith("|"):
+            units.extend(" ".join(row.split()) for row in block.splitlines())
+        elif re.match(r"[-*+] |\d+\. ", stripped):
+            units.extend(
+                " ".join(part.split())
+                for part in re.split(r"\n(?=\s*(?:[-*+] |\d+\. ))", block)
+            )
+        else:
+            units.append(" ".join(block.split()))
+    return [unit for unit in units if unit]
+
+
+def _subjects_near(
+    unit: str, phrase: re.Match[str], pattern: re.Pattern[str]
+) -> list[tuple[str, ...]]:
+    """Every ``pattern`` group-tuple within the claim window around ``phrase``."""
+    found = []
+    for match in pattern.finditer(unit):
+        distance = phrase.start() - match.end()
+        if -_CLAIM_LOOKAHEAD <= distance <= _CLAIM_LOOKBEHIND:
+            found.append(match.groups())
+    return found
+
+
+def claimed_red_tests(text: str) -> dict[str, str]:
+    """``test name -> the claim`` for every test the README says is failing now."""
+    claims: dict[str, str] = {}
+    for unit in readme_claim_units(text):
+        for phrase in _RED_CLAIM.finditer(unit):
+            for _file, name in _subjects_near(unit, phrase, _TEST_IDENT):
+                claims.setdefault(name, unit)
+    return claims
+
+
+def claimed_untracked_paths(text: str) -> dict[str, str]:
+    """``path -> the claim`` for every path the README says git does not hold."""
+    claims: dict[str, str] = {}
+    for unit in readme_claim_units(text):
+        for phrase in _UNTRACKED_CLAIM.finditer(unit):
+            for (path,) in _subjects_near(unit, phrase, _PATH_IDENT):
+                claims.setdefault(path, unit)
+    return claims
+
+
+#: The two rigs must not run themselves: a README that named one of them as red
+#: would otherwise recurse until the process died.
+_SELF = (
+    "test_no_test_the_readme_calls_red_actually_passes",
+    "test_no_path_the_readme_calls_untracked_is_actually_tracked",
+)
+
+#: Ceiling on how many node ids one run will execute. A stale-disclosure paragraph
+#: names one or two tests; a page naming twenty has a different problem, and this
+#: file should say so rather than turn into a suite runner.
+_MAX_RED_CLAIMS = 8
+
+
+def _run_node_id(node_id: str) -> int:
+    """Run one test in its own pytest and return the exit code."""
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node_id],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    ).returncode
+
+
+#: Canned claims the extractors must still find. These are the tripwire on the
+#: instrument itself, and they are not decoration: both rigs return quietly when
+#: they find no claim, which is correct on a clean README and indistinguishable
+#: from a regex that has stopped matching. This file already learned that lesson
+#: once -- ``one_match`` exists because an anchor that silently stops matching turns
+#: a loop over zero matches into a vacuous pass -- and a rig whose whole job is to
+#: catch a claim is worth exactly nothing the day it stops recognising one.
+_RED_PROBE = "`tests/nowhere.py::test_probe_the_red_claim_extractor` is still failing today."
+_UNTRACKED_PROBE = "The file `probe/only/for/the/extractor.txt` is untracked as this is written."
+
+
+def check_no_stale_red_test_claim(text: str) -> None:
+    """The rig, as a function of the text, so it can be exercised on a synthetic one."""
+    assert "test_probe_the_red_claim_extractor" in claimed_red_tests(_RED_PROBE), (
+        "the red-claim extractor no longer recognises a plainly-worded claim, so this "
+        f"rig now passes on every README. Probe: {_RED_PROBE!r}"
+    )
+
+    claims = claimed_red_tests(text)
+    if not claims:
+        return
+    assert len(claims) <= _MAX_RED_CLAIMS, (
+        f"the README names {len(claims)} tests as currently failing: {sorted(claims)}. "
+        "That is not a disclosure, it is a broken tree -- fix it or stop shipping it"
+    )
+
+    defined = defined_tests()
+    still_green: list[str] = []
+    uncited: list[str] = []
+    for name, claim in sorted(claims.items()):
+        if name in _SELF:
+            continue
+        if name not in defined:
+            uncited.append(f"{name}: named as failing, defined in no file under tests/")
+            continue
+        node_id = f"tests/{sorted(defined[name])[0]}::{name}"
+        code = _run_node_id(node_id)
+        if code == 0:
+            still_green.append(f"{node_id} PASSES; the README says: {claim[:220]!r}")
+        elif code == 5:
+            uncited.append(f"{node_id}: collected nothing, so the citation is dead")
+
+    assert not still_green, (
+        "the README discloses a failing test that is not failing:\n  "
+        + "\n  ".join(still_green)
+        + "\n\nA disclosure outlives its defect by default -- the fix lands, the "
+        "sentence stays, and a reviewer discounts the next real regression as the "
+        "one they were told to expect. Delete the disclosure with the fix."
+    )
+    assert not uncited, "the README calls a test red and the citation does not resolve:\n  " + (
+        "\n  ".join(uncited)
+    )
+
+
+def check_no_stale_untracked_claim(text: str) -> None:
+    """As above, for "this path is not in git"."""
+    assert "probe/only/for/the/extractor.txt" in claimed_untracked_paths(_UNTRACKED_PROBE), (
+        "the untracked-claim extractor no longer recognises a plainly-worded claim, so "
+        f"this rig now passes on every README. Probe: {_UNTRACKED_PROBE!r}"
+    )
+
+    claims = claimed_untracked_paths(text)
+    if not claims:
+        return
+    tracked: list[str] = []
+    for path, claim in sorted(claims.items()):
+        listed = subprocess.run(
+            ["git", "ls-files", "--", path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if listed.returncode == 0 and listed.stdout.strip():
+            names = listed.stdout.split()
+            tracked.append(
+                f"{path} IS tracked ({len(names)} file(s), e.g. {names[0]}); "
+                f"the README says: {claim[:220]!r}"
+            )
+
+    assert not tracked, (
+        "the README tells a reviewer a path is missing from git, and git has it:\n  "
+        + "\n  ".join(tracked)
+        + "\n\nThis is the same defect class as a stale red-test disclosure and it "
+        "shipped in the same paragraph: the file was committed and the sentence "
+        "warning that a clean clone would not have it was left behind."
+    )
+
+
+def test_no_test_the_readme_calls_red_actually_passes() -> None:
+    """Every test the README names as currently failing is run, and must fail.
+
+    The first of the two rigs that replace a vocabulary tripwire with a fact. It
+    exists because the tripwire beside it -- one regex on ``N passed, M failed, K
+    skipped`` -- had **0** matches on a tree whose README asserted, in prose,
+    ``tests/test_ui_behaviour.py::test_the_page_serves_its_own_favicon_so_a_load_
+    logs_no_console_error`` was "**red on this tree**". That test passed. The
+    guard was green.
+
+    **What binds it:** the node id is extracted from the page and *executed*. There
+    is no shared helper, no shared regex and no restatement between the claim and
+    the check -- the README supplies the subject and pytest supplies the verdict,
+    which is the one arrangement in this file where the two sides cannot rot
+    together. A dead citation (nothing collected) fails too, because a reviewer
+    following it finds nothing either way.
+
+    **What it does not catch:** a red claim written without a backticked test
+    identifier ("the favicon test is red"), or one phrased so it reads as a future
+    or hypothetical failure. The phrase list is present-tense-only by design --
+    "goes red", "would go red" and "was red" are how this document correctly
+    describes guards working and defects fixed, and matching those would make the
+    rig fire on every honest paragraph on the page. So this catches a stale
+    disclosure *with a subject*, which is what all three recurrences were.
+    """
+    check_no_stale_red_test_claim(readme_text())
+
+
+def test_no_path_the_readme_calls_untracked_is_actually_tracked() -> None:
+    """Every path the README says git does not hold is put to ``git ls-files``.
+
+    The sibling defect, and it shipped in the same Deviations row as the one above:
+    "``secure_context_pipeline/ui/favicon.png`` is **untracked** as this row is
+    written -- the file exists in the working tree and matches no ignore rule, and
+    until it is committed a clean clone is back to the 404 this row closes." The
+    file was tracked. This project has already been bitten once by the *opposite*
+    error -- an unanchored ``data/`` in ``.gitignore`` silently untracking the two
+    gazetteers a clean clone needs -- so a sentence about what a clean clone gets
+    is load-bearing here, and a wrong one is worse than none.
+
+    Asked of ``git ls-files -- <path>`` rather than ``--error-unmatch`` so a claim
+    about a *directory* is answered too: ``--error-unmatch`` is a per-pathspec
+    check, while a non-empty listing means "git holds something here" for a file
+    and a tree alike.
+
+    **What it does not catch:** the reverse claim -- "this file IS tracked" when it
+    is not -- which needs no rig, because a missing file fails the tests that read
+    it. And a past-tense record ("they were untracked, and a fresh clone could not
+    start") is deliberately not matched: that is history, and history does not go
+    stale.
+    """
+    check_no_stale_untracked_claim(readme_text())

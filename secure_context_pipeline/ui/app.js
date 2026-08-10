@@ -23,6 +23,29 @@
     // file chosen after a preset would fight it. Arming either one disarms the other
     // here, in one place, and `paintArmed` prints whatever this says.
     armed: null,
+    // Whether the header badge is currently making the claim "the API is unreachable".
+    // `markUnreachable` is the only writer that sets it and `health()` the only one
+    // that clears it, so the badge and this flag cannot disagree. It exists because
+    // that claim used to be permanent: see `noteReachable`.
+    unreachable: false,
+    // The previous run's own tokens, kept for the vault-miss demonstration. Filled on
+    // every successful run from `result.obfuscated_payload`, which is this page's copy
+    // of the string the egress gate cleared, so the ids here are exactly the ones this
+    // session minted for the document on screen. Null until a run succeeds, which is
+    // what `restoreAgain` refuses on. Nothing secret: a token id is the half of the
+    // mapping that is safe to show, and panel 2 is already printing all of them.
+    lastTokens: null,
+    // The fabricated token the NEXT run is carrying, or null. Set by `restoreAgain`
+    // and consumed by `run`, so the verdict banner can name it and report what the
+    // run actually measured rather than what it intended. Cleared in `run`'s
+    // `finally`, so a refused run cannot leave it armed for an unrelated later press.
+    missDemo: null,
+    // Index of the first EGRESS_BLOCK/VAULT_MISS row in the audit table as currently
+    // rendered, or null. Written by `renderAudit` on every render -- including the
+    // empty and failed-lookup branches -- and read by the vault-miss demonstration to
+    // scroll that row into view. A position rather than an element id; see the note in
+    // `renderAudit` for why the id version was wrong.
+    hotRowIndex: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -251,7 +274,37 @@
   // `result.detections.length`, `detected` is `stats.entities_detected`. Absent from
   // `stats`, nothing is printed: there is no second number to reconcile against, and
   // inventing one is the defect this whole block is about.
-  const C1_DETECTED = (n) => ' · detector returned ' + n + ', neither set contains the other';
+  // AND THE CLAUSE IS NOW DERIVED FROM THE TWO NUMBERS RATHER THAN ASSERTED OVER THEM.
+  // This printed ", neither set contains the other" unconditionally, on every run, for
+  // every pair of counts. That sentence is a statement about set MEMBERSHIP and the
+  // only thing this function is given is two integers, so on most runs it was a claim
+  // the page could not support -- and on at least one it was visibly unearned. Measured
+  // in Chrome on fixtures/legal_brief_large.txt as `legal`, tokenization: panel 1 read
+  // "83029 chars · 739 spans masked · detector returned 739, neither set contains the
+  // other". At 739/739 a reviewer reads a flat contradiction, and the honest answer is
+  // that equal counts say nothing either way -- the sets can still differ (the measured
+  // medical_note run drops 3 detections at the enforceability floor and sweeps 1 in, so
+  // 54 and 52 differ by more than the arithmetic shows), and they can also coincide.
+  //
+  // What IS derivable from two counts is exactly one direction, and only when they
+  // differ: more masked spans than the detector returned PROVES at least that many
+  // masked spans were not detections here, because the surplus has to have come from
+  // somewhere -- that is the residual sweep. Fewer proves the mirror fact about
+  // detections that never became masks. Equal proves nothing, so it claims nothing and
+  // says why. `C1_TITLE` still carries the full reconciliation with the measured
+  // numbers; this is the part that must be true on every run without being hovered.
+  const C1_DETECTED = (n, masked) => {
+    const detected = ' · detector returned ' + n;
+    if (masked > n) {
+      return detected + ', so at least ' + (masked - n) + ' masked ' +
+        (masked - n === 1 ? 'span was' : 'spans were') + ' not among them';
+    }
+    if (masked < n) {
+      return detected + ', so at least ' + (n - masked) + ' of them ' +
+        (n - masked === 1 ? 'was' : 'were') + ' not masked';
+    }
+    return detected + ' — the same count, which does not make them the same spans';
+  };
 
   //: restorer.py's sentinel, verbatim. See the gap handling in `renderRestored`.
   const UNRESOLVED = '[UNRESOLVED_ENTITY]';
@@ -398,6 +451,13 @@
         String((err && err.message) || err) + '). Is the server still running?';
       throw dead;
     }
+    // A reply arrived, so the process this page has been calling dead is answering.
+    // Placed HERE -- above the status checks, not on the `return body` at the bottom --
+    // deliberately: the claim the badge makes is about reachability, and a 401, a 422 or
+    // a 429 is as complete a refutation of "unreachable" as a 200 is. Hanging the
+    // recovery off the success path alone would leave the header asserting the API was
+    // down while it was busy correctly refusing something. See `noteReachable`.
+    noteReachable();
     if (res.status === 204) return null;
     const ct = res.headers.get('content-type') || '';
     let body;
@@ -447,6 +507,34 @@
     const el = $('health');
     el.className = 'badge err';
     el.textContent = 'health: unreachable';
+    S.unreachable = true;
+  }
+
+  // The other direction, which did not exist. The badge above was a ONE-WAY latch: the
+  // fix that made a network failure move it (see `markUnreachable`) had no counterpart
+  // for the recovery, so a server that came back left the header permanently asserting
+  // that it was down. That is the same defect the original one was -- the two halves of
+  // the UI reporting one fact differently -- pointing the other way, and it is the worse
+  // half on a demo: the recovery is the moment a reviewer is deciding whether the
+  // failure they just watched was the pipeline's or the laptop's. Reproduced in Chrome
+  // against 127.0.0.1:8099: stop the container, press Run, badge reads `health:
+  // unreachable` / `badge err`; start it again and press Create session, which answers
+  // 200 and mints a session the badge is standing beside -- and the badge still reads
+  // `health: unreachable`. Only a reload cleared it.
+  //
+  // Called from the ONE place every reply passes through, so no future call site can
+  // forget it, and it costs a boolean test on the happy path. The re-poll is a real
+  // `GET /health` rather than a local repaint, because the badge does not say "a
+  // request succeeded", it names the provider, the model and the spaCy model, and only
+  // the endpoint knows those. The flag is cleared BEFORE the call: `health()` goes
+  // through `api()` too, so clearing it afterwards would make its own success re-enter
+  // here and poll again, forever. A `health()` that fails re-sets the flag through its
+  // own catch, which is the correct answer -- the API went away again between the two
+  // requests.
+  function noteReachable() {
+    if (!S.unreachable) return;
+    S.unreachable = false;
+    void health();
   }
 
   // The `detail` half of a banner. Two things it must not do. It must not print the
@@ -868,10 +956,22 @@
   // The response carries no per-record minted/reused flag, so the tip says what IS
   // derivable from the mark itself: it is a fake, and it belongs to this session.
   // Same rule as `strategyClause` and the `tokens_issued` chip.
-  const psTip = (t) => 'A PSEUDONYM standing in for a ' + (t || 'detected value') +
-    '. It reads like a real value and is not one -- it was invented in this session ' +
-    '(not necessarily by this run: the vault reuses a record for the life of the ' +
-    'session) and the original never left the vault.';
+  //: "a" or "an" for the entity type that follows. The tooltip hard-coded "a" and the
+  //: entity types are registry constants, so under pseudonymization the page printed
+  //: "a ADDRESS", "a AMOUNT" and "a EMAIL" -- measured verbatim off a live
+  //: medical_note.txt run, on the surface whose whole job is to tell a reviewer that a
+  //: convincing-looking value is a fake. It is decided on the letter rather than by a
+  //: table because the types are ASCII upper-case identifiers from entities.yaml, so a
+  //: type added later gets the right article without anyone remembering to list it;
+  //: the fallback string is lower-case and takes the same test.
+  const article = (t) => ('AEIOU'.indexOf(String(t).charAt(0).toUpperCase()) >= 0 ? 'an ' : 'a ');
+  const psTip = (t) => {
+    const kind = t || 'detected value';
+    return 'A PSEUDONYM standing in for ' + article(kind) + kind +
+      '. It reads like a real value and is not one -- it was invented in this session ' +
+      '(not necessarily by this run: the vault reuses a record for the life of the ' +
+      'session) and the original never left the vault.';
+  };
 
   // Panels 2 and 3: highlight surrogates (coloured per category) and [REDACTED_*]
   // markers. `from` is where the scan starts; everything before it is plain text.
@@ -1148,14 +1248,35 @@
     const body = $('audit-body');
     const rows = events || [];
     if (!rows.length) {
+      // The empty and the failed-lookup states have no hot row, and saying so is not
+      // tidiness: `loadAudit`'s catch renders through here, so a stale index left
+      // behind by the previous render would have the scroll below pointing at the one
+      // row this branch does emit -- the muted "could not be loaded" line.
+      S.hotRowIndex = null;
       body.innerHTML = '<tr><td colspan="5" class="muted">' + esc(note || 'no events') +
         '</td></tr>';
       return;
     }
     const tail = note ? '<tr><td colspan="5" class="muted">' + esc(note) + '</td></tr>' : '';
-    body.innerHTML = rows.map((e) => {
+    // WHERE the first hot row is, recorded as an INDEX rather than marked with an id.
+    // `.hot` already paints EGRESS_BLOCK and VAULT_MISS red, which is useless on a row
+    // most of the way down a 260px box that opens at scrollTop 0 -- the complaint the
+    // LIVE REVIEW strip makes about VAULT_DESTROY, and the same complaint for the row
+    // the vault-miss demonstration exists to show. So something has to scroll to it.
+    //
+    // The first attempt gave that row `id="audit-hot"` and reached it with
+    // `getElementById`, and `test_every_element_the_ui_addresses_exists_in_the_page`
+    // correctly reddened: it holds every id app.js addresses against the ids
+    // `index.html` DECLARES, and a row minted at runtime declares nothing. That
+    // invariant is worth more than the convenience -- it is what catches a typo'd id
+    // silently becoming a no-op -- so the position is carried here instead and the
+    // lookup below goes through the table's own row list. Null when there is no hot
+    // row, and rewritten on every render, so it can never point into a stale table.
+    S.hotRowIndex = null;
+    body.innerHTML = rows.map((e, i) => {
       const cls = (e.event_type === 'EGRESS_BLOCK' || e.event_type === 'VAULT_MISS') ? ' class="hot"'
         : (e.event_type === 'VAULT_DESTROY' ? ' class="warn-row"' : '');
+      if (S.hotRowIndex === null && cls === ' class="hot"') S.hotRowIndex = i;
       return '<tr' + cls + '><td>' + esc(e.seq == null ? '' : e.seq) + '</td><td>' + esc(e.event_type) +
         '</td><td>' + esc(e.entity_type || '') + '</td><td>' + esc(e.token_id || '') +
         '</td><td class="detail">' + esc(JSON.stringify(e.detail || {})) + '</td></tr>';
@@ -1265,6 +1386,11 @@
   function setBusy(on) {
     S.busy = on;
     $('btn-run').disabled = on;
+    // The vault-miss control issues the same run through the same function, so it
+    // freezes with Run for the same reasons -- and one more: it REWRITES the prompt
+    // box before it starts, and the box is read across the awaits of a request that
+    // may already be in flight.
+    $('btn-miss').disabled = on;
     $('btn-destroy').disabled = on;
     // The two halves of the destroy gate freeze with the button they replace. Only one
     // of the three is visible at a time, so this is belt and braces -- but the armed
@@ -1307,6 +1433,24 @@
   const MINT_BY_RUN = 'run';
 
   async function createSession(origin) {
+    // THE GATE CLOSES WHEN ITS BUTTON IS PRESSED. `<details>` has no auto-close, and
+    // `.guard-body` is `position: absolute` -- it has to be, or opening the gate shoves
+    // the controls beside it sideways (style.css says so) -- so an open panel hangs
+    // OVER the row below. Measured in Chrome at 1550px with the mint committed:
+    // `details.open` true, `.guard-body` at [212,87,330,212], `#strategy` at
+    // [373,142,160,27] underneath it, and `document.elementFromPoint(453,155)` -- the
+    // select's own centre -- returning `SPAN.hint`. The strategy toggle is the control
+    // that decides whether panels 2 and 3 show bracketed tokens or realistic fakes, so
+    // a reviewer following the obvious order (mint a session, then switch strategy)
+    // clicks a dead control immediately after using this one.
+    //
+    // First line of the function rather than the last: it is the press that commits,
+    // not the outcome, that finishes the gate's job, so a mint that FAILS also hands
+    // the controls back instead of leaving the panel over them beside a red banner.
+    // Done here rather than in a second listener on the button so that every path
+    // which commits a mint closes it -- including the node harness's bare
+    // `createSession()`, where the element is a stub and this is a plain assignment.
+    $('guard-session').open = false;
     // Whether Run minted this session because there was none. See `run`: the mint is
     // reached through this function precisely so that it is not a second path.
     const auto = origin === MINT_BY_RUN;
@@ -1668,6 +1812,201 @@
     return r.doc_id;
   }
 
+  // ---------- the vault-miss demonstration (build doc section 9.10) ----------
+  //
+  // 9.10 asks for a demo in which "'Destroy session' then 'run restore again'
+  // demonstrates the vault-miss path live". The destroy sequence does not and cannot:
+  // `/pipeline/run` calls `_require_session` before `services.orchestrator.run`, so a
+  // destroyed session is refused 401 SESSION_EXPIRED before the vault is consulted --
+  // measured against this build, the scripted three steps write VAULT_DESTROY and
+  // exactly ZERO VAULT_MISS rows. It is not a defect one layer down either: `destroy`
+  // pops the session KEY first (see `routes/sessions.py`), so `SessionRegistry.key`
+  // raises SessionExpired before `SessionVault` is in a position to answer "miss" at
+  // all. The erasure is the stronger property and it is what that sequence shows; the
+  // vault-miss path needed its own control, and until this one existed the hatched
+  // "not restored (vault miss)" key in the legend never fired on any flow this page
+  // offers.
+  //
+  // WHAT THIS IS NOT: a simulation, a mock, or a second code path maintained beside
+  // the real one. It presses the same `POST /pipeline/run`, same session, same
+  // document, same strategy, same everything, with one sentence appended to the
+  // prompt. The sentence carries a token that follows this build's surrogate grammar
+  // exactly and whose 8-hex id this session never minted. Downstream, nothing knows
+  // this button exists: the mock provider echoes tokens it finds in the payload
+  // (`mock_provider.find_tokens`), `restorer._restore_tokens` meets an id outside the
+  // run's `issued` set, and everything that follows is the shipped production
+  // behaviour for a model that invented a placeholder -- a hash-chained VAULT_MISS row
+  // classified `fabricated`, `vault_misses` in the stats strip, and
+  // `[UNRESOLVED_ENTITY]` spliced into the answer by `restorer.py`. That is the same
+  // path `demo.py` and `test_vault_miss_on_deobfuscation` exercise.
+  //
+  // WHY THE PAGE AND NOT A MODEL: to show a hallucinated token without a model that
+  // hallucinates, something has to stand in for the model. That is the one synthetic
+  // step and it is stated in the banner, on the strip, and in the prompt box itself --
+  // which is rewritten IN FULL before the run so the reviewer reads the exact string
+  // that was sent rather than taking this comment's word for it.
+  //
+  // WHY NO `POST /pipeline/restore`: it was the first design and it is worse twice
+  // over. It would be a third route able to emit decrypted originals, against an
+  // invariant `api/constants.py` and `routes/documents.py` both state in those words;
+  // and `test_every_mutating_route_is_metered_including_ones_added_later` pins the
+  // mutating route set BY VALUE so that adding one is a deliberate act someone
+  // notices. Reusing `/pipeline/run` means the reviewer watches the real pipeline.
+
+  //: One emitted token, anchored so a partial match cannot be mistaken for a whole
+  //: surrogate. The optional `|hint` suffix is matched so it can be DISCARDED: the
+  //: fabricated token is rebuilt from the three captured parts, so it never carries a
+  //: hint (a hint welded to a restored value is a separate known wart, and a
+  //: demonstration should not arrive wearing one).
+  const TOKEN_PARTS = /^\[(PII|PHI|LEGAL|FIN)_([A-Z][A-Z0-9_]{0,63})_([0-9a-f]{8})(?:\|[a-z0-9-]{1,24})?\]$/;
+
+  // The tokens the previous run ACTUALLY MINTED, as `{cat, type, id}`.
+  //
+  // Read out of `result.detections` -- one entry per span the engine acted on, each
+  // carrying the surrogate it emitted -- and NOT by scanning the payload, which is how
+  // the first version of this got it wrong in a way the browser caught immediately.
+  // `context_injector` opens the payload with instructions that contain a
+  // DOCUMENTATION EXAMPLE ("placeholders like [PHI_NAME_1a2b3c4d]"), which matches the
+  // token grammar perfectly and is not a token: scanning from offset 0 made that
+  // literal the first hit on every run, so the demonstration perturbed a string this
+  // session never issued in the first place and the banner's "the same grammar as X
+  // from the previous run" named something that was never minted. `renderMarks` was
+  // bitten by the identical literal and answers it positionally, by scanning from the
+  // <DOCUMENT> fence. This answers it by identity instead, which is stronger: a
+  // detection IS the record that the engine masked that span.
+  //
+  // Membership in the payload past the fence is then required as well, because both
+  // facts have to hold for the demonstration to mean anything -- minted (so "one hex
+  // digit different from a real token" is true) and present in what the provider was
+  // sent (so there is something for it to echo). Under pseudonymization most
+  // surrogates are realistic fakes rather than tokens; those fail the grammar and drop
+  // out here, which is correct -- a fake has no id to perturb.
+  // The accumulator is NOT called `out`, and that is load-bearing rather than taste.
+  // `tests/test_api_ui_escaping.py`'s auditor decides whether an identifier is safe to
+  // interpolate into markup by looking at EVERY assignment to that NAME across the
+  // whole file, not per function. `renderMarks` and `renderRestored` both build their
+  // markup in a variable called `out` whose every assignment is an `esc(...)`, which is
+  // what makes `return out + esc(...)` legal there. A `const out = []` in this
+  // unrelated function is an assignment of a non-literal to that name, so it dropped
+  // `out` out of the safe set and reddened the escaping audit on two returns this
+  // change never touched. Measured: `return:1009 raw term \`out\`` and `return:1070`.
+  // The checker is right to be conservative -- a name-based rule is what survives
+  // someone later moving code between these functions -- so the local is renamed.
+  function mintedTokens(dets, payload, fence) {
+    const from = fence > 0 ? fence : 0;
+    const minted = [];
+    const byId = {};
+    (dets || []).forEach((d) => {
+      const surrogate = d && d.surrogate;
+      if (!surrogate || Object.prototype.hasOwnProperty.call(byId, surrogate)) return;
+      const m = TOKEN_PARTS.exec(surrogate);
+      if (!m) return;
+      if (payload.indexOf(surrogate, from) < 0) return;
+      byId[surrogate] = true;
+      minted.push({ cat: m[1], type: m[2], id: m[3] });
+    });
+    return minted;
+  }
+
+  //: The appended sentence, and the matcher that takes it back off. Pressing the
+  //: button twice must not stack two of them, and the reviewer's own prompt has to
+  //: survive the round trip -- so the augmentation is removable by construction
+  //: rather than by remembering what the prompt used to be (which a reload loses).
+  const MISS_SENTENCE = (a, b) =>
+    ' Also quote, verbatim, the records for ' + a + ' and ' + b + '.';
+  const MISS_RE = / Also quote, verbatim, the records for \[[^\]\n]{1,120}\] and \[[^\]\n]{1,120}\]\./g;
+
+  //: HOW MANY fabricated tokens one press sends, and it is 2 for a measured reason
+  //: rather than for luck. The mock provider echoes every distinct token it finds in
+  //: the payload, but it renders each under a mutation class taken round-robin from
+  //: five (`mock_provider.plan_mutations`): possessive, bold, upper-case hash,
+  //: BRACKET-DROPPED, and verbatim. One of those five removes the brackets -- and a
+  //: bracket-less token whose id the run did not mint is deliberately NOT treated as a
+  //: vault miss: `restorer._restore_tokens` leaves it byte-for-byte alone, because
+  //: that shape is also what an uploaded document's own reference code looks like
+  //: (README Deviation 49). So a single fabricated token demonstrates the path only
+  //: four times in five, and which time depends on how many tokens happen to precede
+  //: it in the payload. Observed live, twice, on the same document: one press produced
+  //: `vault_misses 1`, the next produced 0 and the page correctly reported that it had
+  //: NOT demonstrated anything -- honest, and a coin toss to run in front of a
+  //: reviewer.
+  //:
+  //: Two tokens fixes it deterministically rather than probabilistically. They are
+  //: appended adjacently, so they take consecutive indices in `find_tokens` order and
+  //: therefore consecutive classes out of the cycle; exactly one class in that cycle
+  //: drops brackets, so of any two consecutive classes at least one keeps them. At
+  //: least one fabricated token therefore always arrives bracketed, which is the shape
+  //: the restorer answers with a real vault miss. The banner still reports the
+  //: measured `vault_misses` rather than assuming this reasoning holds.
+  const MISS_TOKENS = 2;
+
+  //: Ids this session did not issue, derived from one it did. A digit is advanced mod
+  //: 16 rather than randomised so a press is reproducible, and every candidate is
+  //: checked against the run's OWN id set: flipping into a token that really was
+  //: minted would quietly restore a real value, and the demo would show the exact
+  //: opposite of what it claims. Every candidate differs from the source in exactly
+  //: one hex digit, which is what makes the banner's description of it true. Returns
+  //: fewer than asked -- possibly none -- rather than inventing anything; the caller
+  //: refuses in that case.
+  function unissuedIds(id, taken, want) {
+    const found = [];
+    for (let i = id.length - 1; i >= 0 && found.length < want; i--) {
+      const digit = parseInt(id.charAt(i), 16);
+      for (let bump = 1; bump < 16 && found.length < want; bump++) {
+        const candidate = id.slice(0, i) + ((digit + bump) % 16).toString(16) + id.slice(i + 1);
+        if (taken.indexOf(candidate) < 0 && found.indexOf(candidate) < 0) found.push(candidate);
+      }
+    }
+    return found;
+  }
+
+  async function restoreAgain() {
+    if (S.busy) return;
+    setDestroyArmed(false);
+    clearBanner();
+    // Three refusals, each naming the control that fixes it. They are local and issue
+    // no request on purpose: none of them is a question the server can answer, and a
+    // round trip that can only fail is noise in the network panel a reviewer of a
+    // security demo has open.
+    const tokens = S.lastTokens;
+    if (!tokens || !tokens.length) {
+      banner('warn', 'NO_PREVIOUS_RUN',
+        'There is no run to restore again yet. Press Run first: this control needs the ' +
+        'tokens that run minted, so it can build one that looks exactly like them and ' +
+        'was never issued. (A run whose payload carried no tokens at all cannot ' +
+        'demonstrate a vault miss either -- there would be nothing for the provider to ' +
+        'echo back.)');
+      return;
+    }
+    if (!S.sessionId) {
+      banner('warn', 'NO_LIVE_SESSION',
+        'The vault-miss path needs a LIVE session, and this page does not have one. ' +
+        'That is the whole point: a destroyed session is refused at the session check ' +
+        'before the vault is ever consulted, which is why "Destroy session then Run" ' +
+        'writes VAULT_DESTROY and no VAULT_MISS. Press "Create session", then Run, then ' +
+        'this button.');
+      return;
+    }
+    const source = tokens[0];
+    const fakeIds = unissuedIds(source.id, tokens.map((t) => t.id), MISS_TOKENS);
+    if (fakeIds.length < MISS_TOKENS) {
+      banner('warn', 'NO_UNISSUED_ID',
+        'Could not derive ' + MISS_TOKENS + ' token ids this session has not already ' +
+        'issued from the previous run. Run a different document and try again.');
+      return;
+    }
+    const name = (id) => '[' + source.cat + '_' + source.type + '_' + id + ']';
+    const fakes = fakeIds.map(name);
+    const real = name(source.id);
+    // Written into the box, not held in a variable: the reviewer must be able to read
+    // the exact prompt this run sends, and `run` reads the box, so what is on screen
+    // and what is sent are the same string by construction rather than by agreement.
+    const base = $('prompt').value.replace(MISS_RE, '').trim();
+    $('prompt').value = (base + MISS_SENTENCE(fakes[0], fakes[1])).slice(0, 8000);
+    S.missDemo = { fakes: fakes, real: real };
+    await run();
+  }
+
   async function run() {
     if (S.busy) return;
     // Same reason as in `createSession`: a confirm button left armed while the reviewer
@@ -1676,7 +2015,24 @@
     setDestroyArmed(false);
     clearBanner();
     const prompt = $('prompt').value.trim();
-    if (!prompt) { banner('err', 'NO_PROMPT', 'Enter a prompt.'); return; }
+    if (!prompt) {
+      // The panels are cleared FIRST, which is what the other two preflight refusals
+      // already did and this one did not. `resetRun` runs inside the `try` below, so
+      // NO_FILE and NO_CATEGORY blank the screen before they banner -- verified in
+      // Chrome, both leave all four panels at the placeholder -- while this branch
+      // returned above it and left the PREVIOUS run fully rendered. Measured on
+      // 127.0.0.1:8099 after a successful medical_note.txt run, emptying the prompt
+      // box and pressing Run: a red `NO_PROMPT` banner over panel 1 holding 2 826
+      // characters of the document, panel 2 holding 4 262, panel 4 holding 2 278
+      // including its `[UNRESOLVED_ENTITY]` mark, the stats strip populated and
+      // `#audit-run` still naming the previous run. Every one of those is the earlier
+      // run's, under a banner that reads as this click's verdict -- the cross-run
+      // mixture the whole of `resetRun` exists to prevent, and the reason its own
+      // comment gives for existing.
+      resetRun();
+      banner('err', 'NO_PROMPT', 'Enter a prompt.');
+      return;
+    }
     // ---- the session this run is scoped by, and the three states it can be in ----
     //
     // Every step below is scoped by a session, and this page used to make the
@@ -1809,11 +2165,19 @@
         // response did not carry the other number.
         const st = result.stats || {};
         const detected = Math.round('entities_detected' in st ? Number(st.entities_detected) : NaN);
-        $('c1').textContent = doc.chars + ' chars · ' + (result.detections || []).length +
-          C1_MASKED + (Number.isFinite(detected) && detected >= 0 ? C1_DETECTED(detected) : '');
+        const masked = (result.detections || []).length;
+        $('c1').textContent = doc.chars + ' chars · ' + masked +
+          C1_MASKED +
+          (Number.isFinite(detected) && detected >= 0 ? C1_DETECTED(detected, masked) : '');
         $('c1').title = C1_TITLE;
       }
       const fence = result.obfuscated_payload.indexOf(DOC_OPEN);
+      // The tokens this run minted, kept for `restoreAgain`. See `mintedTokens` for
+      // why this is read off the detections and cross-checked against the payload past
+      // the fence rather than scanned out of the payload. Set on every successful run,
+      // including one that IS a vault-miss run, so a second press perturbs a token of
+      // the latest run rather than a stale one.
+      S.lastTokens = mintedTokens(result.detections, result.obfuscated_payload, fence);
       $('p2').innerHTML = renderMarks(result.obfuscated_payload, result.detections, fence);
       $('c2').textContent = result.obfuscated_payload.length + ' chars';
       // Panel 3 is the provider's-eye view and was the one panel rendered with no
@@ -1840,12 +2204,73 @@
       // the same click, so without this clause the green verdict a reviewer actually
       // reads would say nothing about the scope having been minted for it.
       const strat = strategyClause(result.strategy, result.stats);
-      banner(strat.drift ? 'warn' : 'ok', strat.drift ? 'RUN_OK_STRATEGY_DRIFT' : 'RUN_OK',
-        'run_id ' + result.run_id + ' · ' + strat.text +
-        (minted ? ' · session ' + sid.slice(0, 12) + '… was auto-created by this Run: there ' +
-          'was none, and every step above is scoped by it.' : ''));
+      // The vault-miss demonstration reports what it MEASURED, never what it intended.
+      // `misses` comes out of the run's own stats, so the branch that says the
+      // demonstration worked is the branch on which the pipeline says a token was not
+      // resolved -- and if the fabricated token never came back (a provider that does
+      // not echo, a gate that stripped it) the page says exactly that instead of
+      // printing a claim the panels do not support. This is the same rule the destroy
+      // banner follows: assert the erasure only on the branch where the audit log
+      // proved it.
+      const demo = S.missDemo;
+      const misses = Math.round(Number((result.stats || {}).vault_misses));
+      if (demo && Number.isFinite(misses) && misses > 0) {
+        banner('warn', 'VAULT_MISS_DEMO',
+          'run_id ' + result.run_id + ' · ' + strat.text + ' · vault_misses ' + misses +
+          '. This page — not a model — appended ' + demo.fakes.join(' and ') + ' to your ' +
+          'prompt: the same grammar as ' + demo.real + ' from the previous run, each with ' +
+          'one hex digit of the id changed, so this session never issued them. (Two, ' +
+          'because the mock renders each echoed token under one of five mutations and one ' +
+          'of them drops the brackets — and an unbracketed token this run did not mint is ' +
+          'deliberately left alone rather than called a miss. Two adjacent tokens take ' +
+          'consecutive mutations, so at least one always arrives bracketed.) Everything ' +
+          'after that is the ordinary pipeline: the provider echoed them, the restorer ' +
+          'could not resolve what it did not issue, and the result is [UNRESOLVED_ENTITY] ' +
+          'in panel 4 (hatched, per the legend) with a VAULT_MISS row in the audit tail ' +
+          'below, scrolled to. That row is hash-chained like every other — press ' +
+          '"Verify chain".');
+      } else if (demo) {
+        banner('err', 'VAULT_MISS_DEMO_NO_MISS',
+          'run_id ' + result.run_id + ' · the run succeeded but recorded vault_misses ' +
+          (Number.isFinite(misses) ? misses : '(not reported)') + ', so this press did NOT ' +
+          'demonstrate the vault-miss path and this page will not claim it did. ' +
+          demo.fakes.join(' and ') + ' were appended to the prompt (still in the box, ' +
+          'verbatim) but did not come back bracketed in the provider\'s answer, so the ' +
+          'restorer never had an unknown token it was willing to claim. A provider that ' +
+          'does not echo its input cannot show this path from the outside; demo.py and ' +
+          'test_vault_miss_on_deobfuscation drive the restorer directly.');
+      } else {
+        // The strategy half is `strategyClause`: the composition the run EMITTED, not
+        // the literal it was asked for. The code keeps its `RUN_OK` prefix on both
+        // branches because the run did succeed either way -- what the drift branch
+        // reports is the page's own label, not a pipeline failure -- and a reviewer
+        // greps `RUN_OK`. The colour is the difference a reviewer sees first.
+        banner(strat.drift ? 'warn' : 'ok', strat.drift ? 'RUN_OK_STRATEGY_DRIFT' : 'RUN_OK',
+          'run_id ' + result.run_id + ' · ' + strat.text +
+          (minted ? ' · session ' + sid.slice(0, 12) + '… was auto-created by this Run: there ' +
+            'was none, and every step above is scoped by it.' : ''));
+      }
       $('audit-run').textContent = 'run_id ' + result.run_id;
       await loadAudit(result.run_id);
+      // Only on the press that went looking for the row -- an ordinary Run never yanks
+      // the page around. `renderAudit` has just recorded which row is the first hot one
+      // (see `S.hotRowIndex`); without this the row is red somewhere down a 260px box
+      // that opens at scrollTop 0, which is the exact complaint the LIVE REVIEW strip
+      // makes about VAULT_DESTROY.
+      //
+      // Every step is feature-tested rather than assumed, because
+      // `tests/test_ui_behaviour.py` drives this file under node against a DOM stub
+      // whose elements are plain objects with no `rows` collection and no
+      // `scrollIntoView`, and a demo control must not be the one thing that cannot be
+      // tested there. `HTMLTableSectionElement.rows` in the browser, undefined in the
+      // stub, and the whole block is then skipped.
+      if (demo && S.hotRowIndex !== null) {
+        const tableRows = $('audit-body').rows;
+        const hotRow = tableRows ? tableRows[S.hotRowIndex] : null;
+        if (hotRow && typeof hotRow.scrollIntoView === 'function') {
+          hotRow.scrollIntoView({ block: 'center' });
+        }
+      }
     } catch (e) {
       showError(e);
       // The 422 body names the run that was refused. Without it the tail was
@@ -1879,7 +2304,16 @@
       // wasted call: it keeps the rows under the emptied label agreeing with the
       // panels beside them, which is what this reload is for.
       if (e.code !== 'NO_FILE' && e.code !== 'NO_CATEGORY') await loadAudit(refused);
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+      // Consumed by THIS run and by no other. A refused vault-miss run must not leave
+      // the flag armed for the reviewer's next ordinary press of Run, which would then
+      // print a demonstration verdict about a run that carried no fabricated token.
+      // The appended sentence deliberately stays in the prompt box: it is what was
+      // sent, `MISS_RE` takes it back off on the next press of this control, and
+      // silently rewriting the box on a failure would hide the input that failed.
+      S.missDemo = null;
+    }
   }
 
   async function loadAudit(runId) {
@@ -2033,6 +2467,10 @@
   $('btn-destroy-confirm').addEventListener('click', confirmDestroy);
   $('btn-destroy-cancel').addEventListener('click', () => setDestroyArmed(false));
   $('btn-run').addEventListener('click', run);
+  // Section 9.10's vault-miss demonstration. Not a variant of Run wired to the same
+  // listener: it has its own preflights (a previous run to take a token from, a LIVE
+  // session) and its own verdict, and it goes through `run` for everything else.
+  $('btn-miss').addEventListener('click', restoreAgain);
   $('btn-verify').addEventListener('click', verifyChain);
   $('fixture').addEventListener('change', (ev) => {
     const opt = ev.target.selectedOptions[0];

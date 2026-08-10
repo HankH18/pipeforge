@@ -99,7 +99,14 @@ filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
     "leakage: 100-run zero-PII-in-transit harness (section 10.5)",
     "bench: performance benchmarks (section 12)",
-    "real_llm: requires ANTHROPIC_API_KEY and network; skipped by default",
+    # "requires ANTHROPIC_API_KEY and network; skipped by default" is what this line
+    # used to say, and it read as "runs once the key is set". It could not: the pop
+    # in `tests/conftest.py` happens at import time, before collection, so the
+    # module-level `skipif(not os.getenv("ANTHROPIC_API_KEY"))` in `tests/test_llm.py`
+    # was always true and `pytest -m real_llm` printed SKIPPED with a key exported.
+    # The flag is what makes it reachable, and the key is read from the environment
+    # only -- never from `.env`, which the same conftest now disables for the session.
+    "real_llm: spends a real ANTHROPIC_API_KEY over the network. Reachable ONLY with `pytest --real-llm` AND the key exported in the environment; skipped, not deselected, otherwise",
 ]
 
 # --------------------------------------------------------------------------

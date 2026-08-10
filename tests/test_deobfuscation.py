@@ -16,6 +16,7 @@ VAULT_MISS event" is only worth asserting against the real hash-chained writer.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -33,6 +34,9 @@ from secure_context_pipeline.deobfuscation.restorer import (
     _MAX_LABEL_LEN,
     _MAX_MISS_ROWS,
     _MAX_RESTORE_ROWS,
+    _SALVAGE_SEG,
+    _SALVAGE_SEP_CHARS,
+    _WS_BOUND,
     MISS_FABRICATED,
     MISS_INDETERMINATE,
     MISS_LOST,
@@ -43,7 +47,9 @@ from secure_context_pipeline.deobfuscation.restorer import (
     Restorer,
     RestoreResult,
     _canonical_by_shape,
+    _compile_salvage_pattern,
     _compile_surrogate_pattern,
+    _minted_id_spans,
 )
 from secure_context_pipeline.errors import ConfigError, PipelineError, VaultMissError
 from secure_context_pipeline.llm.mock_provider import (
@@ -3781,3 +3787,760 @@ def test_the_restore_row_cap_clears_the_largest_shipped_fixture_with_real_margin
         "restore benchmark before raising it -- the cap exists for the section 12 "
         "500 ms budget, not for an adversary."
     )
+
+
+# --------------------------------------------------------------------------
+# The widened salvage matcher and the provenance-anchored residue sweep.
+#
+# Six mangled forms reached the user un-restored AND unflagged: the post-restore
+# assertion did not fire, because it was built out of `TOKEN_RE` -- the same
+# matcher that had already failed to restore them. A check derived from the thing
+# it checks is blind exactly where that thing is blind, so the outcome was the
+# worst one on offer: a visible placeholder in the answer with `restored_count` 0,
+# `vault_misses` 0, `foreign_tokens` 0 and outcome `ok`.
+#
+# Two mechanisms close it and they are deliberately independent:
+#
+# * `_compile_salvage_pattern` -- a widened matcher that lives HERE and is never
+#   imported by the egress gate, so tolerance can grow without widening a single
+#   span of outbound payload the gate stops scanning; and
+# * `_minted_id_spans` -- a sweep for hashes THIS RUN MINTED, which shares no
+#   regex, no helper and no grammar with either matcher, and therefore cannot
+#   inherit their blind spot.
+#
+# Whatever the first cannot restore, the second flags. Silence is the defect.
+# --------------------------------------------------------------------------
+
+SALVAGE_ID = NAME_ID
+SALVAGE_VALUE = NAME_VALUE
+
+
+def _separated(codepoint: int) -> str:
+    """A canonical token with ``codepoint`` standing in for both ``_`` separators.
+
+    Built from the codepoint rather than written out, for the same reason the
+    module under test builds ``_RSQUO`` and its confusable separator class that
+    way: a literal NARROW NO-BREAK SPACE in a source file is indistinguishable
+    from an ordinary space to every reader and to most diffs, and these cases are
+    *about* that difference.
+    """
+    separator = chr(codepoint)
+    return f"[PII{separator}NAME{separator}{SALVAGE_ID}]"
+
+
+
+#: (label, fragment as the model wrote it). Every one of these carries
+#: `NAME_ID`, so every one of them is a token this run minted.
+#:
+#: The first seven are the reported set, verbatim. The rest are the sibling sweep
+#: -- other Unicode spaces, other separator punctuation, doubled separators, mixed
+#: case, other hash manglings, bracket variants -- because a defect found once in
+#: a separator class is a defect *class*, and enumerating six of it proves nothing
+#: about the seventh.
+SALVAGEABLE_FORMS = [
+    # -- the six reported forms, plus the in-hash whitespace case --------------
+    ("separator -> space", f"[PII NAME {SALVAGE_ID}]"),
+    ("separator -> period", f"[PII.NAME.{SALVAGE_ID}]"),
+    ("separator -> NBSP", _separated(0x00A0)),
+    ("category dropped", f"[NAME_{SALVAGE_ID}]"),
+    ("word inserted inside", f"[PII_NAME_<word>_{SALVAGE_ID}]"),
+    ("0x-prefixed hash", f"[PII_NAME_0x{SALVAGE_ID}]"),
+    ("whitespace inside the hash", "[PII_NAME_1a2b\n3c4d]"),
+    # -- sibling sweep: other Unicode spaces as the separator ------------------
+    ("separator -> NNBSP", _separated(0x202F)),
+    ("separator -> EN SPACE", _separated(0x2002)),
+    ("separator -> EM SPACE", _separated(0x2003)),
+    ("separator -> THIN SPACE", _separated(0x2009)),
+    ("separator -> FIGURE SPACE", _separated(0x2007)),
+    ("separator -> IDEOGRAPHIC SPACE", _separated(0x3000)),
+    ("separator -> tab", f"[PII\tNAME\t{SALVAGE_ID}]"),
+    ("separator -> newline", f"[PII\nNAME\n{SALVAGE_ID}]"),
+    # -- sibling sweep: other separator punctuation ---------------------------
+    ("separator -> colon", f"[PII:NAME:{SALVAGE_ID}]"),
+    ("separator -> slash", f"[PII/NAME/{SALVAGE_ID}]"),
+    ("separator -> pipe", f"[PII|NAME|{SALVAGE_ID}]"),
+    ("separator -> comma", f"[PII,NAME,{SALVAGE_ID}]"),
+    ("separator -> semicolon", f"[PII;NAME;{SALVAGE_ID}]"),
+    ("separator -> tilde", f"[PII~NAME~{SALVAGE_ID}]"),
+    ("separator -> plus", f"[PII+NAME+{SALVAGE_ID}]"),
+    ("separator -> equals", f"[PII=NAME={SALVAGE_ID}]"),
+    ("separator -> caret", f"[PII^NAME^{SALVAGE_ID}]"),
+    ("separator -> hash sign", f"[PII#NAME#{SALVAGE_ID}]"),
+    ("separator -> at", f"[PII@NAME@{SALVAGE_ID}]"),
+    ("separator -> star", f"[PII*NAME*{SALVAGE_ID}]"),
+    # The dash- and underscore-alikes, by codepoint so no confusable literal
+    # appears in this file -- the same rule the module follows for `_RSQUO`.
+    ("separator -> MIDDLE DOT", _separated(0x00B7)),
+    ("separator -> EN DASH", _separated(0x2013)),
+    ("separator -> EM DASH", _separated(0x2014)),
+    ("separator -> MINUS SIGN", _separated(0x2212)),
+    ("separator -> NB HYPHEN", _separated(0x2011)),
+    ("separator -> FULLWIDTH _", _separated(0xFF3F)),
+    # -- sibling sweep: doubled and mixed separators --------------------------
+    ("doubled underscore", f"[PII__NAME__{SALVAGE_ID}]"),
+    ("doubled dash", f"[PII--NAME--{SALVAGE_ID}]"),
+    ("underscore then dash", f"[PII_-NAME_-{SALVAGE_ID}]"),
+    ("doubled period", f"[PII..NAME..{SALVAGE_ID}]"),
+    # -- sibling sweep: the category, mangled beyond the four literals --------
+    ("category misspelled", f"[PXI_NAME_{SALVAGE_ID}]"),
+    ("category spelled out", f"[PERSONAL_NAME_{SALVAGE_ID}]"),
+    ("category fullwidth", f"[{chr(0xFF30)}{chr(0xFF29)}{chr(0xFF29)}_NAME_{SALVAGE_ID}]"),
+    # -- sibling sweep: the hash, mangled but still present -------------------
+    ("0X-prefixed hash", f"[PII_NAME_0X{SALVAGE_ID}]"),
+    ("hash-sign prefix", f"[PII_NAME_#{SALVAGE_ID}]"),
+    ("dash inside the hash", "[PII_NAME_1a2b-3c4d]"),
+    ("space between every digit", "[PII_NAME_1 a 2 b 3 c 4 d]"),
+    # -- sibling sweep: inserted words --------------------------------------
+    ("hyphenated word inserted", f"[PII_NAME_the-token_{SALVAGE_ID}]"),
+    ("spaced phrase inserted", f"[PII_NAME_the word_{SALVAGE_ID}]"),
+    # -- sibling sweep: bracket variants around a widened separator ----------
+    ("space separator, parens", f"(PII NAME {SALVAGE_ID})"),
+    ("space separator, braces", f"{{PII NAME {SALVAGE_ID}}}"),
+    ("space separator, angles", f"<PII NAME {SALVAGE_ID}>"),
+    ("space separator, no bracket", f"PII NAME {SALVAGE_ID}"),
+    ("space separator, opener only", f"[PII NAME {SALVAGE_ID}"),
+    ("space separator, closer only", f"PII NAME {SALVAGE_ID}]"),
+    # -- sibling sweep: mixed case on a widened separator --------------------
+    ("lowercased, spaced", f"[pii name {SALVAGE_ID}]"),
+    ("title-cased, dotted", f"[Pii.Name.{SALVAGE_ID}]"),
+    ("upper-cased hash, spaced", f"[PII NAME {SALVAGE_ID.upper()}]"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "fragment"), SALVAGEABLE_FORMS, ids=[case[0] for case in SALVAGEABLE_FORMS]
+)
+async def test_a_mangled_token_this_run_minted_is_restored_not_leaked(
+    restorer: Restorer, label: str, fragment: str
+) -> None:
+    """Every one of these left the value un-restored AND the assertion silent.
+
+    Asserted on the whole answer rather than on ``NAME_VALUE in result.text``,
+    because "the value is present" is satisfied by an output that ALSO still
+    carries the placeholder. The failure being fixed is a visible placeholder, so
+    the assertion has to be about the whole string.
+    """
+    result = await restorer.restore(
+        SESSION, sentence(fragment), strategy=TOKENIZATION, issued={SALVAGE_ID}, run_id=RUN
+    )
+
+    assert result.text == sentence(SALVAGE_VALUE), f"{label}: not restored cleanly"
+    assert result.restored_count == 1
+    assert result.vault_misses == 0
+    assert result.unresolved == ()
+    assert TOKEN_RE.search(result.text) is None
+    # The ID itself is gone, checked by the sweep that does not share the
+    # matcher's grammar -- so this cannot pass by both halves being blind.
+    assert _minted_id_spans(result.text, {SALVAGE_ID}) == []
+
+
+@pytest.mark.parametrize(
+    ("label", "fragment"), SALVAGEABLE_FORMS, ids=[case[0] for case in SALVAGEABLE_FORMS]
+)
+async def test_every_salvageable_form_was_a_silent_leak_before_the_widened_matcher(
+    restorer: Restorer, label: str, fragment: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The premise, pinned: without the widened matcher every form above LEAKS.
+
+    A table of 55 forms that pass is worth nothing on its own -- it is equally
+    consistent with "the grammar already handled them", in which case the fix is
+    dead code and the table is decoration. So the table is run a second time with
+    :func:`_compile_salvage_pattern` sabotaged into a no-op, and each form must
+    then fail to restore. That is the measurement the six-form report made by
+    hand, generalised and made permanent.
+
+    Note *which* outcome the sabotage produces: not silence, but a
+    ``PipelineError``. The residue sweep is independent of the matcher, so
+    disabling the matcher degrades the answer loudly instead of shipping a
+    placeholder. Before either mechanism existed these same forms returned
+    ``outcome: ok``.
+    """
+    import secure_context_pipeline.deobfuscation.restorer as module
+
+    monkeypatch.setattr(module, "_compile_salvage_pattern", lambda ids: None)
+
+    with pytest.raises(PipelineError) as excinfo:
+        await restorer.restore(
+            SESSION, sentence(fragment), strategy=TOKENIZATION, issued={SALVAGE_ID}, run_id=RUN
+        )
+
+    assert excinfo.value.detail["reason"] == "residual_token_after_restore", label
+
+
+async def test_a_minted_hash_in_the_models_own_prose_is_flagged_never_silent(
+    restorer: Restorer, audit: AuditLogger
+) -> None:
+    """The refusal case, and the guarantee that it is loud.
+
+    A bare hash with no bracket, no category and no type region is NOT claimed by
+    the widened matcher, and that refusal is deliberate: there is nothing around
+    it to say a token stood there, so the only honest reading of ``the identifier
+    1a2b3c4d could not be resolved`` is a sentence about an identifier. Claiming
+    it would mean rewriting the model's own words into a patient's name.
+
+    What must never happen is the refusal being *silent*. The residue sweep is
+    keyed on ``issued``, not on any grammar, so it sees the hash the matcher
+    declined, and the run fails with the same reason a residual token has always
+    failed with -- plus a ``DEOBFUSCATE`` row recording the outcome.
+    """
+    text = f"The identifier {SALVAGE_ID} could not be resolved."
+
+    with pytest.raises(PipelineError) as excinfo:
+        await restorer.restore(
+            SESSION, text, strategy=TOKENIZATION, issued={SALVAGE_ID}, run_id=RUN
+        )
+
+    assert excinfo.value.detail["reason"] == "residual_token_after_restore"
+    assert excinfo.value.detail["residual"] == 1
+    rows = [
+        event
+        for event in await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+        if event.detail.get("outcome") == "assertion_failed"
+    ]
+    assert len(rows) == 1, "the refusal must leave an audit row, not just an exception"
+    assert rows[0].detail["reason"] == "residual_token_after_restore"
+    # And nothing that could carry a value: a count and a reason only.
+    assert SALVAGE_VALUE not in rows[0].model_dump_json()
+
+
+async def test_the_residue_sweep_shares_no_machinery_with_the_matcher_it_backstops(
+    restorer: Restorer,
+) -> None:
+    """The root cause, pinned directly rather than through its symptoms.
+
+    The old assertion scanned with ``TOKEN_RE`` -- the matcher ``_restore_tokens``
+    restores with -- so every shape the matcher missed, the guard missed too. The
+    replacement asks a question no grammar can answer: is a hash *this run minted*
+    still in the string?
+
+    Exercised by handing the sweep a string the token grammar cannot see at all,
+    and asserting the two disagree in the direction that matters.
+    """
+    leaked = f"The chart lists [PII NAME {SALVAGE_ID}] today."
+
+    assert TOKEN_RE.search(leaked) is None, "premise: the shared grammar is blind here"
+    assert [span[2] for span in _minted_id_spans(leaked, {SALVAGE_ID})] == [SALVAGE_ID]
+    # And the sweep does not fire on a hash this run did NOT mint, which is what
+    # keeps a document's own reference code out of it.
+    assert _minted_id_spans(leaked, {"deadbeef"}) == []
+
+
+async def test_the_widened_matcher_never_deletes_a_word_the_model_wrote(
+    restorer: Restorer,
+) -> None:
+    """The regression the anchored head exists to prevent, in both shapes it took.
+
+    A first cut of the salvage grammar wrote the head as "optional opener,
+    optional category, then up to four words". Nothing bounds the word run on its
+    left, so it walked into the model's prose and the restored value swallowed it.
+    Measured on that version, with ``1a2b3c4d`` issued and vaulted::
+
+        The patient in room 5 PII NAME 1a2b3c4d was seen.
+          ->  The patient in John Smith was seen.
+
+    "room 5" is gone from a clinical answer with nothing on screen to say so,
+    which is precisely the harm ``_consume_unclosed_tail`` refuses at length: a
+    visible remnant is cosmetic, a deleted clause is not.
+    """
+    text = f"The patient in room 5 PII NAME {SALVAGE_ID} was seen."
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued={SALVAGE_ID}, run_id=RUN
+    )
+
+    assert result.text == f"The patient in room 5 {SALVAGE_VALUE} was seen."
+    assert result.tokens_salvaged == 1
+
+
+async def test_a_widened_separator_never_claims_the_documents_own_reference_code(
+    restorer: Restorer, vault: FakeVault
+) -> None:
+    """The countervailing property. Tolerance must not become destruction.
+
+    ``[PII NAME 1a2b3c4d]`` and ``Reference: FIN ACCOUNT 40281993`` are the same
+    *shape*, and a separator class wide enough to read the first is wide enough to
+    read the second. What separates them is not the grammar but provenance: the
+    salvage matcher's hash alternative is compiled from the IDs this run minted,
+    so a code the run never issued is not merely improbable to match -- it is
+    inexpressible in the pattern.
+
+    Both spellings the module docstring records, and the vault must not be asked
+    about either.
+    """
+    before = len(vault.token_calls)
+    for text in (
+        "Reference: FIN ACCOUNT 40281993 is disputed.",
+        "Reference (FIN-ACCOUNT-40281993) is disputed.",
+        "Record locator PHI MRN 48273910 on file.",
+    ):
+        result = await restorer.restore(
+            SESSION, text, strategy=TOKENIZATION, issued={SALVAGE_ID}, run_id=RUN
+        )
+        assert result.text == text, "a reference code the run never issued was rewritten"
+        assert result.tokens_salvaged == 0
+    assert vault.token_calls[before:] == [], "the vault was asked about text we never issued"
+
+
+async def test_without_issued_the_widened_matcher_is_inert(restorer: Restorer) -> None:
+    """DECLARED BOUNDARY: salvage needs ``issued``, and refusing without it is right.
+
+    The widened matcher's whole safety argument is that its hash alternative is
+    built from the IDs this run minted. With no ``issued`` set there is no such
+    list, and ``[PII NAME 1a2b3c4d]`` becomes indistinguishable from a document's
+    own ``[FIN ACCOUNT 40281993]``. Guessing would delete the user's reference
+    code; the module already refuses that trade for the narrower grammar and
+    refuses it here for the same reason.
+
+    So the form passes through un-restored -- and, without ``issued``, also
+    unflagged, because the sweep is keyed on the same set. That is the honest cost
+    and it is bounded: ``orchestrator.py`` always supplies ``issued``, so the
+    shipped pipeline never takes this path. Asserted rather than described, so
+    that a future change which starts salvaging here has to come and read this.
+    """
+    text = sentence(f"[PII NAME {SALVAGE_ID}]")
+
+    result = await restorer.restore(SESSION, text, strategy=TOKENIZATION, run_id=RUN)
+
+    assert result.text == text
+    assert result.restored_count == 0
+    assert result.tokens_salvaged == 0
+
+
+def test_a_hash_the_model_truncated_is_neither_restorable_nor_detectable() -> None:
+    """DECLARED BOUNDARY: the ID is the only provenance there is.
+
+    ``[PII_NAME_1a2b3c4]`` -- seven hex digits -- is the one shape in the swept
+    family that stays silent, and it is silent for a reason no widening can fix:
+    the eight-character ID this run minted does not occur in the string at all, so
+    there is nothing for a provenance-anchored sweep to anchor on. Matching it
+    would mean guessing which of the run's tokens a shortened hash meant, and with
+    500 live tokens a one-character-short prefix is not a unique key.
+
+    This is the same boundary ``test_the_docs_shortened_example_token_is_not_
+    matchable`` already pins for the emitter side, stated for the detector side.
+    Pinned in both directions -- undetectable *and* unissuable -- because "we
+    cannot find it" is only acceptable while "we cannot emit it" also holds.
+    """
+    truncated = f"[PII_NAME_{SALVAGE_ID[:-1]}]"
+
+    assert TOKEN_RE.search(truncated) is None
+    assert _minted_id_spans(truncated, {SALVAGE_ID}) == []
+    with pytest.raises(ConfigError) as excinfo:
+        format_surrogate("PII", "NAME", SALVAGE_ID[:-1])
+    assert excinfo.value.detail["reason"] == "malformed_token_id"
+
+
+async def test_a_salvaged_token_is_counted_and_audited_as_salvaged(
+    restorer: Restorer, audit: AuditLogger
+) -> None:
+    """``tokens_salvaged`` is the signal that the provider is damaging our markers.
+
+    ``restored_count`` cannot carry it: a run where every token had to be salvaged
+    restores perfectly and looks identical to a clean one. The counter is what
+    makes "the model mangled 40 of 40 tokens" visible to an operator, and it is on
+    the ``DEOBFUSCATE`` row as well as on the result.
+    """
+    text = f"{sentence(f'[PII NAME {SALVAGE_ID}]')} Also [PHI_NAME_{SALVAGE_ID}]."
+
+    result = await restorer.restore(
+        SESSION, text, strategy=TOKENIZATION, issued={SALVAGE_ID}, run_id=RUN
+    )
+
+    assert result.restored_count == 2, "one canonical occurrence and one mangled"
+    assert result.tokens_salvaged == 1, "only the mangled one was salvaged"
+    stage = [
+        event
+        for event in await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+        if "tokens_seen" in event.detail
+    ]
+    assert len(stage) == 1
+    assert stage[0].detail["tokens_salvaged"] == 1
+
+
+async def test_a_salvaged_row_never_invents_a_category_it_could_not_read(
+    restorer: Restorer, audit: AuditLogger
+) -> None:
+    """A dropped category audits as UNKNOWN, not as a guess and not as the model's word.
+
+    Two halves. ``[NAME_1a2b3c4d]`` has no category at all, and ``[PERSONAL_NAME_
+    1a2b3c4d]`` has a word the model invented in the category's place. Neither may
+    reach a compliance column dressed as one of the four literals this pipeline
+    ships -- the ``OBFUSCATE`` row for the same ``token_id`` already carries the
+    real pair, so the join answers the question without this row guessing.
+    """
+    for fragment in (f"[NAME_{SALVAGE_ID}]", f"[PERSONAL_NAME_{SALVAGE_ID}]"):
+        result = await restorer.restore(
+            SESSION, sentence(fragment), strategy=TOKENIZATION, issued={SALVAGE_ID}, run_id=RUN
+        )
+        assert result.text == sentence(SALVAGE_VALUE)
+
+    # The itemisation, identified by carrying a token ID rather than by
+    # `_entity_rows`' `detail['action']` filter: the stage row is the one this
+    # must exclude, and `token_id is None` is what actually distinguishes it.
+    rows = [
+        event
+        for event in await audit.query(session_id=SESSION, event_type=DEOBFUSCATE)
+        if event.token_id is not None
+    ]
+    assert rows, "the itemisation must still be written for a salvaged token"
+    for row in rows:
+        assert row.token_id == SALVAGE_ID
+        assert row.detail["category"] == "UNKNOWN"
+        assert row.entity_type == "NAME"
+
+
+def test_the_salvage_matcher_is_not_reachable_from_the_egress_gates_skip_list() -> None:
+    """The security half: widening tolerance must not widen what the gate skips.
+
+    ``surrogates.TOKEN_RE`` is shared by three components, and the gate builds its
+    detector skip-list from ``STRICT_TOKEN_RE`` spans -- so every shape added to
+    that grammar is a span of outbound payload the gate stops re-scanning. The
+    widened matcher deliberately does not live there. It is a private name in the
+    de-obfuscation module, it is compiled per call from the run's own ``issued``
+    set, and no other module imports it.
+
+    Asserted structurally rather than by inspection: this reddens the moment
+    someone exports it or moves it into the shared grammar.
+    """
+    import secure_context_pipeline.deobfuscation.restorer as module
+    from secure_context_pipeline import surrogates
+    from secure_context_pipeline.pipeline import egress_gate as gate
+
+    assert not hasattr(surrogates, "_compile_salvage_pattern")
+    assert not hasattr(gate, "_compile_salvage_pattern")
+    assert "_compile_salvage_pattern" not in module.__all__
+    # The shared grammar is unchanged: the six reported forms are still outside it,
+    # which is exactly why they must be handled here instead.
+    for _label, fragment in SALVAGEABLE_FORMS[:7]:
+        assert surrogates.STRICT_TOKEN_RE.search(fragment) is None
+
+
+def test_the_salvage_whitespace_bound_matches_the_shared_grammars() -> None:
+    """`_WS_BOUND` is a copy of a private constant. Pin it, or it drifts.
+
+    ``surrogates._WS`` is private, so the salvage pattern spells the class out
+    rather than importing it. A copy that nobody checks is how two matchers end up
+    tolerating different amounts of whitespace, which is the divergence
+    ``textrules`` exists to prevent for the boundary rule.
+    """
+    import secure_context_pipeline.surrogates as surrogates_module
+
+    assert _WS_BOUND == surrogates_module._WS
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        pytest.param(" " * 40000, id="whitespace run"),
+        pytest.param("[" + "word " * 8000, id="bracket then a long word run"),
+        pytest.param("[" + "a" * 40000, id="bracket then a long hex-ish run"),
+        pytest.param("[" + "-" * 40000, id="bracket then a long separator run"),
+        pytest.param("[PII_NAME_1a2b3c4 " * 3000, id="near-miss hashes"),
+        pytest.param("[PII_NAME_" + "1 - . a " * 3000, id="gap spam inside a hash"),
+    ],
+)
+def test_the_widened_grammar_stays_linear_on_hostile_input(hostile: str) -> None:
+    """Every quantifier in the salvage pattern is bounded, for the reason `TOKEN_RE`'s are.
+
+    This runs on the raw LLM response, which is untrusted, and the widened grammar
+    nests quantifiers that ``TOKEN_RE`` does not -- a word region inside a
+    separator run, gap runs inside the hash. An unbounded ``\\s*`` in ``TOKEN_RE``
+    once cost **94 seconds** on 128 000 spaces, a denial of service reachable from
+    an ordinary document upload, and the same shape is available here.
+
+    The wall-clock budget is the weaker half and is stated as such. Every mutation
+    tried against it -- unbinding the intra-hash gap, unbinding the word region,
+    unbinding the whitespace class -- stayed *linear*, because the classes involved
+    are disjoint and the blow-up needs ambiguity rather than length. It is kept as
+    a class guard and given a loose budget so contention cannot flake it; the
+    assertions that actually bind are in
+    :func:`test_the_salvage_grammar_has_no_unbounded_quantifier_and_no_ambiguity`.
+    """
+    pattern = _compile_salvage_pattern({SALVAGE_ID})
+    assert pattern is not None
+
+    started = time.perf_counter()
+    pattern.findall(hostile)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+    assert elapsed_ms < 1000.0, (
+        f"{len(hostile):,} hostile characters took {elapsed_ms:.0f} ms in the salvage "
+        "matcher; a bound was lost and this is reachable from an uploaded document"
+    )
+
+
+def test_the_salvage_grammar_has_no_unbounded_quantifier_and_no_ambiguity() -> None:
+    """The two structural invariants the timing test above cannot pin.
+
+    Written structurally after the timing test was measured against real
+    mutations and found not to bind: unbinding a quantifier left the pattern
+    linear, so a wall-clock assertion passes on a grammar that has lost the
+    property it claims to guard. What *did* change measurably was making the word
+    class overlap the separator class -- 0.8 ms to 110 ms on ``PII_a_a_a...``, a
+    140x step from one character moving between two classes -- and that is
+    ambiguity, not length.
+
+    So both invariants are asserted directly:
+
+    * **No unbounded quantifier.** ``*``, ``+`` and ``{n,}`` are what turned
+      ``TOKEN_RE`` into a 94-second denial of service on 128 000 spaces. Literal
+      ``*`` and ``+`` inside the separator class are skipped, since ``re.escape``
+      writes them backslashed and they are data there, not quantifiers.
+    * **The word and separator classes are disjoint.** That is what stops the two
+      from competing for the same character, which is the only ambiguity the
+      grammar has room for.
+    """
+    pattern = _compile_salvage_pattern({SALVAGE_ID})
+    assert pattern is not None
+
+    unbounded: list[str] = []
+    source = pattern.pattern
+    index = 0
+    in_class = False
+    while index < len(source):
+        char = source[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        elif not in_class:
+            if char in "*+":
+                unbounded.append(f"bare {char!r} at {index}")
+            elif char == "{":
+                close = source.find("}", index)
+                body = source[index + 1 : close]
+                if body.endswith(","):
+                    unbounded.append(f"open-ended {{{body}}} at {index}")
+        index += 1
+    assert unbounded == [], (
+        f"the salvage matcher runs on untrusted LLM output and has unbounded "
+        f"quantifiers: {unbounded}"
+    )
+
+    # Disjointness, char by char rather than by inspecting the class strings --
+    # `_SALVAGE_SEP_CHARS` is partly `re.escape`d, so reading it is not reading it.
+    word = re.compile(f"\\A{_SALVAGE_SEG}\\Z")
+    overlapping = [
+        char
+        for char in re.compile(f"[{_SALVAGE_SEP_CHARS}]").pattern
+        if word.match(char) and re.compile(f"[{_SALVAGE_SEP_CHARS}]").fullmatch(char)
+    ]
+    assert overlapping == [], (
+        f"these characters are both a word and a separator in the salvage grammar, "
+        f"so the two quantifiers compete for them: {overlapping!r}"
+    )
+
+
+async def test_the_restore_stage_hands_every_cpu_phase_to_a_thread(
+    restorer: Restorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Build doc: all I/O and CPU-bound work off the event loop.
+
+    Measured before this: a 500-surrogate restore was 127.9 ms of work with a
+    127.1 ms worst event-loop stall -- essentially 100% on the loop, which on an
+    ASGI app is head-of-line blocking for every concurrent request. Every other
+    CPU-bound stage already offloads (``detector.py``, ``extraction.py``,
+    ``egress_gate.py``, ``engine.py``); this module had zero ``asyncio.to_thread``
+    calls.
+
+    Asserted structurally rather than by timing. A stall measurement is the right
+    way to FIND this and the wrong way to guard it -- it flakes under load and it
+    passes on a fast machine that is doing the wrong thing. What must not regress
+    is that each phase is handed to a thread, so the phases are named.
+    """
+    import secure_context_pipeline.deobfuscation.restorer as module
+
+    offloaded: list[str] = []
+    real_to_thread = asyncio.to_thread
+
+    async def recording(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+        offloaded.append(getattr(func, "__name__", repr(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(module.asyncio, "to_thread", recording)
+
+    await restorer.restore(
+        SESSION,
+        f"{sentence(f'[PHI_NAME_{NAME_ID}]')} Maria Torres signed off.",
+        strategy=PSEUDONYMIZATION,
+        surrogates={"Maria Torres": "Jane Alderton"},
+        issued={NAME_ID},
+        run_id=RUN,
+    )
+
+    for phase in (
+        "_compile_surrogate_pattern",
+        "_scan_surrogates",
+        "_rebuild_surrogates",
+        "_sweep_surrogate_residue",
+        "_count_surrogate_near_misses",
+        "_scan_tokens",
+        "_rebuild_tokens",
+        "_sweep_residue",
+    ):
+        assert phase in offloaded, f"{phase} still runs on the event loop"
+
+
+# --------------------------------------------------------------------------
+# `detail['emitted_strategy']` -- the log records the OUTCOME, not just the request
+# --------------------------------------------------------------------------
+# `strategy` on a DEOBFUSCATE row is what the caller ASKED for, and it was the only
+# strategy fact the row carried. The vault has no strategy dimension -- documented,
+# required, and not to be "fixed" -- so a session's second run restores whatever
+# composition its first minted, and the row then told a compliance reader
+# `pseudonymization` about a restore that saw nothing but hash tokens.
+#
+# Reproduced end to end before the fix (integration test
+# `test_the_audit_log_records_the_composition_restored_not_the_one_requested`):
+# run 1 tokenization, run 2 pseudonymization, same session -->
+#   PipelineResult.emitted_strategy = tokenization
+#   DEOBFUSCATE detail              = {"strategy": "pseudonymization", ...}
+# The response object was already right; the log was not.
+
+
+async def _rows(audit: AuditLogger, event_type: str = DEOBFUSCATE) -> list[AuditEvent]:
+    return [row for row in await audit.query(limit=1000) if row.event_type == event_type]
+
+
+async def test_every_deobfuscate_row_carries_both_the_request_and_the_outcome(
+    restorer: Restorer, audit: AuditLogger
+) -> None:
+    """Both facts on every shape of the row, and they are allowed to differ.
+
+    ``strategy`` is the request; ``emitted_strategy`` is the composition the run
+    actually put on the wire, classified once by the orchestrator from the token
+    records and handed down. The value used here is deliberately the *contradicting*
+    one -- a pseudonymization request whose payload carried only tokens -- because a
+    row that merely echoed ``strategy`` under a second key would pass a test that
+    used the same word twice.
+
+    Both shapes of the row are checked: the stage summary and the per-entity
+    itemisation. Requirement 7 wants the log queryable for compliance, and "what was
+    actually sent" is answerable only if every row agrees.
+    """
+    await restorer.restore(
+        SESSION,
+        sentence(f"[PHI_NAME_{NAME_ID}]"),
+        strategy=PSEUDONYMIZATION,
+        issued={NAME_ID},
+        emitted_strategy=TOKENIZATION,
+        run_id=RUN,
+    )
+
+    rows = await _rows(audit)
+    assert rows, "the restore emitted no DEOBFUSCATE row at all"
+    stage = [row for row in rows if row.detail.get("action") != RESTORE_ACTION]
+    entities = [row for row in rows if row.detail.get("action") == RESTORE_ACTION]
+    assert stage and entities, (
+        f"both shapes must exist for this to be a coverage test: "
+        f"{[dict(row.detail) for row in rows]}"
+    )
+    for row in rows:
+        assert row.detail["strategy"] == PSEUDONYMIZATION, dict(row.detail)
+        assert row.detail["emitted_strategy"] == TOKENIZATION, dict(row.detail)
+
+
+async def test_a_restore_that_is_not_told_what_it_emitted_says_so(
+    restorer: Restorer, audit: AuditLogger
+) -> None:
+    """No caller-supplied composition is recorded as ``indeterminate``, never guessed.
+
+    The same rule as :data:`MISS_INDETERMINATE`, for the same reason. This module
+    cannot re-derive the composition from what it is handed: ``issued`` is a set of
+    token IDs and ``surrogates`` is keyed by surrogate, both de-duplicated, while the
+    classifier counts *records*. A second derivation here would be free to disagree
+    with the one the response reports, which is the exact defect class the field
+    exists to close -- so the honest value is "not stated".
+
+    Asserted as "not the request either": defaulting to ``strategy`` would put a
+    request in an outcome column, which is where this started.
+    """
+    await restorer.restore(
+        SESSION,
+        sentence(f"[PHI_NAME_{NAME_ID}]"),
+        strategy=PSEUDONYMIZATION,
+        issued={NAME_ID},
+        run_id=RUN,
+    )
+
+    rows = await _rows(audit)
+    assert rows
+    for row in rows:
+        assert row.detail["emitted_strategy"] == "indeterminate", dict(row.detail)
+        assert row.detail["emitted_strategy"] != row.detail["strategy"]
+
+
+async def test_the_failure_row_carries_the_composition_too(
+    vault: FakeVault, settings: Settings, audit: AuditLogger
+) -> None:
+    """The assertion-failed row is the one a reviewer reads after an incident.
+
+    It is written on the path where a token this run issued survived restoration, so
+    it is precisely the row on which "what was actually sent?" is asked -- and it was
+    carrying the request alone like every other.
+    """
+    broken = Restorer(vault=LeakyVault(tokens=TOKENS), settings=settings, audit=audit)
+    with pytest.raises(PipelineError):
+        await broken.restore(
+            SESSION,
+            sentence(f"[PHI_NAME_{NAME_ID}]"),
+            strategy=TOKENIZATION,
+            issued={NAME_ID, "5e6f7a8b"},
+            emitted_strategy="mixed",
+            run_id=RUN,
+        )
+
+    rows = await _rows(audit)
+    failures = [row for row in rows if row.detail.get("outcome") == "assertion_failed"]
+    assert failures, "no assertion_failed row was written"
+    for row in failures:
+        assert row.detail["strategy"] == TOKENIZATION, dict(row.detail)
+        assert row.detail["emitted_strategy"] == "mixed", dict(row.detail)
+
+
+async def test_naming_the_emitted_composition_changes_no_output_byte(
+    restorer: Restorer, vault: FakeVault, settings: Settings, tmp_path: Path
+) -> None:
+    """It is an audit label. The answer the user reads must be byte-identical.
+
+    Run twice over a body that exercises both passes -- a bracketed token, a mangled
+    one, a surrogate and prose -- once with the composition named and once without.
+    The restored text, and every count on the result, must match exactly; only the
+    audit row may differ.
+    """
+    body = (
+        f"{sentence(f'[PHI_NAME_{NAME_ID}]')} "
+        f"phi_medication_{MED_ID.upper()} was continued. "
+        "Maria Torres signed off, and PHI_NAME_deadbeef was not ours."
+    )
+
+    async def once(emitted: str | None) -> RestoreResult:
+        log = await AuditLogger.open(tmp_path / f"audit-{emitted}.db")
+        try:
+            fresh = Restorer(
+                vault=FakeVault(tokens=TOKENS, surrogates={"Maria Torres": "Ana Ruiz"}),
+                settings=settings,
+                audit=log,
+            )
+            return await fresh.restore(
+                SESSION,
+                body,
+                strategy=PSEUDONYMIZATION,
+                surrogates={"Maria Torres": "Ana Ruiz"},
+                issued={NAME_ID, MED_ID},
+                emitted_strategy=emitted,
+                run_id=RUN,
+            )
+        finally:
+            await log.close()
+
+    named = await once("mixed")
+    unnamed = await once(None)
+    assert named.text == unnamed.text
+    assert named.restored_count == unnamed.restored_count
+    assert named.tokens_seen == unnamed.tokens_seen
+    assert named.foreign_tokens == unnamed.foreign_tokens
+    assert named.model_dump(exclude={"elapsed_ms"}) == unnamed.model_dump(exclude={"elapsed_ms"})

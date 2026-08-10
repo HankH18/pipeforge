@@ -32,8 +32,10 @@ import contextlib
 import fnmatch
 import importlib.metadata
 import json
+import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -41,7 +43,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -65,7 +67,7 @@ from secure_context_pipeline.api.app import (
     _read_capped,
     create_app,
 )
-from secure_context_pipeline.api.constants import MAX_REAP_PER_REQUEST
+from secure_context_pipeline.api.constants import MAX_REAP_PER_REQUEST, UI_DIRNAME
 from secure_context_pipeline.api.deps import (
     MAX_REAP_ATTEMPTS,
     _enqueue_for_reaping,
@@ -73,6 +75,7 @@ from secure_context_pipeline.api.deps import (
 )
 from secure_context_pipeline.api.errors import EXTRA_FIELD_MARKER
 from secure_context_pipeline.api.routes.audit import MAX_AUDIT_OFFSET
+from secure_context_pipeline.api.routes.documents import DEMO_FIXTURES, FIXTURES_DIR
 from secure_context_pipeline.api.schemas import MAX_ID_LEN
 from secure_context_pipeline.audit.logger import (
     DETECT,
@@ -80,7 +83,8 @@ from secure_context_pipeline.audit.logger import (
     LLM_CALL,
     SESSION_CREATE,
 )
-from secure_context_pipeline.config import Settings
+from secure_context_pipeline.config import DEFAULT_REGISTRY_PATH, PACKAGE_ROOT, Settings
+from secure_context_pipeline.detection.registry import GAZETTEER_DIR
 from secure_context_pipeline.errors import (
     MAX_DETAIL_VALUE_LEN,
     UNREADABLE_AUDIT_REMEDY,
@@ -3198,8 +3202,8 @@ async def test_the_dockerignore_matcher_agrees_with_a_real_docker_build() -> Non
     assert not _dockerignore_match("*.db", "a/audit.db")
 
 
-def _git_tracked(relative: str) -> bool | None:
-    """Is ``relative`` in git's index? ``None`` when there is no git tree to ask.
+def _git(*args: str, stdin: bytes = b"") -> subprocess.CompletedProcess[bytes] | None:
+    """Run a git query in this checkout, or ``None`` when there is no tree to ask.
 
     Deliberately shells out rather than reading ``.gitignore`` and reimplementing
     git's matcher. A reimplementation of the matcher is exactly what shipped the
@@ -3207,20 +3211,200 @@ def _git_tracked(relative: str) -> bool | None:
     by a human and applied unanchored by git, and any hand-written checker would
     have been written from the same misreading. ``git ls-files`` is the other
     implementation.
+
+    ``None`` -- no ``.git``, no git binary -- is the honest answer outside a
+    working tree (a ``git archive`` tarball, an installed wheel) and callers skip
+    the question rather than faking an answer to it.
+
+    ``core.excludesFile`` is pinned empty so the answers are **this repository's**,
+    not this developer's. The machine-global file is real here -- git falls back to
+    ``~/.config/git/ignore`` with no config at all, and on the author's machine that
+    file carries a rule -- and a guard that read it would pass or fail per laptop.
+    ``tests/test_build_context.py`` makes the same distinction from the other side.
+    ``.git/info/exclude`` is the one residue: per-clone, and there is no flag for it.
     """
     if not (REPO_ROOT / ".git").exists():
         return None
     try:
-        completed = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", relative],
+        return subprocess.run(
+            ["git", "-c", f"core.excludesFile={os.devnull}", *args],
             cwd=REPO_ROOT,
+            input=stdin,
             capture_output=True,
             timeout=30,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):  # pragma: no cover - no git binary
         return None
-    return completed.returncode == 0
+
+
+def _git_index() -> frozenset[str] | None:
+    """Every path in git's index, repo-relative. ``None`` outside a working tree.
+
+    The whole index in one call rather than ``git ls-files --error-unmatch`` per
+    path, because the list of things to ask about is *derived* and grows: a
+    per-file subprocess puts a cost on adding an asset to that list, and that is
+    the kind of cost that gets a check quietly narrowed later. ``-z`` so a name
+    needing quoting cannot be misread as two names.
+    """
+    completed = _git("ls-files", "-z")
+    if completed is None or completed.returncode != 0:  # pragma: no cover - not a tree
+        return None
+    return frozenset(filter(None, completed.stdout.decode("utf-8", "replace").split("\0")))
+
+
+def _git_ignored(paths: Sequence[str]) -> frozenset[str] | None:
+    """Which of ``paths`` an ignore rule in *this repository* matches.
+
+    A different question from :func:`_git_index`, and the one that names the
+    cause rather than the symptom. ``git ls-files`` reports the index as it
+    stands today; ignoring is what silently empties it. A file that is both
+    tracked and ignored passes the index check while sitting one ``git rm
+    --cached``, one ``.gitignore`` tidy-up, or one clone-and-re-add away from
+    vanishing -- which is precisely how the gazetteers left the repository.
+
+    ``--no-index`` is what makes this about the rule: without it, git declines to
+    answer for a path that is already tracked, i.e. it answers only in the case
+    where the answer no longer matters.
+    """
+    if not paths:  # pragma: no cover - the caller always derives a non-empty list
+        return frozenset()
+    completed = _git(
+        "check-ignore", "--stdin", "-z", "--no-index", stdin="\0".join(paths).encode("utf-8")
+    )
+    # 0 = something matched, 1 = nothing matched. Anything else (128) is git
+    # refusing the question, and a refusal must never read as "nothing is ignored".
+    if completed is None or completed.returncode not in (0, 1):  # pragma: no cover - no tree
+        return None
+    return frozenset(filter(None, completed.stdout.decode("utf-8", "replace").split("\0")))
+
+
+#: Repo-relative paths this guard derives and is nevertheless allowed not to
+#: require. **Empty on purpose.** The check below refuses an entry that no longer
+#: names a derived asset, so a name parked here to quiet a red run rots into a
+#: failure of its own instead of into silent, permanent coverage loss.
+ASSETS_EXEMPT_FROM_SHIPPING: frozenset[str] = frozenset()
+
+#: File names that are never a runtime asset wherever they turn up -- OS and
+#: interpreter droppings, not content this system loads or serves. Deliberately a
+#: deny-list of junk rather than an allow-list of extensions: a new ``.svg``,
+#: ``.woff2`` or ``.map`` under ``ui/`` is an asset and has to be covered the day
+#: it lands, which an extension allow-list would silently skip.
+NEVER_A_RUNTIME_ASSET = frozenset({".DS_Store"})
+
+
+def _repo_relative(path: Path) -> str:
+    """A path constant re-expressed against *this checkout*, not the import site.
+
+    The constants are read from the imported package because that is the honest
+    answer to "where does the running process look for this": ``load_registry``
+    opens :data:`DEFAULT_REGISTRY_PATH`, the recognizers open files under
+    :data:`GAZETTEER_DIR`, ``_mount_ui`` serves ``PACKAGE_ROOT / UI_DIRNAME``, and
+    ``GET /fixtures/{name}`` reads :data:`FIXTURES_DIR`. Only their *shape* is
+    taken from the constant; the tree they are then checked in is always
+    ``REPO_ROOT``, because an editable or wheel install resolves those constants
+    into some other directory entirely -- and a guard that graded that directory
+    would be grading a copy of the repository nobody is about to clone.
+    """
+    return path.resolve().relative_to(PACKAGE_ROOT.parent).as_posix()
+
+
+def _same_origin_references(html: str) -> list[str]:
+    """Relative ``src=``/``href=`` targets in ``html``: the files the page needs.
+
+    Absolute URLs, protocol-relative URLs, ``data:`` URIs, bare fragments and
+    root-anchored paths are not files sitting beside ``index.html``, so the static
+    mount is not what has to be able to open them and they are not asserted here.
+    """
+    found = []
+    for value in re.findall(r'(?:src|href)="([^"]+)"', html):
+        target = value.split("?")[0].split("#")[0]
+        if not target or ":" in target or "//" in target or target.startswith(("/", "#")):
+            continue
+        found.append(target)
+    return sorted(set(found))
+
+
+def _dockerfile_copy_sources() -> list[str]:
+    """Every context path a ``COPY`` brings into the image.
+
+    ``--from=`` lines copy out of an earlier build stage rather than out of the
+    build context, so their sources are not repository paths and nothing in this
+    tree can be checked against them.
+    """
+    return sorted(
+        {
+            source
+            for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+            if (stripped := line.strip()).startswith("COPY ") and "--from" not in stripped
+            for source in _copy_sources(stripped)
+        }
+    )
+
+
+def _files_the_image_ships(root: Path, copied: Sequence[str], dockerignore: str) -> set[str]:
+    """Everything under ``root`` a ``COPY`` carries in and ``.dockerignore`` keeps.
+
+    A directory source is walked rather than trusted, which is what makes a file
+    added to ``ui/`` tomorrow covered tomorrow instead of on the day somebody
+    remembers to extend a list.
+    """
+    shipped: set[str] = set()
+    for source in copied:
+        base = root / source
+        candidates = [base] if base.is_file() else [p for p in base.rglob("*") if p.is_file()]
+        for path in candidates:
+            relative = path.relative_to(root).as_posix()
+            if path.name in NEVER_A_RUNTIME_ASSET or _dockerignored(relative, dockerignore):
+                continue
+            shipped.add(relative)
+    return shipped
+
+
+def _assets_the_code_names() -> dict[str, str]:
+    """Repo-relative asset -> the code that names it and cannot run without it.
+
+    Every entry is derived from a constant or from a file the constant points at,
+    so renaming ``ui/`` or moving the gazetteer directory moves this check with
+    it. The registry is read from the working tree deliberately: it is what the
+    author is about to ship, so a gazetteer added and not yet committed is
+    covered today rather than after the commit that would have broken the clone.
+    That is safe only because ``entities.yaml`` is itself in the returned mapping
+    and therefore has to answer the same tracked-by-git question it drives.
+    """
+    named: dict[str, str] = {}
+
+    registry = _repo_relative(DEFAULT_REGISTRY_PATH)
+    named[registry] = "config.DEFAULT_REGISTRY_PATH -- load_registry fails closed without it"
+    assert (REPO_ROOT / registry).is_file(), (
+        f"{registry} is where DEFAULT_REGISTRY_PATH points and it is not on disk; "
+        f"nothing in this system starts"
+    )
+
+    registry_text = (REPO_ROOT / registry).read_text(encoding="utf-8")
+    gazetteers = re.findall(r"^\s*gazetteer:\s*(\S+)\s*$", registry_text, flags=re.MULTILINE)
+    assert gazetteers, "entities.yaml must name the gazetteers this test is about"
+    gazetteer_dir = _repo_relative(GAZETTEER_DIR)
+    for filename in gazetteers:
+        named[f"{gazetteer_dir}/{filename}"] = f"entities.yaml names `gazetteer: {filename}`"
+
+    ui_dir = _repo_relative(PACKAGE_ROOT / UI_DIRNAME)
+    # `_mount_ui` mounts this directory with `html=True`; `index.html` is the
+    # fixed name Starlette then serves at `/`, so its absence is a blank demo.
+    index = f"{ui_dir}/index.html"
+    assert (REPO_ROOT / index).is_file(), f"{index} is absent, so _mount_ui serves nothing at /"
+    named[index] = "_mount_ui serves this directory at / with html=True"
+    references = _same_origin_references((REPO_ROOT / index).read_text(encoding="utf-8"))
+    assert references, "index.html references no local file at all; the reference scan is broken"
+    for reference in references:
+        named[f"{ui_dir}/{reference}"] = f"index.html loads it (`{reference}`)"
+
+    fixtures_dir = _repo_relative(FIXTURES_DIR)
+    assert DEMO_FIXTURES, "the fixture allow-list is empty, so GET /fixtures/{name} serves nothing"
+    for filename in DEMO_FIXTURES:
+        named[f"{fixtures_dir}/{filename}"] = "on the DEMO_FIXTURES allow-list"
+
+    return named
 
 
 async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image() -> None:
@@ -3229,7 +3413,7 @@ async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image
     Three separate things have to be true for a stranger to start this system, and
     the interesting one is the third:
 
-    1. every gazetteer ``entities.yaml`` names is on disk;
+    1. every asset the running code names is on disk;
     2. a ``COPY`` in the ``Dockerfile`` brings it into the image, and
        ``.dockerignore`` does not filter it back out;
     3. **git tracks it**, so it survives ``git clone``.
@@ -3249,6 +3433,31 @@ async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image
     has been hunting, in its packaging form, and the fix is to ask a source that
     does not share the blind spot -- git's own index, via ``git ls-files``.
 
+    That fix was then applied to two files out of seven, and to the wrong source
+    for the one that mattered most. The asset list came from ``gazetteer:`` lines,
+    so structurally it could never cover anything but the two gazetteers, while
+    ``entities.yaml`` itself, ``ui/app.js``, ``ui/index.html`` and ``ui/style.css``
+    were covered by nobody. Worse, the registry was read off the **working tree**
+    -- so untracking ``entities.yaml`` left this test reading the present-on-disk
+    copy and passing, which is the same blind spot one level up: git was asked
+    about the gazetteers and the filesystem was asked about the file that names
+    them. Measured in a real clone: ``git rm --cached entities.yaml ui/app.js
+    ui/index.html ui/style.css`` and the suite was ``2693 passed, 1 skipped``,
+    exit 0, while ``entities.yaml`` alone is a total start failure on that clone.
+
+    So the list is now derived rather than enumerated, from two directions that do
+    not share a source:
+
+    * what the **code names** -- ``DEFAULT_REGISTRY_PATH``, the ``gazetteer:``
+      entries it points at, ``GAZETTEER_DIR``, ``PACKAGE_ROOT / UI_DIRNAME`` and
+      the files ``index.html`` itself loads, ``FIXTURES_DIR`` and
+      ``DEMO_FIXTURES``. These get the on-disk half of (1): a named file that is
+      missing is a failure even if nothing ships it.
+    * what the **image carries** -- every file under a ``COPY`` source that
+      ``.dockerignore`` does not remove. This is what makes a ``ui/`` asset added
+      tomorrow covered tomorrow, and it is checked against the directory listing
+      independently, so narrowing the sweep cannot quietly narrow the coverage.
+
     The ignore rule is now ``/data/``: runtime blobs still ignored, gazetteers
     tracked. The image escapes the whole question only because ``.dockerignore``
     reads the same line differently -- its patterns are anchored to the context
@@ -3260,39 +3469,147 @@ async def test_every_runtime_asset_the_registry_needs_actually_reaches_the_image
     disagree with the disk: in that world (1) already *is* the whole question.
     """
     dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
-    registry_text = (REPO_ROOT / "entities.yaml").read_text(encoding="utf-8")
 
-    needed = re.findall(r"^\s*gazetteer:\s*(\S+)\s*$", registry_text, flags=re.MULTILINE)
-    assert needed, "entities.yaml must name the gazetteers this test is about"
+    copied = _dockerfile_copy_sources()
+    assert copied, "no COPY source parsed out of the Dockerfile; the parser or the file moved"
+    for source in copied:
+        assert (REPO_ROOT / source).exists(), (
+            f"the Dockerfile copies `{source}`, which is not in this tree at all -- "
+            f"`docker build` fails on that COPY line, so nothing downstream of it is real"
+        )
 
-    copied = {
-        source
-        for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
-        if (stripped := line.strip()).startswith("COPY ")
-        for source in _copy_sources(stripped)
+    assets = _assets_the_code_names()
+    for relative in _files_the_image_ships(REPO_ROOT, copied, dockerignore):
+        assets.setdefault(relative, "a COPY carries it into the image")
+
+    # The mounted UI directory, listed directly rather than through the sweep, so
+    # that a file `.dockerignore` removes -- or one the sweep stops walking -- is a
+    # failure here instead of a silent hole. This is the limb that covers a UI
+    # asset added by somebody who never read this test.
+    ui_dir = REPO_ROOT / _repo_relative(PACKAGE_ROOT / UI_DIRNAME)
+    on_disk_ui = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in ui_dir.rglob("*")
+        if path.is_file() and path.name not in NEVER_A_RUNTIME_ASSET
+    }
+    assert on_disk_ui, f"{ui_dir} holds no files, so _mount_ui serves an empty site"
+    assert on_disk_ui <= set(assets), (
+        f"these files sit in the mounted UI directory and this guard does not cover them: "
+        f"{sorted(on_disk_ui - set(assets))}. A UI asset is covered the day it lands or not "
+        f"at all; if `.dockerignore` is what dropped it, the developer's browser loads it "
+        f"and the reviewer's container answers 404"
+    )
+
+    assert ASSETS_EXEMPT_FROM_SHIPPING <= set(assets), (
+        f"ASSETS_EXEMPT_FROM_SHIPPING names paths this guard no longer derives: "
+        f"{sorted(ASSETS_EXEMPT_FROM_SHIPPING - set(assets))}. Delete them rather than "
+        f"leaving an exemption that has quietly stopped meaning anything"
+    )
+    checked = {
+        relative: why
+        for relative, why in sorted(assets.items())
+        if relative not in ASSETS_EXEMPT_FROM_SHIPPING
     }
 
-    for filename in needed:
-        relative = f"secure_context_pipeline/detection/data/{filename}"
+    tracked = _git_index()
+    for relative, why in checked.items():
         assert (REPO_ROOT / relative).is_file(), (
-            f"{relative} is required by entities.yaml and load_registry refuses to "
-            f"start without it, but it is not on disk"
+            f"{relative} is not on disk, and the running system needs it: {why}"
         )
         assert any(relative == source or relative.startswith(f"{source}/") for source in copied), (
-            f"no COPY in the Dockerfile brings {relative} into the image; copied={sorted(copied)}"
+            f"no COPY in the Dockerfile brings {relative} into the image ({why}); "
+            f"copied={copied}"
         )
         assert not _dockerignored(relative, dockerignore), (
-            f".dockerignore filters {relative} out of the build context, so the "
-            f"container starts and immediately fails registry validation"
+            f".dockerignore filters {relative} out of the build context ({why}), so the "
+            f"container starts without a file the running code opens"
         )
-        tracked = _git_tracked(relative)
-        assert tracked is not False, (
-            f"{relative} exists on disk but git does not track it, so it is absent "
-            f"from a fresh clone and from any archive built out of the index -- "
-            f"`load_registry` then fails closed and nothing starts. Check "
-            f"`git check-ignore -v {relative}`: an unanchored ignore pattern "
-            f"matches a directory of that name at any depth."
+        if tracked is not None:
+            assert relative in tracked, (
+                f"{relative} exists on disk but git does not track it, so it is absent "
+                f"from a fresh clone and from any archive built out of the index -- it "
+                f"is needed because {why}. Check `git check-ignore -v {relative}`: an "
+                f"unanchored ignore pattern matches a directory of that name at any depth."
+            )
+
+    # And the rule rather than the index: a file can be tracked *and* ignored, which
+    # is how the gazetteers were one `git rm --cached` away from gone while every
+    # index check passed.
+    ignored = _git_ignored(list(checked))
+    if ignored is not None:
+        assert not ignored, (
+            f"an ignore rule in this repository matches {sorted(ignored)}, which the "
+            f"running code opens. They are tracked today and one `git rm --cached`, one "
+            f".gitignore tidy-up or one clone-and-re-add from being gone. Run "
+            f"`git check-ignore -v` on them and anchor the rule with a leading slash"
         )
+
+
+async def test_the_runtime_asset_derivation_covers_every_family_it_claims_to() -> None:
+    """The guard above is only as good as its derivation, so the derivation is pinned.
+
+    Written after the derivation had been narrowed once already: the previous
+    version enumerated assets from ``gazetteer:`` lines, which *structurally*
+    could not cover ``entities.yaml`` or anything under ``ui/`` no matter how the
+    tree changed. A limb that silently returns nothing is the same failure with
+    better manners, and neither shows up as a red test in the guard itself --
+    a guard over an empty list passes.
+
+    Filenames are deliberately not frozen here: ``ui/`` is under active edit and a
+    rename must not be a test failure. What is pinned is that each family is
+    *reached*, and the anchors -- the registry filename, the gazetteer directory,
+    the UI directory, the fixtures directory -- which the Dockerfile's ``COPY``
+    lines and both ignore files are written against by name.
+    """
+    named = _assets_the_code_names()
+
+    registry = _repo_relative(DEFAULT_REGISTRY_PATH)
+    gazetteer_dir = _repo_relative(GAZETTEER_DIR)
+    ui_dir = _repo_relative(PACKAGE_ROOT / UI_DIRNAME)
+    fixtures_dir = _repo_relative(FIXTURES_DIR)
+    assert (registry, gazetteer_dir, ui_dir, fixtures_dir) == (
+        "entities.yaml",
+        "secure_context_pipeline/detection/data",
+        "secure_context_pipeline/ui",
+        "fixtures",
+    ), (registry, gazetteer_dir, ui_dir, fixtures_dir)
+
+    assert registry in named, "the registry limb is gone; entities.yaml is unguarded again"
+    for prefix, family in (
+        (f"{gazetteer_dir}/", "gazetteer"),
+        (f"{ui_dir}/", "UI"),
+        (f"{fixtures_dir}/", "fixture"),
+    ):
+        assert any(key.startswith(prefix) for key in named), (
+            f"the {family} limb derived nothing under {prefix}; a guard over an empty "
+            f"list passes, so this is coverage loss that reports itself as green"
+        )
+    # The four documents the allow-list serves, and both gazetteers the registry
+    # names, reached by derivation rather than by being written out here.
+    assert {f"{fixtures_dir}/{name}" for name in DEMO_FIXTURES} <= set(named), named
+    assert sum(key.startswith(f"{gazetteer_dir}/") for key in named) >= 2, named
+
+    # The reference scan decides which UI files are *named* requirements, so its
+    # two failure directions are pinned: swallowing an off-host URL as a local
+    # file, and dropping a local file because it carries a query or a fragment.
+    assert _same_origin_references(
+        '<link rel="stylesheet" href="style.css"><script src="app.js?v=2"></script>'
+        '<link rel="icon" href="favicon.png#i"><a href="https://example.test/x">'
+        '<img src="data:image/png;base64,AA=="><a href="/health"><a href="#main">'
+    ) == ["app.js", "favicon.png", "style.css"]
+
+    # And the sweep's filter: `.dockerignore` decides what ships, so a rule that
+    # removes a file must remove it from the list this guard requires in git too --
+    # otherwise the guard demands that git track a file the image never sees.
+    root = Path(tempfile.mkdtemp())
+    try:
+        (root / "pkg" / "sub").mkdir(parents=True)
+        for relative in ("pkg/keep.js", "pkg/sub/drop.pyc", "pkg/.DS_Store", "solo.txt"):
+            (root / relative).write_text("x", encoding="utf-8")
+        shipped = _files_the_image_ships(root, ["pkg", "solo.txt"], "**/*.py[cod]\n")
+        assert shipped == {"pkg/keep.js", "solo.txt"}, shipped
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 async def test_ttl_expiry_runs_the_whole_destruction_path(

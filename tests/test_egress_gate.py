@@ -26,6 +26,7 @@ import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -56,6 +57,7 @@ from secure_context_pipeline.models import (
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import (
+    _INDEPENDENT_PATTERNS,
     AUDIT_EMIT_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
     HIGH_SEVERITY_TYPES,
@@ -1771,7 +1773,7 @@ async def test_a_below_threshold_ssn_shape_still_blocks_on_the_independent_pass(
     ],
 )
 async def test_an_ssn_the_shipped_detector_scores_at_zero_still_blocks(
-    real_detector: Detector, real_settings: Settings, ssn: str
+    unbackstopped_detector: Detector, real_settings: Settings, ssn: str
 ) -> None:
     """Presidio's invalidation rules, read back as a list of values that used to leak.
 
@@ -1782,27 +1784,367 @@ async def test_an_ssn_the_shipped_detector_scores_at_zero_still_blocks(
     difference between an example and a real number that happens to look like one,
     and neither can the provider.
 
-    The premise is measured rather than asserted: the shipped detector is run first
-    and must find nothing high-severity, so a block here can only be pass 3. Delete
+    The premise is measured rather than asserted: the detector is run first and must
+    find nothing high-severity, so a block here can only be pass 3. Delete
     ``_INDEPENDENT_PATTERNS`` and every one of these payloads reaches the provider
     with the SSN in the clear, which is what happened before it existed.
+
+    **THE ISOLATION VEHICLE CHANGED, AND THE PREMISE GUARD IS WHAT SAID SO.** This
+    test used to take ``real_detector`` -- the shipped one -- because the shipped
+    detector genuinely found nothing here, and the guard below existed to fail the
+    moment that stopped being true. It stopped being true on purpose: ``entities.yaml``
+    now carries an ``SSN.patterns`` backstop that claims every value in this list at
+    0.70, which is the *repair* for the leak this file documents, and the guard went
+    red exactly as designed rather than the test passing vacuously through pass 2.
+
+    The premise is re-established from a real recogniser rather than from a fake:
+    ``unbackstopped_detector`` is a ``Detector`` over the shipped registry with the
+    SSN backstop deleted -- i.e. the detector that shipped before the repair. So the
+    claim under test is now strictly stronger than the one it replaces: pass 3 blocks
+    these values *even when the registry that would have detected them is edited to
+    stop*. That independence is the whole reason ``_INDEPENDENT_PATTERNS`` is written
+    in the gate's own module and its own regex dialect instead of being imported from
+    the registry, and nothing else in the suite was pinning it.
+
+    ``test_the_shipped_detector_now_claims_every_invalidated_ssn`` below asserts the
+    other half -- that the shipped registry *does* claim these -- so neither the
+    backstop nor the gate can regress behind the other.
     """
     payload = f"Member SSN {ssn} verified against records."
     found = [
         det
-        for det in await real_detector.detect(payload, None)
+        for det in await unbackstopped_detector.detect(payload, None)
         if det.entity_type in HIGH_SEVERITY_TYPES and det.score >= real_settings.threshold_obfuscate
     ]
     assert not found, (
-        "premise gone: the shipped detector now finds this, so the payload no "
+        "premise gone: the un-backstopped detector now finds this, so the payload no "
         f"longer isolates pass 3 -- {found}"
     )
 
-    gate = _real_gate(real_detector, real_settings, set())
+    gate = _real_gate(unbackstopped_detector, real_settings, set())
     with pytest.raises(EgressBlockedError) as exc:
         await gate.check(payload, SESSION)
     assert exc.value.detail["reason"] == "independent_pattern"
     assert exc.value.detail["entity_types"] == "SSN"
+
+
+#: The bare nine-digit spelling of everything in the parametrize list above, plus the
+#: two spellings whose *only* difference from a valid SSN is Presidio's example list.
+#: Each is a real SSN as far as this pipeline can possibly know, and each was scored
+#: 0.0 by ``UsSsnRecognizer`` before ``entities.yaml`` grew its backstop.
+_INVALIDATED_SSN_SPELLINGS = [
+    pytest.param("123456789", id="bare-canonical-example"),
+    pytest.param("123-45-6789", id="canonical-example"),
+    pytest.param("987654320", id="bare-second-published-example"),
+    pytest.param("987-65-4320", id="second-published-example"),
+    pytest.param("078051120", id="bare-woolworth-wallet-ssn"),
+    pytest.param("078-05-1120", id="woolworth-wallet-ssn"),
+    pytest.param("000456789", id="bare-never-issued-area-000"),
+    pytest.param("000-45-6789", id="never-issued-area-000"),
+    pytest.param("666456789", id="bare-never-issued-area-666"),
+    pytest.param("666-45-6789", id="never-issued-area-666"),
+    pytest.param("412007891", id="bare-all-zero-group"),
+    pytest.param("412-00-7891", id="all-zero-group"),
+    pytest.param("412330000", id="bare-all-zero-serial"),
+    pytest.param("412-33-0000", id="all-zero-serial"),
+    pytest.param("111111111", id="bare-all-one-digit"),
+    pytest.param("111-11-1111", id="all-one-digit"),
+    pytest.param("412-33.7891", id="mismatched-delimiters"),
+    pytest.param("123 45 6789", id="canonical-example-with-spaces"),
+    pytest.param("123.45.6789", id="canonical-example-with-dots"),
+    pytest.param("078 05 1120", id="published-example-with-spaces"),
+    pytest.param("412 00 7891", id="all-zero-group-with-spaces"),
+]
+
+
+@pytest.mark.parametrize("ssn", _INVALIDATED_SSN_SPELLINGS)
+async def test_the_shipped_detector_now_claims_every_invalidated_ssn(
+    real_detector: Detector, real_settings: Settings, ssn: str
+) -> None:
+    """The repair, asserted where the defect was: detection, not denial.
+
+    Every value here is one ``UsSsnRecognizer.invalidate_result`` returns a hard 0.0
+    for, and before ``entities.yaml`` grew ``SSN.patterns`` the pipeline did one of
+    two things with it, neither of them right:
+
+    * the **delimited** spellings were *blocked* by pass 3 -- a run refused rather
+      than a value protected, and a red demo for any reviewer who types the most
+      common placeholder SSN into their own test document;
+    * the **bare** spelling matched pass 3's delimiter requirement not at all, so
+      ``Member SSN 123456789 verified against payer records.`` was detected by
+      nothing, vaulted by nothing, and reached the provider with the nine digits in
+      the payload verbatim, under both strategies, with ``EGRESS_PASS`` recorded.
+
+    Detected is what closes both, and it closes them in the direction that keeps the
+    document useful: the span is vaulted and obfuscated, so it is restorable, rather
+    than denied or irreversibly redacted. The score assertion is what makes that
+    concrete -- at or above ``threshold_obfuscate`` is the band that vaults.
+    """
+    hits = [
+        det
+        for det in await real_detector.detect(f"Member SSN {ssn} verified against records.", None)
+        if det.entity_type == "SSN"
+    ]
+    assert [det.text for det in hits] == [ssn], (
+        f"the SSN backstop no longer claims {ssn!r}; this is the leak in the module "
+        "docstring above, and it reaches the provider in the clear"
+    )
+    assert hits[0].score >= real_settings.threshold_obfuscate, (
+        f"{ssn!r} is detected but below the obfuscate band, so it is redacted rather "
+        "than vaulted -- irreversible, and with no pass-1 needle for a second mention"
+    )
+
+
+async def test_pass_three_blocks_a_labelled_bare_nine_digit_ssn(
+    unbackstopped_detector: Detector, real_settings: Settings
+) -> None:
+    """The gate half of the same repair, with detection removed.
+
+    ``Member SSN 123456789 verified against payer records.`` is the exact string the
+    module docstring above records as having reached the provider verbatim: Presidio
+    invalidates the canonical example whether or not it carries delimiters, and pass
+    3's one pattern required a delimiter, so the bare spelling walked every pass.
+
+    Run against a detector with the registry backstop deleted, so a pass here can
+    only be pass 3. This is the assertion that makes "detection is best-effort, the
+    gate is the guarantee" a property of the code rather than a sentence in a
+    docstring: delete ``entities.yaml``'s SSN pattern and the value is still not
+    allowed out.
+    """
+    payload = "Member SSN 123456789 verified against payer records."
+    found = [
+        det
+        for det in await unbackstopped_detector.detect(payload, None)
+        if det.entity_type in HIGH_SEVERITY_TYPES and det.score >= real_settings.threshold_obfuscate
+    ]
+    assert not found, f"premise gone: this payload no longer isolates pass 3 -- {found}"
+
+    with pytest.raises(EgressBlockedError) as exc:
+        await _real_gate(unbackstopped_detector, real_settings, set()).check(payload, SESSION)
+    assert exc.value.detail["reason"] == "independent_pattern"
+    assert exc.value.detail["entity_types"] == "SSN"
+
+
+async def test_pass_three_still_refuses_a_bare_nine_digit_run_with_no_ssn_label(
+    unbackstopped_detector: Detector, real_settings: Settings
+) -> None:
+    """The other side of the label rule, because a block is a denial.
+
+    The second entry in ``_INDEPENDENT_PATTERNS`` drops the delimiter requirement,
+    which is only shippable because it buys the specificity back from the label. If
+    it ever degenerates into ``\\b[0-9]{9}\\b`` these payloads start blocking, and
+    every zip+4, order number and ledger reference in an ordinary document becomes a
+    refused request. That is the failure mode a fail-closed pass has, and it is
+    louder than the one it prevents.
+
+    One shape is deliberately NOT probed here: nine digits with a Presidio SSN
+    *context* word loose in the sentence but no label in identifier position
+    ("Social Security benefits of 412337891 dollars were disbursed"). The enhancer
+    lifts that to ``SSN`` 0.40, which is at or above ``threshold_redact``, and pass 2
+    has always blocked a high-severity hit at that score -- measured on the
+    un-backstopped detector too, so it is a pre-existing pass-2 property with nothing
+    to do with this pattern. Probing it here would assert pass 2's threshold policy
+    under a pass-3 name.
+    """
+    for benign in (
+        "The ledger reference 412337891 was archived.",
+        "Zip+4 on file is 940255551 for the mailing address.",
+        "Ship to 021440 and reference order 100200300 for the pallet.",
+        "Purchase order 987654321 shipped on Tuesday.",
+        "Employee badge 412337891 was reissued this quarter.",
+    ):
+        report = await _real_gate(unbackstopped_detector, real_settings, set()).check(
+            benign, SESSION
+        )
+        assert report.payload_chars == len(benign), benign
+
+
+def test_pass_three_reports_the_value_span_not_the_label_span() -> None:
+    """``_independent_hits`` compares group ``v`` against the protected spans.
+
+    The labelled pattern matches the label as well as the value, and ``_overlaps``
+    excuses on *any* overlap -- so handing it the whole match would let a protected
+    span touching the LABEL excuse a raw SSN sitting beside it. Group ``v`` is the
+    value alone, and that is the only span our own output can honestly account for.
+
+    **This is a unit test of the function and not an end-to-end payload, deliberately,
+    because the end-to-end shape is not constructible today and pretending otherwise
+    would be the more comfortable lie.** For a protected span to cover the label, the
+    label would have to start inside one of our own emissions, and it cannot: the
+    pattern anchors on ``\\b`` and both emission shapes put the label between word
+    characters -- ``[PII_SSN_ab12cd34`` and ``[REDACTED_SSN]`` have ``_`` on the left
+    of every ``SSN`` in them, and ``_`` is a word character, so there is no boundary
+    to match at. A pseudonym containing a bare ``SSN`` token is the remaining route
+    and the generators do not produce one.
+
+    So the rule is defence against a future emission shape rather than a fix for a
+    live leak, and it is asserted where it is decidable. Handing the whole match to
+    ``_overlaps`` here makes this test fail; that is the point of writing it at this
+    level rather than not writing it.
+    """
+    from secure_context_pipeline.pipeline.egress_gate import _independent_hits
+
+    payload = "Member SSN 123456789 verified against payer records."
+    label_only = [(payload.index("SSN"), payload.index("SSN") + len("SSN"))]
+    value_only = [(payload.index("123456789"), payload.index("123456789") + 9)]
+
+    assert _independent_hits(payload, label_only) == ["SSN"], (
+        "a protected span covering only the LABEL excused a raw SSN beside it"
+    )
+    assert _independent_hits(payload, value_only) == []
+    assert _independent_hits(payload, []) == ["SSN"]
+
+
+#: Separator runs spanning BOTH dialects: the ones the registry's original
+#: ``[\s:#.\-]*+`` class already covered, and the ones only the gate's
+#: ``[^0-9A-Za-z]`` class did. The second group is the whole point of the test --
+#: every one of them was a document the gate refused and the detector could have
+#: protected. ``''`` and the long runs probe the two quantifier bounds.
+_LABEL_VALUE_SEPARATORS = [
+    # in both classes from the start
+    "", " ", "  ", ":", ": ", " : ", "#", ".", ". ", "-", " - ", "\t", "\n", "\n\n",
+    ":\n", " -- ", "...", "  :  ",
+    # gate-only until the registry class was widened to match
+    ",", ", ", " , ", "(", " (", "[", " [", "/", " / ", "=", " = ", "?", "? ",
+    "—", " — ", "–", "|", " | ", "*", " * ", '"', ' "', ">", " > ",  # noqa: RUF001
+    "_", "+", "~", ";", "; ", "!", ")", "]", "}", " ", ") ", "], ", " => ",  # noqa: RUF001
+    # long runs, to probe the gate's {0,24} bound against the registry's unbounded *+
+    " " * 20, "-" * 20, " ." * 8,
+]
+
+_SSN_LABELS = [
+    "SSN", "ssn", "SSNs", "S.S.N.", "S.S.N", "Social Security", "social security",
+    "SOCIAL  SECURITY", "Soc. Sec.", "Soc Sec", "SS#", "SS #", "ITIN", "itins",
+]
+
+#: The connective tissue the two patterns each spell out in their own middle groups.
+_SSN_MIDDLES = ["", " Number", " number", " No", " no.", " Nbr", " #", " ID", " id",
+                " is", " was", " Number is", " no. was"]
+
+#: Both delimiter conventions plus the bare run, so the value half is exercised too.
+_SSN_VALUES = ["123456789", "123-45-6789", "123 45 6789", "123.45.6789", "078051120"]
+
+
+def _registry_ssn_pattern() -> Any:
+    """The shipped registry's SSN backstop, compiled with ``regex`` as Presidio does."""
+    import regex
+
+    spec = yaml.safe_load(REGISTRY_PATH.read_text())["entities"]["SSN"]["patterns"]
+    assert len(spec) == 1, f"expected exactly one SSN backstop pattern, got {len(spec)}"
+    return regex.compile(spec[0])
+
+
+def test_every_labelled_ssn_the_gate_claims_the_registry_claims_too() -> None:
+    """The gate's labelled SSN rule must be a SUBSET of the registry's, span for span.
+
+    This is the test the note above :data:`_INDEPENDENT_PATTERNS` promises, and it did
+    not exist when that note first claimed it did. Two rules were authored separately
+    to say the same thing -- the registry's in ``entities.yaml`` against ``regex``, the
+    gate's in ``egress_gate.py`` against ``re`` -- and they said different things:
+
+        registry separator class   ``[\\s:#.\\-]*+``
+        gate separator class       ``[^0-9A-Za-z]{0,24}``
+
+    **The gate's was wider, and wider in the gate is the dangerous direction.** The two
+    layers do opposite things when they match. A value the registry claims is vaulted,
+    obfuscated and restorable. A value only the *gate* claims was never detected, so it
+    was never vaulted, so pass 3 blocks it: ``422 EGRESS_BLOCKED``, ``demo.py --file``
+    exit 1. Every string in the gap was therefore a working document the pipeline
+    refused -- ``Member SSN, 123456789``, ``Social Security Number (SSN): 123456789``,
+    ``Applicant SSN [123456789]`` -- ordinary intake-form spellings, all of them
+    measured red before the registry class was widened to ``[^0-9A-Za-z]*+``.
+
+    So the invariant is one-directional and this test asserts it in that direction
+    only: *anything pass 3 would block on a labelled SSN, the detector already claims.*
+    The converse is deliberately allowed -- detection may be broader than the gate,
+    because detection is best-effort and the gate is the guarantee. Narrowing the gate
+    to close the gap would have re-opened the leak pass 3 exists to catch, which is why
+    the repair widened the registry instead.
+
+    **It compares the two LANGUAGES, not the two texts.** A string comparison would
+    pass the moment someone pasted one pattern into the other file and would say
+    nothing about ``regex``-vs-``re`` dialect differences (possessive quantifiers, the
+    ``\\K`` reset). This generates a corpus spanning both separator classes, both
+    delimiter conventions and both quantifier bounds, and asks each compiled pattern
+    what it claims. Spans are compared too, not just match/no-match: if the registry
+    claimed a *different* substring it would vault something other than what the gate
+    protects, and the invariant would be satisfied on paper while still blocking.
+    """
+    registry_pattern = _registry_ssn_pattern()
+    # The label-anchored entry is the second one; the first is the unlabelled
+    # delimited rule, which is deliberately NOT registry-backed (README Deviation 58).
+    assert [name for name, _ in _INDEPENDENT_PATTERNS] == ["SSN", "SSN"], (
+        "pass 3's pattern list changed shape; this test indexes the label-anchored "
+        "entry positionally and must be re-derived rather than re-indexed blindly"
+    )
+    gate_labelled = _INDEPENDENT_PATTERNS[1][1]
+
+    missed: list[tuple[str, str, tuple[int, int]]] = []
+    span_mismatch: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+    claimed = 0
+
+    for label in _SSN_LABELS:
+        for middle in _SSN_MIDDLES:
+            for separator in _LABEL_VALUE_SEPARATORS:
+                for value in _SSN_VALUES:
+                    document = f"Member {label}{middle}{separator}{value} on file."
+                    gate_hit = gate_labelled.search(document)
+                    if gate_hit is None:
+                        continue
+                    claimed += 1
+                    gate_span = gate_hit.span("v")
+                    registry_hit = registry_pattern.search(document)
+                    if registry_hit is None:
+                        missed.append((document, gate_hit.group("v"), gate_span))
+                    elif registry_hit.span() != gate_span:
+                        span_mismatch.append((document, gate_span, registry_hit.span()))
+
+    assert claimed > 2000, (
+        f"only {claimed} of the generated corpus was claimed by the gate at all -- the "
+        "corpus stopped exercising the rule and this test is no longer evidence"
+    )
+    assert not missed, (
+        f"{len(missed)} labelled SSN spellings are claimed by the egress gate and NOT "
+        f"by the registry backstop. Each one is a document pass 3 blocks and the "
+        f"detector could have vaulted -- 422 EGRESS_BLOCKED, demo exit 1. Widen "
+        f"entities.yaml -> SSN.patterns; do NOT narrow the gate. First 5: {missed[:5]}"
+    )
+    assert not span_mismatch, (
+        f"{len(span_mismatch)} spellings where both patterns claim but the spans "
+        f"differ, so the registry would vault a different substring than the gate "
+        f"protects. First 5: {span_mismatch[:5]}"
+    )
+
+
+def test_the_registry_ssn_separator_class_is_not_narrower_than_the_gates() -> None:
+    """The character-class containment behind the corpus test above, stated directly.
+
+    The corpus test can only fail on a spelling somebody thought to generate. This one
+    fails on the *class*: every character the gate accepts between an SSN label and the
+    digits, the registry must accept too. It is the guard that survives a corpus that
+    stopped being representative.
+    """
+    import regex
+
+    registry_pattern = _registry_ssn_pattern()
+    gate_labelled = _INDEPENDENT_PATTERNS[1][1]
+
+    gate_class = regex.compile(r"[^0-9A-Za-z]")
+    assert "[^0-9A-Za-z]" in gate_labelled.pattern, (
+        "the gate's separator class changed; re-derive this test against the new one "
+        "rather than editing the expectation"
+    )
+
+    rejected = [
+        chr(code)
+        for code in [*range(32, 127), 0x00A0, 0x2013, 0x2014, 0x2026]
+        if gate_class.fullmatch(chr(code))
+        and registry_pattern.search(f"Member SSN{chr(code)}123456789 on file.") is None
+    ]
+    assert not rejected, (
+        "the registry's SSN separator class rejects characters the gate accepts, so "
+        f"each of these spellings blocks instead of vaulting: {rejected}"
+    )
 
 
 async def test_pass_three_does_not_block_on_our_own_pseudonyms(
@@ -3118,6 +3460,37 @@ def real_settings(tmp_path_factory: pytest.TempPathFactory) -> Settings:
 def real_detector(real_settings: Settings) -> Detector:
     """The shipped detector. Module-scoped: the spaCy pipeline is expensive to build."""
     return Detector(load_registry(REGISTRY_PATH), real_settings)
+
+
+@pytest.fixture(scope="module")
+def unbackstopped_detector(real_settings: Settings) -> Detector:
+    """The shipped detector with ``entities.yaml``'s SSN backstop pattern deleted.
+
+    This is the detector that shipped before that pattern existed: everything else
+    about it is the real thing -- the real registry, the real Presidio recognizers,
+    the real spaCy pipeline -- and only the one ``patterns:`` entry is removed. It is
+    how the pass-3 tests isolate the gate now that detection claims the same values.
+
+    A ``FakeDetector`` would have been one line and would have proved nothing: the
+    premise those tests need is "a real recogniser says nothing about this string",
+    and a fake lets the test invent that premise instead of measuring it. Removing
+    exactly one registry field keeps the premise measured while making the question
+    "does pass 3 hold on its own?" answerable at all.
+
+    It also pins the layering claim directly. Detection is configuration and the gate
+    is the guarantee, so a registry edit must not be able to switch the gate off --
+    this fixture *is* that registry edit, applied deliberately.
+    """
+    shipped = load_registry(REGISTRY_PATH)
+    entities = dict(shipped.entities)
+    entities["SSN"] = entities["SSN"].model_copy(update={"patterns": ()})
+    assert shipped.entities["SSN"].patterns, (
+        "entities.yaml no longer carries an SSN backstop pattern; this fixture is "
+        "supposed to REMOVE one, and removing nothing would make every pass-3 test "
+        "below pass for the wrong reason"
+    )
+    stripped = shipped.model_copy(update={"entities": entities})
+    return Detector(stripped, real_settings)
 
 
 def _real_gate(detector: Detector, settings: Settings, originals: set[str]) -> EgressGate:

@@ -23,7 +23,21 @@ code { color: var(--dim); }
 
 .controls { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center;
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
-.grp { display: flex; align-items: center; gap: 6px; }
+/* `.controls` wraps and each `.grp` did not, so ONE group decided the page's minimum
+   width. The demo-document group holds a label, a 316px <select>, a second label, the
+   file picker and the armed-state hint on a single unbreakable line: min-content 756px.
+   Measured in Chrome in a real 606px viewport before this rule -- scrollWidth 779
+   against clientWidth 606, `#file` laid out at x=451..681, i.e. 75px of the only
+   control that loads a document sitting past the right edge -- and `body` carries
+   `overflow-x: hidden`, so there is no scrollbar to reach it. Not "awkward at narrow
+   widths": the picker is unreachable, and a run without a document is NO_FILE. It
+   went unnoticed because the group fits from ~820px up, which is every desktop.
+   `flex-wrap` lets the group break onto a second line like the bar around it already
+   does, and the `max-width` lets the widest child stop being a floor of its own.
+   Re-measured after, same viewport: scrollWidth 606 == clientWidth, `#file` fully
+   inside the viewport, and no element anywhere on the page extending past it. */
+.grp { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.grp > select { max-width: 100%; }
 .grp.wide { flex: 1 1 320px; }
 .grp.wide input { flex: 1 1 auto; min-width: 200px; }
 label { color: var(--dim); }

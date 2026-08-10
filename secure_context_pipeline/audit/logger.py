@@ -65,7 +65,7 @@ import json
 import logging
 import sqlite3
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -74,6 +74,8 @@ import aiosqlite
 
 from secure_context_pipeline.errors import AuditUnavailableError, PipelineError
 from secure_context_pipeline.models import (
+    AUDIT_ACTION_KEY,
+    AUDIT_ACTIONS,
     MAX_AUDIT_LABEL_LEN,
     MAX_DETAIL_VALUE_LEN,
     AuditEvent,
@@ -83,11 +85,13 @@ from secure_context_pipeline.models import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ACTION_KEY",
     "DEFAULT_DB_FILENAME",
     "DEOBFUSCATE",
     "DETECT",
     "EGRESS_BLOCK",
     "EGRESS_PASS",
+    "EVENT_ACTIONS",
     "EVENT_TYPES",
     "GENESIS_HASH",
     "LLM_CALL",
@@ -153,6 +157,35 @@ EVENT_TYPES: frozenset[str] = frozenset(
         VAULT_DESTROY,
         SESSION_EXPIRE,
     }
+)
+
+# --------------------------------------------------------------------------
+# ``detail['action']`` -- the explicitly-named required field
+# --------------------------------------------------------------------------
+#: Re-exported from :mod:`~secure_context_pipeline.models`, where it is applied.
+#:
+#: The action label is stamped onto :class:`AuditEvent` at construction rather than
+#: here, so that a row read back still equals the event that was emitted -- this
+#: module does not alter what it is handed. See
+#: :data:`~secure_context_pipeline.models.AUDIT_ACTIONS` for the requirement, the
+#: measurement, and the placement argument; the vocabulary is re-exported under this
+#: module's names because this is where a reader looking for audit event semantics
+#: goes first.
+EVENT_ACTIONS = AUDIT_ACTIONS
+ACTION_KEY = AUDIT_ACTION_KEY
+
+# The vocabulary is written down in two modules -- the event-type constants here,
+# the action labels next to the model that applies them, because that module cannot
+# import this one. The duplication is made checkable rather than hoped for: a
+# thirteenth event type, or a renamed one, is an import-time failure here instead of
+# a row that quietly ships without the field requirement 7 names. Same technique as
+# `_UNREADABLE`: one rule, asserted rather than trusted to stay in step.
+assert EVENT_TYPES == frozenset(EVENT_ACTIONS), (
+    "every audit event type needs exactly one action label in models.AUDIT_ACTIONS"
+)
+assert all(0 < len(action) <= MAX_DETAIL_VALUE_LEN for action in EVENT_ACTIONS.values()), (
+    "an action label must fit the audit detail ceiling, or the writer would start "
+    "refusing rows because of its own constant"
 )
 
 DEFAULT_DB_FILENAME = "audit.db"
@@ -507,6 +540,14 @@ class AuditLogger:
     async def emit(self, event: AuditEvent) -> int:
         """Assign ``seq``, extend the hash chain, insert, and return the ``seq``.
 
+        A batch of one. Every line of the write path lives in :meth:`emit_many`, and
+        this delegates rather than duplicating it, because "the single-event path and
+        the batch path agree" is not something a reviewer should have to check by
+        reading two implementations of a hash chain. One row through this method and
+        one row through ``emit_many`` produce the same ``seq``, the same
+        ``prev_hash`` and the same ``entry_hash``, by construction rather than by
+        care -- see ``test_emit_and_emit_many_write_byte_identical_rows``.
+
         The supplied ``event`` is not mutated; ``seq``/``prev_hash``/``entry_hash``
         on it are ignored. Read ``query()`` back for the persisted form.
 
@@ -549,11 +590,76 @@ class AuditLogger:
         unreadable watermark to ``False``, so the tamper is still reported by the
         component whose job that is.
         """
-        conn = self._connection()
-        _reject_content_sized_fields(event)
-        detail = dict(event.detail)
-        detail_json = canonical_json(detail)
+        return (await self.emit_many((event,)))[0]
 
+    async def emit_many(self, events: Sequence[AuditEvent]) -> list[int]:
+        """Append every event in ``events`` in **one** transaction. Returns their ``seq``s.
+
+        Same rows, written more cheaply. This is not a different chain, a summarised
+        chain, or a reordered one: ``events`` is appended in the order given, each
+        row's ``prev_hash`` is the row before it, and the ``entry_hash`` formula is
+        untouched. What changes is that ``BEGIN IMMEDIATE``, the watermark read, the
+        chain-tail read, the high-water bump and the ``COMMIT`` are paid **once for
+        the batch** instead of once per row.
+
+        **Why it exists.** ``deobfuscation/restorer.py`` writes one ``DEOBFUSCATE``
+        row per distinct token ID restored, capped at 512, and each one was its own
+        transaction. Measured on the 500-token restore benchmark on this machine,
+        that put the stage at **252-289 ms against a 500 ms budget** -- 1.7-2.0x
+        headroom on the tightest budget in the product, with the audit writer, not
+        the vault or the regex work, as the dominant term. The engine's
+        ``OBFUSCATE`` rows have the same shape and the same fix available.
+
+        **Atomic, and that is a change worth naming.** N separate ``emit`` calls that
+        fail on row K leave K-1 rows committed; one ``emit_many`` that fails leaves
+        none. For a per-entity itemisation that is the better failure: a half-written
+        itemisation is indistinguishable from a complete one for a document with
+        fewer entities, whereas an absent one is visibly absent next to the stage row
+        that says how many were restored.
+
+        Everything else is :meth:`emit`'s contract, unchanged and argued there: the
+        ceilings are re-checked **before** the transaction opens (a caller handing us
+        content is not a database we cannot read); ``seq`` is allocated above the
+        watermark rather than above the surviving tail; an unreadable watermark
+        degrades and an unreadable chain tail refuses; a ``seq`` lost to another
+        *process* rolls the whole batch back and re-chains onto the tail they left.
+
+        An empty ``events`` writes nothing and opens no transaction.
+        """
+        conn = self._connection()
+        if not events:
+            return []
+
+        # Validated, action-stamped and serialised BEFORE the write lock: a refusal
+        # here must not have taken a transaction, and `canonical_json` is pure CPU
+        # that has no business inside one.
+        #
+        # The stamp is on a COPY. The caller's event is not mutated (`emit` promises
+        # that and `test_emit_does_not_mutate_the_caller_event` pins it), and it lands
+        # before `canonical_json`, so `action` is inside the digest rather than beside
+        # it -- a field added after the hash was taken would be one an attacker could
+        # rewrite freely with `verify_chain()` still returning True.
+        prepared: list[tuple[AuditEvent, dict[str, int | float | str], str]] = []
+        for event in events:
+            _reject_content_sized_fields(event)
+            detail = dict(event.detail)
+            action = EVENT_ACTIONS.get(event.event_type)
+            # `setdefault`, not assignment: a call site that already said what it did
+            # keeps saying it. Today the only emitter that names an action is
+            # `restorer.py`, and it writes "restore" -- which is what this map holds
+            # for DEOBFUSCATE anyway, so the two are indistinguishable in the shipped
+            # code and a test written against that pairing pins nothing (it did not:
+            # swapping this for a plain assignment left the suite green until
+            # `test_a_caller_that_already_named_its_action_keeps_it` was rewritten to
+            # use a value that differs). The rule is kept because the field's whole
+            # value is a caller being able to say something narrower than its event
+            # type -- a partial restore, a replay, a compensating write -- and a
+            # writer that overwrites would erase exactly that, silently.
+            if action is not None:
+                detail.setdefault(ACTION_KEY, action)
+            prepared.append((event, detail, canonical_json(detail)))
+
+        seqs: list[int] = []
         try:
             async with self._lock:
                 for attempt in range(MAX_EMIT_ATTEMPTS):
@@ -563,6 +669,7 @@ class AuditLogger:
                     # mechanism -- with a deferred transaction the read is unprotected
                     # and the collision is routine.
                     await conn.execute("BEGIN IMMEDIATE")
+                    seqs = []
                     try:
                         try:
                             watermark = await self._watermark()
@@ -582,36 +689,50 @@ class AuditLogger:
                         else:
                             last_seq = int(row["seq"])
                             prev_hash = str(row["entry_hash"])
-                        seq = max(last_seq, 0 if watermark is None else watermark) + 1
+                        seq = max(last_seq, 0 if watermark is None else watermark)
 
-                        payload = chain_payload(
-                            seq=seq,
-                            ts=event.ts,
-                            session_id=event.session_id,
-                            run_id=event.run_id,
-                            event_type=event.event_type,
-                            entity_type=event.entity_type,
-                            token_id=event.token_id,
-                            detail=detail,
-                        )
-                        entry_hash = compute_entry_hash(prev_hash, payload)
+                        for event, detail, detail_json in prepared:
+                            seq += 1
+                            payload = chain_payload(
+                                seq=seq,
+                                ts=event.ts,
+                                session_id=event.session_id,
+                                run_id=event.run_id,
+                                event_type=event.event_type,
+                                entity_type=event.entity_type,
+                                token_id=event.token_id,
+                                detail=detail,
+                            )
+                            entry_hash = compute_entry_hash(prev_hash, payload)
 
-                        await conn.execute(
-                            _INSERT_SQL,
-                            {
-                                "seq": seq,
-                                "ts": event.ts,
-                                "session_id": event.session_id,
-                                "run_id": event.run_id,
-                                "event_type": event.event_type,
-                                "entity_type": event.entity_type,
-                                "token_id": event.token_id,
-                                "detail": detail_json,
-                                "prev_hash": prev_hash,
-                                "entry_hash": entry_hash,
-                            },
-                        )
+                            await conn.execute(
+                                _INSERT_SQL,
+                                {
+                                    "seq": seq,
+                                    "ts": event.ts,
+                                    "session_id": event.session_id,
+                                    "run_id": event.run_id,
+                                    "event_type": event.event_type,
+                                    "entity_type": event.entity_type,
+                                    "token_id": event.token_id,
+                                    "detail": detail_json,
+                                    "prev_hash": prev_hash,
+                                    "entry_hash": entry_hash,
+                                },
+                            )
+                            # The chain is carried forward in memory rather than
+                            # re-read: inside one transaction this connection is the
+                            # only writer, so the row we just inserted IS the tail.
+                            # Re-reading it would be the same value at the cost of a
+                            # round trip per row, which is the cost this method exists
+                            # to remove.
+                            prev_hash = entry_hash
+                            seqs.append(seq)
+
                         try:
+                            # Once, with the batch's highest seq. The mark only ever
+                            # grows (the table's own trigger enforces it), so bumping
+                            # to the last is bumping past every one before it.
                             await conn.execute(_META_BUMP_SQL, {"seq": seq})
                         except sqlite3.Error as exc:
                             # Best-effort, and deliberately so. If the second mark cannot
@@ -668,23 +789,34 @@ class AuditLogger:
             # it -- which
             # `test_no_release_survives_an_audit_write_that_failed_before_it`
             # exists to forbid.
+            #
+            # ``operation="emit"`` for a batch too, and that is the answer rather
+            # than an oversight: this string is written into an HTTP body, where its
+            # job is to tell an operator that the audit *write* refused the run.
+            # Whether the writer was holding one row or five hundred is not a fact
+            # the client can act on, and splitting it would give the API two codes
+            # for one failure.
             raise self._unreadable(exc, operation="emit") from exc
 
         # Token IDs and counts only -- never a value, never the detail payload's
-        # provenance beyond its key count.
-        logger.info(
-            "audit event recorded",
-            extra={
-                "audit_seq": seq,
-                "audit_event_type": event.event_type,
-                "session_id": event.session_id,
-                "run_id": event.run_id,
-                "entity_type": event.entity_type,
-                "token_id": event.token_id,
-                "detail_keys": len(detail),
-            },
-        )
-        return seq
+        # provenance beyond its key count. One line per row, batched or not: this is
+        # the operator-facing record of what was written, and thinning it for a batch
+        # would make the log stream depend on how the caller happened to group its
+        # writes.
+        for (event, detail, _json), seq in zip(prepared, seqs, strict=True):
+            logger.info(
+                "audit event recorded",
+                extra={
+                    "audit_seq": seq,
+                    "audit_event_type": event.event_type,
+                    "session_id": event.session_id,
+                    "run_id": event.run_id,
+                    "entity_type": event.entity_type,
+                    "token_id": event.token_id,
+                    "detail_keys": len(detail),
+                },
+            )
+        return seqs
 
     # -- read path ---------------------------------------------------------
 

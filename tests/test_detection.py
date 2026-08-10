@@ -63,6 +63,7 @@ from secure_context_pipeline.errors import ConfigError, DetectionError
 from secure_context_pipeline.models import Detection
 from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.obfuscation.strategies.base import available_strategies
+from secure_context_pipeline.pipeline.egress_gate import _INDEPENDENT_PATTERNS
 from secure_context_pipeline.vault.session_registry import SessionRegistry
 from secure_context_pipeline.vault.session_vault import SessionVault
 
@@ -292,6 +293,89 @@ async def test_entity_positive_and_near_miss(
 
     misses = await detector.detect(negative, doc_category)
     assert entity_type not in types_of(misses), f"{entity_type} fired on its near-miss fixture"
+
+
+# ---------------------------------------------------------------------------
+# 1a. The validated-built-in blind spot, as a rule instead of as two anecdotes
+# ---------------------------------------------------------------------------
+# A Presidio recogniser that VALIDATES its candidates does not score a rejected one
+# low -- it returns nothing at all. For a `presidio:`-backed registry entity that is
+# the worst possible failure: undetected is unvaulted, unvaulted is invisible to the
+# egress gate's pass 1, and pass 2 re-runs the same recogniser, so the value leaves
+# the process in the clear with every pass silent.
+#
+# This repository has met that defect twice, in the same shape, a year apart:
+#
+#   EMAIL  -- `EmailRecognizer.validate_result` resolves the domain against the
+#             Public Suffix List, so every internal corporate address
+#             (@acme.internal, @hospital.local) scored zero. 5/5 missed.
+#   SSN    -- `UsSsnRecognizer.invalidate_result` returns a hard 0.0 for the
+#             published example SSNs, every 000/666 area number, every all-zero
+#             group and every mismatched delimiter. `Member SSN 123456789 verified
+#             against payer records.` reached the provider with the digits verbatim.
+#
+# Both were fixed the same way, by a `patterns:` backstop in `entities.yaml`, and
+# both were found by a human noticing. This test is the third one being found by the
+# suite instead: it derives the question from the INSTALLED recogniser classes, so a
+# future registry entry that remaps a validating built-in without a backstop fails
+# here on the day it is added, and a Presidio upgrade that adds a validator to a
+# recogniser this registry already uses fails here on the day of the upgrade.
+#
+# `own_dict` and not `hasattr`: `EntityRecognizer` defines both hooks as no-op stubs,
+# so every recogniser in the library "has" them and a `hasattr` check would be
+# vacuously true for all of them -- the exact shape of checker this codebase keeps
+# catching. Only a class that overrides one in its own body actually validates.
+VALIDATION_HOOKS = ("invalidate_result", "validate_result")
+
+#: `presidio:` built-ins whose recogniser validates and whose registry entity is
+#: deliberately shipped WITHOUT a backstop pattern, each with the reason. Empty, and
+#: that is the point: an exemption has to be written down with its evidence.
+VALIDATED_BUILTINS_WITHOUT_A_BACKSTOP: dict[str, str] = {}
+
+
+def _validating_recognizer_classes(analyzer: Any, builtin: str) -> list[str]:
+    """Names of loaded recogniser classes for ``builtin`` that override a hook."""
+    names: list[str] = []
+    for recognizer in analyzer.registry.recognizers:
+        if builtin not in recognizer.supported_entities:
+            continue
+        cls = type(recognizer)
+        if any(hook in cls.__dict__ for hook in VALIDATION_HOOKS):
+            names.append(cls.__name__)
+    return names
+
+
+def test_every_validated_builtin_the_registry_remaps_carries_a_backstop(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """The rule behind EMAIL's backstop and SSN's, asserted once for both."""
+    analyzer = detector.analyzer
+    missing: list[str] = []
+    covered: list[str] = []
+    for name, spec in registry.entities.items():
+        if not spec.presidio:
+            continue
+        validators = _validating_recognizer_classes(analyzer, spec.presidio)
+        if not validators:
+            continue
+        if spec.patterns or spec.gazetteer:
+            covered.append(f"{name} <- {spec.presidio} ({', '.join(validators)})")
+        elif name not in VALIDATED_BUILTINS_WITHOUT_A_BACKSTOP:
+            missing.append(f"{name} <- {spec.presidio} ({', '.join(validators)})")
+
+    assert missing == [], (
+        "these registry entities remap a Presidio recogniser that VALIDATES its "
+        "candidates, and carry no backstop of their own -- a value the validator "
+        "rejects is detected by nothing, vaulted by nothing, and invisible to every "
+        "egress pass:\n  " + "\n  ".join(missing)
+    )
+    assert covered, (
+        "no registry entity remaps a validating built-in any more, so this test is "
+        "vacuous; either the registry changed or the hook detection did"
+    )
+    assert not set(VALIDATED_BUILTINS_WITHOUT_A_BACKSTOP) - set(registry.entities), (
+        "an exemption names an entity the registry no longer has"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1437,6 +1521,35 @@ COVERAGE_FLOORS: dict[str, float] = {
 OVERALL_COVERAGE_FLOOR = 0.98
 OVERALL_TYPED_FLOOR = 0.98
 
+# The EXACT counts, asserted for equality in both directions. See the note above
+# HELD_OUT_COVERAGE_MEASURED for why a floor table alone is not a measurement and
+# which published numbers it let drift.
+COVERAGE_MEASURED: dict[str, tuple[int, int, int]] = {
+    "ACCOUNT_NUMBER": (10, 10, 10),
+    "ADDRESS": (5, 5, 5),
+    "AMOUNT": (13, 13, 13),
+    "CASE_ID": (17, 17, 17),
+    "CASE_STRATEGY": (10, 10, 10),
+    "CLIENT_IDENTITY": (12, 12, 14),
+    "DATE": (5, 5, 5),
+    "DIAGNOSIS": (27, 27, 27),
+    "DOB": (32, 32, 32),
+    "EMAIL": (29, 29, 29),
+    "INSURANCE_ID": (5, 5, 5),
+    "LAB_RESULT": (10, 10, 10),
+    "MEDICATION": (23, 23, 23),
+    "MRN": (15, 15, 15),
+    "NAME": (46, 46, 47),
+    "PHONE": (29, 29, 29),
+    "PRIVILEGED_MARKER": (9, 9, 9),
+    "SETTLEMENT_TERM": (3, 3, 3),
+    "SSN": (12, 12, 12),
+    "TAX_ID": (5, 5, 5),
+}
+
+#: ``(covered, typed, total)`` over the whole tuned corpus.
+COVERAGE_TOTALS_MEASURED = (317, 317, 320)
+
 
 class Residual(NamedTuple):
     """One annotated value the detector did not fully and correctly claim.
@@ -1545,6 +1658,23 @@ async def test_recall_per_entity_meets_its_measured_floor(detector: Detector) ->
     assert sum(row[1] for row in tally.values()) / total >= OVERALL_TYPED_FLOOR
 
 
+async def test_recall_is_exactly_the_measured_table(detector: Detector) -> None:
+    """The tuned counts, bound in both directions -- see COVERAGE_MEASURED."""
+    tally, _misses = await measure_recall(detector)
+    measured = {name: tuple(row) for name, row in tally.items()}
+    assert measured == COVERAGE_MEASURED, (
+        "the tuned recall table moved. Re-measure, update COVERAGE_MEASURED *and* "
+        "every published figure derived from it (README) in the same commit; do not "
+        "relax this to >=, which is the one-sidedness this test exists to remove."
+    )
+    totals = (
+        sum(row[0] for row in tally.values()),
+        sum(row[1] for row in tally.values()),
+        sum(row[2] for row in tally.values()),
+    )
+    assert totals == COVERAGE_TOTALS_MEASURED
+
+
 async def test_every_spec_mandated_entity_is_found_in_realistic_prose(
     detector: Detector,
 ) -> None:
@@ -1613,6 +1743,18 @@ async def test_clean_documents_produce_no_detections(detector: Detector) -> None
 # neighbouring prose shows up here rather than silently.
 MAX_UNANNOTATED_SPANS = 6
 
+# The four that actually occur, by name. The cap above is one-sided -- it reddens on
+# a sixth span and says nothing when one disappears -- so it can only ever half-report
+# a precision change, and the two spans of headroom made "4" and "6" indistinguishable
+# from outside. This is the same fix HELD_OUT_COVERAGE_MEASURED applies to the recall
+# floors: keep the cap, add the exact set beside it, assert equality.
+UNANNOTATED_SPANS_MEASURED = (
+    "adv_prose_ids: CLIENT_IDENTITY 'Harborline'",
+    "fin_disclosure: ADDRESS 'Fifth Third'",
+    "fin_disclosure: ADDRESS 'Ohio'",
+    "med_progress_note: DATE '62-year-old'",
+)
+
 
 async def test_over_detection_on_realistic_prose_stays_bounded(detector: Detector) -> None:
     extra: list[str] = []
@@ -1623,6 +1765,10 @@ async def test_over_detection_on_realistic_prose_stays_bounded(detector: Detecto
                 extra.append(f"{doc_id}: {found.entity_type} {found.text!r}")
     print("\n".join(["", "unannotated spans:", *extra]))
     assert len(extra) <= MAX_UNANNOTATED_SPANS, "\n".join(["over-detection grew:", *extra])
+    assert tuple(sorted(extra)) == UNANNOTATED_SPANS_MEASURED, (
+        "the over-detection set changed. A span that STOPPED firing is a real change "
+        "too and the cap above cannot see it -- re-measure and update the tuple."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2776,10 +2922,68 @@ HELD_OUT_COVERAGE_FLOORS: dict[str, float] = {
     "TAX_ID": 1.0,
 }
 
-# Measured: 332/366 covered, 330/366 typed; in-policy 332/355.
+# Measured: 334/366 covered, 332/366 typed; in-policy 334/355.
 HELD_OUT_COVERAGE_FLOOR = 0.90
 HELD_OUT_TYPED_FLOOR = 0.90
 HELD_OUT_IN_POLICY_COVERAGE_FLOOR = 0.93
+
+# The EXACT counts. Equality in both directions, not ``>=``.
+#
+# **A one-sided assertion is not a measurement, and this is where that cost real
+# accuracy.** Every floor above is a ``>=``, so an entity that gets BETTER reddens
+# nothing: the number in the README is written once from a measurement, the
+# measurement then improves, and nothing anywhere says the published figure has gone
+# stale. Two live examples when this table was added, both of them numbers a reviewer
+# would read off the README:
+#
+#   ACCOUNT_NUMBER   published 95%   floor 1.0   actually 19/19  = 100%
+#   INSURANCE_ID     published 100%  floor 0.80  actually  5/5   = 100%
+#
+# The first is the drift itself -- a published point value two buckets below the
+# truth. The second is the shape that produces it: a floor of 0.80 on a 5-value
+# sample admits 4/5, so the entity could lose a value and the suite would stay green
+# while the README kept claiming 100%. Neither direction was visible.
+#
+# So the floors stay -- nothing here weakens one -- and this table sits beside them
+# with ``==``. A regression reddens (it always did) and an IMPROVEMENT reddens too,
+# which is the half that was missing: closing a gap now means editing this table and
+# the README in the same commit. That is the same discipline
+# HELD_OUT_INCIDENTAL_MASKS already applies to its own claim, for the same reason.
+#
+# Equality is affordable because the measurement is deterministic, and that is
+# checked rather than assumed: spaCy is deterministic for a fixed model, the corpora
+# are literals in this file, and two consecutive runs of ``measure_coverage`` over
+# both corpora produce byte-identical tallies and byte-identical residual lists.
+#
+# **This table, not the floor table, is the source of truth for the README's
+# per-entity numbers.** A floor is a promise about the future; these are the facts.
+HELD_OUT_COVERAGE_MEASURED: dict[str, tuple[int, int, int]] = {
+    "ACCOUNT_NUMBER": (19, 19, 19),
+    "ADDRESS": (5, 5, 5),
+    "AMOUNT": (21, 21, 25),
+    "CASE_ID": (15, 15, 15),
+    "CASE_STRATEGY": (2, 2, 2),
+    "CLIENT_IDENTITY": (12, 12, 13),
+    "DATE": (3, 3, 10),
+    "DIAGNOSIS": (21, 21, 21),
+    "DOB": (29, 28, 33),
+    "EMAIL": (43, 43, 43),
+    "INSURANCE_ID": (5, 5, 5),
+    "LAB_RESULT": (7, 7, 7),
+    "MEDICATION": (18, 18, 18),
+    "MRN": (12, 12, 15),
+    "NAME": (47, 46, 58),
+    "PHONE": (47, 47, 47),
+    "PRIVILEGED_MARKER": (2, 2, 2),
+    "SETTLEMENT_TERM": (0, 0, 2),
+    "SSN": (15, 15, 15),
+    "TAX_ID": (11, 11, 11),
+}
+
+#: ``(covered, typed, total)`` over the whole held-out corpus, and over the subset
+#: the registry's document-category scoping actually asks for.
+HELD_OUT_TOTALS_MEASURED = (334, 332, 366)
+HELD_OUT_IN_POLICY_MEASURED = (334, 332, 355)
 
 # entity type -> (how many of its held-out values fall short, and why).
 #
@@ -2974,6 +3178,62 @@ async def test_held_out_recall_meets_its_measured_floor(
     assert sum(row[0] for row in tally.values()) / total >= HELD_OUT_COVERAGE_FLOOR
     assert sum(row[1] for row in tally.values()) / total >= HELD_OUT_TYPED_FLOOR
     assert covered_in_policy / total_in_policy >= HELD_OUT_IN_POLICY_COVERAGE_FLOOR
+
+
+async def test_held_out_recall_is_exactly_the_measured_table(
+    detector: Detector, registry: EntityRegistry
+) -> None:
+    """The held-out counts, bound in both directions -- see HELD_OUT_COVERAGE_MEASURED.
+
+    The test above cannot see an improvement, so the README's published per-entity
+    numbers could drift upward indefinitely with the suite green. This one fails on
+    any movement, in either direction, and names the number to copy.
+    """
+    tally, _residual, in_policy = await measure_held_out(detector, registry)
+    measured = {name: tuple(row) for name, row in tally.items()}
+    assert measured == HELD_OUT_COVERAGE_MEASURED, (
+        "the held-out recall table moved. Re-measure, update "
+        "HELD_OUT_COVERAGE_MEASURED *and* every published figure derived from it "
+        "(README) in the same commit; do not relax this to >=."
+    )
+    totals = (
+        sum(row[0] for row in tally.values()),
+        sum(row[1] for row in tally.values()),
+        sum(row[2] for row in tally.values()),
+    )
+    assert totals == HELD_OUT_TOTALS_MEASURED
+    assert tuple(in_policy) == HELD_OUT_IN_POLICY_MEASURED
+
+
+@pytest.mark.parametrize(
+    ("label", "floors", "exact"),
+    [
+        pytest.param("tuned", COVERAGE_FLOORS, COVERAGE_MEASURED, id="tuned"),
+        pytest.param(
+            "held-out", HELD_OUT_COVERAGE_FLOORS, HELD_OUT_COVERAGE_MEASURED, id="held-out"
+        ),
+    ],
+)
+def test_no_floor_claims_more_than_the_measurement(
+    label: str, floors: dict[str, float], exact: dict[str, tuple[int, int, int]]
+) -> None:
+    """The floor tables and the exact tables cannot drift apart.
+
+    Two tables describing the same quantity is how a stale number survives: the
+    floors could be edited without the counts, or a floor could be set *above* what
+    the corpus delivers and nothing would notice until an unrelated run failed. Both
+    directions are pinned -- identical entity sets, and every floor satisfied by the
+    exact count beside it. It reads the counts rather than re-running the detector on
+    purpose: a check that re-derived the numbers from the thing it is checking would
+    agree with it whatever either one said.
+    """
+    assert set(floors) == set(exact), f"{label}: floor and measured tables disagree"
+    for entity_type, floor in sorted(floors.items()):
+        covered, _typed, total = exact[entity_type]
+        assert covered / total >= floor, (
+            f"{label}: {entity_type} floor {floor} is above its measured "
+            f"{covered}/{total} -- the floor is a claim the corpus does not support"
+        )
 
 
 async def test_held_out_residual_stays_inside_the_documented_shapes(
@@ -3472,15 +3732,37 @@ def test_annotations_mark_the_value_and_never_its_label(
 async def test_mid_confidence_span_is_returned_inside_the_redact_band(
     detector: Detector, settings: Settings
 ) -> None:
-    """A bare 9-digit SSN with context is weak evidence: returned, but redact-band.
+    """A bare 9-digit SSN with loose context is weak evidence: returned, redact-band.
 
     The engine turns exactly this band into ``[REDACTED_SSN]`` with no vault entry,
     so the detector's job is to hand the score over rather than round it away.
+
+    **THE WITNESS MOVED AND THE OLD ONE IS ASSERTED BELOW RATHER THAN DELETED.** This
+    test used to use ``'Her SSN is 412337891 per the intake form.'``, which scored
+    0.40 because Presidio's ``SSN4`` pattern fires at 0.05 and its context enhancer
+    lifts it. ``entities.yaml`` now carries an ``SSN.patterns`` backstop, so a bare
+    nine-digit run introduced by an SSN label *in identifier position* is claimed at
+    0.70 -- deliberately, because that was the leak: ``UsSsnRecognizer`` invalidates
+    the canonical example SSNs outright, so a labelled bare run was detected by
+    nothing and reached the provider in the clear.
+
+    The band is still real and still reachable, so the property under test is
+    unchanged and only the input had to move: an SSN context word loose in the
+    sentence, with no label introducing the digits, is exactly the "weak evidence"
+    this test is about. Both scores are asserted here so the change of contract is
+    visible in the diff rather than implied by an input swap.
     """
-    hits = await detector.detect("Her SSN is 412337891 per the intake form.")
-    ssn = [d for d in hits if d.entity_type == "SSN"]
+    weak = await detector.detect("Her social security file carries 412337891 today.")
+    ssn = [d for d in weak if d.entity_type == "SSN"]
     assert len(ssn) == 1
     assert settings.threshold_redact <= ssn[0].score < settings.threshold_obfuscate
+
+    # The old witness, now above the band -- the backstop's whole purpose. Losing
+    # this assertion is losing the repair, so it lives here rather than nowhere.
+    labelled = await detector.detect("Her SSN is 412337891 per the intake form.")
+    strong = [d for d in labelled if d.entity_type == "SSN"]
+    assert len(strong) == 1
+    assert strong[0].score >= settings.threshold_obfuscate
 
 
 def test_per_entity_threshold_override_moves_the_detector_floor(
@@ -3536,6 +3818,295 @@ async def test_below_floor_span_is_dropped(detector: Detector) -> None:
     assert "SSN" not in types_of(hits)
 
 
+#: Every spelling of an SSN that ``UsSsnRecognizer.invalidate_result`` scores at a
+#: hard 0.0, written both ways round. Before ``entities.yaml`` grew ``SSN.patterns``
+#: the delimited half was *blocked* by the egress gate's pass 3 -- a refused run, and
+#: a red ``demo.py --file`` for any reviewer who typed the most common placeholder
+#: SSN into a test document -- and the bare half was matched by nothing at all and
+#: reached the provider with the nine digits verbatim under both strategies.
+INVALIDATED_SSN_SPELLINGS = [
+    "123456789", "123-45-6789", "123 45 6789", "123.45.6789", "123-45.6789",
+    "987654320", "987-65-4320",
+    "078051120", "078-05-1120",
+    "000123456", "000-12-3456",
+    "666123456", "666-12-3456",
+    "412007891", "412-00-7891",
+    "412330000", "412-33-0000",
+    "111111111", "111-11-1111",
+]
+
+
+@pytest.mark.parametrize("ssn", INVALIDATED_SSN_SPELLINGS)
+async def test_an_ssn_presidio_invalidates_is_vaultable_not_merely_blockable(
+    detector: Detector, settings: Settings, ssn: str
+) -> None:
+    """The repair for the leak, asserted at the detector.
+
+    ``invalidate_result`` returning True is defensible for a detector and
+    indefensible as the last word before a third-party API call: this pipeline
+    cannot tell an example SSN from a real one that looks like an example, and
+    neither can the provider. The registry's backstop claims the value from its
+    LABEL rather than from Presidio's opinion of the digits.
+
+    The score assertion is the load-bearing half. Detected-but-redact-band would
+    still remove the digits from *this* span, and would still be wrong twice over:
+    the redaction is irreversible, and nothing is vaulted, so a second mention of the
+    same number elsewhere in the document has no pass-1 needle and leaves in the
+    clear. At or above ``threshold_obfuscate`` is what makes it vaulted, restorable,
+    and protected everywhere it appears.
+    """
+    hits = [
+        d
+        for d in await detector.detect(f"Member SSN {ssn} verified against payer records.")
+        if d.entity_type == "SSN"
+    ]
+    assert [d.text for d in hits] == [ssn]
+    assert hits[0].score >= settings.threshold_obfuscate
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("The ledger reference 412337891 was archived.", id="ledger-reference"),
+        pytest.param("Purchase order 987654321 shipped on Tuesday.", id="order-number"),
+        pytest.param("Zip+4 on file is 940255551 for the address.", id="zip-plus-four"),
+        pytest.param("Routing number 021000021 on the wire.", id="aba-routing"),
+        pytest.param("Employee badge 412337891 was reissued.", id="badge-number"),
+        pytest.param("Policy BCBS123456789 is current.", id="letters-then-digits"),
+        pytest.param("The claim total was $123,456,789 this quarter.", id="currency-amount"),
+        pytest.param("Member SSN 12345678 is eight digits.", id="eight-digits"),
+        pytest.param("Member SSN 1234567890 is ten digits.", id="ten-digits"),
+    ],
+)
+async def test_the_ssn_backstop_needs_a_label_in_identifier_position(
+    detector: Detector, text: str
+) -> None:
+    """What the backstop deliberately does NOT claim, because precision is the design.
+
+    A bare ``\\b\\d{9}\\b`` rule would close the leak above and take every zip+4,
+    order number and ledger reference in every document with it -- the trade the
+    identifier-position note above ``MRN`` in ``entities.yaml`` exists to refuse. The
+    backstop asks for an SSN or ITIN noun phrase introducing the digits, and these
+    rows are what that buys.
+
+    ``ledger-reference`` is also README Deviation 58 stated as a test: nine digits
+    with no label anywhere near them stay below the redact floor and reach the
+    provider verbatim. The backstop narrows that gap to "unlabelled" and does not
+    close it; closing it means redacting every nine-digit run in every document, and
+    that is a product decision written up at ``Detector._floor_for``.
+    """
+    assert "SSN" not in types_of(await detector.detect(text))
+
+
+async def test_a_bare_itin_is_claimed_the_way_a_delimited_one_already_was(
+    detector: Detector, settings: Settings
+) -> None:
+    """The sibling the SSN sweep turned up, closed by the same label list.
+
+    An ITIN is issued in SSN format, and this pipeline ALREADY typed the delimited
+    spelling as ``SSN``: Presidio's ``SSN5`` pattern claims ``912-70-1234`` at 0.50
+    and the registry maps ``US_SSN`` to ``SSN``. The bare spelling ``912701234`` was
+    claimed by nothing -- ``US_ITIN`` is not a registry entity, so the detector never
+    requests it, and ``SSN4`` scores 0.05 with no ITIN context word to lift it.
+
+    Same document, same nine digits, same taxpayer: one spelling vaulted and the
+    other on the wire. ``itin`` in the backstop's label list makes the two agree. It
+    adds no entity type and makes no new claim about what an ITIN is.
+    """
+    for spelling in ("912-70-1234", "912701234"):
+        hits = [
+            d
+            for d in await detector.detect(f"The taxpayer ITIN {spelling} is on file.")
+            if d.entity_type == "SSN"
+        ]
+        assert [d.text for d in hits] == [spelling], spelling
+        assert hits[0].score >= settings.threshold_obfuscate, spelling
+
+
+# ---------------------------------------------------------------------------
+# 3b. The containment invariant, over EVERY egress-gate pattern
+# ---------------------------------------------------------------------------
+# The invariant, stated exactly:
+#
+#     Every span any pattern in ``egress_gate._INDEPENDENT_PATTERNS`` would block,
+#     the registry claims too, with the SAME span, at a score at or above
+#     ``threshold_obfuscate`` -- so it is vaulted, obfuscated and restorable rather
+#     than merely denied.
+#
+# It is one-directional on purpose. The registry may claim MORE than the gate does
+# (detection is best-effort; the gate is the guarantee), and the repair direction is
+# fixed: widen the registry, never narrow the gate.
+#
+# It used to hold for entry 1 only. ``test_egress_gate.py`` indexes
+# ``_INDEPENDENT_PATTERNS[1]`` positionally and says so, which left entry 0 -- the
+# unlabelled delimited rule -- with no agreement test at all, and the same defect
+# class alive inside it: ``'Employee 123-45-6789'`` was claimed by no detector, so it
+# was never vaulted, so pass 3 blocked it (422 EGRESS_BLOCKED, ``demo.py --file``
+# exit 1). The tests below DISCOVER the entries rather than enumerating them, so an
+# entry added tomorrow is covered on the next run instead of being silently skipped,
+# and they import the gate's compiled patterns rather than re-typing them -- a
+# re-typed copy would agree with itself and say nothing about the shipped rule.
+
+#: Spellings the gate's UNLABELLED entry claims. Both delimiter conventions, the
+#: mismatched pairings ``invalidate_result`` rejects, and the three published sample
+#: SSNs -- which is the whole of what Presidio's own ``SSN5`` pattern does NOT hand
+#: the detector, and therefore the whole of the gap this closes.
+_UNLABELLED_SSN_VALUES = [
+    "412-33-7891", "412 33 7891", "412.33.7891",
+    "123-45-6789", "123 45 6789", "123.45.6789",
+    "987-65-4320", "987 65 4320", "987.65.4320",
+    "078-05-1120", "078 05 1120", "078.05.1120",
+    "000-12-3456", "666-12-3456", "412-00-7891", "412-33-0000", "111-11-1111",
+    "123-45.6789", "123.45-6789", "123 45-6789", "123-45 6789",
+]
+
+#: Carriers with no SSN word anywhere -- the point of entry 0 is that it needs no
+#: label, so a corpus that supplied one would be testing entry 1 again.
+_UNLABELLED_SSN_CARRIERS = [
+    "Employee {v} was verified against payer records.",
+    "Intake summary. {v} is on the signed form.",
+    "{v}",
+    "Row: {v}, filed today.",
+    "The applicant wrote {v} in the box.",
+    "See attachment ({v}) for details.",
+    "Column three reads {v} and column four is blank.",
+]
+
+
+def _registry_ssn_pattern_compiled() -> Any:
+    """The shipped registry's SSN backstop, compiled the way Presidio compiles it.
+
+    ``regex``, not ``re``: ``presidio_analyzer.pattern_recognizer`` imports ``regex``,
+    so that is the engine that actually evaluates this string against document text,
+    and the two dialects are not the same language.
+    """
+    import regex
+
+    patterns = load_registry(Path("entities.yaml")).spec("SSN").patterns
+    return regex.compile("|".join(f"(?:{p})" for p in patterns))
+
+
+@pytest.mark.parametrize("index", range(len(_INDEPENDENT_PATTERNS)))
+def test_every_egress_gate_pattern_is_contained_by_the_registry(index: int) -> None:
+    """For EVERY gate pattern: what it claims, the registry claims, span for span.
+
+    ``range(len(...))`` rather than a written-out list, so the parametrisation grows
+    with the constant. A gate entry with no corpus that exercises it fails the
+    ``claimed`` assertion rather than passing vacuously, which is the failure mode a
+    hand-listed index set produces.
+    """
+    entity_type, gate_pattern = _INDEPENDENT_PATTERNS[index]
+    registry_pattern = _registry_ssn_pattern_compiled()
+    assert entity_type == "SSN", f"entry {index} claims {entity_type}; no registry rule mirrors it"
+
+    documents = [
+        carrier.format(v=value)
+        for carrier in _UNLABELLED_SSN_CARRIERS
+        for value in _UNLABELLED_SSN_VALUES
+    ]
+    documents += [
+        f"Member {label}{middle}{separator}{value} on file."
+        for label in ("SSN", "ssn", "S.S.N.", "Social Security", "Soc. Sec.", "SS#", "ITIN")
+        for middle in ("", " Number", " no.", " is")
+        for separator in ("", " ", ": ", ", ", " (", " [", "/", "=", " -- ", " " * 20)
+        for value in ("123456789", "123-45-6789", "123 45 6789", "078051120")
+    ]
+
+    missed: list[tuple[str, str]] = []
+    span_mismatch: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+    claimed = 0
+    for document in documents:
+        gate_hit = gate_pattern.search(document)
+        if gate_hit is None:
+            continue
+        claimed += 1
+        gate_span = gate_hit.span("v")
+        registry_hit = registry_pattern.search(document)
+        if registry_hit is None:
+            missed.append((document, gate_hit.group("v")))
+        elif registry_hit.span() != gate_span:
+            span_mismatch.append((document, gate_span, registry_hit.span()))
+
+    assert claimed > 20, (
+        f"gate entry {index} claimed only {claimed} of {len(documents)} generated "
+        "documents -- the corpus does not exercise it and this test is not evidence"
+    )
+    assert not missed, (
+        f"{len(missed)} strings gate entry {index} claims and the registry does not. "
+        f"Each is a document pass 3 blocks and the detector could have vaulted -- 422 "
+        f"EGRESS_BLOCKED, demo exit 1. Widen entities.yaml -> SSN.patterns; do NOT "
+        f"narrow the gate. First 5: {missed[:5]}"
+    )
+    assert not span_mismatch, (
+        f"{len(span_mismatch)} strings where both claim but the spans differ, so the "
+        f"registry would vault a different substring than the gate protects. "
+        f"First 5: {span_mismatch[:5]}"
+    )
+
+
+@pytest.mark.parametrize("index", range(len(_INDEPENDENT_PATTERNS)))
+async def test_every_egress_gate_pattern_is_vaultable_not_merely_blockable(
+    detector: Detector, settings: Settings, index: int
+) -> None:
+    """Containment at the PATTERN is not the claim; containment at the DETECTOR is.
+
+    A registry pattern that matches proves nothing on its own: the hit still has to
+    survive the redact floor, overlap resolution and the document-category scope
+    before anything is vaulted, and only a vaulted value is restorable. So this runs
+    the shipped detector and asserts the span *and* the band, which is what turns
+    "pass 3 would not block" into "the round trip works".
+    """
+    _entity_type, gate_pattern = _INDEPENDENT_PATTERNS[index]
+    documents = [
+        carrier.format(v=value)
+        for carrier in _UNLABELLED_SSN_CARRIERS
+        for value in _UNLABELLED_SSN_VALUES
+    ] + [
+        f"Member {label}{separator}{value} on file."
+        for label in ("SSN", "Social Security Number", "ITIN")
+        for separator in ("", " ", ": ", ", ", " [", "/", "=", " -- ", "  ")
+        for value in ("123456789", "123-45-6789", "078051120", "912-70-1234")
+    ]
+
+    unvaultable: list[str] = []
+    checked = 0
+    for document in documents:
+        gate_hit = gate_pattern.search(document)
+        if gate_hit is None:
+            continue
+        start, end = gate_hit.span("v")
+        checked += 1
+        covering = [
+            d
+            for d in await detector.detect(document, "financial")
+            if d.start <= start and end <= d.end and d.score >= settings.threshold_obfuscate
+        ]
+        if not covering:
+            unvaultable.append(f"{document!r} -> {gate_hit.group('v')!r}")
+    assert checked > 20, f"gate entry {index} was exercised by only {checked} documents"
+    assert not unvaultable, "\n".join(
+        [
+            f"{len(unvaultable)} values gate entry {index} blocks that the detector "
+            "does not vault at or above threshold_obfuscate:",
+            *unvaultable[:10],
+        ]
+    )
+
+
+@pytest.mark.parametrize("index", range(len(_INDEPENDENT_PATTERNS)))
+def test_every_egress_gate_pattern_carries_the_value_group(index: int) -> None:
+    """``_independent_hits`` compares group ``v`` against our protected spans.
+
+    An entry without that group would raise inside the gate at request time rather
+    than at import, and an entry whose group ``v`` spanned the label as well as the
+    value would let a label abutting one of our tokens excuse a leak beside it. The
+    gate's own docstring states the requirement; this is what costs something to
+    break it.
+    """
+    _entity_type, pattern = _INDEPENDENT_PATTERNS[index]
+    assert "v" in pattern.groupindex, f"gate entry {index} has no named group 'v'"
+
+
 async def test_every_returned_detection_clears_the_redact_floor(
     detector: Detector, settings: Settings
 ) -> None:
@@ -3566,10 +4137,19 @@ async def test_redact_band_reaches_the_obfuscated_text_end_to_end(
     Exactly one vault row for two SSN-shaped values is what "graceful degradation"
     means in practice, and it is the property the README's irreversibility note
     depends on.
+
+    **The weak half used to read ``'A second SSN is 412337891 …'`` and no longer can.**
+    ``entities.yaml``'s ``SSN.patterns`` backstop claims a bare nine-digit run
+    introduced by an SSN label at 0.70, which is the repair for a real leak (see
+    ``test_mid_confidence_span_is_returned_inside_the_redact_band``), so that sentence
+    now lands in the *obfuscate* band and would give this document two vault rows. The
+    band itself is unchanged and still reachable from ordinary text -- an SSN context
+    word loose in the sentence, with nothing introducing the digits -- so every
+    assertion below is the one it always was, against a weak half that is still weak.
     """
     text = (
         "Her SSN is 412-33-7891 on the signed form.\n\n"
-        "A second SSN is 412337891 per the unverified intake sheet."
+        "Her social security file carries 412337891 from the unverified intake sheet."
     )
     detections = await detector.detect(text)
     scores = {d.text: d.score for d in detections if d.entity_type == "SSN"}
@@ -5218,6 +5798,17 @@ REDOS_ATTACKS: list[tuple[str, Callable[[int], str]]] = [
     ("account-number-is-blanks", lambda n: "account number is" + " " * n),
     ("record-mixed-separators", lambda n: "record" + " :#.-/" * (n // 6)),
     ("subject-id-blanks-tail", lambda n: "subject id" + " " * n + "x"),
+    # SSN's backstop is the identifier-position shape again, so it gets the same
+    # family: one row per branch (bare label, generic word, copula tail), a mixed
+    # separator run, and a near-miss tail that forces the whole label machinery to be
+    # walked and then thrown away at the digit group.
+    ("ssn-blanks", lambda n: "SSN" + " " * n),
+    ("ssn-number-blanks", lambda n: "SSN number" + " " * n),
+    ("ssn-is-blanks", lambda n: "social security number is" + " " * n),
+    ("ssn-mixed-separators", lambda n: "ssn" + " :#.-" * (n // 5)),
+    ("ssn-blanks-partial-digits", lambda n: "SSN no." + " " * n + "123-45-678"),
+    ("social-security-blanks", lambda n: "Social Security" + " " * n),
+    ("itin-blanks", lambda n: "ITIN" + " " * n),
     ("settlement-filler", lambda n: "settlement " + "x" * n),
     ("dollar-groups", lambda n: "$" + "1," * (n // 2)),
     ("dollar-groups-settlement", lambda n: "$" + "1," * (n // 2) + " settlement"),
@@ -6284,6 +6875,142 @@ async def test_a_pattern_backed_span_is_never_trimmed_at_a_label_shaped_wrap(
     spans = [d.text for d in await detector.detect(text, "legal")
              if d.entity_type == "PRIVILEGED_MARKER"]
     assert spans == ["attorney work\nPRODUCT"], spans
+
+
+# ---------------------------------------------------------------------------
+# 12b. A span's TYPE and its EXTENT must come from the same claim
+# ---------------------------------------------------------------------------
+# The defect these pin: a general-purpose recogniser returns a span whose boundary is
+# a delimiter rather than a value, overlap resolution unions it with the narrow
+# pattern hit inside it, and the surviving detection carries the PATTERN's label on
+# the MODEL's boundary. Measured on the shipped pipeline, 150 random nine-digit
+# values per spelling, glued '[' 1/150 and glued '/' 4/150 before the repair.
+#
+# What it costs is not cosmetic. The span is what gets vaulted, so ``'[075839143'``
+# becomes the "original": pass 1 of the egress gate then has no needle for a second,
+# correctly written mention of the same digits, and under pseudonymization the
+# surrogate merely OVERLAPS the protected span, which raises a spurious
+# ``detector_rescan`` block.
+
+
+@pytest.mark.parametrize(
+    ("document", "value", "entity_type"),
+    [
+        pytest.param("SSN [075839143]", "075839143", "SSN", id="bracket-glued-to-value"),
+        pytest.param("SSN [601238743]", "601238743", "SSN", id="bracket-second-value"),
+        pytest.param("SSN/601238743", "601238743", "SSN", id="slash-glued-label"),
+        pytest.param("SSN=601238743", "601238743", "SSN", id="equals-glued-label"),
+        pytest.param("SSN#601238743", "601238743", "SSN", id="hash-glued-label"),
+        # No SSN rule is involved in this one, and that is the point: there is a
+        # single candidate, nothing overlaps, and the boundary is still wrong. It is
+        # what proves the defect is produced by the recogniser rather than by
+        # ``resolve_overlaps``, and therefore where the repair has to live.
+        pytest.param("Ref [021000021]", "021000021", "PHONE", id="no-pattern-hit-at-all"),
+    ],
+)
+async def test_a_delimiter_is_never_part_of_the_vaulted_value(
+    detector: Detector, document: str, value: str, entity_type: str
+) -> None:
+    covering = [
+        d for d in await detector.detect(document, "financial") if value in d.text
+    ]
+    assert covering, f"{value!r} was not detected at all in {document!r}"
+    assert [(d.entity_type, d.text) for d in covering] == [(entity_type, value)], (
+        f"the surviving span in {document!r} carries {entity_type}'s label on some "
+        f"other recogniser's boundary: {[(d.entity_type, d.text) for d in covering]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        pytest.param("Call (555) 123-4567 now.", "(555) 123-4567", id="balanced-parens"),
+        pytest.param("Fax +1 (415) 555-0132 today.", "+1 (415) 555-0132", id="leading-plus"),
+    ],
+)
+async def test_a_bracket_that_is_part_of_the_value_is_kept(
+    detector: Detector, document: str, expected: str
+) -> None:
+    """The half that makes the trim safe: a BALANCED bracket belongs to the value.
+
+    ``(555) 123-4567`` is how a US phone number is written, and a rule that stripped
+    every leading bracket would vault ``555) 123-4567``. The trim removes only a
+    bracket whose partner is outside the span -- a delimiter the recogniser cut in
+    half -- so these are untouched.
+    """
+    phones = [d.text for d in await detector.detect(document, "financial") if d.entity_type == "PHONE"]
+    assert phones == [expected], phones
+
+
+async def test_a_hyphenated_identifier_prefix_is_never_trimmed(detector: Detector) -> None:
+    """A hyphen JOINS the parts of an identifier; it does not introduce a value.
+
+    ``HPS-307984`` is one exhibit reference, not a label glued to a digit run, and
+    the first spelling of the glued-label rule -- separator class ``[^0-9A-Za-z\\s]``,
+    any non-alphanumeric -- trimmed exactly this shape. Three spans of the 873-span
+    fixture census moved, and the splice would have left ``HPS-`` standing in the
+    clear beside the mask. This is the measurement that narrowed the class.
+    """
+    document = "The exhibit is filed under HPS-307984 in the record."
+    covering = [d for d in await detector.detect(document, "legal") if "307984" in d.text]
+    assert all(d.text != "307984" for d in covering), (
+        f"the 'HPS-' prefix was trimmed off an identifier: {[d.text for d in covering]}"
+    )
+
+
+async def test_a_space_separated_prefix_is_never_trimmed(detector: Detector) -> None:
+    """The declared residual, and the leak that makes it the right trade.
+
+    spaCy types a word followed by a space and a nine-digit run as one ``PERSON``,
+    and nothing in the text says whether that word is a label or a name::
+
+        'Intake summary. Employee 987.65.4320 was verified.' -> 'Employee 987.65.4320'
+        'Record Marcus 221-55-0084 today.'                   -> 'Marcus 221-55-0084'
+
+    A rule that trimmed the first would send ``Marcus`` to the provider in the clear,
+    so the glued-label rule requires a punctuation separator and this shape keeps its
+    prefix. Both halves are asserted: the name stays covered, which is the guarantee,
+    and the label case keeps its prefix too, which is the price, recorded here so it
+    is a known residual rather than a surprise.
+    """
+    leaky = "Record Marcus 221-55-0084 today."
+    assert uncovered(leaky, await detector.detect(leaky, "financial"), "Marcus") == "", (
+        "a name spaCy spanned together with a digit run was left in the clear"
+    )
+    residual = "Intake summary. Employee 987.65.4320 was verified."
+    covering = [d for d in await detector.detect(residual, "financial") if "987.65.4320" in d.text]
+    assert [d.text for d in covering] == ["Employee 987.65.4320"], (
+        "the space-separated residual changed shape; re-measure the leak above before "
+        "narrowing it, because the two cases are indistinguishable from the text"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "span", "expected"),
+    [
+        pytest.param("SSN [075839143]", (4, 14), (5, 14), id="unmatched-opener"),
+        pytest.param("[075839143]", (0, 11), (0, 11), id="balanced-pair-kept"),
+        pytest.param("x 075839143]", (2, 12), (2, 11), id="unmatched-closer"),
+        pytest.param("SSN [[075839143", (4, 15), (6, 15), id="two-openers-both-trimmed"),
+        pytest.param("(555) 123-4567", (0, 14), (0, 14), id="balanced-parens-kept"),
+        pytest.param("SSN/075839143", (0, 13), (4, 13), id="glued-label"),
+        pytest.param("HPS-307984", (0, 10), (0, 10), id="hyphen-joins-an-identifier"),
+        pytest.param("Rev.100200300", (0, 13), (0, 13), id="dot-joins-an-identifier"),
+        pytest.param("Employee 987654320", (0, 18), (0, 18), id="space-is-not-a-glue"),
+        pytest.param("March 2024", (0, 10), (0, 10), id="a-date-is-not-a-labelled-value"),
+        pytest.param("Email:a@b.example", (0, 17), (0, 17), id="tail-is-not-a-digit-run"),
+    ],
+)
+def test_the_delimited_value_trim_is_exactly_its_two_rules(
+    text: str, span: tuple[int, int], expected: tuple[int, int]
+) -> None:
+    """The unit table behind the end-to-end cases, including every refusal.
+
+    The rows that expect NO change carry the weight: each one is a shape an earlier,
+    wider spelling of these rules damaged, and they are what stops the next widening
+    from being written by accident.
+    """
+    assert detector_module._trim_to_the_delimited_value(text, *span) == expected
 
 
 @pytest.mark.parametrize(

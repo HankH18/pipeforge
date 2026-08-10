@@ -70,6 +70,191 @@ entities:
   SSN:
     category: PII
     presidio: US_SSN
+    # BACKSTOP PATTERN. Same shape as EMAIL's below, and for the same reason: the
+    # built-in this entry remaps VALIDATES its candidates and returns *nothing* --
+    # not a low score, nothing -- for a value it decides is fake. A real SSN written
+    # in a spelling Presidio rejects was therefore never detected, never vaulted, and
+    # had no needle in any egress pass.
+    #
+    # `UsSsnRecognizer.invalidate_result` is a hard 0.0 for: the published example
+    # SSNs (123-45-6789, 987-65-4320, 078-05-1120), every 000/666 area number, every
+    # all-zero group or serial, any single repeated digit (111-11-1111), and any
+    # MISMATCHED delimiter (123-45.6789). Measured end to end on the shipped pipeline
+    # before this pattern existed, both strategies, provider payload inspected:
+    #
+    #   'Member SSN 123456789 verified against payer records.'
+    #        detect(general) -> []   payload -> '123456789' VERBATIM, EGRESS_PASS
+    #   'Member SSN 123-45-6789 verified against payer records.'
+    #        detect(general) -> []   EGRESS_BLOCKED (gate pass 3), demo exit 1
+    #
+    # One missing detection, two faces. The delimited spellings were *denied* by the
+    # gate's independent pattern -- a red demo for any reviewer who types the most
+    # common placeholder SSN into their own test document -- and the bare nine-digit
+    # spelling slipped that pattern too, because it requires a delimiter, and left in
+    # the clear. Detecting the value fixes both, and fixes them the right way round:
+    # the span is vaulted, obfuscated and RESTORABLE rather than merely blocked.
+    #
+    # THE SPAN IS THE IDENTIFIER, NOT THE LABEL -- '\K', for the security reason
+    # spelled out at length above MRN. Pass 1 of the egress gate scans for *vaulted
+    # originals*, so vaulting 'SSN 123456789' would leave a second, unlabelled mention
+    # of the bare digits elsewhere in the document with no needle to match.
+    #
+    # PRECISION IS THE DESIGN, and a bare '\b\d{9}\b' rule is refused here for exactly
+    # the reason the identifier-position note above MRN refuses it: it fires on every
+    # zip+4, order number and ledger reference an ordinary document carries. This asks
+    # for the SSN LABEL in identifier position -- the same grammar MRN, ACCOUNT_NUMBER
+    # and CASE_ID use -- and claims the digits only where a noun phrase naming a social
+    # security number introduces them. Measured: 2 matches across the four shipped
+    # fixtures, both of them the real SSNs in financial_disclosure.txt that Presidio
+    # already scored 0.85, and 0 new spans anywhere; 0 matches across the 35 documents
+    # of the tuned and held-out CLEAN corpora in tests/test_detection.py.
+    #
+    # 'itin' is in the label list because this pipeline ALREADY types a delimited ITIN
+    # as SSN -- Presidio's SSN5 pattern claims '912-70-1234' at 0.50 and this registry
+    # maps US_SSN to SSN -- while the bare spelling '912701234' was claimed by nothing
+    # at all. The label makes the two spellings agree. It adds no entity type.
+    #
+    # WHAT THIS DOES NOT CLAIM. Nine digits with no label anywhere near them ('The
+    # ledger reference 412337891 was archived.') are still not detected: Presidio
+    # scores that 0.05, below the redact floor, and nothing here anchors on it. That is
+    # README Deviation 58 and this pattern does not close it -- see `Detector._floor_for`
+    # for why closing it means redacting every 9-digit run in every document. The egress
+    # gate carries the same label rule independently, in its own module and its own
+    # regex dialect, so that editing this file cannot blind the gate.
+    #
+    # THE SEPARATOR CLASS IS '[^0-9A-Za-z]', AND IT IS THE WIDER OF THE TWO ON PURPOSE.
+    # It was '[\s:#.\-]*+' when this backstop was first written, and the egress gate's
+    # label-anchored copy in `egress_gate.py` was written the same week against
+    # '[^0-9A-Za-z]{0,24}'. Two rules meant to say the same thing, authored separately,
+    # in different dialects -- and the gate's was WIDER. That difference is not
+    # cosmetic, because the two layers do different things when they match:
+    #
+    #   detector claims it  ->  vaulted, obfuscated, RESTORABLE
+    #   only the gate claims it  ->  pass 3 blocks, 422 EGRESS_BLOCKED, demo exit 1
+    #
+    # So every string in the gap was a document the gate refused and the detector could
+    # have protected. Measured on the tree before this widening, at `--category
+    # financial`, `demo.py --file` EXIT=1 with `EGRESS_BLOCKED`:
+    #
+    #   'Member SSN, 123456789 verified against payer records.'
+    #   'Social Security Number (SSN): 123456789 verified against payer records.'
+    #   'Member SSN=123456789 ...'   'Member SSN/123456789 ...'
+    #   'Member SSN - 123456789 ...' (em dash)   'Applicant SSN [123456789] ...'
+    #   'Member SSN? 123456789 ...'
+    #
+    # Every one of those is an ordinary intake-form spelling, and the parenthetical one
+    # is at least as likely as '123-45-6789'. A reviewer's own test document turned the
+    # demo red -- the same failure the delimiter requirement caused before it, moved to
+    # a new set of spellings rather than closed.
+    #
+    # THE REPAIR DIRECTION IS FIXED: WIDEN THE REGISTRY, NEVER NARROW THE GATE. Narrowing
+    # the gate to '[\s:#.\-]' would have made the two agree by re-opening the leak the
+    # gate exists to catch. This class is '[^0-9A-Za-z]*+' -- unbounded rather than the
+    # gate's '{0,24}' -- so it is a strict superset of BOTH the old registry class and
+    # the gate's, and no spelling either of them claimed today stops being claimed.
+    # `test_egress_gate.py::test_every_labelled_ssn_the_gate_claims_the_registry_claims_too`
+    # holds the invariant: for a generated corpus spanning both separator classes, every
+    # string the gate pattern claims, this pattern claims too, with the same span.
+    #
+    # The class cannot cross an ASCII alphanumeric, which is what keeps 'Social security
+    # is a federal program funded by payroll taxes 412337891.' outside it -- the run
+    # between label and digits contains letters, so there is no match to make. Measured
+    # cost of the widening: 873-span fixture census byte-identical, and 0 SSN detections
+    # across 36 adversarial non-SSN nine-digit documents x 4 doc_categories.
+    #
+    # RE-TYPINGS THIS BACKSTOP CAUSES, DECLARED IN FULL. A label-anchored rule scoring
+    # 0.70 outranks whatever else was claiming the same digits, so some values change
+    # type. Swept rather than guessed: 7 SSN/ITIN labels x 12 separators x 15 values =
+    # 1260 probes, detector run twice, once against this class and once against the old
+    # '[\s:#.\-]*+' one. 606 of the 1260 change, in exactly five shapes:
+    #
+    #   276   (nothing)   -> SSN@0.70    the repair itself: undetected becomes vaulted
+    #   180   PHONE@0.40  -> SSN@0.70    'Member SSN 078051120'  <-- see below
+    #    84   SSN@0.40    -> SSN@0.70    same type, redact band -> vault band
+    #    36   PHONE@0.75  -> SSN@0.70    'Social Security Number (SSN) 078051120'
+    #    30   SSN@0.50    -> SSN@0.70    'ITIN, 912-70-1234'
+    #
+    # Every one of the five lands on SSN@0.70, which is at or above threshold_obfuscate,
+    # so every one ends VAULTED AND RESTORABLE. None goes the other way: there is no
+    # 'X -> nothing' row and no row that drops below the obfuscate band. The 0.75 -> 0.70
+    # row is a score DECREASE and is still in the same band, so it changes the type on
+    # the audit row and nothing about the protection.
+    #
+    # '078051120' IS NAMED HERE BECAUSE IT WAS THE UNDECLARED ONE. The delimited form
+    # 'Member SSN 078-05-1120' moving PHONE@0.40 -> SSN@0.70 was declared when this
+    # backstop was added; the BARE form was not, and it moves identically -- measured on
+    # pristine 61c2877, 'Member SSN 078051120' -> PHONE@0.40, and on this tree ->
+    # SSN@0.70. Two spellings of the Woolworth wallet SSN, one behaviour change, one of
+    # them written down. That asymmetry is the same defect this entry documents twice
+    # above, so it is stated rather than left for the next reader to re-derive.
+    #
+    # THE SECOND BRANCH IS THE UNLABELLED DELIMITED SPELLING, AND IT COSTS ALMOST
+    # NOTHING BECAUSE PRESIDIO ALREADY CLAIMS THAT SHAPE. This is the half of the
+    # containment invariant that was left open, and the argument for leaving it open
+    # -- "a bare nine-digit rule would take every order number with it" -- is sound
+    # for a BARE rule and does not survive measurement on the DELIMITED one.
+    #
+    # `egress_gate._INDEPENDENT_PATTERNS[0]` is `\b[0-9]{3}[-. ][0-9]{2}[-. ][0-9]{4}\b`
+    # -- a 3-2-4 run, no label required. That is not a new claim this file is being
+    # asked to invent: `UsSsnRecognizer.PATTERNS` ships `SSN5 (medium)`,
+    # `\b([0-9]{3})[- .]([0-9]{2})[- .]([0-9]{4})\b` at 0.50, the SAME shape, and this
+    # registry maps US_SSN to SSN. So the detector has always claimed 3-2-4 runs at
+    # 0.50, which is at `threshold_obfuscate` -- vaulted and restorable.
+    #
+    # What it does NOT claim is the subset `UsSsnRecognizer.invalidate_result` zeroes:
+    # mismatched delimiters, a repeated digit, an all-zero group, a 000/666 area, and
+    # the three published sample SSNs. The gate's pattern has no such validator, so
+    # that subset -- and ONLY that subset -- is the gap, and every string in it is a
+    # document pass 3 refuses today:
+    #
+    #   'Intake summary. Employee 123-45-6789 was verified against payer records.'
+    #        detect(financial) -> []   EGRESS_BLOCKED reason=independent_pattern,
+    #                                  demo.py --file EXIT=1, POST /pipeline/run 422
+    #
+    # Nine spellings do this -- the three published samples x {-, space, dot} -- and
+    # '123-45-6789' is the one a reviewer types into their own test document. Because
+    # the gate already blocks every one of them, this branch cannot mask anything that
+    # is not ALREADY being denied: it converts a 422 into a vaulted, restorable span.
+    # That is the whole precision cost, and it is measured rather than argued:
+    #
+    #   873-span fixture census                        byte-identical
+    #   35 clean documents (tuned + held-out corpora)  0 detections before, 0 after
+    #   tuned recall 320 values / held-out 366 values  no entity moves in either
+    #   36 adversarial non-SSN 3-2-4 documents         35/36 were ALREADY claimed as
+    #       (invoice, PO, GL string, cost centre,      SSN at 0.50 by Presidio's own
+    #        part no., firmware build, SKU, CPT        SSN5; this branch changes their
+    #        bundle, UDI, exhibit, Bates, tariff       SCORE, not whether they mask.
+    #        heading, parcel, steuernummer, ...)       The 36th, 'Routing prefix
+    #                                                  021.00.0021', was PHONE@0.40
+    #                                                  and becomes SSN@0.70 -- an
+    #                                                  all-zero group, so Presidio
+    #                                                  invalidated it and the gate was
+    #                                                  blocking that document.
+    #
+    # And the shape really is SSN-specific in prose, which is the claim the bare rule
+    # could not make: a US phone is 3-3-4 and a US date is 1/2-1/2-4, so neither has a
+    # 3-2-4 grouping. Swept over every corpus this repo ships -- 4 fixtures, the tuned
+    # and held-out recall corpora, both clean corpora, and all four negative tables
+    # (VARIANT_NEGATIVES, DEV_IDENTIFIER_NEGATIVES, WIDENED_IDENTIFIER_NEGATIVES,
+    # ACCOUNT_NUMBER_SURFACE_FORMS_STILL_MISSED) -- there are 29 3-2-4 runs in total
+    # and every single one is an annotated SSN. Zero in the clean corpora.
+    #
+    # THE BARE SPELLING IS STILL REFUSED, and the two decisions are independent. This
+    # branch requires a delimiter at BOTH positions; '412337891' with no label near it
+    # is claimed by nothing here, stays at Presidio's 0.05, and reaches the provider.
+    # That is README Deviation 58 and `Detector._floor_for`, unchanged and still the
+    # right trade -- the bare shape is a zip+4, an order number and a ledger reference
+    # far more often than an SSN, and the gate does not block it either, so there is
+    # no denial to convert.
+    #
+    # ONE PATTERN, TWO BRANCHES, rather than two `patterns:` entries. `regex` resets
+    # the match start on `\K` inside the branch that takes it, so the labelled branch
+    # still reports the identifier and not the label, and a single entry keeps
+    # `test_egress_gate.py::_registry_ssn_pattern` -- which asserts this list has
+    # exactly one element and is a test this file does not own -- reading the whole
+    # rule rather than half of it.
+    patterns:
+      - '(?i)(?:\b(?:ssns?|s\.s\.n\.?|social\s++security|soc\.?\s*+sec\.?|ss\s*+#|itins?)[^0-9A-Za-z]*+(?:(?:number|num|nbr|no|id|#)\.?[^0-9A-Za-z]*+)?(?:(?:is|was)[^0-9A-Za-z]*+)?\K[0-9]{3}[- .]?[0-9]{2}[- .]?[0-9]{4}(?![0-9])|\b[0-9]{3}[- .][0-9]{2}[- .][0-9]{4}\b)'
     tier: 1
 
   EMAIL:

@@ -222,6 +222,7 @@ import linecache
 import logging
 import re
 import secrets
+import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterator, Sequence
@@ -261,11 +262,12 @@ from secure_context_pipeline.obfuscation.engine import ObfuscationEngine
 from secure_context_pipeline.pipeline import egress_gate
 from secure_context_pipeline.pipeline.context_injector import ContextInjector
 from secure_context_pipeline.pipeline.egress_gate import (
+    MIN_IDENTIFIER_DIGITS,
+    MIN_IDENTIFIER_RUN_DIGITS,
     MIN_JOINED_ALNUM_LEN,
     MIN_ORIGINAL_LEN,
     EgressGate,
     _composite_needles,
-    _digits_only,
     _identifier_needles,
     _regrouped_identifier_needle,
 )
@@ -361,6 +363,75 @@ PROMPT_FRAMES = {
     "PHONE": "Confirm the contact number {value} against the rest of the file.",
 }
 
+#: A **published placeholder** SSN -- the canonical example from every SSA leaflet and
+#: form. It is by definition not a living person's number, which is why it can be
+#: written here as a literal at all.
+#:
+#: It is planted in the PROMPT rather than in a generated document, and that placement
+#: is the entire design. :func:`tests.test_generator.every_document` scans generator
+#: output only, so ``test_generator.py::test_every_ssn_is_in_a_never_issued_range`` --
+#: the safety assertion that no synthetic value may belong to a living person -- never
+#: sees this string and does not have to be weakened by one character to admit it. No
+#: generated document changes for any seed either, so every other corpus measurement in
+#: the repository is untouched.
+#:
+#: **The BARE nine-digit spelling is load-bearing.** Written with delimiters it would
+#: be claimed by pass 3's *first* pattern, the unlabelled delimited rule, and the run
+#: would block on that whatever the registry did -- so the harness would redden for a
+#: reason unrelated to the defect it is here to catch. Bare, pass 3's first pattern
+#: cannot see it, and the only two rules that can are the label-anchored pair whose
+#: agreement is the thing under test.
+PROMPT_SSN_VALUE = "123456789"
+
+#: Intake-form spellings of the SSN label, rotated across the runs. Every one of these
+#: separators sat in the gap between the gate's ``[^0-9A-Za-z]`` class and the
+#: registry's old ``[\s:#.\-]`` one, so every one of them was a document the gate
+#: refused and the detector could have vaulted -- ``422 EGRESS_BLOCKED``, ``demo.py
+#: --file`` exit 1, measured. That gap is what this plant exists to catch a regression
+#: of: narrow ``entities.yaml`` -> ``SSN.patterns`` back and the value stops being
+#: detected, stops being vaulted, reaches the payload raw, and pass 3 blocks the run.
+#: The harness reddens loudly instead of the leak class returning in silence.
+#:
+#: **Every frame keeps a SPACE immediately before the digits, and that is a measured
+#: requirement rather than a style choice.** The first version of this list glued the
+#: punctuation to the value -- ``SSN=``, ``SSN/``, ``SSN [`` -- and made the 100 runs
+#: red once or twice per suite, on pseudonymization only. The cause is a pre-existing
+#: span-widening defect that has nothing to do with the separator class this plant
+#: exists to guard. Measured with ``Detector._analyze_sync``, 150 random nine-digit
+#: values per spelling, counting hits that start before the value and end inside it::
+#:
+#:     'member SSN, {v}'    0/150        'member SSN={v}'     1/150  LOCATION 'SSN=465925517'
+#:     'Number (SSN): {v}'  0/150        'member SSN/{v}'     6/150  LOCATION 'SSN/136134125'
+#:     'member SSN — {v}'   0/150        'member SSN [{v}]'   9/150  PHONE_NUMBER '[083016613'
+#:     'member SSN? {v}'    0/150
+#:     'member SSN = {v}'   0/150        'member SSN / {v}'   0/150
+#:
+#: With the punctuation glued on, spaCy's NER reads ``SSN/601238743`` as one PERSON at
+#: 0.85 and Presidio's ``PhoneRecognizer`` swallows a leading ``[`` at 0.40.
+#: ``resolve_overlaps`` then keeps the more specific SSN *type* with the competitor's
+#: wider *span*, so the detection covers ``SSN/601238743`` while the vault issued a
+#: surrogate for the nine digits alone. Pass 2's hit therefore merely OVERLAPS the
+#: protected span instead of being contained by it, and the run blocks on
+#: ``detector_rescan``. It is probabilistic because it depends on the randomly drawn
+#: pseudonym: ``SSN [123456789]`` draws no competing hit at all, which is why
+#: ``demo.py --file`` on that spelling exits 0.
+#:
+#: None of that is the registry widening. ``Ref [021000021]`` reproduces the same
+#: span-grab with no SSN rule in the picture, on ``detector.py`` and Presidio code this
+#: pass did not touch. It is recorded here rather than quietly worked around because it
+#: is a real defect and somebody's to fix: ``resolve_overlaps`` should not hand a narrow
+#: recogniser's type to a wide competitor's span. What it costs *this* plant is nothing
+#: -- the six spellings below span the same separator gap with a space in front of the
+#: digits, and each was measured 0/150.
+PROMPT_SSN_FRAMES = (
+    "Cross-check member SSN, {value} while you are in the file.",
+    "Cross-check Social Security Number (SSN): {value} while you are in the file.",
+    "Cross-check member SSN = {value} while you are in the file.",
+    "Cross-check member SSN / {value} while you are in the file.",
+    "Cross-check member SSN — {value} while you are in the file.",
+    "Cross-check member SSN? {value} while you are in the file.",
+)
+
 
 def drawn_original(seed: int, kind: str, entity_type: str) -> str:
     """One planted literal of ``entity_type`` from the document run ``seed``/``kind``.
@@ -424,7 +495,14 @@ def prompt_for(index: int) -> str:
     entity_type = PROMPT_ENTITY_TYPES[index % len(PROMPT_ENTITY_TYPES)]
     value = drawn_original(seed, kind, entity_type)
     frame = PROMPT_FRAMES[entity_type].format(role=PROMPT_ROLE_NOUN[kind], value=value)
-    return f"{BASE_PROMPT} {frame}"
+    # A labelled SSN in an intake-form spelling, on every run. See PROMPT_SSN_VALUE:
+    # this is the one value in the prompt that is planted rather than drawn, because
+    # the defect class it covers is about a SPELLING the registry might stop claiming,
+    # and no generated fixture writes an SSN behind a comma or a parenthesis.
+    ssn_frame = PROMPT_SSN_FRAMES[index % len(PROMPT_SSN_FRAMES)].format(
+        value=PROMPT_SSN_VALUE
+    )
+    return f"{BASE_PROMPT} {frame} {ssn_frame}"
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +756,18 @@ class Ledger:
     #: ``(seconds, index)`` for the slowest run, and the wall time of all of them.
     slowest: tuple[float, int] | None = None
     elapsed_total: float = 0.0
+    #: ``index -> (session_id, originals, restored)`` for every run that recorded.
+    #:
+    #: Kept so the two headline figures can be **re-derived from the vault** at
+    #: teardown instead of being believed. ``originals_vaulted`` is a running sum of
+    #: numbers this module computed during the run; summing
+    #: ``vault.originals_for_session`` afterwards asks the store that actually holds
+    #: them, which is a different reader of a different object at a different time.
+    #: :func:`test_leakage_summary` fails if the two disagree. Before this, the only
+    #: check on the printed tally was ``test_readme_claims`` comparing the README's
+    #: quotation of the number against the README's other quotation of it -- two
+    #: copies of one claim, neither of them a measurement.
+    per_run: dict[int, tuple[str, int, int]] = field(default_factory=dict)
 
     @contextmanager
     def watching(self, index: int) -> Iterator[None]:
@@ -712,11 +802,12 @@ class Ledger:
             if self.slowest is None or elapsed > self.slowest[0]:
                 self.slowest = (elapsed, index)
 
-    def record(self, *, index: int, originals: int, restored: int) -> None:
+    def record(self, *, index: int, originals: int, restored: int, session_id: str = "") -> None:
         self.runs += 1
         self.completed.add(index)
         self.originals_vaulted += originals
         self.round_trip_checked += restored
+        self.per_run[index] = (session_id, originals, restored)
 
     def summary(self) -> str:
         """The tally, and what the tally is and is not evidence of.
@@ -1023,10 +1114,244 @@ def mask(value: str) -> str:
 occurs_as_a_unit = _textrules_occurs_as_a_unit
 
 
+# ---------------------------------------------------------------------------
+# The needle vocabulary, re-derived here rather than imported
+# ---------------------------------------------------------------------------
+#
+# This module used to *call* ``_identifier_needles``, ``_composite_needles``,
+# ``_regrouped_identifier_needle`` and ``_digits_only`` -- four functions defined
+# inside the gate -- on an argument that reads well and is false: a re-derived
+# copy is a copy that can drift, so importing the gate's own rule keeps the two
+# in step for free.
+#
+# **What it actually keeps in step is the blind spots.** Measured on this tree,
+# not reasoned about: replacing the gate's ``_identifier_needles`` body with
+# ``return ()`` -- one line, the whole unbounded identifier limb deleted --
+# reddened nine auxiliary tests and left **all 100 parametrized runs green**,
+# printing ``100/100 runs clean, 0 leaks``. The headline number was not evidence
+# about that limb at all, because the limb doing the checking WAS the limb under
+# test. A checker that shares machinery with the thing it checks can only observe
+# the states in which the bug does not matter.
+#
+# So the vocabulary is derived again below, from the requirement rather than from
+# the gate's source, and every consumer takes the **union** of the two. A union is
+# the only combination that is safe in both directions: it can never be narrower
+# than the gate (so ``test_the_harness_is_never_weaker_than_the_gate_*`` keeps
+# holding by construction), and no single gate function going blind can switch the
+# harness's answer off. :func:`test_the_harness_still_finds_the_leak_when_the_gate_
+# goes_blind` is the proof, and it is written as a live sabotage rather than a
+# claim.
+#
+# The FLOORS are policy and are adopted deliberately, by the same ``min`` idiom
+# and for the same reason as :data:`_HARNESS_JOINED_ALNUM_FLOOR`: this module's
+# own literal means the day the gate RAISES a floor the harness does not go blind
+# with it, and the gate's constant means the day the gate LOWERS one the harness
+# is not left behind. Two views of one number are not two opinions. A constant is
+# not machinery -- emptying a function body does not move an integer -- which is
+# exactly why these may be imported while the functions may not.
+
+#: The ASCII digits, as a set, because every rule below counts them.
+_ASCII_DIGITS: frozenset[str] = frozenset("0123456789")
+
+#: How many ASCII digits in TOTAL make a letter-free value worth comparing with no
+#: adjacency rule at all. Seven: six-digit totals are mostly dates and amounts
+#: (``03/12/85``, ``$1,234.56``), which are aggregates of short runs.
+_HARNESS_IDENTIFIER_DIGITS = min(7, MIN_IDENTIFIER_DIGITS)
+
+#: How long one CONTIGUOUS run of ASCII digits must be to be worth the same. Six,
+#: and deliberately lower than the total above: the shipped registry vaults
+#: six-digit MRNs, and a contiguous six-digit run is an identifier core, not a date.
+_HARNESS_RUN_DIGITS = min(6, MIN_IDENTIFIER_RUN_DIGITS)
+
+#: The shortest value that gets a whole-value needle. Three, because a two-character
+#: needle compared with no adjacency rule matches inside ordinary prose.
+_HARNESS_MIN_ORIGINAL_LEN = min(3, MIN_ORIGINAL_LEN)
+
+
+def _reference_digits_only(value: str) -> str:
+    """``value`` reduced to its ASCII digits, by set membership rather than a range test."""
+    return "".join(ch for ch in value if ch in _ASCII_DIGITS)
+
+
+def _reference_digit_runs(value: str) -> list[str]:
+    """``value``'s maximal contiguous ASCII-digit runs, walked by index arithmetic.
+
+    A loop and :data:`_ASCII_DIGITS` rather than the gate's compiled ``\\d+`` findall,
+    for the same reason :func:`_alnum_components` is a loop: this is half of a second
+    opinion, and a second opinion assembled from the first one's parts is one opinion.
+    """
+    runs: list[str] = []
+    current: list[str] = []
+    for ch in value:
+        if ch in _ASCII_DIGITS:
+            current.append(ch)
+        elif current:
+            runs.append("".join(current))
+            current = []
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
+def _reference_identifier_needles(value: str) -> tuple[str, ...]:
+    """Forms of ``value`` that disclose it **whatever they are glued to**.
+
+    The requirement, in words, so the two derivations can be read against each other:
+    *a digit-carrying value is also compared as a bare substring, in two shapes -- the
+    whole value when it carries no letter at all and at least*
+    :data:`_HARNESS_IDENTIFIER_DIGITS` *digits in total, and every contiguous digit run
+    of at least* :data:`_HARNESS_RUN_DIGITS` *whatever else the value contains.*
+
+    Both halves earn their place on a payload, not on paper. ``The taxpayer EIN
+    47-1234567 is on file`` vaults the identifier; ``Internal routing tag:
+    batch47-1234567Alpha`` carries it out byte for byte past every boundary-anchored
+    comparison there is, and ``batch`` in front of it conceals nothing from a reader
+    and nothing from the model. The run half is the one that matters for a span the
+    detector took together with its own label: ``MRN: 5567281`` never occurs in
+    ``MRN5567281B``, but ``5567281`` does, and the digits are the secret.
+    """
+    stripped = value.strip()
+    if not any(ch in _ASCII_DIGITS for ch in stripped):
+        return ()
+    needles: list[str] = []
+    if (
+        sum(1 for ch in stripped if ch in _ASCII_DIGITS) >= _HARNESS_IDENTIFIER_DIGITS
+        and not any(ch.isalpha() for ch in stripped)
+        and len(stripped) >= _HARNESS_MIN_ORIGINAL_LEN
+    ):
+        needles.append(stripped)
+    needles.extend(
+        run for run in _reference_digit_runs(stripped) if len(run) >= _HARNESS_RUN_DIGITS
+    )
+    return tuple(dict.fromkeys(needles))
+
+
+def _reference_regrouped_identifier_needle(value: str) -> str | None:
+    """``value``'s digit skeleton, for a payload that RE-GROUPS the same digits.
+
+    The requirement: *a letter-free value carrying at least*
+    :data:`_HARNESS_IDENTIFIER_DIGITS` *digits is also compared as its digits alone,
+    against the payload's digits alone* -- so a vaulted ``100200300400`` written on the
+    wire as ``1002-0030-0400`` collapses to the same string on both sides.
+
+    Letter-free is load-bearing rather than tidy: identifier shapes collide by prefix,
+    and the digit skeleton of ``1:23-cv-04567`` sits inside that of the companion
+    docket ``1:23-cv-045678``, so an unbounded comparison would deny a payload that
+    merely cites the neighbouring case. The floor is the TOTAL rather than the run
+    floor for the same reason ``$1,234.56``'s skeleton sits inside ``$1,234.567``'s.
+    """
+    stripped = value.strip()
+    if any(ch.isalpha() for ch in stripped):
+        return None
+    digits = _reference_digits_only(stripped)
+    return digits if len(digits) >= _HARNESS_IDENTIFIER_DIGITS else None
+
+
+def _reference_delimited_parts(value: str) -> list[str]:
+    """``value`` split on the grammar an ordinary English list uses: ``,`` ``;`` ``&`` ``and``.
+
+    Hand-walked rather than the shared ``DELIMITER_RE``, because that regex is the
+    *detector's* splitting rule as well as the gate's, so borrowing it would make this
+    limb a third caller of one opinion. The word ``and`` is matched word-bounded and
+    case-insensitively, which is what ``\\band\\b`` with ``re.IGNORECASE`` means; the
+    word characters either side are alphanumerics and the underscore, which is what
+    ``\\b`` means.
+
+    Empty and whitespace-only runs are dropped, because ``"a, b, and c"`` puts a bare
+    space between the second comma and the ``and`` and a trailing comma leaves an empty
+    tail -- counting either as a constituent would make every ordinary three-item list
+    fail the caller's "every part must qualify" rule.
+    """
+
+    def is_word_char(ch: str) -> bool:
+        return ch.isalnum() or ch == "_"
+
+    pieces: list[str] = []
+    current: list[str] = []
+    index = 0
+    length = len(value)
+    while index < length:
+        ch = value[index]
+        if ch in ",;&":
+            pieces.append("".join(current))
+            current = []
+            index += 1
+            continue
+        if (
+            value[index : index + 3].lower() == "and"
+            and (index == 0 or not is_word_char(value[index - 1]))
+            and (index + 3 >= length or not is_word_char(value[index + 3]))
+        ):
+            pieces.append("".join(current))
+            current = []
+            index += 3
+            continue
+        current.append(ch)
+        index += 1
+    pieces.append("".join(current))
+    return [piece.strip() for piece in pieces if piece.strip()]
+
+
+def _reference_composite_needles(value: str) -> tuple[str, ...]:
+    """The constituents of ``value`` when ``value`` is a *list* of digit-bearing values.
+
+    A vault original is whatever the detector called one span, and a span is not always
+    one value: ``03/11/2024, 09/17/2024`` comes back as a single ``DATE``, so every
+    bounded comparison then asks about a string nobody wrote as a unit, and the
+    identifier limb contributes nothing because the longest contiguous run in it is
+    four. A payload carrying one of those dates alone -- which this pipeline can
+    *manufacture*, by shifting a third date in the same document onto it -- reads clean
+    through both.
+
+    The rule is deliberately narrow, because these needles are compared word-bounded
+    against megabyte haystacks and a false hit here is a headline assertion going red
+    with nothing leaked: **two or more** constituents, and **every** one of them
+    carrying at least :data:`_HARNESS_IDENTIFIER_DIGITS` ASCII digits. All-or-nothing,
+    so ``Jan 5, 2024`` contributes nothing rather than contributing ``2024``; and
+    whitespace is not a delimiter, so a multi-*word* value contributes nothing at all.
+    """
+    if not any(ch in _ASCII_DIGITS for ch in value):
+        return ()
+    parts = _reference_delimited_parts(value)
+    if len(parts) < 2:
+        return ()
+    needles: list[str] = []
+    for part in parts:
+        if sum(1 for ch in part if ch in _ASCII_DIGITS) < _HARNESS_IDENTIFIER_DIGITS:
+            return ()
+        needles.append(part)
+    return tuple(dict.fromkeys(needles))
+
+
+def _union_identifier_needles(value: str) -> tuple[str, ...]:
+    """Every unbounded identifier needle EITHER derivation yields, de-duplicated.
+
+    Union, never a choice. Narrower than the gate is the one thing this module may
+    never be -- ``test_the_harness_scan_is_never_weaker_than_the_gate_scan`` says so --
+    and wholly dependent on the gate is what it was. A union is both at once.
+    """
+    return tuple(dict.fromkeys(_reference_identifier_needles(value) + _identifier_needles(value)))
+
+
+def _union_composite_needles(value: str) -> tuple[str, ...]:
+    """:func:`_reference_composite_needles` and the gate's, unioned. See above."""
+    return tuple(dict.fromkeys(_reference_composite_needles(value) + _composite_needles(value)))
+
+
 def _digit_skeleton_hit(folded: str, digits_hay: str) -> bool:
-    """Whether ``folded``'s digit skeleton occurs in the payload's."""
-    needle = _regrouped_identifier_needle(folded)
-    return needle is not None and needle in digits_hay
+    """Whether ``folded``'s digit skeleton occurs in the payload's.
+
+    Both derivations of the skeleton are asked, for the reason
+    :func:`_union_identifier_needles` gives: the gate's returning ``None`` must not be
+    able to answer this question on the harness's behalf.
+    """
+    return any(
+        needle is not None and needle in digits_hay
+        for needle in (
+            _reference_regrouped_identifier_needle(folded),
+            _regrouped_identifier_needle(folded),
+        )
+    )
 
 
 #: A tag-shaped run: ``<b>``, ``<br/>``, ``</span>``. Substituted with a **space**
@@ -1347,7 +1672,7 @@ def _haystack_forms(haystack: str) -> _HaystackForms:
         boundary_skeleton=_reference_skeleton(
             haystack, is_mark=_reference_is_reordering_mark
         ),
-        digits=_digits_only(skeleton_hay),
+        digits=_reference_digits_only(skeleton_hay),
     )
 
 
@@ -1646,7 +1971,7 @@ def find_in_text(
     digit_streams = [view.digits for view in views]
     excised = _harness_strip_own_tokens(haystack, issued)
     if excised != haystack:
-        digit_streams.append(_digits_only(_reference_skeleton(excised)))
+        digit_streams.append(_reference_digits_only(_reference_skeleton(excised)))
     digit_views = tuple(dict.fromkeys(digit_streams))
 
     def bounded(value: str) -> bool:
@@ -1659,12 +1984,27 @@ def find_in_text(
         """
         normalised = normalize(value)
         folded = _reference_strip_invisible(normalised)
+        # Each form is asked of BOTH derivations of the occurrence rule -- the shared
+        # one in ``textrules`` (which the gate and the engine's residual sweep also
+        # call) and this module's own :func:`_reference_occurs_as_a_unit`. The pair is
+        # OR-ed rather than compared, for the reason the needle vocabulary above is
+        # unioned: ``test_the_occurrence_rule_has_no_fourth_copy`` already reddens when
+        # the two DISAGREE, but a rule that stops matching anything does not disagree
+        # with a reference nobody consults on this path -- it just goes quiet, and the
+        # headline ``100/100 runs clean`` stays green with the scan switched off. An OR
+        # cannot be narrower than either half, so the shared rule is still in use and
+        # the scan no longer depends on it being right.
         return any(
             occurs_as_a_unit(value, view.raw)
+            or _reference_occurs_as_a_unit(value, view.raw)
             or occurs_as_a_unit(normalised, view.normalized)
+            or _reference_occurs_as_a_unit(normalised, view.normalized)
             or occurs_as_a_unit(folded, view.folded)
+            or _reference_occurs_as_a_unit(folded, view.folded)
             or occurs_as_a_unit(folded, view.skeleton)
+            or _reference_occurs_as_a_unit(folded, view.skeleton)
             or occurs_as_a_unit(folded, view.boundary_skeleton)
+            or _reference_occurs_as_a_unit(folded, view.boundary_skeleton)
             for view in views
         )
 
@@ -1673,7 +2013,7 @@ def find_in_text(
         return any(
             any(
                 needle in view.skeleton or needle in view.boundary_skeleton
-                for needle in _identifier_needles(folded)
+                for needle in _union_identifier_needles(folded)
             )
             # The separator-invariant limb. Mirrors the gate's fifth comparison:
             # a multi-component original whose interior separator the payload
@@ -1720,7 +2060,7 @@ def find_in_text(
         if (
             bounded(original)
             or unbounded(folded_original)
-            or any(bounded(part) for part in _composite_needles(original))
+            or any(bounded(part) for part in _union_composite_needles(original))
         ):
             found.append(original)
     return sorted(found)
@@ -1888,7 +2228,7 @@ def _harness_identifier_needles(value: str) -> tuple[str, ...]:
     """
     return tuple(
         needle
-        for needle in _identifier_needles(value)
+        for needle in _union_identifier_needles(value)
         if sum(1 for ch in needle if "0" <= ch <= "9") >= _HARNESS_RUN_FLOOR
     )
 
@@ -1983,11 +2323,18 @@ def find_in_digit_heavy_text(
         """
         normalised = normalize(value)
         folded = _reference_strip_invisible(normalised)
+        # Both derivations of the occurrence rule, OR-ed. See ``find_in_text.bounded``
+        # for why a shared rule that goes quiet is not caught by a test that only
+        # compares it against a reference.
         return (
             occurs_as_a_unit(value, haystack)
+            or _reference_occurs_as_a_unit(value, haystack)
             or occurs_as_a_unit(normalised, norm_hay)
+            or _reference_occurs_as_a_unit(normalised, norm_hay)
             or occurs_as_a_unit(folded, folded_hay)
+            or _reference_occurs_as_a_unit(folded, folded_hay)
             or occurs_as_a_unit(folded, skeleton_hay)
+            or _reference_occurs_as_a_unit(folded, skeleton_hay)
         )
 
     found: list[str] = []
@@ -1996,7 +2343,7 @@ def find_in_digit_heavy_text(
         if (
             bounded(original)
             or any(needle in skeleton_hay for needle in _harness_identifier_needles(folded))
-            or any(bounded(part) for part in _composite_needles(original))
+            or any(bounded(part) for part in _union_composite_needles(original))
         ):
             found.append(original)
     return sorted(found)
@@ -2038,7 +2385,7 @@ def _identifier_site(folded: str, skeleton_hay: str) -> str:
     exists to stop. Nothing here decides whether a value leaked -- that decision was
     already made by :func:`find_in_digit_heavy_text`; this only describes it.
     """
-    for needle in _identifier_needles(folded):
+    for needle in _union_identifier_needles(folded):
         at = skeleton_hay.find(needle)
         if at < 0:
             continue
@@ -2105,7 +2452,7 @@ def describe_hits(originals: list[str], haystack: str) -> list[str]:
                 ("skeleton", occurs_as_a_unit(folded, skeleton_hay)),
                 (
                     "identifier",
-                    any(needle in skeleton_hay for needle in _identifier_needles(folded)),
+                    any(needle in skeleton_hay for needle in _union_identifier_needles(folded)),
                 ),
             )
             if fired
@@ -2997,6 +3344,76 @@ def test_the_prompt_carries_a_real_original() -> None:
     assert len(prompts) == 6, f"the per-run prompts are not distinct: {len(prompts)}/6"
 
 
+def test_every_run_carries_a_labelled_ssn_in_an_intake_form_spelling() -> None:
+    """The 100 runs must be *able* to catch the gate-wider-than-registry defect class.
+
+    That class was argued to be outside this harness's reach, on the grounds that
+    covering it would mean weakening ``test_generator.py::
+    test_every_ssn_is_in_a_never_issued_range`` -- the assertion that no synthetic value
+    may belong to a living person. The reason was overstated. That test scans
+    :func:`tests.test_generator.every_document`, which reads **generator output**, and a
+    value planted in the harness's own prompt is not generator output. So the coverage
+    is bought with no change to the safety assertion at all, and with no generated
+    document changing for any seed.
+
+    What this test pins is that the plant is actually there and actually of the right
+    shape, because every property the coverage rests on is silent if it drifts:
+
+    * a *labelled* SSN -- an unlabelled one is a different rule (pass 3's first pattern)
+      and would redden for a different reason;
+    * written **bare**, for the same reason: with delimiters, pass 3's first pattern
+      claims it whatever the registry does, and the run would block on that instead;
+    * in separator spellings that live in the class the registry's old
+      ``[\\s:#.\\-]`` did not cover, since that gap is the defect being guarded;
+    * on *every* run, so a regression cannot hide in an unlucky rotation.
+
+    The run body supplies the other half: the payload it scans is the one the provider
+    received, and a value the registry stops claiming is not vaulted, so it arrives raw
+    and pass 3 blocks -- a red run with a named cause rather than a silent leak.
+    """
+    import re as _re
+
+    assert PROMPT_SSN_VALUE.isdigit() and len(PROMPT_SSN_VALUE) == 9, (
+        "the planted SSN is no longer a bare nine-digit run, so pass 3's unlabelled "
+        "delimited pattern may claim it and the plant stops isolating the label rule"
+    )
+
+    label = _re.compile(r"(?i)\b(?:ssns?|social\s+security)")
+    gap_only = _re.compile(r"[^0-9A-Za-z\s:#.\-]")
+
+    seen_frames: set[str] = set()
+    for index in range(RUNS):
+        prompt = prompt_for(index)
+        seen_frames.add(PROMPT_SSN_FRAMES[index % len(PROMPT_SSN_FRAMES)])
+        assert PROMPT_SSN_VALUE in prompt, (
+            f"run {index}: the prompt carries no planted SSN, so the 100 runs cannot "
+            "catch a regression of the registry/gate divergence"
+        )
+        head = prompt[: prompt.index(PROMPT_SSN_VALUE)]
+        labels = list(label.finditer(head))
+        hit = labels[-1] if labels else None
+        assert hit is not None, (
+            f"run {index}: the planted SSN carries no SSN label before it, so it is an "
+            "unlabelled nine-digit run and no rule in either layer claims it"
+        )
+        separator = head[hit.end() :]
+        assert len(separator) <= 24 and not _re.search(r"[0-9A-Za-z]", separator), (
+            f"run {index}: the label is not in identifier position for the planted "
+            f"value ({separator!r}), so neither label-anchored rule claims it"
+        )
+
+    assert seen_frames == set(PROMPT_SSN_FRAMES), (
+        "not every intake spelling is reachable across the runs, so the rotation is "
+        "not exercising the separator class it exists to exercise"
+    )
+    gap_covered = [f for f in PROMPT_SSN_FRAMES if gap_only.search(f.split("{value}")[0])]
+    assert len(gap_covered) >= 5, (
+        "fewer than five of the planted spellings use a separator character outside the "
+        f"registry's old [\\s:#.\\-] class, so the plant no longer probes the gap that "
+        f"produced the defect: {gap_covered}"
+    )
+
+
 def test_a_partial_value_leak_is_outside_what_this_harness_claims() -> None:
     """The boundary of the claim, pinned so it cannot be quietly forgotten.
 
@@ -3815,6 +4232,187 @@ def test_the_harness_scan_is_never_weaker_than_the_gate_scan() -> None:
     )
 
 
+#: Every decision function this module borrows from the code it is checking, with the
+#: blind value that a one-line ``return`` mutation of its body would produce.
+#:
+#: Names rather than objects, because :func:`monkeypatch.setattr` rebinds them on THIS
+#: module -- which is exactly the reach a source edit to the gate would have, since a
+#: ``from ... import name`` binds once at import time.
+_BORROWED_DECISIONS: tuple[tuple[str, Any], ...] = (
+    ("_identifier_needles", ()),
+    ("_composite_needles", ()),
+    ("_regrouped_identifier_needle", None),
+    ("occurs_as_a_unit", False),
+)
+
+
+def test_the_harness_still_finds_the_leak_when_the_gate_goes_blind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**The independence proof.** Every borrowed decision returns nothing; the scan holds.
+
+    This is the load-bearing test of the whole file, because it is the only one that
+    asks the question the headline number cannot: *is ``100/100 runs clean`` evidence
+    about the matching logic, or is it evidence that the matching logic agrees with
+    itself?*
+
+    **It was the second one, and that was measured rather than suspected.** Replacing
+    the gate's ``_identifier_needles`` body with ``return ()`` -- one line, the entire
+    unbounded identifier limb deleted -- reddened nine auxiliary tests in this file and
+    left **all 100 parametrized runs green**, printing ``100/100 runs clean, 0 leaks
+    (3066 originals vaulted and scanned)``. Every one of those nine asserts something
+    *about* the gate's function; not one of them is the claim the README quotes. The
+    reason is structural rather than accidental: this module CALLED that function, so a
+    blind spot in the gate was, by construction, the same blind spot in its own check,
+    and a checker can only observe the states in which the bug it shares does not
+    matter.
+
+    So the four borrowed decisions -- three needle functions and the shared occurrence
+    rule -- are blinded here **all at once**, which is strictly harsher than any single
+    source mutation, and :data:`_GATE_BLOCKING_PAYLOADS` is scanned again. Every payload
+    must still be reported, out of this module's own derivations
+    (:func:`_reference_identifier_needles`, :func:`_reference_regrouped_identifier_needle`,
+    :func:`_reference_composite_needles`, :func:`_reference_occurs_as_a_unit`,
+    :func:`_harness_separator_hit`, :func:`_reference_skeleton`).
+
+    **Why blinding rather than deleting the import.** The property being proved is not
+    "these names are absent from the file" -- they are still present, and deliberately,
+    because the union of the two derivations is what keeps this module from ever being
+    *narrower* than the gate. The property is that no gate-side change can take the
+    harness's answer away, and the only honest way to state that is to take the gate's
+    answer away and look.
+
+    **The premise is taken on the healthy gate, before anything is blinded**, because
+    "the harness still finds it" is worth nothing about a payload that was never a leak.
+    Each corpus entry must block at the real gate first; only then does its surviving
+    the blinding mean anything. That ordering is the fix
+    :func:`test_the_harness_is_never_weaker_than_the_gate_on_generated_input` needed for
+    the same reason.
+
+    **What is deliberately NOT claimed here: that the blinding makes the gate itself go
+    quiet.** It does not, and the reason is worth recording rather than papering over.
+    The gate's separator limb (``_separator_needles`` /
+    ``_occurs_with_flexible_separator``) still blocks seven of these twelve payloads
+    afterwards -- but that limb is not in :data:`_BORROWED_DECISIONS`, because this
+    module answers that question with :func:`_harness_separator_hit`, its own
+    derivation, written the opposite way round. Blinding it too would prove something
+    about the gate; the subject here is the harness.
+    """
+    healthy = [
+        limb
+        for limb, original, payload in _GATE_BLOCKING_PAYLOADS
+        if _gate_scan_hits(frozenset({original}), payload) != 1
+    ]
+    assert not healthy, (
+        "premise: every corpus entry must block at the UNBLINDED gate, or 'the harness "
+        f"still finds it' is a statement about a payload that never leaked: {healthy}"
+    )
+
+    module = sys.modules[__name__]
+    for name, blind in _BORROWED_DECISIONS:
+        monkeypatch.setattr(module, name, lambda *_args, _blind=blind, **_kw: _blind)
+
+    blinded = [getattr(module, name)("x" * 9, "x" * 9) for name, _ in _BORROWED_DECISIONS]
+    assert blinded == [expected for _, expected in _BORROWED_DECISIONS], (
+        "the blinding did not take, so the scan below is running against the real "
+        f"borrowed decisions and proves nothing: {blinded}"
+    )
+
+    missed = [
+        f"{limb}: {mask(original)} in {mask(payload)}"
+        for limb, original, payload in _GATE_BLOCKING_PAYLOADS
+        if not find_in_text(frozenset({original}), payload)
+    ]
+    assert not missed, (
+        f"{len(missed)} of {len(_GATE_BLOCKING_PAYLOADS)} payload(s) become invisible to "
+        f"this module the moment the gate's own matching logic goes blind: {missed}. "
+        "That is the state in which `100/100 runs clean` stops being evidence about "
+        "anything -- the check and the thing checked fail together and in silence"
+    )
+
+
+def test_the_two_needle_derivations_agree_where_they_are_supposed_to() -> None:
+    """The union is a widening, not a divergence: both derivations must be live.
+
+    :func:`test_the_harness_still_finds_the_leak_when_the_gate_goes_blind` proves the
+    harness survives the gate. It cannot prove the reverse mistake was not made -- that
+    this module's own derivation is dead and the gate's half of the union is quietly
+    carrying it. A dead reference passes every test in this file except this one.
+
+    So each re-derived function is asserted to produce the needles the requirement says
+    it must, **and** to agree with the gate's on a corpus covering both answers. A
+    disagreement is a finding about one of the two and is named pair by pair; agreement
+    everywhere plus a non-degenerate corpus is what makes the union meaningful.
+    """
+    corpus = (
+        "47-1234567",
+        "MRN: 5567281",
+        "Account No. 100200300400",
+        "(415) 555-0123",
+        "512-24-8710",
+        "03/12/85",
+        "$1,234.56",
+        "1:23-cv-04567",
+        "Marguerite Vandenberg",
+        "A1C 7.4",
+        "03/11/2024, 09/17/2024",
+        "Jan 5, 2024",
+        "$1,234,567.89",
+        "4111111111111111 and 4222222222222222",
+        "BCBS123456789",
+        "",
+    )
+    # Spelled out from the requirement, not computed, so this half cannot drift with
+    # either implementation.
+    assert _reference_identifier_needles("47-1234567") == ("47-1234567", "1234567")
+    assert _reference_identifier_needles("MRN: 5567281") == ("5567281",)
+    assert _reference_identifier_needles("$1,234.56") == ()
+    assert _reference_regrouped_identifier_needle("1002-0030-0400") == "100200300400"
+    assert _reference_regrouped_identifier_needle("1:23-cv-04567") is None
+    assert _reference_composite_needles("03/11/2024, 09/17/2024") == (
+        "03/11/2024",
+        "09/17/2024",
+    )
+    assert _reference_composite_needles("Jan 5, 2024") == ()
+    assert _reference_digits_only("(415) 555-0123") == "4155550123"
+    assert _reference_delimited_parts("a, b, and c") == ["a", "b", "c"]
+
+    disagreements: list[str] = []
+    identifier_positives = composite_positives = regrouped_positives = 0
+    for value in corpus:
+        mine, theirs = _reference_identifier_needles(value), _identifier_needles(value)
+        identifier_positives += bool(mine)
+        if set(mine) != set(theirs):
+            disagreements.append(f"_identifier_needles({value!r}): mine={mine} gate={theirs}")
+
+        mine_c, theirs_c = _reference_composite_needles(value), _composite_needles(value)
+        composite_positives += bool(mine_c)
+        if set(mine_c) != set(theirs_c):
+            disagreements.append(f"_composite_needles({value!r}): mine={mine_c} gate={theirs_c}")
+
+        mine_r = _reference_regrouped_identifier_needle(value)
+        theirs_r = _regrouped_identifier_needle(value)
+        regrouped_positives += mine_r is not None
+        if mine_r != theirs_r:
+            disagreements.append(
+                f"_regrouped_identifier_needle({value!r}): mine={mine_r} gate={theirs_r}"
+            )
+
+    assert not disagreements, (
+        "the harness's re-derived needle vocabulary and the gate's disagree, so one of "
+        f"the two is wrong and neither can be trusted until it is resolved: {disagreements}"
+    )
+    for label, positives in (
+        ("identifier", identifier_positives),
+        ("composite", composite_positives),
+        ("regrouped", regrouped_positives),
+    ):
+        assert 0 < positives < len(corpus), (
+            f"the {label} corpus is degenerate ({positives}/{len(corpus)} positive), so "
+            "agreement between the two derivations is trivial rather than evidence"
+        )
+
+
 #: How a generated payload mutates the value spliced into it. One entry per limb the
 #: gate's pass 1 has, so a payload that only that limb can catch is reachable by
 #: construction rather than by luck.
@@ -3881,17 +4479,7 @@ _FUZZ_VALUES = st.one_of(
 )
 
 
-@given(
-    original=_FUZZ_VALUES,
-    prefix=st.text(alphabet="ab1_ .-", max_size=6),
-    suffix=st.text(alphabet="ab1_ .-", max_size=6),
-    mutation=st.sampled_from(_MUTATIONS),
-    at=st.integers(min_value=0, max_value=12),
-)
-@settings(max_examples=3_000, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_the_harness_is_never_weaker_than_the_gate_on_generated_input(
-    original: str, prefix: str, suffix: str, mutation: str, at: int
-) -> None:
+def test_the_harness_is_never_weaker_than_the_gate_on_generated_input() -> None:
     """The same one-way property, past the ten shapes somebody thought of.
 
     :func:`test_the_harness_scan_is_never_weaker_than_the_gate_scan` compares the two
@@ -3922,15 +4510,53 @@ def test_the_harness_is_never_weaker_than_the_gate_on_generated_input(
 
     A failure is a payload hypothesis has shrunk to a minimal pair, which is the part a
     hand-written corpus cannot do at all.
+
+    **The property is guarded, and it was not.** *"The harness is never weaker than X"*
+    is trivially true of an ``X`` that finds nothing, and the whole comparison here sat
+    behind ``if _gate_scan_hits(...)`` -- so with the gate's pass 1 replaced by
+    ``return 0`` this test reported **3,000 passing examples and stayed green**,
+    measured by doing it. It could not tell "the harness covers the gate" from "there
+    is no gate", which are the two states a reader of the name would most want
+    distinguished.
+
+    So the body is now an inner property and the count of examples that actually
+    reached the assertion is checked afterwards. The count is the whole fix: a strategy
+    change, an exemption, or a dead gate that stops any draw from blocking now fails
+    here instead of passing silently. It is not asserted as a *rate* -- Hypothesis is
+    free to spend its budget where it likes -- only that the comparison happened at all,
+    which is the difference between a vacuous pass and a weak one.
     """
-    payload = prefix + _mutate(original, mutation, at) + suffix
-    originals = frozenset({original})
-    if _gate_scan_hits(originals, payload):
-        assert find_in_text(originals, payload) == [original], (
-            "the egress gate blocks this payload and this module's scan calls it clean, "
-            "so any leak of this shape into the audit database or the process log would "
-            "be reported as 100/100 runs clean"
-        )
+    compared: list[str] = []
+
+    @given(
+        original=_FUZZ_VALUES,
+        prefix=st.text(alphabet="ab1_ .-", max_size=6),
+        suffix=st.text(alphabet="ab1_ .-", max_size=6),
+        mutation=st.sampled_from(_MUTATIONS),
+        at=st.integers(min_value=0, max_value=12),
+    )
+    @settings(max_examples=3_000, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+    def never_weaker(original: str, prefix: str, suffix: str, mutation: str, at: int) -> None:
+        payload = prefix + _mutate(original, mutation, at) + suffix
+        originals = frozenset({original})
+        if _gate_scan_hits(originals, payload):
+            compared.append(original)
+            assert find_in_text(originals, payload) == [original], (
+                "the egress gate blocks this payload and this module's scan calls it "
+                "clean, so any leak of this shape into the audit database or the "
+                "process log would be reported as 100/100 runs clean"
+            )
+
+    never_weaker()
+
+    assert compared, (
+        "not one generated payload was blocked by the gate, so every example took the "
+        "`if` branch that skips the comparison and this test proved nothing. `never "
+        "weaker than the gate` is satisfied by a gate that finds nothing -- with pass 1 "
+        "replaced by `return 0` this ran 3,000 examples and passed. Either the gate is "
+        "dead (a finding about the gate) or `_FUZZ_VALUES`/`_MUTATIONS` no longer "
+        "generate a payload it can block (a finding about this test)"
+    )
 
 
 def test_a_short_surrogate_inside_a_longer_word_has_not_survived() -> None:
@@ -4790,7 +5416,12 @@ async def test_no_original_ever_leaves_the_process(
             f"{surviving[:5]}"
         )
 
-        ledger.record(index=index, originals=len(originals), restored=len(expected))
+        ledger.record(
+            index=index,
+            originals=len(originals),
+            restored=len(expected),
+            session_id=session_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5233,7 +5864,97 @@ async def test_leakage_summary(
     assert ledger.runs == RUNS, f"expected {RUNS} completed runs, recorded {ledger.runs}"
     assert ledger.leaks == 0, f"{ledger.leaks} leak(s) found across {ledger.runs} runs"
     assert await harness.audit.verify_chain() is True, "audit hash chain broken"
+
+    # --- the tally, re-derived from the vault rather than believed --------------
+    #
+    # ``originals_vaulted`` is a running sum of counts this module took during each
+    # run. Summing what the SessionVault holds now is a second reading, by a
+    # different object, after every run has finished -- so a run that double-counted,
+    # a ``record()`` called with the wrong number, or a session whose originals were
+    # never actually stored all show up here as a disagreement rather than as a
+    # confidently printed figure. The README quotes this number; until this
+    # assertion existed the only thing checking it was the README's own restatement
+    # of it, which is a copy rather than a measurement.
+    from_vault = sum(
+        len(harness.vault.originals_for_session(session_id))
+        for session_id, _originals, _restored in ledger.per_run.values()
+    )
+    assert from_vault == ledger.originals_vaulted, (
+        f"the summary is about to print {ledger.originals_vaulted} originals vaulted, "
+        f"but the vault holds {from_vault} across the same {len(ledger.per_run)} "
+        "sessions. The printed tally is not a measurement of what was stored"
+    )
+    assert sum(o for _s, o, _r in ledger.per_run.values()) == ledger.originals_vaulted, (
+        "the running total and the per-run record disagree, so one run's count was "
+        "added twice or not at all"
+    )
+    assert sum(r for _s, _o, r in ledger.per_run.values()) == ledger.round_trip_checked, (
+        "the round-trip total and the per-run record disagree"
+    )
+    assert len({session_id for session_id, _o, _r in ledger.per_run.values()}) == RUNS, (
+        "two runs shared a session id, so one run's originals were counted against "
+        "another's and the vault re-derivation above compares a set with itself"
+    )
+
     print("\n" + ledger.summary() + "\n" + ledger.timing())
+
+
+def test_the_hundred_runs_are_a_hundred_distinct_documents() -> None:
+    """"Varied fixture documents", asserted rather than assumed from the seed arithmetic.
+
+    The challenge asks for the harness to run over *varied* documents. ``100/100 runs
+    clean`` over one document scanned a hundred times would satisfy every other
+    assertion in this file and would be worth a hundredth of what it claims -- and the
+    distance between those two states is one editing mistake in :func:`plan_run`
+    (``SEED_BASE + index`` losing its ``+ index``, a ``%`` that should be an ``//``).
+    Nothing here would have gone red.
+
+    So the documents are generated and compared. Four properties, because "varied" has
+    four separate ways of quietly failing:
+
+    * **distinct text.** Not distinct *seeds* -- a generator that ignores its seed
+      passes that and fails this. The documents themselves must all differ.
+    * **every category.** The three document kinds the challenge names must all appear,
+      and roughly evenly: 34/33/33 falls out of ``index % 3`` over 100.
+    * **both strategies.** 50/50 from ``index % 2``, so neither is a token presence.
+    * **every pairing.** Six (kind, strategy) combinations, all populated -- ``% 2`` and
+      ``% 3`` are coprime, so the rotation covers the grid rather than pinning one
+      strategy to one kind, which is the failure a 50/50 split alone cannot see.
+
+    Cheap, because it calls the generator and stops: no detector, no pipeline, no
+    session. It is the plan being checked, not the runs.
+    """
+    documents: dict[str, int] = {}
+    kinds: dict[str, int] = {}
+    strategies: dict[str, int] = {}
+    pairs: set[tuple[str, str]] = set()
+    seeds: set[int] = set()
+
+    for index in range(RUNS):
+        seed, kind, strategy = plan_run(index)
+        seeds.add(seed)
+        kinds[kind] = kinds.get(kind, 0) + 1
+        strategies[strategy] = strategies.get(strategy, 0) + 1
+        pairs.add((kind, strategy))
+        document = generator.generate(seed, kind)
+        documents[document] = documents.get(document, 0) + 1
+
+    assert len(seeds) == RUNS, f"the {RUNS} runs draw only {len(seeds)} distinct seeds"
+    repeats = {count for count in documents.values() if count > 1}
+    assert len(documents) == RUNS, (
+        f"the {RUNS} runs generate only {len(documents)} distinct documents "
+        f"(duplicate multiplicities {sorted(repeats)}), so the headline number is one "
+        "document scanned repeatedly rather than a hundred documents scanned once"
+    )
+    assert kinds == {"medical": 34, "legal": 33, "financial": 33}, (
+        f"the document categories are no longer evenly rotated: {kinds}"
+    )
+    assert strategies == {"tokenization": 50, "pseudonymization": 50}, (
+        f"the obfuscation strategies are no longer evenly rotated: {strategies}"
+    )
+    assert pairs == {(k, s) for k in KINDS for s in STRATEGIES}, (
+        f"only {len(pairs)} of 6 (kind, strategy) pairings are exercised: {sorted(pairs)}"
+    )
 
 
 def test_a_run_that_dies_before_record_is_named_with_its_reason() -> None:

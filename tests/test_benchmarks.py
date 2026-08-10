@@ -17,10 +17,14 @@ Full pipeline, 12k-word brief          every stage we control      < 15 s
 
 ``pytest -m bench`` selects *only* these; it is not an opt-in gate, and the
 docstring used to call the marker "opt-in", which was wrong in the direction that
-matters. There is no ``addopts`` in ``pyproject.toml`` and no
-``collection_modifyitems`` hook, so a bare ``pytest`` collects and runs every one
-of them -- which is also what README section 4 counts ("2280 collected: 134
-leakage + 5 bench + rest unit + integration").
+matters. There is no ``addopts`` in ``pyproject.toml`` deselecting them, and the
+one ``pytest_collection_modifyitems`` hook in ``tests/conftest.py`` touches
+``real_llm`` items and nothing else, so a bare ``pytest`` collects and runs every
+one of these -- which is what the collected-test split in README section 1 counts.
+(That sentence used to read "there is no ``collection_modifyitems`` hook" and to
+paste the split as a literal; the first half stopped being true when ``--real-llm``
+was added, and the second was a copy of a number that lives in section 1 and is
+re-derived by ``tests/test_readme_claims.py`` from a real collection.)
 
 **They stay in the default run, deliberately.** These measurements are the only
 evidence behind the section 12 table in the README, and a number nobody re-measures
@@ -101,10 +105,12 @@ RESPONSE_TOKENS = 500
 
 #: Repetitions for the two budgets with the least headroom, scored **best-of-N**.
 #:
-#: A wall-clock assertion measures the machine as much as the code. These two run at
-#: 4.8x and 2.3x headroom, and a reviewer's laptop mid-Spotlight-index, a CI box with
-#: noisy neighbours, or -- as happened during this build -- three other test suites
-#: running concurrently, can plausibly eat that. A benchmark that goes red for
+#: A wall-clock assertion measures the machine as much as the code. The repeated
+#: rows are the ones whose headroom is in single digits -- which rows those are is a
+#: property of the current tree and is printed by every run rather than pasted here
+#: -- and a reviewer's laptop mid-Spotlight-index, a CI box with noisy neighbours,
+#: or -- as happened during this build -- three other test suites running
+#: concurrently, can plausibly eat single-digit headroom. A benchmark that goes red for
 #: reasons unrelated to the code is a benchmark people learn to re-run until it is
 #: green, which is strictly worse than not having it.
 #:
@@ -117,49 +123,75 @@ RESPONSE_TOKENS = 500
 #: minimum moves with it and the test still fails; that is verified by sabotage
 #: rather than argued.
 #:
-#: Applied to every budget whose headroom is in single digits. Best-of-3 as scored,
-#: across three consecutive quiet runs on this machine::
+#: **This comment used to paste a seven-row table of measured timings, and that
+#: table was the third different set of numbers for the same benchmarks in this
+#: repository** -- the README published one set, an audit measured another, and this
+#: docstring carried a third, none of them current. It is deleted rather than
+#: refreshed. A pasted number that nothing re-derives is a claim with a half-life,
+#: and three copies of it is three half-lives; the measurements this module makes
+#: are printed by :class:`Report` on every run and bound to the README's published
+#: table by :func:`test_the_readme_benchmark_table_is_the_one_this_run_measured`,
+#: which is the only copy that cannot go stale silently.
 #:
-#:     full pipeline, 12k-word brief          6.93 - 7.05 s / 15 s     2.1x   repeated
-#:     restore 500 surrogates (pseudonym.)     120 - 123 ms / 500 ms   4.2x   repeated
-#:     obfuscate 2,000 words (pseudonym.)    0.401 - 0.419 s / 2 s     4.9x   repeated
-#:     obfuscate 2,000 words (tokenization)  0.382 - 0.399 s / 2 s     5.1x   repeated
-#:     restore 500 tokens, cold vault          188 ms / 500 ms          2.7x   repeated
-#:     restore 500 tokens, warm vault          138 ms / 500 ms          3.6x   single
-#:     vault lookup p99                          ~0.001 ms / 5 ms     ~4500x  single
+#: What is *not* a measurement and therefore stays written down here is the
+#: reasoning:
 #:
-#: **The two token-restore rows were 73 ms (7.4x) and 5.4 ms (96x) until the restore
-#: stage began itemising what it restored.** Core requirement 7 wants a
-#: de-obfuscation event to name an entity type and a token, so the restorer now
-#: writes one ``DEOBFUSCATE`` row per distinct restored token ID -- the same
-#: one-row-per-entity shape the obfuscation engine already pays for on the way out.
-#: A hash-chained write costs ~0.55 ms, so a 500-token response spends 240 ms in the
-#: audit log and lands at 345 ms (1.4x) if the itemisation is uncapped; that is what
-#: ``restorer._MAX_RESTORE_ROWS`` (512) bounds, and the numbers above are with it.
-#: The added cost is now bounded, whatever the model sends back. The two rows are
-#: still the fastest way to see an ``AuditLogger.emit`` regression: they are almost
-#: entirely audit writes.
-#:
-#: The repetition earns its place on the two newest rows rather than being copied onto
-#: them out of symmetry: single-shot, the surrogate restore came in at 283.5 ms (1.8x,
-#: the tightest budget in the module) and the cold-vault restore at 107.3 ms (4.7x).
-#: Best-of-3 more than halves both. The first iteration is paying for a cold SQLite
-#: page cache and first-call overhead in the regex engine, which is a property of the
-#: measurement rather than of the pipeline -- precisely the case best-of-N is for.
-#:
-#: The surrogate restore is worth calling out because it had no budget test at all
-#: until recently: the section 12 restore row was asserted for the token pass only,
-#: and on the warm path the token pass used to be the cheap half by a factor of 23.
-#: It is not any more -- 138 ms against 124 ms -- and the reason is the itemisation
-#: above, not the matching: a pseudonym has no token ID, so the surrogate pass writes
-#: no per-entity rows and its number did not move.
-#:
-#: The last two are single-shot. That was written when the warm restore sat at 96x,
-#: where no realistic contention reaches; at 3.6x it is now the second-tightest row
-#: in the module and single-shot is no longer justified by headroom -- it is left
-#: that way only because the same 500-token restore *is* repeated one test below,
-#: cold, so a regression in the shared path already has a best-of-3 witness.
+#: * Best-of-N is applied to every budget whose headroom is in single digits, and to
+#:   nothing else. Which rows those are moves with the code, so the module does not
+#:   name them; the printed table does, on every run.
+#: * The token-restore rows are almost entirely audit writes. Core requirement 7
+#:   wants a de-obfuscation event to name an entity type and a token, so the restorer
+#:   writes one ``DEOBFUSCATE`` row per distinct restored token ID -- the same
+#:   one-row-per-entity shape the obfuscation engine already pays for outbound. That
+#:   cost is bounded by ``restorer._MAX_RESTORE_ROWS`` (512) rather than left to
+#:   scale with whatever the model sends back, and these two rows are the fastest way
+#:   to see an ``AuditLogger.emit`` regression.
+#: * The first iteration of a cold-vault restore pays for a cold SQLite page cache
+#:   and first-call overhead in the regex engine. Both are properties of the
+#:   measurement rather than of the pipeline, which is precisely the case best-of-N
+#:   exists for -- and precisely why widening a budget instead would be the wrong
+#:   correction.
+#: * The surrogate restore is worth calling out because it had no budget test at all
+#:   until recently: the section 12 restore row was asserted for the token pass only,
+#:   so the README's unqualified "restore a 500-token response" figure covered one of
+#:   the two strategies.
 BENCH_REPEATS = 3
+
+REPO_ROOT_README = REPO_ROOT / "README.md"
+
+#: How far this run's headroom may sit outside the range the README publishes for
+#: the same row before the published figure is called stale, as a multiplicative
+#: factor. NOT a fraction of the guarded quantity and not a fixed millisecond
+#: allowance: a wall-clock figure moves with the machine, so the only stable thing
+#: to bound is a ratio.
+#:
+#: Chosen from measurement rather than taste, and widened once after measuring:
+#:
+#: * Three consecutive runs of this module on an idle box moved each row's headroom
+#:   by at most **1.15x**.
+#: * The widest *legitimate* gap between a row measured here and the range the README
+#:   publishes for it was **1.48x** on that idle box -- the cold-vault restore, whose
+#:   two published samples were taken on a quieter machine than the rows above them.
+#: * The same row on a **contended** box, with three other suites running, went to
+#:   **2.4x**. That is the number this bound has to survive, and 3.0 did not leave
+#:   enough room above it.
+#: * The defect this bound exists to catch -- a warm-restore row published at
+#:   93.3x while this module measures it in single digits -- is **6.8x** idle and
+#:   **10.4x** contended.
+#:
+#: So 4.0: 1.7x of margin above the worst honest reading and 1.7x below the defect.
+#: A bound placed by measuring both populations rather than by picking a round
+#: number and hoping.
+#:
+#: **What that buys and what it does not.** It catches an order-of-magnitude stale
+#: figure -- the 50x and 7x cases this table has now produced twice -- and it does
+#: not catch a 2x drift. It is a *staleness* detector, not a regression detector:
+#: the regression detector is the budget assertion in each test, which is exact and
+#: is what the README says is the only number it asserts. A reviewer on hardware
+#: more than 3x away from the published range will see this go red, and the correct
+#: response is to add their observation to the published range, which is the
+#: behaviour section 1 already asks for.
+README_HEADROOM_FACTOR = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +559,10 @@ async def test_deobfuscation_of_a_500_token_response_is_under_500ms_with_a_cold_
         reads += 1
         return await original_fetch_one(self, sql, params)
 
-    # Best-of-N: see BENCH_REPEATS. At 4.7x this sits in the same band as the
-    # obfuscation budgets, which are repeated for the same reason. The cache is
+    # Best-of-N: see BENCH_REPEATS. This sits in the same single-digit-headroom
+    # band as the obfuscation budgets, which are repeated for the same reason.
+    # (A headroom figure used to be quoted here; it was one of the three stale
+    # copies BENCH_REPEATS' comment now records deleting. The run prints it.) The cache is
     # dropped again before every repetition, so each one is genuinely cold -- and
     # `reads` is therefore counted per repetition, not cumulatively.
     elapsed_ms = float("inf")
@@ -609,9 +643,11 @@ async def test_deobfuscation_of_a_500_surrogate_response_is_under_500ms(
         )
     response = "\n".join(lines)
 
-    # Best-of-N: see BENCH_REPEATS. At 1.8x this is now the tightest budget in the
-    # module -- tighter than the full pipeline -- so it gets the same treatment the
-    # other tight budgets get, for the same reason and by the same policy. The pass is
+    # Best-of-N: see BENCH_REPEATS. This row is repeated because its headroom is in
+    # single digits, by the same policy as the others; which row is *tightest* moves
+    # with the code, is printed by the run, and is checked against the README's
+    # published table by test_the_readme_benchmark_table_is_the_one_this_run_measured
+    # rather than asserted in a comment here. The pass is
     # read-only with respect to the vault, so repeating it measures the same work.
     elapsed_ms = float("inf")
     restored = None
@@ -708,8 +744,8 @@ async def test_full_pipeline_on_the_large_brief_is_under_fifteen_seconds(
         doc_id = await store.put(
             "bench-user", "legal_brief_large.txt", document.encode("utf-8"), "legal"
         )
-        # Best-of-N: see BENCH_REPEATS. This is the tightest budget in the table
-        # (2.3x) and therefore the one a contended machine can turn red on its own.
+        # Best-of-N: see BENCH_REPEATS. Single-digit headroom, and therefore one a
+        # contended machine can turn red on its own.
         elapsed_s = float("inf")
         result = None
         for _ in range(BENCH_REPEATS):
@@ -748,3 +784,419 @@ async def test_full_pipeline_on_the_large_brief_is_under_fifteen_seconds(
         f"gate {stats['egress_ms']:.0f} ms, restore {stats['restore_ms']:.0f} ms), "
         f"budget {BUDGET_PIPELINE_S} s"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. The README's published table, bound to what this run measured
+# ---------------------------------------------------------------------------
+#
+# Nothing bound it before. `tests/test_readme_claims.py` said so out loud -- "the
+# bench figures are a pasted measurement, not a re-derivation, so nothing here
+# drifts under a later commit" -- and the consequence was exactly what that sentence
+# predicts: the README published a 500-token warm restore at 5.359 ms / 93.3x while
+# this module measured 36.5 ms / 13.7x on a quiet box, and a separate audit had
+# earlier measured the same row near 285 ms. Three numbers, one row, none of them
+# derivable from anything.
+#
+# The correction is not to paste today's numbers, which would rot on the same
+# schedule. It is to bind the things that do not move with the machine:
+#
+#   * the BUDGET, which is a constant in this file;
+#   * the RELATIONSHIP between each published sample and its budget (the headroom
+#     column must be arithmetic on the row's own numbers, at the precision printed);
+#   * the ROW SET, which is whatever this module measures;
+#   * the IDENTITY of the tightest row, which is a property of the code rather than
+#     of the box -- a slower machine moves every row together;
+#   * and, as a staleness detector only, the ratio between published and measured
+#     headroom, bounded by README_HEADROOM_FACTOR.
+
+import math  # noqa: E402 -- kept beside the section that uses it
+import re  # noqa: E402
+
+
+@dataclass(frozen=True, slots=True)
+class ReadmeBenchRow:
+    """One row of the README's section 1 benchmark table, as published."""
+
+    label: str
+    #: Every measurement column, in seconds, in the order printed.
+    samples: tuple[float, ...]
+    #: The same columns as ``(low, high)`` intervals implied by the printed
+    #: precision: ``0.001 ms`` means "somewhere in [0.0005, 0.0015] ms", which is the
+    #: difference between the vault row being checkable and being nonsense.
+    sample_bounds: tuple[tuple[float, float], ...]
+    budget_s: float
+    budget_text: str
+    headroom: float
+    #: The headroom cell as its own printed precision implies: ``1.75x`` stands for
+    #: anything in [1.745, 1.755). Without this the arithmetic check below rejects
+    #: correct rows -- ``2 s / 1.142 s`` is 1.75055, which is not 1.75.
+    headroom_bounds: tuple[float, float]
+    raw: str
+
+    @property
+    def worst_headroom(self) -> float:
+        return self.budget_s / max(self.samples)
+
+    @property
+    def published_headroom_range(self) -> tuple[float, float]:
+        """Every headroom the row's MEASUREMENT columns support, widest reading.
+
+        Derived from the samples alone, and the headroom cell is deliberately not
+        one of the inputs. The first version of this property included it, which
+        made ``low <= headroom <= high`` an assertion that a number lies inside a
+        range built from itself -- vacuous, and caught by sabotage rather than by
+        reading: editing the headroom cell alone left the check green. It is
+        exactly the failure this whole file is here to remove, produced while
+        removing it.
+        """
+        candidates = [self.budget_s / value for _, value in self.sample_bounds]
+        candidates += [self.budget_s / value for value, _ in self.sample_bounds]
+        return min(candidates), max(candidates)
+
+
+_DURATION = re.compile(r"^([\d,]+(?:\.\d+)?)\s*(s|ms)$")
+# The multiplication sign is written as an escape: RUF001 flags the literal as an
+# ambiguous character, and this file is otherwise plain ASCII.
+_HEADROOM = re.compile(r"^([\d,]+(?:\.\d+)?)\s*[x\u00d7]$", re.IGNORECASE)
+
+
+def _number(text: str) -> float:
+    return float(text.replace(",", ""))
+
+
+def _printed_bounds(text: str, scale: float) -> tuple[float, float]:
+    """``"0.001"`` -> the half-open interval its last printed digit stands for."""
+    digits = len(text.partition(".")[2])
+    half = 0.5 * 10.0**-digits
+    value = _number(text)
+    return (value - half) * scale, (value + half) * scale
+
+
+def parse_readme_bench_table(text: str) -> list[ReadmeBenchRow]:
+    """The benchmark table, located by its column headings rather than by position.
+
+    Located rather than counted from the top of the file: section numbering moves,
+    and a table found by index is a table that silently becomes a different table.
+    The header must be unique, which is itself a check -- two benchmark tables on
+    one page is the shape that let the boundary counts disagree six ways.
+    """
+    lines = text.splitlines()
+    headers = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("|")
+        and "budget" in line.lower()
+        and "headroom" in line.lower()
+        and "measurement" in line.lower()
+    ]
+    assert len(headers) == 1, (
+        f"expected exactly one benchmark table (a header row naming Measurement, "
+        f"Budget and Headroom); found {len(headers)}"
+    )
+    columns = [cell.strip().lower() for cell in lines[headers[0]].strip().strip("|").split("|")]
+    budget_at = columns.index(next(c for c in columns if "budget" in c))
+    headroom_at = columns.index(next(c for c in columns if "headroom" in c))
+
+    rows: list[ReadmeBenchRow] = []
+    for line in lines[headers[0] + 2 :]:
+        if not line.startswith("|"):
+            break
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        assert len(cells) == len(columns), f"ragged benchmark row: {line[:80]!r}"
+
+        samples: list[float] = []
+        bounds: list[tuple[float, float]] = []
+        for index, cell in enumerate(cells):
+            if index in (0, budget_at, headroom_at):
+                continue
+            match = _DURATION.match(cell)
+            if match is None:
+                continue
+            scale = 1.0 if match.group(2) == "s" else 1e-3
+            samples.append(_number(match.group(1)) * scale)
+            bounds.append(_printed_bounds(match.group(1), scale))
+        assert samples, f"no measurement column in benchmark row: {line[:80]!r}"
+
+        budget = _DURATION.match(cells[budget_at])
+        assert budget is not None, f"unparsable budget {cells[budget_at]!r} in {line[:80]!r}"
+        headroom = _HEADROOM.match(cells[headroom_at])
+        assert headroom is not None, f"unparsable headroom {cells[headroom_at]!r}"
+
+        rows.append(
+            ReadmeBenchRow(
+                label=cells[0],
+                samples=tuple(samples),
+                sample_bounds=tuple(bounds),
+                budget_s=_number(budget.group(1)) * (1.0 if budget.group(2) == "s" else 1e-3),
+                budget_text=cells[budget_at],
+                headroom=_number(headroom.group(1)),
+                headroom_bounds=_printed_bounds(headroom.group(1), 1.0),
+                raw=line,
+            )
+        )
+    assert rows, "the benchmark table has a header and no rows"
+    return rows
+
+
+def normalise_bench_label(label: str) -> str:
+    """``"Obfuscate 2,000 words (tokenization)"`` -> ``"obfuscate 2000 words (tokenization)"``.
+
+    Thousands separators only: the labels are otherwise expected to match, because
+    the README's are copied from this module's :class:`Report` and that is the
+    coupling worth having. A rename here is meant to force a rename there.
+    """
+    return " ".join(re.sub(r"(?<=\d),(?=\d)", "", label).lower().split())
+
+
+def _tightest_claim_sentences(text: str) -> list[str]:
+    """Every sentence claiming some row has the least headroom.
+
+    Blocks first, then sentences: a markdown table row ends in ``|`` rather than a
+    full stop, so a naive sentence split glues the whole table onto the sentence
+    that follows it and the word count then matches every row at once. Also
+    measured rather than supposed -- a synthetic claim sentence sitting directly
+    under a table passed the first version of this check for that reason.
+
+    Scoped to the SENTENCE and not to the paragraph, and that is not a detail: the
+    paragraph carrying this claim in section 1 also discusses the warm and cold
+    restore rows at length, so a paragraph-scoped word count ties between three
+    rows, identifies none, and the check silently passes on the one case it exists
+    for. Measured, not supposed -- the first version of this test did exactly that.
+    """
+    units: list[str] = []
+    for block in re.split(r"\n\s*\n", text):
+        if block.lstrip().startswith("|"):
+            units.extend(" ".join(row.split()) for row in block.splitlines())
+        else:
+            units.append(" ".join(block.split()))
+    sentences: list[str] = []
+    for unit in units:
+        sentences.extend(re.split(r"(?<=[.!?])\s+(?=[A-Z*`])", unit))
+    return [
+        sentence
+        for sentence in sentences
+        if re.search(r"\btightest\b|\bleast headroom\b", sentence, re.IGNORECASE)
+    ]
+
+
+#: Words that appear in so many row labels that they identify nothing.
+_LABEL_STOPWORDS = frozenset({"a", "the", "of", "and", "response", "words", "per"})
+
+
+def _row_named_by(rows: list[Measurement], sentence: str) -> str | None:
+    """Which measured row a sentence is about, or ``None`` if it does not say.
+
+    Word overlap against each row's label rather than a pattern per sentence: the
+    lesson of every stale claim in this repository is that the next wrong sentence
+    is worded differently, so a matcher keyed on wording is a matcher for the
+    sentence that has already been fixed. Returns ``None`` on a tie, which is the
+    honest answer and the reason the table check beside this one is the binding
+    half.
+    """
+    lowered = sentence.lower()
+    scores = {
+        row.name: sum(
+            1
+            for word in set(re.findall(r"[a-z]+", normalise_bench_label(row.name)))
+            if word not in _LABEL_STOPWORDS and word in lowered
+        )
+        for row in rows
+    }
+    best = max(scores.values())
+    if best == 0:
+        return None
+    named = sorted(name for name, score in scores.items() if score == best)
+    return named[0] if len(named) == 1 else None
+
+
+def _seconds(row: Measurement) -> float:
+    return row.measured if row.unit == "s" else row.measured / 1000.0
+
+
+def _budget_seconds(row: Measurement) -> float:
+    return row.budget if row.unit == "s" else row.budget / 1000.0
+
+
+def check_readme_bench_table(rows: list[Measurement], text: str) -> None:
+    """The published benchmark table, checked against the run that just happened.
+
+    Defined last in the module on purpose: pytest runs a file in definition order,
+    so by the time this executes every other benchmark has recorded its row into the
+    module-scoped :class:`Report`. It therefore costs no extra measurement -- it
+    reads the numbers the run already produced.
+
+    **What this binds.**
+
+    * *The budget column.* ``BUDGET_RESTORE_MS`` and friends are constants in this
+      file, and the README publishes them as a column. Exact, both ways.
+    * *The row set.* Every row this module measures has a published row and every
+      published row is measured. This is the check that catches a benchmark added
+      with no table row -- the shape that let the surrogate-restore pass ship with
+      no budget assertion at all.
+    * *The headroom column.* It must be arithmetic on the row's own published
+      numbers, at the precision they are printed to. ``0.001 ms`` against a 5 ms
+      budget supports any headroom from 3,333x to 10,000x, and pretending it means
+      exactly 5,000x would make the vault row unfalsifiable in one direction and
+      absurd in the other.
+    * *Every published sample is under its own budget.* A table that publishes a
+      measurement its own test would fail is a table describing a red suite.
+    * *The identity of the tightest row.* A slower machine moves every row together,
+      so which row has the least headroom is a property of the code. This is the
+      part of the table that survives being run somewhere else.
+
+    **What this does not bind, stated because the alternative is implying it does.**
+    It does not verify the published numbers were ever observed -- they are one
+    sample of seven taken on someone's laptop, and no test can re-derive a past
+    observation. It does not detect a 2x drift; see :data:`README_HEADROOM_FACTOR`
+    for the measurement behind that number and for why a tighter bound would fail on
+    honest hardware differences. And it is a *staleness* detector, not a performance
+    gate: the gate is the budget assertion in each test above, which is exact.
+    """
+    assert rows, (
+        "no benchmark recorded a row, so this check has nothing to compare. It reads the "
+        "module-scoped Report, so run the whole module rather than this test alone"
+    )
+    measured = {normalise_bench_label(row.name): row for row in rows}
+    published = {
+        normalise_bench_label(row.label): row for row in parse_readme_bench_table(text)
+    }
+
+    assert len(measured) == len(rows), "two benchmarks recorded the same row name"
+    replacement = "\n  ".join(
+        f"| {row.name} | {row.measured:.3f} {row.unit} | {row.budget:g} {row.unit} "
+        f"| {row.headroom:.1f}x |"
+        for row in rows
+    )
+    assert measured.keys() == published.keys(), (
+        f"the README's benchmark table lists {sorted(published)} and this run measured "
+        f"{sorted(measured)}. The table's labels come from this module's Report, so a "
+        f"benchmark added or renamed here has to be added or renamed there.\n"
+        f"This run measured:\n  {replacement}"
+    )
+
+    stale: list[str] = []
+    for key, row in sorted(published.items()):
+        run = measured[key]
+        run_budget = _budget_seconds(run)
+        assert math.isclose(row.budget_s, run_budget, rel_tol=1e-9), (
+            f"{row.label!r} is published against a budget of {row.budget_text} and this "
+            f"module asserts {run.budget:g} {run.unit}; the budget is a constant in "
+            "tests/test_benchmarks.py and the README publishes it, so they cannot differ"
+        )
+
+        low, high = row.published_headroom_range
+        # Interval overlap, not point containment: both sides are rounded for print,
+        # so `2 s / 1.142 s = 1.75055` and a published `1.75x` are the same claim.
+        stated_low, stated_high = row.headroom_bounds
+        assert stated_low < high and stated_high > low, (
+            f"{row.label!r} publishes {row.headroom}x headroom, which its own numbers do "
+            f"not support: {row.budget_text} against {[f'{s:g}' for s in row.samples]} "
+            f"gives {low:.2f}x to {high:.2f}x. One cell of this row was edited alone"
+        )
+        for sample, cell in zip(row.samples, row.sample_bounds, strict=True):
+            assert sample < row.budget_s, (
+                f"{row.label!r} publishes {sample:g} s against a {row.budget_text} budget, "
+                "so the table is quoting a measurement that fails its own assertion"
+            )
+            assert cell[0] > 0, f"{row.label!r} publishes a non-positive measurement"
+
+        run_headroom = run.headroom
+        drift = 1.0
+        if run_headroom < low:
+            drift = low / run_headroom
+        elif run_headroom > high:
+            drift = run_headroom / high
+        if drift > README_HEADROOM_FACTOR:
+            stale.append(
+                f"{row.label}: published {low:.1f}x-{high:.1f}x, this run {run_headroom:.1f}x "
+                f"({run.measured:.3f} {run.unit}) -- {drift:.1f}x outside"
+            )
+
+    assert not stale, (
+        "the README's benchmark table is stale by more than "
+        f"{README_HEADROOM_FACTOR:g}x on:\n  " + "\n  ".join(stale) + "\n\n"
+        "This is a staleness bound, not a budget: every one of these still passed its "
+        "own budget assertion. Re-run `pytest -m bench -q -s` and republish the table "
+        "with the observation the page is missing. This run measured:\n  " + replacement
+    )
+
+    tightest_published = min(published.values(), key=lambda row: row.worst_headroom).label
+    tightest_measured = min(rows, key=lambda row: row.headroom).name
+    assert normalise_bench_label(tightest_published) == normalise_bench_label(
+        tightest_measured
+    ), (
+        f"the README's table gives {tightest_published!r} the least headroom and this run "
+        f"gives it to {tightest_measured!r}. Row *values* move with the machine; which row "
+        "is tightest does not, so this is a real disagreement rather than a slow laptop"
+    )
+
+
+def check_tightest_benchmark_prose(rows: list[Measurement], text: str) -> None:
+    """A sentence naming the tightest benchmark is a claim about the code, so check it.
+
+    Section 1's prose says, in so many words, that one particular row "is now the
+    tightest-scoring benchmark in the module". That sentence outlives its
+    measurement the same way every other pasted figure on the page does -- and
+    unlike the figures it reads as an architectural statement, so nobody re-checks
+    it. It is checkable: the tightest row is whichever this run measured with the
+    least headroom.
+
+    Matched by scoring each measured row's label against the words of the claim,
+    rather than by pattern-matching a sentence: the point of the whole
+    stale-disclosure exercise in this repository is that the next wrong sentence
+    uses different words. A row wins if more of its label's words appear in the
+    claim than any other row's, and a claim that identifies no row at all is
+    ignored -- which is the honest limit of this check and is why the assertion
+    above, on the table itself, is the one that binds.
+    """
+    assert rows, "no benchmark recorded a row; run the whole module"
+
+    # Tripwire on the instrument. Every escape hatch below -- no claim sentence, no
+    # row identified, a tie -- exits green, which is right on a page that makes no
+    # such claim and indistinguishable from a matcher that has stopped working. So
+    # the matcher is put to a claim built from this run's own first row before it is
+    # trusted on the README's.
+    probe_row = rows[0]
+    probe = f"The {probe_row.name} is the tightest benchmark in the module."
+    assert _tightest_claim_sentences(probe) == [probe], (
+        f"the tightest-claim sentence finder no longer recognises {probe!r}, so this "
+        "check now passes on every README"
+    )
+    assert _row_named_by(rows, probe) == probe_row.name, (
+        f"the row matcher can no longer identify {probe_row.name!r} from a sentence that "
+        "names it in full, so this check now passes on every README"
+    )
+
+    claims = _tightest_claim_sentences(text)
+    if not claims:
+        return
+
+    tightest = min(rows, key=lambda row: row.headroom).name
+    for claim in claims:
+        named = _row_named_by(rows, claim)
+        if named is None:
+            continue
+        assert named == tightest, (
+            f"section 1 says {named!r} is the tightest benchmark in the module; this run "
+            f"measures {tightest!r} as the tightest. The sentence is: {claim[:240]!r}"
+        )
+
+
+def test_the_readme_benchmark_table_is_the_one_this_run_measured(report: Report) -> None:
+    """Thin wrapper: :func:`check_readme_bench_table` against the live README.
+
+    Split so the rig can be exercised on a synthetic table without editing the real
+    ``README.md`` -- which other agents are writing to, and which is the document
+    under audit rather than a fixture. A guard that can only be observed failing on
+    the one document it is pointed at has never been shown to *pass* for the right
+    reason.
+    """
+    check_readme_bench_table(report.rows, REPO_ROOT_README.read_text(encoding="utf-8"))
+
+
+def test_the_prose_that_names_a_tightest_benchmark_names_the_one_that_is(
+    report: Report,
+) -> None:
+    """Thin wrapper: :func:`check_tightest_benchmark_prose` against the live README."""
+    check_tightest_benchmark_prose(report.rows, REPO_ROOT_README.read_text(encoding="utf-8"))

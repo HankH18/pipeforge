@@ -17,6 +17,8 @@ Request shape (current API -- these differ from older examples):
 * No ``temperature`` / ``top_p`` / ``top_k`` and no
   ``thinking={"type": "enabled", "budget_tokens": N}``: all four are removed on
   this model family and return HTTP 400.
+* ``fallbacks="default"`` behind the ``server-side-fallback-2026-07-01`` beta --
+  see "Refusals" below.
 * ``max_retries=0`` on the client, so the retry policy below is the *only* one
   in play and a 429 storm cannot be silently multiplied by the SDK's own
   backoff.
@@ -29,14 +31,44 @@ SDK's typed exceptions *and* by the HTTP status, never by string-matching a
 message -- so a 529 (overloaded) is retried whichever exception class the SDK
 renders it as.
 
+Refusals -- and why the request is a *beta* Messages call
+---------------------------------------------------------
+The configured model carries elevated cybersecurity safeguards, and its safety
+classifiers can decline a request with a perfectly ordinary HTTP 200 carrying
+``stop_reason == "refusal"``.  The fixtures this pipeline is demonstrated on are
+medical, legal and financial records, which is squarely the "benign work that
+occasionally trips a classifier" band.  Declining is not an error the retry loop
+above can help with -- it is a decision -- so with no fallback declared a decline
+simply ended the run.
+
+:data:`FALLBACKS` + :data:`FALLBACK_BETA` ask the API to re-run the *same* request
+on a substitute model inside the same call when that happens.  ``"default"`` rather
+than a pinned model list on purpose: the substitute is chosen by refusal category
+server-side, so this module neither maintains a model list nor owes a migration
+when one is retired.  Nothing about the payload changes -- the bytes are the ones
+the egress gate cleared and the orchestrator re-verified, and the fallback model
+sees exactly those.
+
+That is why the call goes through ``client.beta.messages`` and the request lands
+on ``/v1/messages?beta=true``: ``client.messages.create`` accepts neither ``betas``
+nor ``fallbacks`` in the installed SDK, the SDK's client-side
+``BetaRefusalFallbackMiddleware`` explicitly passes non-beta requests through
+untouched, and -- decisively -- a fallback-served response carries a ``fallback``
+content block that only the beta response model can parse.  Measured on
+``anthropic==0.120.2``: ``Message.model_validate`` of such a body raises 35
+validation errors, ``BetaMessage.model_validate`` accepts it.
+
 Terminal responses each have their own outcome, and none of them returns a
-silently degraded answer: ``stop_reason == "refusal"`` raises
+silently degraded answer: ``stop_reason == "refusal"`` on the *final* response --
+i.e. after the whole fallback chain has declined -- raises
 :class:`~secure_context_pipeline.llm.base.LLMRefusalError` carrying the policy
 category and nothing else; a 2xx with no text block raises
 :class:`~secure_context_pipeline.llm.base.LLMResponseError`; a truncated answer
-(``max_tokens``) is returned but logged as ``LLM_TRUNCATED``.  All three are
+(``max_tokens``) is returned but logged as ``LLM_TRUNCATED``.  All of them are
 exercised over ``httpx.MockTransport``, i.e. through the real SDK's own parser,
-in ``tests/test_llm.py``.
+in ``tests/test_llm.py`` -- which is also where the outbound header and parameter
+are asserted, because this is the one part of the request shape that cannot be
+checked against the live API from a test suite that makes no network calls.
 """
 
 from __future__ import annotations
@@ -45,11 +77,11 @@ import asyncio
 import logging
 import secrets
 import time
-from typing import Final
+from typing import Final, Literal
 
 import anthropic
 import httpx
-from anthropic.types import Message, MessageParam
+from anthropic.types.beta import BetaMessage, BetaMessageParam
 
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.errors import ConfigError
@@ -67,6 +99,8 @@ __all__ = [
     "BACKOFF_CAP_S",
     "BACKOFF_FACTOR",
     "EFFORT",
+    "FALLBACKS",
+    "FALLBACK_BETA",
     "JITTER_RATIO",
     "MAX_ATTEMPTS",
     "MAX_BACKOFF_S",
@@ -150,7 +184,32 @@ MAX_BACKOFF_S: Final = BACKOFF_CAP_S * (1.0 + JITTER_RATIO)
 
 #: Reasoning depth. Low: we are asking for a summary of an already-redacted
 #: document, not for analysis worth paying thinking tokens for.
-EFFORT: Final = "low"
+#:
+#: Typed as the literal, not as ``str``: the SDK's ``BetaOutputConfigParam.effort``
+#: is a closed ``Literal`` set, so a widened annotation here would make a typo in
+#: this constant a runtime 400 instead of a type error.
+EFFORT: Final[Literal["low"]] = "low"
+
+#: The beta that gates the server-side ``fallbacks`` request parameter.
+#:
+#: Paired with :data:`FALLBACKS` and **not interchangeable with the other one in the
+#: series**: this header gates the scalar ``"default"`` form, while
+#: ``server-side-fallback-2026-06-01`` gates the array form
+#: (``[{"model": "..."}]``). Sending either header with the other form is a 400, so
+#: the two constants are defined next to each other and changed together.
+FALLBACK_BETA: Final = "server-side-fallback-2026-07-01"
+
+#: What to do when the model's safety classifiers decline this request.
+#:
+#: ``"default"`` -- let the API pick the substitute **by refusal category** -- rather
+#: than a pinned chain such as ``[{"model": "claude-opus-4-8"}]``. Different fallback
+#: models carry different classifiers, so the right substitute depends on *why* the
+#: request was declined, which is a fact this module does not have and the API does;
+#: and a pinned name is a migration this module would owe the day that model is
+#: retired. The chain is still bounded and terminal: when every model in it declines,
+#: the final response comes back with ``stop_reason == "refusal"`` and
+#: :meth:`AnthropicProvider._decode` raises, exactly as before.
+FALLBACKS: Final[Literal["default"]] = "default"
 
 # SystemRandom rather than the `random` module: jitter is not security-relevant,
 # but the package is linted with bandit rules and a seeded PRNG here would be
@@ -250,19 +309,24 @@ class AnthropicProvider:
     async def complete_detailed(
         self, system: str, user: str, *, model: str, timeout_s: float = 60.0
     ) -> LLMResponse:
-        messages: list[MessageParam] = [{"role": "user", "content": user}]
+        messages: list[BetaMessageParam] = [{"role": "user", "content": user}]
         reason = "not_attempted"
         status: int | None = None
 
         for attempt in range(1, self._max_attempts + 1):
             started = time.perf_counter()
             try:
-                raw = await self._client.messages.create(
+                # ``beta.messages``, not ``messages``: that is where ``betas`` and
+                # ``fallbacks`` exist, and it is the only surface whose response model
+                # can parse a fallback-served answer. Argued in the module docstring.
+                raw = await self._client.beta.messages.create(
                     model=model,
                     max_tokens=self._settings.llm_max_tokens,
                     system=system,
                     messages=messages,
                     output_config={"effort": EFFORT},
+                    betas=[FALLBACK_BETA],
+                    fallbacks=FALLBACKS,
                     timeout=timeout_s,
                 )
             except anthropic.APIError as exc:
@@ -296,13 +360,31 @@ class AnthropicProvider:
         )
 
     def _decode(
-        self, raw: Message, model: str, attempt: int, elapsed_ms: float
+        self, raw: BetaMessage, model: str, attempt: int, elapsed_ms: float
     ) -> LLMResponse:
-        """Turn an SDK ``Message`` into an :class:`LLMResponse`.
+        """Turn an SDK ``BetaMessage`` into an :class:`LLMResponse`.
 
         Checks ``stop_reason`` *before* touching ``content``.
         """
         stop_reason = raw.stop_reason
+
+        # A ``fallback`` block marks the point where one model's output gave way to
+        # the next: the request was declined and a substitute served it instead. It
+        # is emitted only on a hop that actually ran and declined, so its presence is
+        # the signal that the fallback chain did work. Recorded because a demo that
+        # silently ran on a different model than the one configured would otherwise
+        # look identical to one that did not -- and because the fallback bills at its
+        # own rates. Model names only; no content, no explanation.
+        for block in raw.content:
+            if block.type == "fallback":
+                logger.warning(
+                    "LLM_FALLBACK model=%s attempt=%d from=%s to=%s category=%s",
+                    model,
+                    attempt,
+                    block.from_.model,
+                    block.to.model,
+                    block.trigger.category,
+                )
 
         if stop_reason == "refusal":
             category = raw.stop_details.category if raw.stop_details is not None else None
@@ -313,6 +395,11 @@ class AnthropicProvider:
                 category,
                 elapsed_ms,
             )
+            # Terminal, and it stays terminal. ``fallbacks`` re-runs the request on a
+            # substitute inside the same call, so a ``refusal`` on the response we are
+            # holding means every model in the chain declined -- there is nothing left
+            # to try and no answer to degrade to.
+            #
             # No content, no explanation: the payload derives from a customer
             # document and must not reach an exception message.
             raise LLMRefusalError(model=model, category=category, attempt=attempt)

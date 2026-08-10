@@ -1010,6 +1010,16 @@ class ObfuscationEngine:
         if audit is None:
             return
         now = time.time()
+        # Imported HERE rather than at module scope, and the reason is a real cycle
+        # rather than taste: `pipeline.orchestrator` imports this module to build the
+        # engine, so a top-level import back would be an `ImportError` at startup.
+        # Copying the four-line classifier instead is the thing that must not happen
+        # -- it derives the composition through the *same* `_is_pseudonym` shape
+        # predicate the pseudonym restore map and `stats["pseudonyms_issued"]` use,
+        # and a second copy of that predicate is a second place for the log and the
+        # payload to disagree. Same technique as `strategies/base.py`'s deferred
+        # `class_hint_for` import.
+        from secure_context_pipeline.pipeline.orchestrator import _emitted_strategy
 
         occurrences: dict[tuple[str, str], int] = {}
         for item in planned:
@@ -1029,7 +1039,16 @@ class ObfuscationEngine:
                     token_id=record.token_id,
                     detail={
                         "occurrences": occurrences.get(key, 0),
+                        # The REQUEST, resolved through any per-entity override.
                         "strategy": self._strategy_name(record.entity_type, requested),
+                        # ...and the OUTCOME, read off the surrogate this row is
+                        # about. The two come apart on every reused record: the vault
+                        # has no strategy dimension, so a session's second run splices
+                        # whatever its first minted, and this row then claimed
+                        # `pseudonymization` for a value that went out as a hash
+                        # token. Derived per record, so a mixed payload gets a row
+                        # apiece that is true rather than one label smeared over both.
+                        "emitted_strategy": _emitted_strategy([record]),
                         "tier": spec.tier if spec is not None else 0,
                     },
                 )

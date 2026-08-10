@@ -8,7 +8,9 @@ schema-level refusal to carry content.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import importlib
 import itertools
 import json
 import re
@@ -18,16 +20,21 @@ import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import NamedTuple
 
 import aiosqlite
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
 
 import secure_context_pipeline.audit.logger as logger_module
 from secure_context_pipeline.audit.logger import (
+    ACTION_KEY,
     DEOBFUSCATE,
     DETECT,
     EGRESS_PASS,
+    EVENT_ACTIONS,
     EVENT_TYPES,
     GENESIS_HASH,
     LLM_CALL,
@@ -45,6 +52,8 @@ from secure_context_pipeline.errors import (
     PipelineError,
 )
 from secure_context_pipeline.models import (
+    AUDIT_ACTION_KEY,
+    AUDIT_ACTIONS,
     MAX_AUDIT_LABEL_LEN,
     MAX_DETAIL_VALUE_LEN,
     AuditEvent,
@@ -118,7 +127,20 @@ async def test_emit_and_query_round_trip(audit: AuditLogger) -> None:
         assert row.event_type == original.event_type
         assert row.entity_type == original.entity_type
         assert row.token_id == original.token_id
-        assert row.detail == original.detail
+        # SUPERSEDED CONTRACT. This was `row.detail == original.detail`, i.e. "the
+        # writer adds nothing", and that is exactly what let one half of the round
+        # trip ship without the `action` core requirement 7 names by name (measured
+        # end to end: OBFUSCATE 0/8 rows, DEOBFUSCATE 8/10, DETECT/EGRESS_PASS/
+        # LLM_CALL 0 of everything). The writer now stamps the event type's action
+        # before the digest is taken.
+        #
+        # NOT loosened: still exact equality over the whole dict, and the one added
+        # key is named rather than allowed for. `| ` rather than a `>=` subset check
+        # deliberately -- a subset check would also pass if the writer started adding
+        # anything else at all, which is the thing worth catching next time.
+        assert dict(row.detail) == dict(original.detail) | {
+            ACTION_KEY: EVENT_ACTIONS[original.event_type]
+        }
         assert row.entry_hash is not None
         assert len(row.entry_hash) == 64
 
@@ -145,7 +167,12 @@ async def test_nullable_columns_round_trip(audit: AuditLogger) -> None:
     assert row.run_id is None
     assert row.entity_type is None
     assert row.token_id is None
-    assert row.detail == {}
+    # SUPERSEDED CONTRACT -- same change as `test_emit_and_query_round_trip`, argued
+    # there in full: the writer stamps `detail['action']`, so no row of a known event
+    # type has an empty detail any more. What this test is *about* -- the three
+    # nullable columns above surviving a round trip as NULL -- is untouched, and the
+    # detail is still asserted exactly rather than merely "non-empty".
+    assert dict(row.detail) == {ACTION_KEY: EVENT_ACTIONS[DETECT]}
     assert await audit.verify_chain() is True
 
 
@@ -916,7 +943,21 @@ async def test_the_logger_exposes_no_update_or_delete_path(audit: AuditLogger) -
         for name, _ in inspect.getmembers(AuditLogger, callable)
         if not name.startswith("_")
     }
-    assert public == {"close", "emit", "length", "open", "query", "verify_chain"}, (
+    # `emit_many` joined the surface, and this allow-list is doing exactly the job its
+    # docstring describes: forcing that addition to be argued rather than noticed. It
+    # is an APPEND method -- one transaction, N inserts, no UPDATE and no DELETE -- so
+    # the append-only claim is unchanged, which the forbidden-SQL scan above re-checks
+    # against the source rather than taking on trust. The set stays exact: a
+    # `purge_session` added later for GDPR reasons still fails here.
+    assert public == {
+        "close",
+        "emit",
+        "emit_many",
+        "length",
+        "open",
+        "query",
+        "verify_chain",
+    }, (
         f"the AuditLogger surface changed to {sorted(public)} -- if a mutation method "
         "was added, the append-only claim in the README must change with it"
     )
@@ -2831,5 +2872,563 @@ async def test_a_partial_relabel_is_invisible_to_the_scope_it_left(tmp_path: Pat
         assert await log.verify_chain(session_id="sess-a") is True, (
             "a non-empty in-scope slice is why 'the scope is empty' cannot be the rule"
         )
+    finally:
+        await log.close()
+
+
+# ---------------------------------------------------------------------------
+# detail['action'] -- the explicitly-named required field, on BOTH halves
+# ---------------------------------------------------------------------------
+
+
+async def test_every_event_type_carries_an_explicit_action(audit: AuditLogger) -> None:
+    """Requirement 7 names five fields; ``action`` was written by one half of the pair.
+
+    Measured before the fix, on a two-run session driven end to end: ``OBFUSCATE``
+    rows with ``detail['action']`` **0 of 8**, ``DEOBFUSCATE`` **8 of 10** (the
+    per-entity rows had it, the stage rows did not), ``DETECT`` / ``EGRESS_PASS`` /
+    ``LLM_CALL`` **0 of everything**. "``event_type`` is the action" is a defensible
+    reading; a reader diffing the two halves of the round trip and finding the field
+    populated on one and absent on the other cannot tell that reading from a missing
+    write.
+
+    Quantified over ``EVENT_TYPES`` rather than over a hand-written list, for the
+    same reason the ceiling test enumerates ``model_fields``: a thirteenth event type
+    must fail this until somebody decides what its action is called.
+    """
+    for event_type in sorted(EVENT_TYPES):
+        await audit.emit(make_event(event_type=event_type, detail={"count": 1}))
+
+    rows = await audit.query(limit=1000)
+    assert {row.event_type for row in rows} == EVENT_TYPES
+    missing = [row.event_type for row in rows if ACTION_KEY not in row.detail]
+    assert not missing, f"event types written with no action: {missing}"
+    for row in rows:
+        assert row.detail[ACTION_KEY] == EVENT_ACTIONS[row.event_type]
+        # It is a label, never content: the schema's own ceiling has to hold for it.
+        assert len(str(row.detail[ACTION_KEY])) <= MAX_DETAIL_VALUE_LEN
+
+
+async def test_a_caller_that_already_named_its_action_keeps_it(audit: AuditLogger) -> None:
+    """The default fills a gap; it does not overwrite an answer.
+
+    The value used here is deliberately **not** one of the defaults, and the first
+    version of this test was worthless for exactly that reason: it emitted a
+    ``DEOBFUSCATE`` row carrying ``action='restore'``, which is what
+    ``EVENT_ACTIONS[DEOBFUSCATE]`` already is -- so an implementation that
+    *overwrote* every caller's value was byte-identical to one that respected it, and
+    a sabotage swapping ``setdefault`` for a plain assignment left the suite green.
+
+    The rule being pinned is the writer's, not any current call site's: a caller that
+    says what it did keeps saying it. Today only ``restorer.py`` names an action and
+    it happens to agree with the default; the moment one does not -- a partial
+    restore, a replay, a compensating write -- the distinction is the whole value of
+    the field, and nothing else in the suite would notice it being erased.
+    """
+    await audit.emit(
+        make_event(
+            event_type=DEOBFUSCATE, detail={"action": "restore_partial", "occurrences": 2}
+        )
+    )
+    await audit.emit(make_event(event_type=OBFUSCATE, detail={"occurrences": 2}))
+
+    restore_row, obfuscate_row = await audit.query(limit=10)
+    assert restore_row.detail[ACTION_KEY] == "restore_partial", (
+        "the writer clobbered a caller-supplied action with the event type's default"
+    )
+    assert restore_row.detail[ACTION_KEY] != EVENT_ACTIONS[DEOBFUSCATE], (
+        "this assertion is only binding while the value differs from the default"
+    )
+    assert obfuscate_row.detail[ACTION_KEY] == "obfuscate"
+
+
+async def test_the_action_is_inside_the_hash_chain_not_beside_it(audit: AuditLogger) -> None:
+    """The filled-in field is part of what is signed, or it is not tamper-evident.
+
+    An ``action`` added to the column after the digest was computed would be a field
+    an attacker could rewrite freely while ``verify_chain()`` stayed ``True``. The
+    check here is the published formula recomputed by hand over the row as stored.
+    """
+    await audit.emit(make_event(event_type=OBFUSCATE, detail={"occurrences": 2}))
+    (row,) = await audit.query(limit=10)
+
+    assert row.detail[ACTION_KEY] == "obfuscate"
+    recomputed = compute_entry_hash(
+        GENESIS_HASH,
+        chain_payload(
+            seq=row.seq or 0,
+            ts=row.ts,
+            session_id=row.session_id,
+            run_id=row.run_id,
+            event_type=row.event_type,
+            entity_type=row.entity_type,
+            token_id=row.token_id,
+            detail=dict(row.detail),
+        ),
+    )
+    assert recomputed == row.entry_hash
+    # And the same digest is NOT reachable from the detail the caller passed in.
+    without_action = {k: v for k, v in row.detail.items() if k != ACTION_KEY}
+    assert (
+        compute_entry_hash(
+            GENESIS_HASH,
+            chain_payload(
+                seq=row.seq or 0,
+                ts=row.ts,
+                session_id=row.session_id,
+                run_id=row.run_id,
+                event_type=row.event_type,
+                entity_type=row.entity_type,
+                token_id=row.token_id,
+                detail=without_action,
+            ),
+        )
+        != row.entry_hash
+    )
+    assert await audit.verify_chain() is True
+
+
+# ---------------------------------------------------------------------------
+# emit_many -- one transaction per batch, the same chain
+# ---------------------------------------------------------------------------
+
+
+async def test_emit_and_emit_many_write_byte_identical_rows(tmp_path: Path) -> None:
+    """The batch path is not a second implementation of the chain.
+
+    ``emit`` is a batch of one, so this is a regression test on the delegation as
+    much as on ``emit_many``: two fresh logs, the same events, one written row by
+    row and one in a single transaction, compared column by column -- ``seq``,
+    ``prev_hash`` and ``entry_hash`` included. If a future edit gives the batch path
+    its own tail read or its own hash input, this is what notices.
+    """
+    events = [
+        make_event(
+            ts=1000.0 + i,
+            event_type=OBFUSCATE if i % 2 else DEOBFUSCATE,
+            token_id=f"{i:08x}",
+            detail={"occurrences": i, "strategy": "tokenization"},
+        )
+        for i in range(40)
+    ]
+
+    def columns(event: AuditEvent) -> tuple[object, ...]:
+        return (
+            event.seq, event.ts, event.session_id, event.run_id, event.event_type,
+            event.entity_type, event.token_id, tuple(sorted(event.detail.items())),
+            event.prev_hash, event.entry_hash,
+        )
+
+    one = await AuditLogger.open(tmp_path / "one.db")
+    try:
+        seqs_one = [await one.emit(event) for event in events]
+        rows_one = [columns(row) for row in await one.query(limit=1000)]
+        assert await one.verify_chain() is True
+    finally:
+        await one.close()
+
+    many = await AuditLogger.open(tmp_path / "many.db")
+    try:
+        seqs_many = await many.emit_many(events)
+        rows_many = [columns(row) for row in await many.query(limit=1000)]
+        assert await many.verify_chain() is True
+        assert await many.verify_chain(session_id="sess-1") is True
+    finally:
+        await many.close()
+
+    assert seqs_one == seqs_many == list(range(1, len(events) + 1))
+    assert rows_one == rows_many
+
+
+async def test_a_batch_preserves_order_and_chains_onto_what_came_before(
+    audit: AuditLogger,
+) -> None:
+    """Batching must not reorder, merge, or drop -- and must extend the tail it found.
+
+    The failure this forbids is the tempting one: sorting, de-duplicating, or
+    collapsing "identical" rows inside the transaction. Every event goes in, in the
+    order given, and the first row of the batch chains onto the row that was already
+    the tail.
+    """
+    first = await audit.emit(make_event(ts=1.0, event_type=SESSION_CREATE))
+    batch = [
+        make_event(ts=2.0 + i, event_type=DEOBFUSCATE, token_id=f"{i:08x}")
+        for i in range(5)
+    ]
+    # A deliberate duplicate: two rows describing the same token must stay two rows.
+    batch.append(batch[0])
+    seqs = await audit.emit_many(batch)
+
+    assert seqs == list(range(first + 1, first + 1 + len(batch)))
+    rows = await audit.query(limit=100)
+    assert len(rows) == 1 + len(batch)
+    assert [row.token_id for row in rows[1:]] == [e.token_id for e in batch]
+    assert rows[1].prev_hash == rows[0].entry_hash, "the batch chained onto the old tail"
+    for previous, current in itertools.pairwise(rows):
+        assert current.prev_hash == previous.entry_hash
+    assert await audit.verify_chain() is True
+
+    # A second batch keeps going from there, and an empty one writes nothing.
+    assert await audit.emit_many([]) == []
+    assert await audit.length() == 1 + len(batch)
+    more = await audit.emit_many(batch[:2])
+    assert more == [seqs[-1] + 1, seqs[-1] + 2]
+    assert await audit.verify_chain() is True
+
+
+async def test_a_batch_opens_one_transaction_rather_than_one_per_row(
+    audit: AuditLogger,
+) -> None:
+    """The cost claim, measured on the mechanism rather than on a stopwatch.
+
+    A latency number belongs in ``test_benchmarks.py`` and moves with the machine.
+    What does not move is the transaction count: 512 per-entity ``DEOBFUSCATE`` rows
+    cost 512 ``BEGIN IMMEDIATE``/``COMMIT`` cycles, each with its own watermark read
+    and chain-tail read, and that -- not the vault or the string rebuild -- was the
+    dominant term in the restore stage. Counting the statements is what keeps the
+    fix from being silently undone by a refactor that reintroduces a per-row loop.
+    """
+    conn = audit._connection()
+    statements: list[str] = []
+    original_execute = conn.execute
+
+    def recording_execute(sql: str, *args: object, **kwargs: object) -> object:
+        statements.append(" ".join(str(sql).split())[:40])
+        return original_execute(sql, *args, **kwargs)
+
+    events = [make_event(ts=float(i), event_type=OBFUSCATE) for i in range(50)]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(conn, "execute", recording_execute)
+        await audit.emit_many(events)
+
+    assert statements.count("BEGIN IMMEDIATE") == 1, statements[:8]
+    assert sum(s.startswith("INSERT INTO audit_events") for s in statements) == len(events)
+    # The high-water mark is bumped once, with the batch's last seq -- the table's
+    # own trigger makes the mark monotonic, so bumping to the last covers them all.
+    assert sum(s.startswith("INSERT INTO audit_chain_meta") for s in statements) == 1
+    assert await audit.verify_chain() is True
+    assert await audit.length() == len(events)
+
+
+async def test_a_batch_that_is_refused_writes_none_of_its_rows(audit: AuditLogger) -> None:
+    """Validation runs before the transaction opens, so a bad row leaves no partial log.
+
+    The ceilings are re-checked at the write boundary because ``model_construct``
+    skips the model's own validators. In a batch that check has to run over *every*
+    event before anything is inserted -- otherwise a document-sized value in row 400
+    leaves 399 rows committed and the caller with an exception, which is the shape
+    that makes a truncated itemisation look like a complete one.
+    """
+    good = make_event(ts=1.0, event_type=OBFUSCATE)
+    poisoned = AuditEvent.model_construct(
+        ts=2.0,
+        session_id="sess-1",
+        run_id="run-1",
+        event_type=OBFUSCATE,
+        entity_type="PHI_NAME",
+        token_id="1a2b3c4d",
+        detail={"note": "x" * (MAX_DETAIL_VALUE_LEN + 1)},
+    )
+
+    with pytest.raises(PipelineError) as excinfo:
+        await audit.emit_many([good, poisoned, good])
+    assert excinfo.value.detail["reason"] == "audit_detail_exceeds_ceiling"
+    assert await audit.length() == 0, "the good rows must not have been committed"
+    assert await audit.verify_chain() is True
+
+
+def test_the_action_vocabulary_cannot_drift_from_the_event_vocabulary() -> None:
+    """One rule, two modules, asserted rather than trusted to stay in step.
+
+    The event-type constants live here in ``audit/logger.py``; the action labels live
+    beside the model that the writer stamps them onto, because ``models.py`` cannot
+    import this module. That duplication is the shape this codebase has been bitten
+    by before (``_UNREADABLE``), so it is closed the same way: an import-time
+    assertion, plus this test, so a thirteenth event type is a hard failure rather
+    than a row that quietly ships without the field requirement 7 names.
+
+    The ceiling matters as much as the coverage. ``_reject_content_sized_fields``
+    refuses any detail value over 64 rendered characters, and the writer adds this one
+    itself -- a label that broke the ceiling would make the audit writer start
+    refusing rows because of its own constant, on the write path, in production.
+    """
+    assert frozenset(EVENT_ACTIONS) == EVENT_TYPES
+    assert EVENT_ACTIONS is AUDIT_ACTIONS, "logger must re-export, not re-declare"
+    assert ACTION_KEY == AUDIT_ACTION_KEY == "action"
+    for event_type, action in EVENT_ACTIONS.items():
+        assert action, event_type
+        assert len(action) <= MAX_DETAIL_VALUE_LEN, (event_type, action)
+        assert len(ACTION_KEY) <= MAX_DETAIL_VALUE_LEN
+    # The two halves of the round trip must be distinguishable, or "action" carries
+    # nothing a reader could filter on.
+    assert EVENT_ACTIONS[OBFUSCATE] != EVENT_ACTIONS[DEOBFUSCATE]
+
+
+def test_the_stage_row_and_the_itemisation_do_not_share_one_action_label() -> None:
+    """``DEOBFUSCATE`` is written in two shapes, and the action must tell them apart.
+
+    Regression test for a defect this file's own change introduced. ``DEOBFUSCATE``
+    covers both a per-entity itemisation (one row per restored token ID, naming its
+    own ``action`` via ``restorer.RESTORE_ACTION``) and a *stage* row summarising the
+    whole restore -- counts, outcome, latency, both label columns NULL. Readers
+    separate the two by that field, because a query by event type returns them
+    together.
+
+    Defaulting the stage row to the same ``"restore"`` collapsed the discriminator,
+    and seven tests in ``test_deobfuscation.py`` started counting the stage row as an
+    entity. Requirement 7 wants *both* shapes to carry an action; it does not want
+    them to carry the *same* one. Asserted against the restorer's own constant rather
+    than a repeated literal, so renaming either side fails here instead of silently
+    re-colliding.
+    """
+    from secure_context_pipeline.deobfuscation.restorer import RESTORE_ACTION
+
+    assert EVENT_ACTIONS[DEOBFUSCATE] != RESTORE_ACTION, (
+        "the stage row's default action must differ from the per-entity rows', or the "
+        "only thing separating the two shapes of a DEOBFUSCATE row is gone"
+    )
+    # Both still readable as de-obfuscation, so a compliance filter on the action
+    # prefix sees the whole half of the round trip.
+    assert EVENT_ACTIONS[DEOBFUSCATE].startswith("restore")
+    assert RESTORE_ACTION.startswith("restore")
+
+
+# ---------------------------------------------------------------------------
+# The event types OUTSIDE `EVENT_TYPES` -- requirement 7 does not stop at twelve
+# ---------------------------------------------------------------------------
+
+
+class _EmitSite(NamedTuple):
+    """One ``AuditEvent(...)`` construction the package performs."""
+
+    event_type: str
+    file: str
+    line: int
+    #: Keys of the ``detail`` dict *literal* at this site, or ``None`` when the
+    #: argument is not a literal (a variable, a comprehension) and so cannot be read.
+    detail_keys: frozenset[str] | None
+
+
+def _emit_sites() -> tuple[list[_EmitSite], list[tuple[str, int, str]]]:
+    """Every ``event_type=`` the PACKAGE passes, discovered from its own source.
+
+    ``test_every_event_type_carries_an_explicit_action`` quantifies over
+    :data:`EVENT_TYPES`, and that is exactly as far as it can see.
+    ``AUDIT_ACCESS_DENIED`` goes through the same writer and is chained like any
+    other row, but is deliberately **not** in that frozenset -- so it sat outside the
+    coverage of every action test in this file and shipped without the field.
+
+    Nothing about "twelve" is load-bearing here. What is load-bearing is that the set
+    is *discovered from the code that emits*, so a fourteenth type added tomorrow is
+    caught by this sweep rather than by somebody remembering to extend a list.
+
+    Two kinds of call site, told apart rather than lumped together:
+
+    *Decisions* -- the ``event_type`` argument is a string literal or a module-level
+    constant, i.e. this line CHOOSES the type. These are what the caller checks.
+
+    *Forwarding* -- the argument is a parameter, an attribute or a value read back
+    out of a row (``str(row["event_type"])``). The choice was made by whoever called
+    it, and that caller is itself in this sweep. Returned separately so a caller can
+    assert none of them is a literal: that is what stops a new event type hiding in
+    the bucket this function admits it cannot resolve.
+    """
+    package_root = Path(logger_module.__file__).resolve().parents[1]
+    decisions: list[_EmitSite] = []
+    forwarded: list[tuple[str, int, str]] = []
+    for path in sorted(package_root.rglob("*.py")):
+        relative = str(path.relative_to(package_root))
+        module_name = "secure_context_pipeline." + relative.removesuffix(".py").replace("/", ".")
+        module_name = module_name.removesuffix(".__init__")
+        namespace: dict[str, object] | None = None
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        # A loop variable bound to a tuple of module constants is still a decision --
+        # `for event_type in (SESSION_EXPIRE, VAULT_DESTROY)` chooses two types in one
+        # statement, and reading it as "forwarding" would have hidden SESSION_EXPIRE,
+        # the one type in the vocabulary emitted this way. Scoped per function so a
+        # same-named parameter elsewhere in the module cannot borrow the binding.
+        loop_bindings: dict[ast.AST, dict[str, list[str]]] = {}
+        for scope in ast.walk(tree):
+            if not isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Module):
+                continue
+            bound: dict[str, list[str]] = {}
+            for node in ast.walk(scope):
+                if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
+                    continue
+                if not isinstance(node.iter, ast.Tuple | ast.List):
+                    continue
+                if namespace is None:
+                    namespace = vars(importlib.import_module(module_name))
+                values = [
+                    str(namespace[element.id])
+                    for element in node.iter.elts
+                    if isinstance(element, ast.Name) and isinstance(namespace.get(element.id), str)
+                ]
+                if len(values) == len(node.iter.elts):
+                    bound[node.target.id] = values
+            if bound:
+                loop_bindings[scope] = bound
+        in_scope: dict[str, list[str]] = {}
+        for bound in loop_bindings.values():
+            in_scope.update(bound)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            argument = next((kw.value for kw in node.keywords if kw.arg == "event_type"), None)
+            if argument is None:
+                continue
+            if namespace is None:
+                namespace = vars(importlib.import_module(module_name))
+            values: list[str] = []
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                values = [argument.value]
+            elif isinstance(argument, ast.Name):
+                resolved = namespace.get(argument.id)
+                if isinstance(resolved, str):
+                    values = [resolved]
+                else:
+                    values = list(in_scope.get(argument.id, ()))
+            if not values:
+                forwarded.append((relative, argument.lineno, type(argument).__name__))
+                continue
+            detail = next((kw.value for kw in node.keywords if kw.arg == "detail"), None)
+            keys: frozenset[str] | None = None
+            if isinstance(detail, ast.Dict):
+                literal: set[str] = set()
+                for key in detail.keys:
+                    # Both spellings a detail key can take at a call site: the string
+                    # itself, and a module constant holding it. Resolving the second
+                    # is what stops `EMITTED_STRATEGY_KEY: ...` style keys -- which
+                    # this package uses -- from reading as "no such key".
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        literal.add(key.value)
+                    elif isinstance(key, ast.Name) and isinstance(namespace.get(key.id), str):
+                        literal.add(str(namespace[key.id]))
+                keys = frozenset(literal)
+            decisions.extend(
+                _EmitSite(value, relative, argument.lineno, keys) for value in values
+            )
+    return decisions, forwarded
+
+
+def test_the_emit_site_sweep_sees_the_whole_vocabulary_and_the_outsider() -> None:
+    """Premise of the test below, held separately so it cannot go vacuous.
+
+    A sweep that silently stopped resolving names would return no decision sites, and
+    "every discovered type carries an action" would then pass by finding nothing. So
+    the sweep's own coverage is asserted first: every one of the twelve found at a
+    real emit site, at least one type outside them, and -- the part that matters --
+    **no forwarding site is a literal**, because a literal in that bucket would be an
+    event type the sweep decided not to look at.
+    """
+    decisions, forwarded = _emit_sites()
+    literal_forwards = [entry for entry in forwarded if entry[2] == "Constant"]
+    assert not literal_forwards, (
+        f"an event_type literal landed in the forwarding bucket, so the sweep is "
+        f"not seeing every decision: {literal_forwards}"
+    )
+    found = {site.event_type for site in decisions}
+    assert EVENT_TYPES <= found, (
+        f"types in EVENT_TYPES that nothing in the package emits: {sorted(EVENT_TYPES - found)}"
+    )
+    assert found - EVENT_TYPES, (
+        "no emitted event type sits outside EVENT_TYPES any more; if that is a "
+        "deliberate change the test below has nothing left to guard"
+    )
+
+
+def test_an_event_type_outside_the_vocabulary_names_its_own_action() -> None:
+    """A type the writer cannot default for must name ``action`` at every emit site.
+
+    ``AuditLogger.emit`` fills ``detail['action']`` from
+    :data:`~secure_context_pipeline.models.AUDIT_ACTIONS`, which is keyed by
+    :data:`EVENT_TYPES`. A type outside that vocabulary gets **nothing**, and that is
+    what ``AUDIT_ACCESS_DENIED`` shipped as: driven through the production emitter
+    ``deps._deny_audit_scope``, the written row was
+    ``{'claimed_user_id', 'route', 'scope_resolved'}`` -- the one of the thirteen
+    types reaching the writer without the field core requirement 7 names.
+
+    Adding it to ``EVENT_TYPES`` would supply the action and falsify that frozenset's
+    own "section 7 vocabulary, verbatim and complete", which ``test_readme_claims.py``
+    asserts. The resolution is the one the writer already allows for (``setdefault``,
+    not assignment): the emitter names it. Held structurally, at every construction
+    site, because "the one emitter remembers" is precisely the property that was
+    already false once -- and a second emitter added later would be a second silent
+    row rather than a failure here.
+    """
+    decisions, _ = _emit_sites()
+    outside = [site for site in decisions if site.event_type not in EVENT_TYPES]
+    assert outside, "premise: at least one emit site is outside the writer's vocabulary"
+    silent = [
+        f"{site.file}:{site.line} ({site.event_type})"
+        for site in outside
+        if site.detail_keys is None or ACTION_KEY not in site.detail_keys
+    ]
+    assert not silent, (
+        f"emit sites for a type the writer cannot default an action for, whose detail "
+        f"does not name one: {silent}"
+    )
+
+
+async def test_the_thirteenth_event_type_is_written_with_an_action(tmp_path: Path) -> None:
+    """The behaviour, driven through the production emitter rather than a stand-in.
+
+    The structural test above reads the source; this one runs
+    ``deps._deny_audit_scope`` -- the only code path that writes this event type --
+    against a real hash-chained log and reads the stored row back. A synthetic
+    ``audit.emit(AuditEvent(event_type=AUDIT_ACCESS_DENIED, ...))`` would prove the
+    opposite of what is wanted: it *still* comes out without an action, because the
+    writer has no default for this type and never will. The action is the emitter's.
+
+    Also pinned here: the row stays outside ``EVENT_TYPES``, the label respects the
+    writer's own detail ceiling, and the chain still verifies with the extra field
+    inside the digest.
+    """
+    from secure_context_pipeline.api import deps
+    from secure_context_pipeline.api.constants import AUDIT_ACCESS_DENIED
+
+    log = await AuditLogger.open(tmp_path / "denied.db")
+    try:
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/audit",
+                "raw_path": b"/audit",
+                "query_string": b"",
+                "headers": [],
+                "client": ("203.0.113.7", 51234),
+                "server": ("testserver", 80),
+                "scheme": "http",
+                "root_path": "",
+                "app": SimpleNamespace(state=SimpleNamespace()),
+            }
+        )
+        await deps._deny_audit_scope(
+            request,
+            SimpleNamespace(audit=log),  # type: ignore[arg-type]
+            deps._AuditScope(session_id=None, owner=None),
+            user_id="mallory",
+            run_id=None,
+        )
+
+        rows = await log.query(limit=10)
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row.event_type == AUDIT_ACCESS_DENIED
+        assert AUDIT_ACCESS_DENIED not in EVENT_TYPES, (
+            "the type moved into the writer's vocabulary; README section 2 and "
+            "test_readme_claims.py both say it is deliberately outside it"
+        )
+        assert ACTION_KEY in row.detail, (
+            f"the deny row still ships without an action: {dict(row.detail)}"
+        )
+        action = str(row.detail[ACTION_KEY])
+        assert action, "an empty action is not an action"
+        assert len(action) <= MAX_DETAIL_VALUE_LEN
+        # A fixed label, not anything the caller supplied: the claimed user_id is in
+        # its own clamped field and must not be smuggled into this one.
+        assert "mallory" not in action
+        assert await log.verify_chain() is True
     finally:
         await log.close()

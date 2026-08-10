@@ -134,7 +134,21 @@
          literal words "Create session" because the SESSION_EXPIRED banner tells a reviewer
          to press them by name. `class="go"` is gone: Run is the page's non-destructive
          primary and should be the only blue button on it. -->
-    <details class="guard">
+    <!-- The id is what lets `createSession` CLOSE this gate once its button has been
+         pressed. It is not cosmetic. `.guard-body` is `position: absolute` (see
+         style.css for why it must be), so while `open` stays true the panel hangs over
+         the control row BELOW it -- measured in Chrome at 1550px with the session
+         committed: `details.open === true`, `DIV.guard-body` occupies
+         [212,87,330,212] and `#strategy` sits at [373,142,160,27] underneath it, so
+         `document.elementFromPoint` at the select's own centre (453,155) returns
+         `SPAN.hint` and NOT the select. A reviewer switching to pseudonymization --
+         the one control that changes what the four panels show -- clicks a dead
+         control, with nothing on screen to say why. `<details>` has no auto-close: the
+         summary toggles it and the button inside does not, so the gate stayed open for
+         the rest of the demo. Closed in `createSession` rather than by a second
+         listener on the button, so every path that commits a mint (including the node
+         harness's bare call) leaves the row clickable. -->
+    <details class="guard" id="guard-session">
       <summary>Create session&hellip;</summary>
       <div class="guard-body">
         <span class="hint">With a session already live this REPLACES it, and replacing it
@@ -217,9 +231,20 @@
     </select>
   </div>
 
+  <!-- `maxlength` mirrors `MAX_PROMPT_CHARS` in api/schemas.py, and it is the same
+       mirror-with-a-test arrangement `FIELD_LIMITS` and `SCOPED_RULES` in app.js
+       already have: tests/test_ui_behaviour.py imports the Python constant and
+       asserts this attribute carries it, so moving the ceiling in Python fails there
+       rather than leaving this number quietly wrong. Without it the box accepted any
+       length and the server answered the run with a 422 VALIDATION_ERROR naming
+       `body.prompt` -- a refusal that arrives AFTER the document has been uploaded,
+       for a limit nothing on the page had mentioned. The banner's sentence for that
+       422 stays exactly as it is: this attribute is the browser's own stop, not a
+       replacement for the server's, and a paste can still be truncated rather than
+       refused, which is why the 422 path is still reachable and still explained. -->
   <div class="grp wide">
     <label for="prompt">prompt</label>
-    <input id="prompt" value="Summarize this document and list the key facts.">
+    <input id="prompt" maxlength="8000" value="Summarize this document and list the key facts.">
   </div>
 </section>
 
@@ -234,6 +259,67 @@
      alone inside one box. -->
 <section class="controls" aria-label="run the pipeline">
   <button id="btn-run" class="go big">Run <span id="spin" class="spin" hidden></span></button>
+  <!-- BUILD DOC SECTION 9.10, THE HALF THE DESTROY SEQUENCE CANNOT DELIVER.
+       9.10 asks that "run restore again" demonstrate the VAULT-MISS path live. The
+       red strip below scripts Run -> Destroy session -> Run, and that sequence
+       demonstrates the erasure and NOT a vault miss: `/pipeline/run` calls
+       `_require_session` before `services.orchestrator.run`, so the second run is
+       refused 401 SESSION_EXPIRED before the vault is reached. Measured against this
+       build, the three steps write VAULT_DESTROY and exactly ZERO VAULT_MISS rows,
+       and it is not a bug to be fixed there: a destroyed session's key is gone, so
+       `SessionRegistry.key` raises before `SessionVault` can even answer "miss".
+       The hatched "not restored (vault miss)" key in the legend below therefore
+       never fired on the demo's own scripted flow.
+
+       This button is the flow that does deliver it, and it is NOT a simulation:
+       every step is the shipped production path. It re-sends the SAME document and
+       the SAME live session through the SAME `POST /pipeline/run`, with one extra
+       sentence appended to the prompt carrying tokens that follow this build's
+       surrogate grammar exactly but whose 8-hex ids this session never issued (app.js
+       `restoreAgain` derives them from a real token of the previous run and advances
+       one hex digit, checked against that run's own tokens so they cannot collide).
+       The mock provider echoes tokens it finds in the payload, the restorer then meets
+       an id it did not mint, and what follows is real: a genuine VAULT_MISS audit
+       row in the hash chain, `vault_misses` in the stats strip,
+       `[UNRESOLVED_ENTITY]` spliced into panel 4 by `restorer.py`, and the hatched
+       legend key lit. Measured on fixtures/medical_note.txt as `medical`:
+       `restored_count 32, vault_misses 1, unresolved_fabricated 1` and the row
+       `VAULT_MISS {"category":"PII","classification":"fabricated",
+       "reason":"token_not_in_vault","stage":"deobfuscate"}`.
+
+       TWO tokens, not one, and that is a measured correction rather than belt and
+       braces. The mock renders each echoed token under a mutation class taken
+       round-robin from five, and one of the five DROPS THE BRACKETS -- which the
+       restorer deliberately declines to treat as a miss, leaving an unbracketed
+       unminted token byte-for-byte alone because that shape is also what a real
+       document's own reference codes look like (README Deviation 49). So a single
+       fabricated token demonstrated the path only four presses in five, and which
+       press depended on how many tokens happened to precede it in the payload.
+       Observed live on the same document: one press produced `vault_misses 1`, the
+       very next produced 0 and the page correctly said it had demonstrated nothing.
+       Two adjacent tokens take consecutive mutation classes, exactly one of which
+       drops brackets, so at least one always arrives in the shape the restorer
+       answers with a real miss. The banner still reports the MEASURED count rather
+       than assuming this argument holds.
+
+       No new endpoint, deliberately and not merely conveniently. A `POST
+       /pipeline/restore` was the first design and it is refused twice over: it would
+       be a THIRD route able to emit decrypted originals, against the invariant
+       `api/constants.py` and `routes/documents.py` both state ("one of exactly two"),
+       and `tests/test_api.py::test_every_mutating_route_is_metered_including_ones_added_later`
+       pins the mutating route set BY VALUE precisely so that adding one is a
+       deliberate act somebody notices. Going through the untouched `/pipeline/run`
+       means the reviewer is watching the real pipeline rather than a demo path
+       maintained beside it.
+
+       Honesty is the whole point of the control, so the page never hides what it
+       did: the augmented prompt is written into the prompt box before the run, in
+       full, so the reviewer reads the exact string that was sent, and the banner
+       names the fabricated token, says the PAGE (not a model) put it there, and
+       reports what the run actually measured -- including saying so plainly if no
+       miss occurred. `class="go"` is deliberately NOT used: Run is this page's only
+       primary. -->
+  <button id="btn-miss" class="big">Restore again with an unissued token</button>
   <!-- "to the provider" is the third place on this page that reads as a live model call,
        swept as a sibling of the panel 2 and 3 labels below. It points at those labels
        rather than repeating the switch a third time: the belief a reviewer has to not
@@ -241,7 +327,13 @@
   <span class="hint">Uploads the armed document, detects and obfuscates it, sends only the
     obfuscated payload to the provider named on panels 2 and 3, and restores the answer into
     panel 4. Nothing here is destructive and it can be repeated. If this page has never held
-    a session, this is also what creates one.</span>
+    a session, this is also what creates one.
+    <b>The second button</b> repeats that same run against the same live session with one
+    extra sentence appended to the prompt, carrying a correctly-shaped token this session
+    never issued &mdash; which is what a model inventing a placeholder looks like. It is the
+    build doc&rsquo;s vault-miss demonstration: a real <code>VAULT_MISS</code> row, a real
+    <code>[UNRESOLVED_ENTITY]</code> in panel 4, and the hatched legend key lit. The prompt
+    box is rewritten in full first, so you read exactly what was sent.</span>
 </section>
 
 <section class="controls danger" id="review-pair" aria-label="destructive controls">
@@ -274,12 +366,49 @@
        refresh -- and is deliberately NOT done here as a CSS `column-reverse`, because that
        silently reverses the tail for every OTHER load too and would double-reverse against
        the newest-first fetch the same finding proposes for `loadAudit`. -->
+  <!-- THE ROW COUNT WAS WRONG BY 251 AND IT IS THE NUMBER THIS SENTENCE EXISTS FOR.
+       "349 rows on the large brief" is what sets the reviewer's expectation that a long
+       scroll is normal rather than a bug, and it did not describe this build.
+
+       It also has to be the count for the RIGHT tail, which is the trap the first
+       re-measurement fell into. After a destroy, `loadAudit` is called with no run id,
+       so the tail is SESSION-scoped -- and this sentence is about what is on screen
+       after Destroy session. Driven end to end in Chrome against 127.0.0.1:8099 (arm
+       legal_brief_large.txt as `legal`, tokenization, Run, Destroy session, Confirm)
+       and counted off the live DOM:
+         * run-scoped, immediately after Run: 598 rows -- 1 DETECT, 251 OBFUSCATE,
+           64 REDACT, 28 STRIP, 1 EGRESS_PASS, 1 LLM_CALL, 252 DEOBFUSCATE;
+         * session-scoped, after Confirm: 600 -- those 598 plus SESSION_CREATE and
+           VAULT_DESTROY, whose row is `740 VAULT_DESTROY {"existed":1,
+           "source":"api_logout"}` and IS the last of them, as the sentence says.
+       349 matches neither, so the figure is re-measured rather than adjusted, and both
+       numbers are printed because a reviewer sees the first one before pressing
+       Destroy. The same run recorded ZERO VAULT_MISS rows, which is what the last
+       sentence of this strip states.
+
+       THE STRATEGY IS NAMED because the count depends on it, which the first draft of
+       this sentence left unsaid. Re-measured on the same document under
+       pseudonymization: 405 rows, not 598 -- a tier answered with a realistic fake
+       emits no OBFUSCATE/DEOBFUSCATE pair. Tokenization is the <select>'s default and
+       is therefore what a reviewer running this strip's script from a fresh load
+       actually gets, so it is the number quoted; naming it is what stops the figure
+       being wrong again the moment somebody changes one dropdown. "Nine at a time" is unchanged and still exact:
+       `.tablewrap` is 260px against a 13 808px scrollHeight, opening at scrollTop 0
+       with exactly nine rows fully visible. The counts move with `entities.yaml`, so
+       `tests/test_api_ui_escaping.py` asserts this number and the two travel together.
+       -->
   <span class="tag">LIVE REVIEW &mdash; irreversible erasure: press <b>Run</b> above, then
     <b>Destroy session</b> here, then <b>Run</b> above again &mdash; the second run is refused
     with SESSION_EXPIRED before the vault is consulted, and VAULT_DESTROY is written as the
     LAST row of the session. The audit tail below opens at row 1 and shows nine at a time
-    (349 rows on the large brief), so scroll it to the END to read
-    <code>existed=1</code></span>
+    (598 rows for one large-brief run at the default <b>tokenization</b>, 600 once
+    SESSION_CREATE and VAULT_DESTROY join them after the erasure; pseudonymization emits
+    fewer), so scroll it to the END to read
+    <code>existed=1</code>.
+    <b>Do the vault-miss demonstration first</b>, with <b>Restore again with an unissued
+    token</b> above: it needs the session this erases, and it is the one that writes
+    <code>VAULT_MISS</code>. This sequence writes none &mdash; the refusal happens before the
+    vault is reached, which is the erasure being stronger than a miss, not a gap.</span>
   <!-- Two steps, and NOT a `confirm()` dialog. One click on the single red button erased
        the session outright -- next to copy that calls the erasure irreversible -- so a
        reviewer exploring the controls destroyed their own demo, and the recovery is a

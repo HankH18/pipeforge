@@ -31,6 +31,36 @@ Three passes, of which only the first two were ever independent of the detector:
    ``Member SSN 123-45-6789`` was never vaulted, never obfuscated, and reached the
    provider in the clear with all three passes silent.
 
+   **What this pass covers is two SSN spellings, and this entry used to claim the
+   hole rather than the patch.** It said pass 3 closed the invalidated-SSN hole and
+   cited ``Member SSN 123-45-6789`` as the case. The pattern it pointed at required a
+   *delimiter*, so what it actually closed was the delimited subset. The same document
+   with the same nine digits written bare -- ``Member SSN 123456789`` -- was detected by
+   nothing, vaulted by nothing, matched by nothing here, and reached the provider
+   verbatim under both strategies with ``EGRESS_PASS`` recorded. A docstring that
+   describes a class of defect while the code handles one spelling of it is worse than
+   silence, because it is where the next reader stops looking. Pass 3 now carries two
+   patterns: the separated spelling unconditionally, and any nine-digit SSN spelling --
+   bare included -- introduced by an SSN or ITIN label. The registry carries a label
+   rule of its own as a detection backstop (``entities.yaml`` -> ``SSN.patterns``),
+   which is what turns those documents from *blocked* into *vaulted, obfuscated and
+   restorable*; this pass is the copy that a registry edit cannot switch off.
+
+   The two rules are separately authored, so what they owe each other is
+   **containment, not equality**: everything this pass would block on a labelled SSN,
+   the registry must already claim. It did not, for one revision -- the gate's
+   separator class was ``[^0-9A-Za-z]{0,24}`` and the registry's was ``[\\s:#.\\-]*+``,
+   so ordinary intake spellings (``Member SSN, 123456789``, ``Social Security Number
+   (SSN): 123456789``) were blocked rather than vaulted. The registry class is now the
+   superset ``[^0-9A-Za-z]*+`` and two tests hold the containment; the full account is
+   above :data:`_INDEPENDENT_PATTERNS`.
+
+   The residual is stated rather than left to be inferred: nine digits with **no** SSN
+   label near them are not claimed by either pattern, here or in the registry. Presidio
+   scores that shape 0.05, an ordinary document writes far more order numbers and ledger
+   references in it than SSNs, and a block is a denial. See README Deviation 58 and
+   :meth:`~secure_context_pipeline.detection.detector.Detector._floor_for`.
+
 The skip-list in pass 2 is load-bearing. Pseudonyms are PII-shaped *by design*: a
 fake name is still a name. Without the skip-list every pseudonymization run would
 false-positive on its own output.
@@ -2688,12 +2718,24 @@ def _composite_needles(value: str) -> tuple[str, ...]:
 #: is invisible to both"); this constant is the part that stops it being true of the
 #: *egress* gate as well as of detection.
 #:
-#: Scope is deliberately narrow, because pass 3 blocks and a block is a denial:
+#: That sentence was true and incomplete for as long as this constant held one entry,
+#: and the incompleteness was the live defect: ``invalidate_result`` rejects the same
+#: nine digits written **bare**, and the one entry required a delimiter, so
+#: ``Member SSN 123456789 verified against payer records.`` was released with the digits
+#: in the payload verbatim while its delimited twin was blocked. Both are now claimed --
+#: here, and (as detection rather than denial) by ``SSN.patterns`` in ``entities.yaml``.
 #:
-#: * The **separated** SSN spelling only. A bare ``\\b[0-9]{9}\\b`` rule would fire on
-#:   every zip+4, order number and invoice ID in an ordinary document -- the registry
-#:   rejects a bare-digit MRN rule for exactly that reason -- and it would fire on
-#:   text this pipeline had already handled correctly.
+#: Scope is deliberately narrow, because pass 3 blocks and a block is a denial. The
+#: first entry claims one spelling and the second buys its specificity from a label:
+#:
+#: * **Unlabelled: the separated spelling only.** A bare ``\\b[0-9]{9}\\b`` rule with
+#:   no label requirement would fire on every zip+4, order number and invoice ID in an
+#:   ordinary document -- the registry rejects a bare-digit MRN rule for exactly that
+#:   reason -- and it would fire on text this pipeline had already handled correctly.
+#: * **Labelled: any nine-digit spelling, bare included.** Once an SSN or ITIN noun
+#:   phrase introduces the digits, the delimiter is carrying no specificity that the
+#:   label is not already carrying, and requiring one only separated the *denied*
+#:   spellings from the *leaked* one. See the second half of this note.
 #: * The separator class is ``[-. ]``: Presidio's own, deliberately, because the job
 #:   here is to remove Presidio's *validation* blind spot rather than to invent
 #:   shapes it never claimed. A spelling outside that class (``123/45/6789``) is not
@@ -2724,8 +2766,97 @@ def _composite_needles(value: str) -> tuple[str, ...]:
 #: Our own output is exempt by span (:meth:`EgressGate._protected_spans`), which is
 #: what keeps a pseudonymized fake SSN -- SSN-shaped by design -- from blocking every
 #: run that produces one.
+#:
+#: **The second entry, and why the first one alone was not the fix it was written as.**
+#: The paragraph above argued a bare ``\b[0-9]{9}\b`` rule out of this constant and was
+#: right to; what it then did was leave the *labelled* bare spelling uncovered as well,
+#: which is not the same decision. Measured on the shipped pipeline, both strategies,
+#: with the provider payload inspected byte for byte::
+#:
+#:     'Member SSN 123-45-6789 verified against payer records.'  -> EGRESS_BLOCKED
+#:     'Member SSN 123456789 verified against payer records.'    -> RELEASED, and the
+#:                                                                  nine digits are in
+#:                                                                  the payload verbatim
+#:
+#: Same document, same missing detection, opposite outcomes, and the *worse* outcome on
+#: the spelling this pattern was supposed to be about: ``invalidate_result`` rejects the
+#: canonical example whether or not it carries delimiters, so the delimiter requirement
+#: separated a denial from a leak rather than separating a leak from a benign number.
+#:
+#: The second entry therefore drops the delimiter requirement and buys the specificity
+#: back from the *label* instead: an SSN or ITIN noun phrase in identifier position,
+#: within a short non-alphanumeric run of the digits. That is the grammar the registry
+#: uses for every numeric identifier it recognises (see the note above ``MRN`` in
+#: ``entities.yaml``), and it is what keeps every probe in
+#: ``test_pass_three_is_narrow_enough_to_ship`` -- a zip+4, an order number, an invoice
+#: reference -- outside this pattern while ``Member SSN 123456789`` is inside it.
+#:
+#: **It is deliberately a second copy of a rule the registry also states**, written here
+#: in this module's own dialect against ``re`` rather than imported from
+#: ``entities.yaml``. Detection is config; the gate is the guarantee. Importing the
+#: registry's spelling would mean a one-line edit to a YAML file could blind the gate at
+#: the same moment it blinds the detector, which is the single failure mode pass 3
+#: exists to rule out.
+#:
+#: **What the two copies must satisfy is CONTAINMENT, not equality, and this note used
+#: to claim equality while the code did not deliver it.** It said "same rule, ``re``
+#: instead of ``regex``". That was false when it was written. The separator classes
+#: were different languages::
+#:
+#:     registry (entities.yaml)   [\s:#.\-]*+          -- whitespace, colon, hash, dot, hyphen
+#:     gate (here)                [^0-9A-Za-z]{0,24}   -- ANY non-alphanumeric run
+#:
+#: and the gate's was the wider one, which is the direction that costs availability.
+#: A value both layers claim is vaulted and restorable. A value only *this* pattern
+#: claims was never detected, so it was never vaulted, so pass 3 blocks: ``422
+#: EGRESS_BLOCKED``, ``demo.py --file`` exit 1. Every spelling in the gap was a working
+#: document the pipeline refused -- ``Member SSN, 123456789``, ``Social Security Number
+#: (SSN): 123456789``, ``Applicant SSN [123456789]``, ``Member SSN=``, ``SSN/``,
+#: ``SSN --``, ``Member SSN?`` -- all measured red at ``--category financial``. That is
+#: the same "a reviewer's own document turns the demo red" defect the second entry was
+#: added to fix, relocated from hyphenated placeholders to intake-form punctuation.
+#:
+#: The repair widened the REGISTRY to ``[^0-9A-Za-z]*+`` -- a strict superset of both
+#: classes -- and deliberately did **not** narrow this one, because narrowing the gate
+#: would make the two agree by re-opening the leak pass 3 exists to catch. The invariant
+#: is therefore one-directional and stated as such:
+#:
+#:     anything pass 3 would block on a LABELLED SSN, the detector already claims,
+#:     vaults and can restore.
+#:
+#: The converse is allowed on purpose: the registry may claim more than this pattern
+#: does, because detection is best-effort and the gate is the guarantee.
+#:
+#: Two tests hold it, and they compare the two LANGUAGES rather than the two texts --
+#: a string comparison would pass the instant someone pasted one pattern into the other
+#: file and would say nothing about ``regex``-vs-``re`` dialect differences:
+#: ``test_egress_gate.py::test_every_labelled_ssn_the_gate_claims_the_registry_claims_too``
+#: generates a corpus spanning both separator classes, both delimiter conventions and
+#: both quantifier bounds and asserts gate-claims ⊆ registry-claims span for span, and
+#: ``::test_the_registry_ssn_separator_class_is_not_narrower_than_the_gates`` asserts the
+#: character-class containment directly so it survives a corpus that stopped being
+#: representative. Separately, ``::test_an_ssn_the_shipped_detector_scores_at_zero_still_blocks``
+#: and ``::test_pass_three_blocks_a_labelled_bare_nine_digit_ssn`` build the gate against
+#: a registry whose SSN backstop has been deleted, which is what proves this copy still
+#: works when the config one is switched off.
+#:
+#: (An earlier revision of this note named a test
+#: ``test_pass_three_still_blocks_a_labelled_ssn_with_detection_removed`` that was never
+#: written. Naming a guard that does not exist is worse than naming none, because it is
+#: where the next reader stops looking -- the same defect this module documents in
+#: itself twice above.)
 _INDEPENDENT_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
-    ("SSN", re.compile(r"\b[0-9]{3}[-. ][0-9]{2}[-. ][0-9]{4}\b")),
+    ("SSN", re.compile(r"\b(?P<v>[0-9]{3}[-. ][0-9]{2}[-. ][0-9]{4})\b")),
+    (
+        "SSN",
+        re.compile(
+            r"\b(?:ssns?|s\.s\.n\.?|social\s+security|soc\.?\s*sec\.?|ss\s*#|itins?)"
+            r"[^0-9A-Za-z]{0,24}(?:(?:number|num|nbr|no|id|#)\.?[^0-9A-Za-z]{0,24})?"
+            r"(?:(?:is|was)[^0-9A-Za-z]{0,24})?"
+            r"(?P<v>[0-9]{3}[-. ]?[0-9]{2}[-. ]?[0-9]{4})(?![0-9])",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 
@@ -2738,11 +2869,20 @@ def _independent_hits(payload: str, protected: list[tuple[int, int]]) -> list[st
     character is not seen here; pass 1 sees that one for any value that was vaulted,
     and a value that was neither vaulted nor plainly written is the residual this
     pass narrows rather than closes.
+
+    **The span compared against ``protected`` is group ``v``, not the whole match**,
+    and every pattern in the constant is required to carry that group. A pattern that
+    matches a label as well as a value would otherwise offer the union of the two to
+    :func:`_overlaps`, and ``_overlaps`` excuses on *any* overlap -- so a label that
+    happened to abut one of our tokens would excuse a leak sitting beside it. Group
+    ``v`` is the value and nothing else, which is the only span our own output can
+    honestly account for.
     """
     hits: list[str] = []
     for entity_type, pattern in _INDEPENDENT_PATTERNS:
         for match in pattern.finditer(payload):
-            if not _overlaps(match.start(), match.end(), protected):
+            start, end = match.span("v")
+            if not _overlaps(start, end, protected):
                 hits.append(entity_type)
     return hits
 

@@ -22,6 +22,7 @@ from fastapi import status as http_status
 
 from secure_context_pipeline.api.constants import (
     AUDIT_ACCESS_DENIED,
+    AUDIT_ACCESS_DENIED_ACTION,
     HTTP_413_TOO_LARGE,
     HTTP_429_TOO_MANY_REQUESTS,
     MAX_REAP_PER_REQUEST,
@@ -675,6 +676,13 @@ async def _deny_audit_scope(
             run_id=_clamp(run_id) if run_id else None,
             event_type=AUDIT_ACCESS_DENIED,
             detail={
+                # Named HERE because this event type is outside `EVENT_TYPES`, so
+                # `AUDIT_ACTIONS` has no entry and the writer's `setdefault` stamps
+                # nothing -- this row was the only one of the thirteen types reaching
+                # `emit` without the field requirement 7 names. See
+                # :data:`AUDIT_ACCESS_DENIED_ACTION` for why the fix is here rather
+                # than in the vocabulary.
+                "action": AUDIT_ACCESS_DENIED_ACTION,
                 "route": request.url.path[:MAX_DETAIL_VALUE_LEN],
                 "claimed_user_id": _clamp(user_id),
                 "scope_resolved": int(scope.session_id is not None),

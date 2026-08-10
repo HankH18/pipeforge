@@ -160,6 +160,29 @@ HTTP_429_TOO_MANY_REQUESTS = 429
 #: change that belongs to whoever owns the audit package.
 AUDIT_ACCESS_DENIED = "AUDIT_ACCESS_DENIED"
 
+#: ``detail['action']`` for :data:`AUDIT_ACCESS_DENIED`, supplied by the emitter.
+#:
+#: Requirement 7 names ``action`` among the five fields an audit event must carry,
+#: and :data:`~secure_context_pipeline.models.AUDIT_ACTIONS` supplies it for the
+#: twelve types in the build doc's vocabulary. This type is deliberately outside
+#: that vocabulary -- see the note above, and ``test_readme_claims.py``, which
+#: asserts the exclusion -- so the map has no entry for it and the writer's
+#: ``setdefault`` stamped nothing: measured on a written row,
+#: ``{'route', 'claimed_user_id', 'scope_resolved'}`` and no ``action``, the only
+#: one of the thirteen types missing the field.
+#:
+#: Adding the type to ``EVENT_TYPES`` would have supplied the action *and* falsified
+#: that frozenset's docstring ("section 7 vocabulary, verbatim and complete") plus
+#: the published claim tested against it. Naming the action at the emitter is the
+#: resolution that leaves both statements true: the writer keeps a caller's own
+#: ``action`` (``setdefault``, not assignment), so this reaches the row and is
+#: inside the hash chain like every other detail field.
+#:
+#: A fixed literal, so it can carry nothing about the request; well inside the
+#: :data:`~secure_context_pipeline.errors.MAX_DETAIL_VALUE_LEN` ceiling the writer
+#: enforces on every ``detail`` value.
+AUDIT_ACCESS_DENIED_ACTION = "audit_access_denied"
+
 #: Recorded as the ``session_id`` of a deny row whose scope named only a
 #: ``run_id`` that resolved to nothing -- there is no session to file it under.
 #: Cannot collide with a real session: :meth:`SessionRegistry.create` mints

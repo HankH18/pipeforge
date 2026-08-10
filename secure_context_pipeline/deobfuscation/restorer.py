@@ -127,12 +127,13 @@ wrong name to a pronoun is worse than leaving the pronoun alone.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 import unicodedata
 from collections.abc import Collection, Iterable, Mapping
-from typing import NamedTuple, NoReturn, Protocol
+from typing import Any, NamedTuple, NoReturn, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -140,7 +141,7 @@ from secure_context_pipeline.audit.logger import DEOBFUSCATE, VAULT_MISS, AuditL
 from secure_context_pipeline.config import Settings
 from secure_context_pipeline.errors import PipelineError, VaultMissError
 from secure_context_pipeline.models import MASK, AuditEvent
-from secure_context_pipeline.surrogates import HINT_RE, TOKEN_RE
+from secure_context_pipeline.surrogates import CATEGORIES, HINT_RE, TOKEN_RE
 from secure_context_pipeline.textrules import (
     LEFT_GUARD,
     RIGHT_GUARD,
@@ -152,6 +153,8 @@ from secure_context_pipeline.textrules import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "EMITTED_INDETERMINATE",
+    "EMITTED_STRATEGY_KEY",
     "MISS_FABRICATED",
     "MISS_INDETERMINATE",
     "MISS_LOST",
@@ -185,6 +188,21 @@ MISS_INDETERMINATE = "indeterminate"
 
 TOKENIZATION = "tokenization"
 PSEUDONYMIZATION = "pseudonymization"
+
+#: The ``detail`` key carrying the surrogate composition the run actually emitted,
+#: beside ``strategy``, which carries what the caller asked for. Both, because they
+#: come apart and both are wanted: the request is what a reviewer audits an
+#: *intent* against, the outcome is what the payload and this response contained.
+EMITTED_STRATEGY_KEY = "emitted_strategy"
+
+#: ``detail[EMITTED_STRATEGY_KEY]`` when the caller did not name the composition it
+#: emitted. Its own value rather than a copy of ``strategy``, for the same reason
+#: :data:`MISS_INDETERMINATE` is: this module cannot re-derive the composition from
+#: what it is handed without writing a second classifier that would drift from
+#: :func:`~secure_context_pipeline.pipeline.orchestrator._emitted_strategy` -- the
+#: ``issued`` set is de-duplicated by token ID while the classifier counts records
+#: -- and a guess in an audit row is worse than an honest "not stated".
+EMITTED_INDETERMINATE = "indeterminate"
 
 
 def _is_known_strategy(name: str) -> bool:
@@ -268,6 +286,413 @@ _HINT_TAIL_RE = re.compile(r"[^\s\]\}\)]{0,48}")
 #: One run of whitespace. Compiled once: it is used per surrogate per call, both
 #: to build the matcher and to key the issued map back from a flexed match.
 _WS_RUN_RE = re.compile(r"\s+")
+
+#: ``derive_token_id`` is ``hexdigest()[:8]``, so every ID this run minted is
+#: exactly this long. Both halves of the salvage machinery below key on it.
+_TOKEN_ID_LEN = 8
+
+#: Non-whitespace characters a model can drop *between* the hex digits of a token
+#: ID. Whitespace is handled separately (``str.isspace``) so that every Unicode
+#: space -- NBSP, thin space, ideographic space -- is covered without listing one.
+_ID_GAP_CHARS = frozenset("_-.")
+
+#: One run of gap characters, as :func:`_collapse_for_ids` skips them. ``\s``
+#: rather than a space literal so every Unicode space is a gap.
+_GAP_RUN_RE = re.compile(r"[\s_.\-]+")
+
+#: How long a run of gap characters may be and still be read as *inside* one ID.
+#: Bounded for the same reason every quantifier in the surrogate grammar is
+#: bounded, and additionally so that ``9c92`` at the end of one sentence cannot
+#: be welded to ``ff23`` at the start of the next across a paragraph of dashes.
+_MAX_ID_GAP_RUN = 4
+
+#: Runs of hex long enough to *contain* a token ID, in the collapsed coordinates
+#: :func:`_collapse_for_ids` produces. Scanning for these once and testing each
+#: 8-character window against the minted set is O(text) rather than O(text x
+#: |minted|), which matters: a 500-token response carries 500 minted IDs and the
+#: sweep runs twice per restore (before restoration, to find what to salvage, and
+#: after it, to prove nothing survived).
+_HEX_RUN_RE = re.compile(rf"[0-9a-f]{{{_TOKEN_ID_LEN},}}")
+
+#: What the audit records for a half of the label the model destroyed. A mangled
+#: token can arrive with its category dropped (``[NAME_9c92ff23]``) or its type
+#: region unreadable, and the ID still resolves -- restore keys on the hash alone.
+#: Writing a *guess* into a compliance column would be worse than writing this:
+#: the ``OBFUSCATE`` row for the same ``token_id`` carries both fields correctly,
+#: so the join still answers "which entity was this?".
+_UNKNOWN_LABEL = "UNKNOWN"
+
+#: Openers and closers the *salvage* matcher tolerates. Wider than
+#: :data:`_BRACKET_PAIRS` by ``<``/``>``, which is what a model reaches for when
+#: it re-writes a placeholder it has decided to paraphrase. This is a *tolerance*
+#: class and never a provenance one -- :func:`_is_bracketed` still asks the
+#: narrower question, and the salvage matcher does not use it at all, because its
+#: provenance test is stronger than any bracket: the hash has to be one we minted.
+_SALVAGE_OPENERS = r"\[\{\(<"
+_SALVAGE_CLOSERS = r"\]\}\)>"
+
+#: The dash- and underscore-alikes, built with ``chr`` for the same reason
+#: :data:`_RSQUO` is: no character confusable with an ASCII separator appears
+#: literally in this source file. Every one of these was measured leaving a token
+#: in the user's answer whole.
+_SALVAGE_SEP_CONFUSABLES = "".join(
+    chr(code)
+    for code in (
+        0x00B7,  # MIDDLE DOT
+        0x2011,  # NON-BREAKING HYPHEN
+        0x2013,  # EN DASH
+        0x2014,  # EM DASH
+        0x2027,  # HYPHENATION POINT
+        0x2212,  # MINUS SIGN
+        0xFF3F,  # FULLWIDTH LOW LINE
+    )
+)
+
+#: What a model writes where :func:`~secure_context_pipeline.surrogates
+#: .format_surrogate` wrote ``_``. ``TOKEN_RE`` accepts ``_`` and ``-`` only, so
+#: every other character here was a token that reached the user whole. The class
+#: is deliberately generous because **it is not what makes the match safe** --
+#: see :func:`_compile_salvage_pattern`. Whitespace is added separately so all of
+#: Unicode's spaces are covered without listing one.
+_SALVAGE_SEP_CHARS = "_" + re.escape(".:;,/|~+=*#@<>&^-") + _SALVAGE_SEP_CONFUSABLES
+
+#: One separator run. Bounded, and >1 on purpose: ``[PII__NAME__9c92ff23]`` and
+#: ``[PII_-NAME_-9c92ff23]`` are the same failure as a single wrong separator.
+_SALVAGE_SEP = f"(?:[{_SALVAGE_SEP_CHARS}]|\\s){{1,6}}"
+
+#: One word of the type region. ``[^\W_]`` rather than ``[A-Za-z0-9]`` -- the same
+#: class ``textrules`` uses for a word edge -- so a fullwidth or accented spelling
+#: of the type is a word here too, and ``_`` is excluded because it belongs to
+#: :data:`_SALVAGE_SEP_CHARS`. The two classes are disjoint by construction, so
+#: they can never compete for a character.
+_SALVAGE_SEG = r"[^\W_]{1,64}"
+
+#: How many words may stand between the anchor and the hash. The forms this has
+#: to cover need three (``NAME`` + an inserted two-word phrase); four leaves one
+#: word of slack. It is a *deletion* bound, so it is deliberately tight -- every
+#: word inside the match is a word the user does not get to read.
+_MAX_SALVAGE_SEGMENTS = 4
+
+#: The category literals as the salvage matcher reads them: ASCII, any casing.
+#: Built from the public ``CATEGORIES`` tuple rather than importing the surrogate
+#: module's private any-case alternation -- a new category must not be able to
+#: exist in one matcher and not the other.
+_SALVAGE_CATEGORY = "|".join(
+    "".join(f"[{char.upper()}{char.lower()}]" for char in category) for category in CATEGORIES
+)
+
+#: A prefix a model puts in front of a hex string it has decided is a number.
+_SALVAGE_HASH_PREFIX = r"(?:0[xX]|\#|U\+)?"
+
+#: Non-whitespace gap characters, as a regex class, for the flexed ID.
+_ID_GAP_CLASS = "_\\-."
+
+#: The same bounded whitespace class ``TOKEN_RE`` uses. Spelled here rather than
+#: imported because ``surrogates._WS`` is private to that module; pinned equal to
+#: it by ``tests/test_deobfuscation.py`` so the two cannot drift.
+_WS_BOUND = r"\s{0,4}"
+
+#: How many vault resolutions may run back to back before this stage hands the
+#: event loop back.
+#:
+#: The two resolve loops are the only phases that *must* stay on the loop -- they
+#: await the vault, which is I/O. But ``await`` is not a yield: a warm
+#: ``SessionVault`` answers from its own decrypted cache and the coroutine returns
+#: without ever suspending, so 500 distinct tokens are 500 awaits that hand the
+#: loop nothing. Measured on the 500-token benchmark, that loop alone held the
+#: loop for ~12 ms after everything around it had been offloaded. One
+#: ``asyncio.sleep(0)`` costs ~1 us and is the difference between "this stage is
+#: non-blocking" and "this stage is non-blocking unless the cache is warm", which
+#: is the request path.
+_YIELD_EVERY = 64
+
+
+class _Hit(NamedTuple):
+    """One token-shaped run in the response, and which matcher found it.
+
+    ``salvaged`` distinguishes a :data:`~secure_context_pipeline.surrogates
+    .TOKEN_RE` match -- the shared grammar, which the emitter and the egress gate
+    also speak -- from one this module's own widened matcher recovered. The flag
+    is not cosmetic: the two carry their ``entity_type`` region under different
+    grammars, so the label normalisation differs, and only the salvaged ones are
+    counted into ``RestoreResult.tokens_salvaged``.
+    """
+
+    match: re.Match[str]
+    salvaged: bool
+
+
+def _token_id_of(match: re.Match[str]) -> str:
+    """The lowercased 8-hex lookup key group 3 carries, gaps removed.
+
+    ``TOKEN_RE``'s group 3 is ``[0-9a-fA-F]{8}`` and cannot contain a gap, so for
+    every match of the shared grammar this is exactly the ``.lower()`` it replaced.
+    The salvage matcher's group 3 *can*: ``[PII_NAME_9c92\\nff23]`` is a token a
+    model wrapped mid-hash, and the key behind it is still ``9c92ff23``.
+    """
+    return "".join(
+        char
+        for char in match.group(3).lower()
+        if not (char.isspace() or char in _ID_GAP_CHARS)
+    )
+
+
+def _collapse_for_ids(text: str) -> tuple[str, list[int]]:
+    """Lowercase ``text`` with short gap runs deleted, plus a map back to offsets.
+
+    ``offsets[i]`` is the index in ``text`` of the character that became
+    ``collapsed[i]``. A gap run longer than :data:`_MAX_ID_GAP_RUN` is replaced by
+    a NUL rather than deleted, so it breaks a hex run instead of welding two
+    distant ones together.
+
+    This is the whole of the residue detector's machinery, and it deliberately
+    shares **none** with the matchers it backstops. A check built out of the same
+    regex as the thing it checks cannot see the shapes that regex misses -- which
+    is exactly how six mangled forms reached the user with the post-restore
+    assertion silent. The detector asks a question the matchers cannot: *is a hash
+    this run minted still in the string?* -- and ``minted`` comes from the
+    obfuscation side, not from any grammar.
+
+    Built out of one ``finditer`` over gap *runs* rather than a per-character
+    Python loop, and the difference is the point rather than tidiness: this
+    function runs twice per restore over the whole answer, so a per-character loop
+    put ~7 ms of new work on a stage that had 6 ms of work in it. The runs between
+    gaps are copied as slices and their offsets come from ``range``, both at C
+    speed; only the gap runs are visited from Python, and there are far fewer of
+    them than there are characters.
+    """
+    lowered = text.lower()
+    chunks: list[str] = []
+    offsets: list[int] = []
+    cursor = 0
+    for run in _GAP_RUN_RE.finditer(lowered):
+        start, end = run.span()
+        if start > cursor:
+            chunks.append(lowered[cursor:start])
+            offsets.extend(range(cursor, start))
+        if end - start > _MAX_ID_GAP_RUN:
+            chunks.append("\x00")
+            offsets.append(start)
+        cursor = end
+    if cursor < len(lowered):
+        chunks.append(lowered[cursor:])
+        offsets.extend(range(cursor, len(lowered)))
+    return "".join(chunks), offsets
+
+
+def _minted_id_spans(
+    text: str,
+    minted: Collection[str],
+    *,
+    protected: tuple[tuple[int, int], ...] = (),
+) -> list[tuple[int, int, str]]:
+    """Every occurrence of an ID **this run minted**, in ``text`` coordinates.
+
+    Ascending, half-open, gap-tolerant. Spans lying wholly inside ``protected``
+    -- values the surrogate pass spliced in -- are excluded, the same scope and
+    the same reason as :meth:`Restorer._assert_no_tokens`.
+
+    Provenance, not shape, is what makes this safe to act on. An eight-hex run in
+    the model's answer is not evidence of anything (the module docstring's
+    ``FIN-ACCOUNT-40281993`` is the standing counter-example), but an eight-hex
+    run that *equals an ID this run minted* can only have got there by way of a
+    token we handed the model. So the false-positive question is not "how often
+    does prose look like this?" but "how often does prose reproduce one of our
+    hashes?", and that is 2**-32 per candidate window.
+    """
+    if not minted or not text:
+        return []
+    collapsed, offsets = _collapse_for_ids(text)
+    found: list[tuple[int, int, str]] = []
+    for run in _HEX_RUN_RE.finditer(collapsed):
+        body = run.group(0)
+        for cursor in range(len(body) - _TOKEN_ID_LEN + 1):
+            candidate = body[cursor : cursor + _TOKEN_ID_LEN]
+            if candidate not in minted:
+                continue
+            at = run.start() + cursor
+            start = offsets[at]
+            end = offsets[at + _TOKEN_ID_LEN - 1] + 1
+            if any(span_start <= start and end <= span_end for span_start, span_end in protected):
+                continue
+            found.append((start, end, candidate))
+    found.sort()
+    return found
+
+
+_Span = tuple[int, int, "Any"]
+
+
+def _uncovered(spans: list[_Span], covered: list[tuple[int, int]]) -> list[_Span]:
+    """Those of ``spans`` that share no character with any span in ``covered``.
+
+    One merge walk, not a nested scan, and that is a real bound rather than a
+    tidiness preference. Written as ``any(...)`` inside a comprehension it is
+    O(occurrences x matches), and both of those numbers are "one per token in the
+    response": on the 500-token benchmark the nested form cost **4.6 ms** and grew
+    quadratically, so a 1 000-token answer would have paid four times that for a
+    filter that is linear by construction.
+
+    Both lists must be ascending by start. ``covered`` additionally must be
+    non-overlapping, which ``finditer`` guarantees -- that is what lets the walk
+    stop at the first candidate rather than test the rest.
+    """
+    if not covered:
+        return spans
+    result: list[_Span] = []
+    index = 0
+    for span in spans:
+        start, end = span[0], span[1]
+        while index < len(covered) and covered[index][1] <= start:
+            index += 1
+        if index < len(covered) and covered[index][0] < end:
+            continue
+        result.append(span)
+    return result
+
+
+def _flexed_id(token_id: str) -> str:
+    """One token ID as a regex that tolerates gaps and casing between its digits."""
+    gap = f"(?:[{_ID_GAP_CLASS}]|\\s){{0,{_MAX_ID_GAP_RUN}}}"
+    return gap.join(
+        f"[{char}{char.upper()}]" if char.isalpha() else re.escape(char) for char in token_id
+    )
+
+
+def _compile_salvage_pattern(token_ids: Collection[str]) -> re.Pattern[str] | None:
+    """A widened token matcher, built **around IDs this run actually minted**.
+
+    ``TOKEN_RE`` is the grammar three components share -- the emitter, this
+    module, and the egress gate's skip-list -- so widening it is a security change
+    as well as a tolerance one, and the gate's own module docstring says so.  This
+    pattern is the tolerance half taken on its own: it lives here, nothing else
+    imports it, and it therefore cannot widen a single span of outbound payload
+    the gate stops scanning.
+
+    What makes it safe to *rewrite* on is not the character classes, which are
+    deliberately loose. It is that the hash alternative is a literal list of the
+    IDs this run minted. A separator class wide enough to read ``[PII NAME
+    9c92ff23]`` is also wide enough to read ``Reference: FIN ACCOUNT 40281993`` out
+    of an uploaded document -- the exact reference code the module docstring
+    records this pipeline once deleted and replaced with ``[UNRESOLVED_ENTITY]``.
+    Compiling the hash from ``minted`` makes that string un-matchable rather than
+    merely improbable: the pattern has no way to express an ID we did not issue.
+
+    **The head is anchored, and that is the bound on how much of the answer this
+    can delete.** The match must begin at an opening bracket or at a category
+    literal; the type region can only be entered from one of those two. Written
+    the obvious way instead -- an optional opener, an optional category, then an
+    optional run of words -- the region has nothing on its left to stop it and it
+    walks straight into the model's prose. Measured on that version, with
+    ``9c92ff23`` issued and vaulted::
+
+        The patient in room 5 PII NAME 9c92ff23 was seen.
+          ->  The patient in Marisol Vanterpool was seen.       # "room 5" gone
+        The identifier 9c92ff23 could not be resolved.
+          ->  Marisol Vanterpool could not be resolved.         # "The identifier" gone
+
+    Both are the failure :func:`_consume_unclosed_tail` refuses at length: a
+    visible remnant is cosmetic, whereas deleting words the model wrote changes
+    the answer the user reads and leaves nothing on screen to say so. Anchored,
+    the first restores only ``PII NAME 9c92ff23`` and the second does not match at
+    all -- a bare hash in prose is left alone and caught by
+    :meth:`Restorer._assert_no_tokens` instead.
+
+    Groups: 1 is the whole head (opener, category and type region together), 2 is
+    an always-empty placeholder, 3 is the hash. Numbered so that group 3 is the
+    hash under *either* matcher, which is what lets :func:`_span_and_suffix`, the
+    rebuild and :func:`_token_id_of` take both without asking. The head is parsed
+    in Python rather than captured piecewise because the two branches would
+    otherwise need two copies of the category group.
+
+    Returns ``None`` for an empty ID set, so the caller pays nothing on the
+    overwhelmingly common response in which nothing was mangled at all.
+    """
+    ordered = sorted({token_id.lower() for token_id in token_ids if token_id})
+    if not ordered:
+        return None
+    ids = "|".join(_flexed_id(token_id) for token_id in ordered)
+    region = f"(?:{_SALVAGE_SEG}{_SALVAGE_SEP}){{0,{_MAX_SALVAGE_SEGMENTS}}}"
+    category = f"(?:{_SALVAGE_CATEGORY}){_SALVAGE_SEP}"
+    head = (
+        f"(?:[{_SALVAGE_OPENERS}]{_WS_BOUND}(?:{category})?{region}"
+        f"|{category}{region})"
+    )
+    return re.compile(
+        rf"({head})()"
+        rf"{_SALVAGE_HASH_PREFIX}"
+        rf"((?:{ids}))"
+        rf"(?:{_WS_BOUND}\|{_WS_BOUND}[a-z0-9\-]{{1,24}})?"
+        rf"{_WS_BOUND}[{_SALVAGE_CLOSERS}]?"
+    )
+
+
+def _salvage_head_words(match: re.Match[str]) -> list[str]:
+    """The head of a salvage match, split into words. Bracket and separators gone."""
+    return [word for word in re.split(r"[\W_]+", match.group(1), flags=re.UNICODE) if word]
+
+
+def _category_label(match: re.Match[str], *, salvaged: bool) -> str:
+    """The category an audit row should carry for this match.
+
+    For a ``TOKEN_RE`` match this is group 1 upper-cased -- one of the four
+    ``CATEGORIES`` literals, the half of the label that provably cannot carry a
+    value. A salvaged match may have no category at all (``[NAME_9c92ff23]``, the
+    dropped-category form); that records :data:`_UNKNOWN_LABEL` rather than a
+    guess, and the ``OBFUSCATE`` row for the same ``token_id`` still has it.
+
+    A salvaged head whose first word is *not* a category literal is treated as
+    having none: the model wrote ``PERSONAL`` or ``PXI`` there, and echoing that
+    into a compliance column as if it were a namespace of ours would be worse than
+    saying we do not know.
+    """
+    if not salvaged:
+        return match.group(1).upper()
+    words = _salvage_head_words(match)
+    if words and words[0].upper() in CATEGORIES:
+        return words[0].upper()
+    return _UNKNOWN_LABEL
+
+
+def _type_label(match: re.Match[str], *, salvaged: bool) -> str:
+    """The entity type an audit row should carry for this match.
+
+    For a ``TOKEN_RE`` match this is group 2 upper-cased and capped, unchanged --
+    that group is the emitter's own ``[A-Z][A-Z0-9_]*`` grammar, and it is the one
+    spelling that joins a ``DEOBFUSCATE`` row to the ``OBFUSCATE`` row the engine
+    wrote from ``record.entity_type``.
+
+    A salvaged match has no such group: its head is a *region* under a much looser
+    grammar -- ``NAME_the-token_``, ``PERSONAL_NAME_``, a fullwidth spelling of
+    the category followed by ``NAME``, or nothing at all. Which word in it is the
+    type depends on whether the category survived, and the emitter's shape
+    (``CATEGORY_TYPE_hash``) is what decides:
+
+    * **First word is one of the four ``CATEGORIES``** -- the category survived, so
+      the type is the word after it and anything further is an insertion the model
+      made. ``[PII_NAME_<word>_1a2b3c4d]`` is ``NAME``, not ``word``.
+    * **It is not** -- the category was dropped or mangled, so counting from the
+      left would read a *type* as a category or an invented word as a type. Count
+      from the hash instead: the word immediately before it is the type.
+      ``[NAME_1a2b3c4d]`` and ``[PERSONAL_NAME_1a2b3c4d]`` are both ``NAME``.
+
+    Taking the first word unconditionally put ``PERSONAL`` -- a word the *model*
+    invented -- in the column a compliance query groups by, next to a ``category``
+    of ``UNKNOWN`` that had correctly refused to record the same word. One of the
+    two was wrong and it was this one.
+
+    Bounded by the same cap as the ``TOKEN_RE`` path for the same reason: these
+    are bytes the model wrote.
+    """
+    if not salvaged:
+        return match.group(2).upper()[:_MAX_LABEL_LEN]
+    words = _salvage_head_words(match)
+    if not words:
+        return _UNKNOWN_LABEL
+    if words[0].upper() in CATEGORIES:
+        rest = words[1:]
+        return rest[0].upper()[:_MAX_LABEL_LEN] if rest else _UNKNOWN_LABEL
+    return words[-1].upper()[:_MAX_LABEL_LEN]
 
 #: Longest label copied out of untrusted text into an audit row.
 #:
@@ -412,6 +837,14 @@ class RestoreResult(BaseModel):
         and it is an upper bound, not a defect count: a fake drawn from ordinary
         English (``Long``, ``Brown``, ``May``) matches its lowercase common-word
         twin and is counted here. Non-zero means "look", never "fail".
+    ``tokens_salvaged``
+        Occurrences restored by the widened matcher rather than by the shared
+        ``TOKEN_RE`` grammar -- i.e. tokens the model mangled past the grammar the
+        emitter and the egress gate speak. Counted separately because it is the
+        one number that says *the provider is damaging our markers*, which is
+        operational information the aggregate ``restored_count`` hides: a run
+        where every token needed salvaging restored perfectly and is still worth
+        looking at.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -430,6 +863,7 @@ class RestoreResult(BaseModel):
     surrogates_suspected_unrestored: int = 0
     foreign_tokens: int = 0
     restored_collisions: int = 0
+    tokens_salvaged: int = 0
     elapsed_ms: float = 0.0
 
     def __repr__(self) -> str:
@@ -444,6 +878,7 @@ class RestoreResult(BaseModel):
             f"surrogates_suspected_unrestored={self.surrogates_suspected_unrestored}, "
             f"foreign_tokens={self.foreign_tokens}, "
             f"restored_collisions={self.restored_collisions}, "
+            f"tokens_salvaged={self.tokens_salvaged}, "
             f"elapsed_ms={self.elapsed_ms:.3f})"
         )
 
@@ -487,6 +922,8 @@ class _TokenPass(NamedTuple):
     #: One entry per distinct token ID whose original was spliced into ``text``.
     #: The itemisation the ``DEOBFUSCATE`` audit rows are written from.
     restored_tokens: tuple[_RestoredToken, ...] = ()
+    #: Occurrences the widened salvage matcher claimed rather than ``TOKEN_RE``.
+    salvaged: int = 0
 
 
 class _SurrogatePass(NamedTuple):
@@ -542,6 +979,7 @@ class Restorer:
         surrogates: Mapping[str, str] | None = None,
         issued: Collection[str] | None = None,
         hints: Mapping[str, str] | None = None,
+        emitted_strategy: str | None = None,
         run_id: str | None = None,
     ) -> RestoreResult:
         """Restore ``text`` for ``session_id`` and verify that nothing leaked.
@@ -572,6 +1010,17 @@ class Restorer:
         :data:`MISS_INDETERMINATE` and every token-shaped residue is fatal, because
         without the set our tokens and the document's own text are the same shape.
 
+        ``emitted_strategy`` is the surrogate **composition** the run being restored
+        actually put on the wire -- ``none``/``tokenization``/``pseudonymization``/
+        ``mixed``, classified by :func:`~secure_context_pipeline.pipeline
+        .orchestrator._emitted_strategy` from the token records themselves. It is a
+        parameter rather than something derived here, and that is deliberate: the
+        two facts this module *does* hold, ``issued`` and ``surrogates``, are both
+        de-duplicated by key, while the classifier counts records, so re-deriving it
+        would be a second classifier free to disagree with the one the response
+        reports. It is written to every ``DEOBFUSCATE`` row beside ``strategy``, and
+        defaults to :data:`EMITTED_INDETERMINATE` when the caller does not name it.
+
         Raises :class:`PipelineError` if a token this run issued, or a known
         surrogate, survives the pass. Returns normally with ``[UNRESOLVED_ENTITY]``
         spliced in when a token ID is simply absent from the vault: an unknown
@@ -582,9 +1031,17 @@ class Restorer:
             raise PipelineError(reason="unknown_strategy", strategy=str(strategy)[:32])
 
         supplied: dict[str, str] = {key: value for key, value in (surrogates or {}).items() if key}
-        pattern = _compile_surrogate_pattern(supplied) if supplied else None
+        # Compiling the alternation is the single most expensive CPU step in this
+        # module -- a 300-surrogate pattern is measured in this file's own history
+        # at 17 ms *after* the prefilter fix and 683 ms before it -- and it ran on
+        # the event loop. Off it goes, with everything else that scales with the
+        # provider's response length.
+        pattern = (
+            await asyncio.to_thread(_compile_surrogate_pattern, supplied) if supplied else None
+        )
         minted = None if issued is None else {token_id.lower() for token_id in issued}
         emitted_hints = _emitted_hints(hints)
+        emitted = emitted_strategy or EMITTED_INDETERMINATE
 
         working = text
         surrogate_pass = _SurrogatePass(working, 0, 0, 0, ())
@@ -603,10 +1060,14 @@ class Restorer:
                 pattern=pattern,
                 spliced=surrogate_pass.spliced,
                 strategy=strategy,
+                emitted_strategy=emitted,
                 run_id=run_id,
             )
-            suspected = _count_surrogate_near_misses(
-                working, supplied, spliced=surrogate_pass.spliced
+            suspected = await asyncio.to_thread(
+                _count_surrogate_near_misses,
+                working,
+                supplied,
+                spliced=surrogate_pass.spliced,
             )
 
         token_pass = await self._restore_tokens(
@@ -624,6 +1085,7 @@ class Restorer:
             minted=minted,
             protected=token_pass.protected,
             strategy=strategy,
+            emitted_strategy=emitted,
             run_id=run_id,
         )
 
@@ -643,6 +1105,7 @@ class Restorer:
             surrogates_suspected_unrestored=suspected,
             foreign_tokens=foreign,
             restored_collisions=token_pass.collisions,
+            tokens_salvaged=token_pass.salvaged,
             elapsed_ms=elapsed_ms,
         )
         await self._emit(
@@ -650,7 +1113,16 @@ class Restorer:
             run_id=run_id,
             event_type=DEOBFUSCATE,
             detail={
+                # BOTH halves of the pair, and the second one is not decoration.
+                # `strategy` is what the caller ASKED for; the vault has no strategy
+                # dimension, so a session's second run restores whatever composition
+                # its first run minted. Tokenize then pseudonymize the same session
+                # and this row said `pseudonymization` for a restore that saw nothing
+                # but hash tokens -- a compliance reader reconstructing what was sent
+                # got a false answer from the log while the response object beside it
+                # was already correct.
                 "strategy": strategy,
+                EMITTED_STRATEGY_KEY: emitted,
                 "tokens_seen": result.tokens_seen,
                 "surrogates_seen": result.surrogates_seen,
                 "restored": result.restored_count,
@@ -669,6 +1141,10 @@ class Restorer:
                 "surrogates_suspected_unrestored": result.surrogates_suspected_unrestored,
                 "foreign_tokens": result.foreign_tokens,
                 "restored_collisions": result.restored_collisions,
+                # Non-zero means the provider is damaging our markers: these were
+                # restored, but only by the widened matcher, not by the grammar
+                # the emitter and the egress gate share.
+                "tokens_salvaged": result.tokens_salvaged,
                 "elapsed_ms": round(elapsed_ms, 3),
                 "outcome": "ok",
             },
@@ -679,7 +1155,11 @@ class Restorer:
         # and a reader paging the log in `seq` order should meet the outcome before
         # the list it summarises.
         await self._emit_restored_rows(
-            session_id, run_id=run_id, strategy=strategy, restored=token_pass.restored_tokens
+            session_id,
+            run_id=run_id,
+            strategy=strategy,
+            emitted_strategy=emitted,
+            restored=token_pass.restored_tokens,
         )
         # Counts only -- never the text, never a value.
         logger.info(
@@ -741,62 +1221,24 @@ class Restorer:
         placeholders cost 227 ms and 1 000 cost 561 ms, against the 500 ms budget
         for the whole stage; capped, the same 1 000 cost 22 ms.
         """
-        matches = list(TOKEN_RE.finditer(text))
-        if not matches:
+        # Scanning, span widening and label extraction are pure CPU over a string
+        # the provider chose the length of, so they go to a thread -- the same
+        # treatment the detector, the extractor, the engine sweep and the gate's
+        # first pass already get. Measured on a 500-surrogate response, this stage
+        # held the event loop for 127 ms of its 128 ms, which on an ASGI app is
+        # head-of-line blocking for every other request in flight.
+        scan = await asyncio.to_thread(
+            _scan_tokens, text, minted=minted, protected=protected, hints=hints
+        )
+        if not scan.hits:
             # `protected` is handed straight back rather than dropped: no splice
             # happened, so no offset moved, and the assertion downstream must not
             # depend on this branch having been taken.
             return _TokenPass(text, 0, 0, (), (), (), 0, 0, 0, protected)
 
-        # Widen once, up front: the claim decision is about the span that would
-        # actually disappear, not about the bare regex match.
-        spans = [_span_and_suffix(text, match, hints=hints) for match in matches]
-        claimable: list[bool] = []
-        collisions = 0
-        foreign = 0
-        for match, (span_start, span_end, _suffix) in zip(matches, spans, strict=True):
-            if _overlaps(span_start, span_end, protected):
-                collisions += 1
-                claimable.append(False)
-            elif (
-                minted is not None
-                and match.group(3).lower() not in minted
-                and not _is_bracketed(match.group(0))
-            ):
-                foreign += 1
-                claimable.append(False)
-            else:
-                claimable.append(True)
-
-        # Resolve each distinct claimable token ID once. This cache is per call by
-        # design: one that outlived the call would outlive its session scope.
-        order: list[str] = []
-        labels: dict[str, str] = {}
-        # Group 1 alone, kept apart from the full label: it is one of the four
-        # literals in `CATEGORIES`, a closed set this module ships, so it is the
-        # half of the label that provably cannot carry a value.
-        categories: dict[str, str] = {}
-        # Group 2 alone: the *registry* entity type, and therefore the one spelling
-        # that joins a DEOBFUSCATE row to the OBFUSCATE row for the same entity --
-        # the engine writes `record.entity_type`, which is exactly this string.
-        types: dict[str, str] = {}
-        for match, claimed in zip(matches, claimable, strict=True):
-            if not claimed:
-                continue
-            token_id = match.group(3).lower()
-            if token_id not in labels:
-                # UPPER-CASED, and that is not cosmetic. `TOKEN_RE` groups 1 and 2
-                # are case-tolerant now (a model that lower-cases a token still has
-                # to restore), so the same entity reached this line as `PHI_NAME`,
-                # `phi_name` and `Phi_Name` depending on how the model typed it --
-                # three spellings of one audit label, and a compliance query that
-                # groups by entity_type would report them as three entity types.
-                # The grammar is ASCII-only by construction (`surrogates._any_case`),
-                # so `.upper()` here is exact rather than locale-dependent.
-                labels[token_id] = f"{match.group(1)}_{match.group(2)}".upper()[:_MAX_LABEL_LEN]
-                categories[token_id] = match.group(1).upper()
-                types[token_id] = match.group(2).upper()[:_MAX_LABEL_LEN]
-                order.append(token_id)
+        order = scan.order
+        labels = scan.labels
+        categories = scan.categories
 
         resolved: dict[str, str] = {}
         unresolved: list[str] = []
@@ -804,7 +1246,12 @@ class Restorer:
         lost: list[str] = []
         emitted_misses = 0
         suppressed: dict[str, int] = {}
-        for token_id in order:
+        for index, token_id in enumerate(order):
+            if index and index % _YIELD_EVERY == 0:
+                # See `_YIELD_EVERY`: a warm vault never suspends, so without this
+                # the resolve loop is the one phase of the stage still capable of
+                # holding the loop for the length of the provider's response.
+                await asyncio.sleep(0)
             try:
                 if minted is not None and token_id not in minted:
                     # Not ours. The vault is never asked -- asking is how a
@@ -941,60 +1388,18 @@ class Restorer:
                 },
             )
 
-        parts: list[str] = []
-        cursor = 0
-        restored = 0
-        missed = 0
-        # Occurrences actually spliced back, per distinct token ID. Counted here
-        # rather than derived from `resolved` because a resolved ID whose every
-        # occurrence was swallowed by an earlier splice put nothing in the answer,
-        # and an audit row saying it was restored would be a claim about text that
-        # is not there.
-        occurrences: dict[str, int] = {}
-        # (input_start, input_end, replacement_length) per committed splice, in
-        # ascending order -- everything needed to move a protected span's offsets.
-        edits: list[tuple[int, int, int]] = []
-        for match, claimed, (span_start, span_end, possessive) in zip(
-            matches, claimable, spans, strict=True
-        ):
-            # Not claimed -> not touched, and the cursor does not move: the bytes
-            # are emitted by the next lead slice exactly as the model wrote them.
-            if not claimed or span_end <= cursor:  # swallowed by the previous splice
-                continue
-            parts.append(text[cursor : max(span_start, cursor)])
-            token_id = match.group(3).lower()
-            value = resolved.get(token_id)
-            if value is None:
-                piece = UNRESOLVED_ENTITY + possessive
-                missed += 1
-            else:
-                piece = value + possessive
-                restored += 1
-                occurrences[token_id] = occurrences.get(token_id, 0) + 1
-            parts.append(piece)
-            edits.append((max(span_start, cursor), span_end, len(piece)))
-            cursor = span_end
-        parts.append(text[cursor:])
-        return _TokenPass(
-            "".join(parts),
-            restored,
-            missed,
-            tuple(unresolved),
-            tuple(fabricated),
-            tuple(lost),
-            len(matches),
-            foreign,
-            collisions,
-            _shift_spans(protected, edits),
-            tuple(
-                _RestoredToken(
-                    token_id=token_id,
-                    entity_type=types[token_id],
-                    category=categories[token_id],
-                    occurrences=count,
-                )
-                for token_id, count in occurrences.items()
-            ),
+        # The rebuild is the second half of the CPU, and it is offloaded for the
+        # same reason the scan is: it concatenates a string whose length the
+        # provider chose.
+        return await asyncio.to_thread(
+            _rebuild_tokens,
+            text,
+            scan,
+            resolved,
+            protected=protected,
+            unresolved=tuple(unresolved),
+            fabricated=tuple(fabricated),
+            lost=tuple(lost),
         )
 
     # -- pseudonymization --------------------------------------------------
@@ -1008,32 +1413,22 @@ class Restorer:
         supplied: Mapping[str, str],
         run_id: str | None,
     ) -> _SurrogatePass:
-        """Replace surrogates longest-first, carrying any possessive suffix through."""
-        matches = list(pattern.finditer(text))
-        if not matches:
+        """Replace surrogates longest-first, carrying any possessive suffix through.
+
+        Scanning and splitting go to a thread in one hop, and so does the rebuild.
+        On a 500-surrogate response those two were 127 ms of unbroken event loop.
+        """
+        scan = await asyncio.to_thread(_scan_surrogates, text, pattern, supplied)
+        if not scan.matches:
             return _SurrogatePass(text, 0, 0, 0, ())
 
-        # The surrogate/possessive split is computed once per match and reused by
-        # both loops below, so the two can never disagree about where the
-        # surrogate ended.
-        canonical = _canonical_by_shape(supplied)
-        split = [
-            _split_surrogate_match(match.group(0), supplied, canonical) for match in matches
-        ]
-
-        resolved: dict[str, str] = {}
-        missing: set[str] = set()
-        for surrogate, _possessive in split:
-            if surrogate in resolved or surrogate in missing:
-                continue
-            original = supplied.get(surrogate)
-            if original:
-                resolved[surrogate] = original
-                continue
+        resolved = scan.resolved
+        for index, surrogate in enumerate(scan.pending):
+            if index and index % _YIELD_EVERY == 0:
+                await asyncio.sleep(0)
             try:
                 resolved[surrogate] = await self._vault.get_by_surrogate(session_id, surrogate)
             except VaultMissError:
-                missing.add(surrogate)
                 # There is no token ID for a surrogate-only miss, and the
                 # surrogate itself never enters the audit row.
                 #
@@ -1063,30 +1458,9 @@ class Restorer:
                     },
                 )
 
-        parts: list[str] = []
-        spliced: list[tuple[int, int]] = []
-        cursor = 0
-        written = 0
-        restored = 0
-        missed = 0
-        for match, (surrogate, possessive) in zip(matches, split, strict=True):
-            lead = text[cursor : match.start()]
-            parts.append(lead)
-            written += len(lead)
-
-            value = resolved.get(surrogate)
-            if value is None:
-                piece = UNRESOLVED_ENTITY + possessive
-                missed += 1
-            else:
-                piece = value + possessive
-                restored += 1
-            parts.append(piece)
-            spliced.append((written, written + len(piece)))
-            written += len(piece)
-            cursor = match.end()
-        parts.append(text[cursor:])
-        return _SurrogatePass("".join(parts), restored, missed, len(matches), tuple(spliced))
+        return await asyncio.to_thread(
+            _rebuild_surrogates, text, scan.matches, scan.split, resolved
+        )
 
     # -- post-restore assertions ------------------------------------------
 
@@ -1098,6 +1472,7 @@ class Restorer:
         minted: set[str] | None,
         protected: tuple[tuple[int, int], ...],
         strategy: str,
+        emitted_strategy: str,
         run_id: str | None,
     ) -> int:
         """In-code guarantee: no token **this run issued** reaches the user.
@@ -1140,22 +1515,47 @@ class Restorer:
 
         ``[UNRESOLVED_ENTITY]`` is inert against the grammar (checked at import),
         so a legitimate vault miss does not trip this.
+
+        **The grammar sweep is not the whole check, and it never could have been.**
+        ``TOKEN_RE`` is the matcher :meth:`_restore_tokens` restores with, so a
+        scan built out of it is blind in exactly the places restoration is blind:
+        every shape the matcher misses is a shape this assertion also misses, and
+        the failure mode is the worst one available -- a token reaches the user
+        *and* the guard that exists to prevent that stays silent. Measured before
+        this was fixed, with the ID issued and in the vault::
+
+            [PII NAME 9c92ff23]     [PII.NAME.9c92ff23]     [PII\\xa0NAME\\xa09c92ff23]
+            [NAME_9c92ff23]         [PII_NAME_<word>_9c92ff23]
+            [PII_NAME_0x9c92ff23]   [PII_NAME_9c92\\nff23]
+
+        -- seven forms, seven placeholders in the answer, ``restored_count`` 0,
+        ``vault_misses`` 0, ``foreign_tokens`` 0, outcome ``ok``. A sweep of 68
+        adjacent shapes found 59 of them in the same state.
+
+        So the check now asks a second question with machinery the matchers do not
+        share: :func:`_minted_id_spans` looks for a hash **this run minted** in the
+        output, keyed on ``issued`` -- which comes from the obfuscation side, not
+        from any grammar -- and tolerant of gaps inside the hash. Widening
+        ``TOKEN_RE`` would have moved the blind spot; it could not have removed it,
+        because the same regex would still be on both sides of the question.
         """
-        # Containment is tested on the *core* -- ``start(1)`` (category) through
-        # ``end(3)`` (hash) -- not on the whole match. Both brackets and both
-        # whitespace runs are optional and greedy, so a match around a restored
-        # value routinely reaches one character past it on each side; testing the
-        # raw span would excuse nothing and the exclusion would be dead code. The
-        # core is the part that identifies a token, and it is still the model's
-        # prose that has to supply anything outside a restored value for a
-        # straddling residue (``PHI-`` + ``MRN-48273910``) to stay reported.
-        residues = [
-            match
-            for match in TOKEN_RE.finditer(text)
-            if not any(
-                start <= match.start(1) and match.end(3) <= end for start, end in protected
+        residual_ids, residues = await asyncio.to_thread(
+            _sweep_residue, text, minted=minted, protected=protected
+        )
+        if residual_ids:
+            # An ID we minted, still in the answer. Reported through the same
+            # `_fail` path and the same reason as a grammar residue, because it is
+            # the same incident: this stage was handed a token of ours and did not
+            # give the value back. Counted from the independent sweep, which sees
+            # every occurrence the grammar sweep does and the mangled ones besides.
+            await self._fail(
+                session_id,
+                run_id=run_id,
+                strategy=strategy,
+                emitted_strategy=emitted_strategy,
+                reason="residual_token_after_restore",
+                count=len(residual_ids),
             )
-        ]
         if not residues:
             return 0
         if minted is None:
@@ -1163,15 +1563,17 @@ class Restorer:
                 session_id,
                 run_id=run_id,
                 strategy=strategy,
+                emitted_strategy=emitted_strategy,
                 reason="residual_token_after_restore",
                 count=len(residues),
             )
-        ours = [match for match in residues if match.group(3).lower() in minted]
+        ours = [match for match in residues if _token_id_of(match) in minted]
         if ours:
             await self._fail(
                 session_id,
                 run_id=run_id,
                 strategy=strategy,
+                emitted_strategy=emitted_strategy,
                 reason="residual_token_after_restore",
                 count=len(ours),
             )
@@ -1198,6 +1600,7 @@ class Restorer:
         pattern: re.Pattern[str],
         spliced: tuple[tuple[int, int], ...],
         strategy: str,
+        emitted_strategy: str,
         run_id: str | None,
     ) -> None:
         """Assert no known surrogate survived in text the *model* wrote.
@@ -1224,21 +1627,22 @@ class Restorer:
         splice list skips the exclusion instead of exercising it.
 
         Both lists are in ascending order, so one linear walk covers them.
+
+        The walk itself is offloaded: it is a ``finditer`` over the whole answer
+        with a pattern carrying one branch per issued surrogate, which is the same
+        CPU shape as the pass it checks. ``_fail`` is awaited *after* the thread
+        returns rather than from inside it, so the audit write and the raise stay
+        on the loop where they belong.
         """
-        index = 0
-        for match in pattern.finditer(text):
-            while index < len(spliced) and spliced[index][1] <= match.start():
-                index += 1
-            if index < len(spliced):
-                start, end = spliced[index]
-                if start <= match.start() and match.end() <= end:
-                    continue
+        residual = await asyncio.to_thread(_sweep_surrogate_residue, text, pattern, spliced)
+        if residual:
             await self._fail(
                 session_id,
                 run_id=run_id,
                 strategy=strategy,
+                emitted_strategy=emitted_strategy,
                 reason="residual_surrogate_after_restore",
-                count=len(pattern.findall(text)),
+                count=residual,
             )
 
     async def _fail(
@@ -1247,6 +1651,7 @@ class Restorer:
         *,
         run_id: str | None,
         strategy: str,
+        emitted_strategy: str,
         reason: str,
         count: int,
     ) -> NoReturn:
@@ -1269,6 +1674,7 @@ class Restorer:
         """
         detail: dict[str, int | float | str] = {
             "strategy": strategy,
+            EMITTED_STRATEGY_KEY: emitted_strategy,
             "outcome": "assertion_failed",
             "reason": reason,
             "residual": count,
@@ -1299,6 +1705,7 @@ class Restorer:
         *,
         run_id: str | None,
         strategy: str,
+        emitted_strategy: str,
         restored: tuple[_RestoredToken, ...],
     ) -> None:
         """One ``DEOBFUSCATE`` row per distinct token ID restored. Requirement 7.
@@ -1353,20 +1760,39 @@ class Restorer:
         """
         if self._audit is None or not restored:
             return
-        for entry in restored[:_MAX_RESTORE_ROWS]:
-            await self._emit(
-                session_id,
-                run_id=run_id,
-                event_type=DEOBFUSCATE,
-                entity_type=entry.entity_type,
-                token_id=entry.token_id,
-                detail={
-                    "action": RESTORE_ACTION,
-                    "strategy": strategy,
-                    "category": entry.category,
-                    "occurrences": entry.occurrences,
-                },
-            )
+        # ONE transaction for the whole itemisation, not one per row. The rows are
+        # unchanged -- same order, same `ts` per row, same `prev_hash` linkage, same
+        # `entry_hash` formula; `AuditLogger.emit_many` is `emit`'s own write path
+        # with the per-row `BEGIN IMMEDIATE`/watermark read/tail read/COMMIT hoisted
+        # out of the loop, and `emit` is now literally a batch of one so the two
+        # cannot drift. What changes is the cost: a 500-token restore measured
+        # 252-289 ms against this stage's 500 ms budget with 512 separate
+        # transactions, dominated by them rather than by the vault or the rebuild.
+        #
+        # It also makes the itemisation atomic. That is the better failure for a
+        # per-entity list: a half-written one is indistinguishable from a complete
+        # one for a smaller document, while an absent one is visibly absent beside
+        # the stage row that says how many were restored.
+        await self._audit.emit_many(
+            [
+                AuditEvent(
+                    ts=time.time(),
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type=DEOBFUSCATE,
+                    entity_type=entry.entity_type,
+                    token_id=entry.token_id,
+                    detail={
+                        "action": RESTORE_ACTION,
+                        "strategy": strategy,
+                        EMITTED_STRATEGY_KEY: emitted_strategy,
+                        "category": entry.category,
+                        "occurrences": entry.occurrences,
+                    },
+                )
+                for entry in restored[:_MAX_RESTORE_ROWS]
+            ]
+        )
         suppressed = len(restored) - _MAX_RESTORE_ROWS
         if suppressed > 0:
             await self._emit(
@@ -1418,6 +1844,361 @@ class Restorer:
 # --------------------------------------------------------------------------
 # Matching helpers -- pure string/regex work over untrusted text.
 # --------------------------------------------------------------------------
+
+
+class _TokenScan(NamedTuple):
+    """Everything the token pass can work out without touching the vault.
+
+    Split out of :meth:`Restorer._restore_tokens` so the CPU half can be handed to
+    ``asyncio.to_thread`` in one hop rather than five. Pure: no I/O, no state, and
+    nothing here depends on the event loop.
+    """
+
+    hits: tuple[_Hit, ...]
+    spans: tuple[tuple[int, int, str], ...]
+    claimable: tuple[bool, ...]
+    collisions: int
+    foreign: int
+    salvaged: int
+    order: tuple[str, ...]
+    labels: Mapping[str, str]
+    categories: Mapping[str, str]
+    types: Mapping[str, str]
+
+
+def _token_hits(
+    text: str, *, minted: set[str] | None
+) -> tuple[_Hit, ...]:
+    """Every token-shaped run to consider, from both matchers, in ascending order.
+
+    ``TOKEN_RE`` first and unconditionally: it is the shared grammar, and every
+    decision the rest of this module makes about brackets, provenance and foreign
+    text is written against it.
+
+    Then, and only when the caller supplied ``issued``, the widened salvage pass.
+    Its ID alternation is built from the minted IDs that a
+    :func:`_minted_id_spans` sweep found *outside* every ``TOKEN_RE`` match --
+    typically none, in which case nothing is compiled and nothing is scanned. That
+    ordering is what keeps the tolerance widening off the hot path: a response the
+    model did not mangle pays one linear sweep and no second regex at all.
+
+    A salvage match overlapping a ``TOKEN_RE`` match is dropped. The shared grammar
+    wins every contest it enters, so the widened matcher can only ever *add*
+    coverage, never re-interpret a run the emitter's own grammar already read.
+
+    Without ``issued`` this returns ``TOKEN_RE``'s matches alone, and that is a
+    correctness decision rather than an omission: ``[PII NAME 9c92ff23]`` and
+    ``Reference: FIN ACCOUNT 40281993`` are the same shape, and the only thing that
+    tells our token from a document's own reference code is whether this run minted
+    the hash. Deleting the second to restore the first is the trade the module
+    docstring already refuses for the narrower grammar.
+    """
+    matches = list(TOKEN_RE.finditer(text))
+    if not minted:
+        return tuple(_Hit(match, False) for match in matches)
+
+    covered = [(match.start(), match.end()) for match in matches]
+    stray = {
+        token_id
+        for _start, _end, token_id in _uncovered(_minted_id_spans(text, minted), covered)
+    }
+    pattern = _compile_salvage_pattern(stray)
+    if pattern is None:
+        return tuple(_Hit(match, False) for match in matches)
+
+    hits = [_Hit(match, False) for match in matches]
+    hits.extend(
+        _Hit(match, True)
+        for _start, _end, match in _uncovered(
+            [(match.start(), match.end(), match) for match in pattern.finditer(text)], covered
+        )
+    )
+    hits.sort(key=lambda hit: (hit.match.start(), hit.match.end()))
+    return tuple(hits)
+
+
+def _scan_tokens(
+    text: str,
+    *,
+    minted: set[str] | None,
+    protected: tuple[tuple[int, int], ...],
+    hints: Mapping[str, str],
+) -> _TokenScan:
+    """Match, widen, decide claimability and extract labels. Pure CPU, one hop."""
+    hits = _token_hits(text, minted=minted)
+    if not hits:
+        return _TokenScan((), (), (), 0, 0, 0, (), {}, {}, {})
+
+    # Widen once, up front: the claim decision is about the span that would
+    # actually disappear, not about the bare regex match.
+    spans = [_span_and_suffix(text, hit.match, hints=hints) for hit in hits]
+    claimable: list[bool] = []
+    collisions = 0
+    foreign = 0
+    for hit, (span_start, span_end, _suffix) in zip(hits, spans, strict=True):
+        if _overlaps(span_start, span_end, protected):
+            collisions += 1
+            claimable.append(False)
+        elif (
+            minted is not None
+            and _token_id_of(hit.match) not in minted
+            and not _is_bracketed(hit.match.group(0))
+        ):
+            foreign += 1
+            claimable.append(False)
+        else:
+            claimable.append(True)
+
+    # Resolve each distinct claimable token ID once. This cache is per call by
+    # design: one that outlived the call would outlive its session scope.
+    order: list[str] = []
+    labels: dict[str, str] = {}
+    # Group 1 alone, kept apart from the full label: it is one of the four
+    # literals in `CATEGORIES`, a closed set this module ships, so it is the
+    # half of the label that provably cannot carry a value.
+    categories: dict[str, str] = {}
+    # Group 2 alone: the *registry* entity type, and therefore the one spelling
+    # that joins a DEOBFUSCATE row to the OBFUSCATE row for the same entity --
+    # the engine writes `record.entity_type`, which is exactly this string.
+    types: dict[str, str] = {}
+    for hit, claimed in zip(hits, claimable, strict=True):
+        if not claimed:
+            continue
+        token_id = _token_id_of(hit.match)
+        if token_id not in labels:
+            # UPPER-CASED, and that is not cosmetic. `TOKEN_RE` groups 1 and 2
+            # are case-tolerant now (a model that lower-cases a token still has
+            # to restore), so the same entity reached this line as `PHI_NAME`,
+            # `phi_name` and `Phi_Name` depending on how the model typed it --
+            # three spellings of one audit label, and a compliance query that
+            # groups by entity_type would report them as three entity types.
+            # The grammar is ASCII-only by construction (`surrogates._any_case`),
+            # so `.upper()` here is exact rather than locale-dependent.
+            category = _category_label(hit.match, salvaged=hit.salvaged)
+            entity_type = _type_label(hit.match, salvaged=hit.salvaged)
+            labels[token_id] = f"{category}_{entity_type}"[:_MAX_LABEL_LEN]
+            categories[token_id] = category
+            types[token_id] = entity_type
+            order.append(token_id)
+
+    return _TokenScan(
+        hits,
+        tuple(spans),
+        tuple(claimable),
+        collisions,
+        foreign,
+        sum(1 for hit, claimed in zip(hits, claimable, strict=True) if claimed and hit.salvaged),
+        tuple(order),
+        labels,
+        categories,
+        types,
+    )
+
+
+def _rebuild_tokens(
+    text: str,
+    scan: _TokenScan,
+    resolved: Mapping[str, str],
+    *,
+    protected: tuple[tuple[int, int], ...],
+    unresolved: tuple[str, ...],
+    fabricated: tuple[str, ...],
+    lost: tuple[str, ...],
+) -> _TokenPass:
+    """Assemble the answer left to right from slices of the *original* string.
+
+    Equivalent to replacing right-to-left, and safer: an earlier splice can never
+    shift a later match's offsets. Pure CPU, offloaded in one hop.
+    """
+    parts: list[str] = []
+    cursor = 0
+    restored = 0
+    missed = 0
+    salvaged = 0
+    # Occurrences actually spliced back, per distinct token ID. Counted here
+    # rather than derived from `resolved` because a resolved ID whose every
+    # occurrence was swallowed by an earlier splice put nothing in the answer,
+    # and an audit row saying it was restored would be a claim about text that
+    # is not there.
+    occurrences: dict[str, int] = {}
+    # (input_start, input_end, replacement_length) per committed splice, in
+    # ascending order -- everything needed to move a protected span's offsets.
+    edits: list[tuple[int, int, int]] = []
+    for hit, claimed, (span_start, span_end, possessive) in zip(
+        scan.hits, scan.claimable, scan.spans, strict=True
+    ):
+        # Not claimed -> not touched, and the cursor does not move: the bytes
+        # are emitted by the next lead slice exactly as the model wrote them.
+        if not claimed or span_end <= cursor:  # swallowed by the previous splice
+            continue
+        parts.append(text[cursor : max(span_start, cursor)])
+        token_id = _token_id_of(hit.match)
+        value = resolved.get(token_id)
+        if value is None:
+            piece = UNRESOLVED_ENTITY + possessive
+            missed += 1
+        else:
+            piece = value + possessive
+            restored += 1
+            occurrences[token_id] = occurrences.get(token_id, 0) + 1
+            if hit.salvaged:
+                salvaged += 1
+        parts.append(piece)
+        edits.append((max(span_start, cursor), span_end, len(piece)))
+        cursor = span_end
+    parts.append(text[cursor:])
+    return _TokenPass(
+        "".join(parts),
+        restored,
+        missed,
+        unresolved,
+        fabricated,
+        lost,
+        len(scan.hits),
+        scan.foreign,
+        scan.collisions,
+        _shift_spans(protected, edits),
+        tuple(
+            _RestoredToken(
+                token_id=token_id,
+                entity_type=scan.types[token_id],
+                category=scan.categories[token_id],
+                occurrences=count,
+            )
+            for token_id, count in occurrences.items()
+        ),
+        salvaged,
+    )
+
+
+class _SurrogateScan(NamedTuple):
+    """The surrogate pass's CPU half. See :func:`_scan_surrogates`."""
+
+    matches: list[re.Match[str]]
+    split: list[tuple[str, str]]
+    #: Surrogate -> original, for every fake the caller's map already answers.
+    resolved: dict[str, str]
+    #: Distinct fakes the caller's map does not answer, in first-seen order.
+    #: These -- and only these -- cost a vault round trip.
+    pending: list[str]
+
+
+def _scan_surrogates(
+    text: str, pattern: re.Pattern[str], supplied: Mapping[str, str]
+) -> _SurrogateScan:
+    """Match every issued fake, split off its possessive, and pre-resolve what we can.
+
+    The split is computed once per match and reused by the rebuild, so the two can
+    never disagree about where the surrogate ended.
+
+    Pre-resolving here rather than in the caller is what keeps the resolve loop
+    short. ``surrogates`` is supplied by the caller from the obfuscation result, so
+    on the ordinary path *every* fake is answered from that map and the vault is
+    never asked -- but the loop that discovered this still ran once per match, on
+    the event loop, with no ``await`` that suspends. On a 500-surrogate response
+    that was 1 000 iterations of pure CPU sitting between two threaded phases.
+    Only the fakes the map cannot answer come back as ``pending``.
+
+    The truthiness test on the original is deliberate and preserved: a key present
+    with an empty value falls through to ``vault.get_by_surrogate`` exactly as it
+    always has.
+    """
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return _SurrogateScan([], [], {}, [])
+    canonical = _canonical_by_shape(supplied)
+    split = [_split_surrogate_match(match.group(0), supplied, canonical) for match in matches]
+
+    resolved: dict[str, str] = {}
+    pending: list[str] = []
+    seen: set[str] = set()
+    for surrogate, _possessive in split:
+        if surrogate in seen:
+            continue
+        seen.add(surrogate)
+        original = supplied.get(surrogate)
+        if original:
+            resolved[surrogate] = original
+        else:
+            pending.append(surrogate)
+    return _SurrogateScan(matches, split, resolved, pending)
+
+
+def _rebuild_surrogates(
+    text: str,
+    matches: list[re.Match[str]],
+    split: list[tuple[str, str]],
+    resolved: Mapping[str, str],
+) -> _SurrogatePass:
+    """Splice originals in, recording the half-open spans this pass wrote."""
+    parts: list[str] = []
+    spliced: list[tuple[int, int]] = []
+    cursor = 0
+    written = 0
+    restored = 0
+    missed = 0
+    for match, (surrogate, possessive) in zip(matches, split, strict=True):
+        lead = text[cursor : match.start()]
+        parts.append(lead)
+        written += len(lead)
+
+        value = resolved.get(surrogate)
+        if value is None:
+            piece = UNRESOLVED_ENTITY + possessive
+            missed += 1
+        else:
+            piece = value + possessive
+            restored += 1
+        parts.append(piece)
+        spliced.append((written, written + len(piece)))
+        written += len(piece)
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return _SurrogatePass("".join(parts), restored, missed, len(matches), tuple(spliced))
+
+
+def _sweep_residue(
+    text: str,
+    *,
+    minted: set[str] | None,
+    protected: tuple[tuple[int, int], ...],
+) -> tuple[list[tuple[int, int, str]], list[re.Match[str]]]:
+    """Both post-restore residue scans, run together off the event loop.
+
+    The first is provenance-anchored and shares nothing with the matchers; the
+    second is the ``TOKEN_RE`` grammar scan, which is what still answers the
+    *foreign token* question. See :meth:`Restorer._assert_no_tokens` for why one
+    of them alone was never a check.
+    """
+    residual_ids = _minted_id_spans(text, minted or (), protected=protected)
+    residues = [
+        match
+        for match in TOKEN_RE.finditer(text)
+        if not any(start <= match.start(1) and match.end(3) <= end for start, end in protected)
+    ]
+    return residual_ids, residues
+
+
+def _sweep_surrogate_residue(
+    text: str, pattern: re.Pattern[str], spliced: tuple[tuple[int, int], ...]
+) -> int:
+    """Surviving fakes in the model's own prose, as the count ``_fail`` reports.
+
+    Returns 0 when every match lies wholly inside a span the surrogate pass wrote,
+    and otherwise the total number of matches in ``text`` -- deliberately the total
+    and not the un-excused subset, because that is the number this assertion has
+    always reported and it names how much of the answer is suspect.
+    """
+    index = 0
+    for match in pattern.finditer(text):
+        while index < len(spliced) and spliced[index][1] <= match.start():
+            index += 1
+        if index < len(spliced):
+            start, end = spliced[index]
+            if start <= match.start() and match.end() <= end:
+                continue
+        return len(pattern.findall(text))
+    return 0
 
 
 def _span_and_suffix(
@@ -1666,7 +2447,7 @@ def _consume_emitted_hint(
     """
     if not hints:
         return end
-    hint = hints.get(match.group(3).lower())
+    hint = hints.get(_token_id_of(match))
     if hint is None:
         return end
     tail = "|" + hint

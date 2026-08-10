@@ -4727,43 +4727,56 @@ async def test_contained_and_disjoint_spans_are_left_alone(env: Env) -> None:
 
     README Deviation #35 -- "Overlap resolution ranks pattern/gazetteer-backed
     entities above presidio-backed ones, below policy actions, above score" -- is
-    the cited rule, and ``ACCOUNT_NUMBER`` is pattern-backed while ``SSN`` is
-    presidio-backed (``presidio: US_SSN``, no ``patterns:`` in ``entities.yaml``).
-    ``{"SSN", "NAME"}`` therefore encoded the defect as the contract. It is the
-    same span geometry as
+    the cited rule, and ``ACCOUNT_NUMBER`` is pattern-backed while the outer entity
+    here is presidio-backed. ``{"SSN", "NAME"}`` therefore encoded the defect as the
+    contract. It is the same span geometry as
     ``test_resolve_overlaps_prefers_a_registry_pattern_over_a_general_ner_label``
     in ``tests/test_detection.py``, which asserts the opposite outcome -- the repo
     held two contradictory expectations for one input.
 
     What Deviation #35 promises is that *only the label* moves, so this test now
     pins coverage and reversibility explicitly rather than leaving them implied.
+
+    **THE OUTER ENTITY IS ``PHONE``, AND IT USED TO BE ``SSN``.** The paragraph above
+    read "``SSN`` is presidio-backed (``presidio: US_SSN``, no ``patterns:`` in
+    ``entities.yaml``)", and that is no longer a fact about this repository: SSN now
+    carries a backstop pattern, because ``UsSsnRecognizer`` invalidates real SSNs and
+    they were reaching the provider in the clear. That makes SSN pattern-backed, so
+    this geometry stopped demonstrating Deviation #35 at all -- both spans would be on
+    the same side of the rule and the winner would fall out of containment instead.
+
+    Flipping the expectation to ``{"SSN", "NAME"}`` would have made the test green
+    while deleting the only thing it proves, so the *rule* is kept and the witness
+    moved to an entity that is still presidio-only. ``PHONE`` (``presidio:
+    PHONE_NUMBER``) is that entity, the geometry is identical, and every assertion
+    below is the one it was.
     """
-    text = "SSN 123-45-6789 and name John Smith on file."
-    ssn = span(text, "123-45-6789", "SSN")
-    inner = Detection(  # fully contained by the SSN span, lower ranked
+    text = "Phone 415-555-0177 and name John Smith on file."
+    outer = span(text, "415-555-0177", "PHONE")
+    inner = Detection(  # fully contained by the PHONE span, lower ranked
         entity_type="ACCOUNT_NUMBER",
         category=EntityCategory.FIN,
-        start=ssn.start,
-        end=ssn.start + 6,
-        text=text[ssn.start : ssn.start + 6],
+        start=outer.start,
+        end=outer.start + 6,
+        text=text[outer.start : outer.start + 6],
         score=0.5,
     )
     name = span(text, "John Smith", "NAME")
 
     result = await env.engine.obfuscate(
-        env.session_id, text, [ssn, inner, name], strategy="tokenization"
+        env.session_id, text, [outer, inner, name], strategy="tokenization"
     )
 
     assert len(result.spans) == 2, "the contained span collapses, the disjoint one survives"
     # The pattern-backed label wins over the presidio-backed one it sits inside.
     assert {item.entity_type for item in result.spans} == {"ACCOUNT_NUMBER", "NAME"}
     assert [(item.start, item.end) for item in result.spans] == [
-        (ssn.start, ssn.end),
+        (outer.start, outer.end),
         (name.start, name.end),
     ], "a contained loser must not widen its winner"
-    assert "123-45-6789" not in result.obfuscated_text
+    assert "415-555-0177" not in result.obfuscated_text
     assert "John Smith" not in result.obfuscated_text
-    # "Only the label moves": the full SSN span is still masked as one unit, still
+    # "Only the label moves": the full PHONE span is still masked as one unit, still
     # obfuscated rather than downgraded to an irreversible redaction, and still
     # restores to the value that stood there. Asserting the label alone would let a
     # future ranking change silently trade a token for a redaction.
@@ -5392,3 +5405,74 @@ def test_the_two_fallback_anchors_share_no_field() -> None:
     """
     a, b = daterules._FALLBACK_ANCHOR, daterules._FALLBACK_PROBE
     assert a.year != b.year and a.month != b.month and a.day != b.day
+
+
+# ---------------------------------------------------------------------------
+# The OBFUSCATE row's strategy: the request AND what was actually emitted
+# ---------------------------------------------------------------------------
+
+
+async def test_the_obfuscate_row_reports_the_surrogate_it_emitted_not_only_the_request(
+    env: Env,
+) -> None:
+    """Vault reuse makes the two come apart, and the row must show both.
+
+    The vault has no strategy dimension -- documented and required: a run reuses
+    whatever record an earlier call in the same session minted. So obfuscate once
+    under tokenization and again under pseudonymization, and the second call splices
+    the *first* call's hash token while ``detail['strategy']`` said
+    ``pseudonymization``. That is the request in an outcome column, on the row a
+    compliance reader uses to reconstruct what left the process.
+
+    The expected value is derived here from the surrogate string by a test the
+    production code does not use -- "does it start with ``[``" rather than
+    ``STRICT_TOKEN_RE`` -- so a label sharing the pipeline's regex bug, or hardcoded
+    to a constant, fails one of the two directions. Both directions are asserted:
+    the reused run must report ``tokenization``, and a fresh session asking for the
+    same thing must report ``pseudonymization``.
+    """
+    text = "Patient John Smith was admitted."
+
+    async def rows_for(session_id: str, strategy: str) -> list[dict[str, object]]:
+        before = len(await env.audit.query(limit=1000))
+        result = await env.engine.obfuscate(
+            session_id, text, [span(text, "John Smith", "NAME")], strategy=strategy
+        )
+        assert result.tokens, "premise: the call vaulted a value"
+        surrogate = result.tokens[0].surrogate
+        rows = [
+            dict(row.detail)
+            for row in (await env.audit.query(limit=1000))[before:]
+            if row.event_type == OBFUSCATE
+        ]
+        assert rows, f"no OBFUSCATE row for the {strategy} call"
+        for row in rows:
+            row["_surrogate"] = surrogate
+        return rows
+
+    first = await rows_for(env.session_id, "tokenization")
+    assert all(str(row["_surrogate"]).startswith("[") for row in first)
+    for row in first:
+        assert row["strategy"] == "tokenization"
+        assert row["emitted_strategy"] == "tokenization", row
+
+    second = await rows_for(env.session_id, "pseudonymization")
+    assert all(str(row["_surrogate"]).startswith("[") for row in second), (
+        "premise: the second call reused the first call's hash token"
+    )
+    for row in second:
+        assert row["strategy"] == "pseudonymization", row
+        assert row["emitted_strategy"] == "tokenization", (
+            f"the row reports the request rather than what was emitted: {row}"
+        )
+
+    # Same document, same request, a session that minted nothing yet: the label
+    # follows the payload, so here it really is pseudonymization.
+    fresh, _ = await env.sessions.create("test-user-2")
+    third = await rows_for(fresh, "pseudonymization")
+    assert not any(str(row["_surrogate"]).startswith("[") for row in third), (
+        "premise: a fresh session under pseudonymization emits a realistic fake"
+    )
+    for row in third:
+        assert row["strategy"] == "pseudonymization"
+        assert row["emitted_strategy"] == "pseudonymization", row
