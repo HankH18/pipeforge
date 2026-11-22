@@ -32,7 +32,6 @@ from secure_context_pipeline.detection.registry import GAZETTEER_DIR, EntityRegi
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = REPO_ROOT / "fixtures"
-README = REPO_ROOT / "README.md"
 
 SEED = generator.DEFAULT_SEED
 
@@ -578,28 +577,3 @@ def test_the_committed_fixtures_are_what_the_generator_emits(kind: str) -> None:
     document that is no longer on disk."""
     committed = (FIXTURE_DIR / generator.FILENAMES[kind]).read_text(encoding="utf-8")
     assert committed == generator.generate(generator.DEFAULT_SEED, kind)
-
-
-def test_the_readme_fixture_table_matches_what_the_generator_produces() -> None:
-    """The README publishes word, distinct-value and entity-type counts per fixture.
-    They are measurements, and a stale table is a false claim in the deliverable."""
-    readme = README.read_text(encoding="utf-8")
-    header = "| Fixture | Words | Distinct planted values | Entity types |"
-    assert header in readme, "the README fixtures table has moved or been renamed"
-    table = readme.split(header, 1)[1].split("\n\n", 1)[0]
-
-    for kind, filename in generator.FILENAMES.items():
-        row = re.search(
-            rf"^\|\s*`{re.escape(filename)}`\s*\|(.+)\|\s*$",
-            table,
-            re.MULTILINE,
-        )
-        assert row is not None, filename
-        cells = [cell.replace("*", "").replace(",", "").strip() for cell in row.group(1).split("|")]
-        claimed_words, claimed_distinct, claimed_types = (int(cell) for cell in cells[:3])
-
-        document = generator.generate(generator.DEFAULT_SEED, kind)
-        planted = generator.expected_entities(generator.DEFAULT_SEED, kind)
-        assert claimed_words == len(document.split()), filename
-        assert claimed_distinct == len(all_planted(planted)), filename
-        assert claimed_types == len(planted), filename

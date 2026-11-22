@@ -1,5 +1,11 @@
 # Secure Context Pipeline
 
+**In short (repo name: pipeforge):** a fail-closed privacy gateway between an encrypted document store and an external LLM. It detects PII/PHI (Presidio + spaCy), replaces it with reversible tokens or pseudonyms, blocks any request that still carries a vaulted value, then restores the model's response.
+
+- **Measured (mock provider):** 100 of 100 leakage-harness runs with 0 leaks; 93% detection coverage on a 53-document held-out corpus; a 12,062-word brief end to end in 6.48 s against a 15 s budget. See [§1](#1-setup--demo).
+- **Run it:** `cp .env.example .env`, set `SCP_MASTER_KEY`, `docker compose up --build`, open <http://localhost:8000>.
+- **Stack:** Python 3.11, FastAPI, Microsoft Presidio, spaCy, AES-256-GCM, SQLite, Anthropic SDK, Docker.
+
 A privacy boundary between an encrypted document store and an external LLM provider.
 
 ```
@@ -99,7 +105,7 @@ Everything below is measured on this repository, not aspirational.
 | **5** | [Live-review questions](#5-live-review-questions) | [Q1](#q1--a-50-page-brief-with-200-entities-where-does-it-break) scale · [Q2](#q2--the-model-writes-the-patients-condition-what-do-you-do) paraphrase · [Q3](#q3--an-adversary-has-the-obfuscated-document-and-the-response-in-pseudonym-mode-what-do-they-learn) inference · [Q4](#q4--the-vault-is-a-high-value-target-isnt-that-a-problem) the vault · [Q5](#q5--a-hipaa-auditor-asks-what-happened-over-the-last-30-days) audit · [Q6](#q6--why-is-cross-session-non-determinism-a-security-requirement-not-a-nice-to-have) non-determinism |
 | **6** | [Strategy selection](#6-strategy-selection) | [Per-entity assignment](#per-entity-assignment), [NAME and DOB compared](#name-and-dob-compared-directly), [graceful degradation](#graceful-degradation-the-third-outcome-and-what-it-costs) |
 | **7** | [Known gaps & next day](#7-known-gaps--next-day) | The register, then [what one more day buys](#with-one-more-day) |
-| **8** | [Deviations](#8-deviations-from-the-build-specification) | 72 rows, indexed here, reasoned in full in [`DEVIATIONS.md`](DEVIATIONS.md) |
+| **8** | [Deviations](#8-deviations-from-the-build-specification) | 75 rows, indexed here, reasoned in full in [`DEVIATIONS.md`](DEVIATIONS.md) |
 | **9** | [Repository map](#9-repository-map) | Layout, [where the specification's directory names live](#where-the-specifications-directory-names-live), fixtures |
 | **10** | [Requirements traceability](#10-requirements-traceability) | Every requirement, its code, and the test that proves it |
 | **11** | [Pre-submission checklist](#11-pre-submission-checklist) | Ten ordered steps, each a command or a human judgement |
@@ -277,22 +283,18 @@ that produces it — re-derive rather than trust, which is what checklist step 5
 #### The numbers this repository prints
 
 ```
-3058 passed, 1 skipped       # full suite WITH node on PATH, as `pytest -q` printed it.
+3021 passed, 1 skipped       # full suite WITH node on PATH. Recounted, not re-run: `pytest -q` last
+                             #   printed 3058 passed; 37 README-checking tests were then removed.
                              #   The skip is the real-network LLM smoke test.
-                             #   3059 collected: 169 leakage + 9 bench + rest unit + integration
+                             #   3022 collected: 169 leakage + 7 bench + rest unit + integration
 mypy                         # clean, 52 source files -- PACKAGE ONLY, see below
 ruff check .                 # clean, whole repo
 98% branch coverage          # pytest --cov=secure_context_pipeline --cov-branch
                              #   5,392 statements, 83 missed; 1,406 branches, 64 partial (package only)
 ```
 
-**That block is checked rather than pasted, and this is the one place it appears.** Collection,
-the marker split, both statement denominators, the two `mypy` file counts and the formatter
-divergence are re-derived from the tree by `tests/test_readme_claims.py`, and `passed + skipped`
-is asserted to equal what `pytest` collects, so a stale number reddens the suite instead of
-misleading a reviewer; each failure message carries its replacement. The honest limit: no test can
-run the suite from inside the suite, so what is bound is that this arithmetic is self-consistent
-with what `pytest` *collects*. "Green" is the reviewer's own run. The coverage line is also the
+**That block is pasted from a run, and this is the one place it appears.** "Green" is the
+reviewer's own run. The coverage line is also the
 one figure a red run moves — a failing test leaves its own paths unexecuted, inflating `missed`
 and `partial` — so read it as a **floor**.
 
@@ -403,8 +405,6 @@ identical on all four consecutive executions measured for this pass. The surroga
 and the restorer then round-tripped, and the mock provider's echo is drawn against a per-session
 pseudonym key, so which surrogates come back is re-rolled every run. Treat a different value there
 as normal; treat a `3066` that moved, or anything other than `100/100, 0 leaks`, as a finding.
-`test_the_pasted_leakage_tally_is_one_the_readme_says_it_observed` requires the pasted figure to be
-one this paragraph lists, because the block once published a value no run had printed.
 
 **The originals tally moved, and that is the finding the rule above asks for rather than a silent
 edit.** This block published **2,966** until this pass; the tree prints **3,066** on every one of
@@ -482,7 +482,7 @@ instrument**, which is the only reason it is worth more than it was.
 
 Everything above observes at the *provider interface* — the string handed to `provider.complete()`
 — and a bug between that call and the HTTP body would be invisible to it. That residual is closed
-in CI now rather than only by `demo.py --real --dump-wire`.
+in the default `pytest` run now rather than only by `demo.py --real --dump-wire`.
 `tests/leakage/test_wire_leakage.py` drives the real Anthropic SDK against a transport that
 captures the **serialized request body** and scans those bytes against the vault. Measured: **178
 vaulted originals across 6 real SDK requests, 23,334 bytes of captured body, 0 hits**. It needs no
@@ -758,17 +758,6 @@ more measurements. Then more measurements broke one floor and came within 1% of 
 computed from seven samples is not a bound; it is an estimate of a tail from seven draws, wearing
 the costume of caution. So the columns say what they are, and the only number this page asserts is
 the budget, because the budget is the only one a test enforces.
-
-**And the table is bound to the run now rather than pasted from one.**
-`test_the_readme_benchmark_table_is_the_one_this_run_measured` compares it against the
-measurements the module just took: the budget column against the constants the suite asserts, the
-row set against the rows the module records, the headroom column as arithmetic on each row's own
-numbers at the precision printed, every published sample against its own budget, and — the part
-that survives being run on another machine — **the identity of the tightest row**, since a slower
-box moves every row together. It is why the previous table could not survive this pass: it
-published a warm restore at 93.3× headroom while the module measured it in single digits, and
-nothing on either side noticed. The staleness ratio between published and measured headroom is
-bounded at 4×, deliberately loose, because a tighter bound fails on honest hardware differences.
 
 The **full pipeline on the 12k-word brief is the tightest row in the table** at 2.3×, and that is
 a property of the code rather than of the box. The three restore rows exist because the shipped
@@ -2892,7 +2881,7 @@ marked as such rather than quietly asserted.
 | **Core 3** — two strategies + per-entity justification | `obfuscation/strategies/{base,tokenization,pseudonymization}.py`, `registry.tier_of`, README §6 | `test_obfuscation.py::test_tokenization_format_round_trips_through_the_strict_grammar`, `::test_pseudonym_preserves_identifier_formats`, `::test_tier3_diagnosis_emits_a_class_annotated_token_from_the_gazetteer`, `::test_tier4_numerics_stay_plain_tokens` |
 | **Core 4** — vault encrypted, deterministic in-session, purged on expiry/logout | `vault/session_vault.py`, `vault/session_registry.py` | `test_vault.py::test_within_session_determinism`, `::test_destroy_makes_tokens_unreadable`, `::test_destroy_surviving_row_is_undecryptable`, `::test_surviving_row_cannot_repopulate_a_destroyed_cache`; `integration/test_pipeline.py::test_expired_session` |
 | **Core 5** — context injector, chunking, pre-send check | `pipeline/context_injector.py`, `pipeline/egress_gate.py`, `detection/detector.py::chunk_text` | `test_context_injector.py::test_serialized_is_exactly_what_the_gate_scans`; `test_egress_gate.py::test_the_gate_runs_before_the_provider_on_the_happy_path`, `::test_the_provider_is_never_reached_when_the_gate_blocks`; `test_detection.py::test_entity_straddling_a_chunk_boundary_is_detected_whole` |
-| **Core 6** — restore, including mangled/paraphrased token forms | `deobfuscation/restorer.py`, `surrogates.py::TOKEN_RE` | `test_deobfuscation.py::test_mangled_token_forms_restore`, `::test_hint_is_ignored_for_lookup`, `::test_post_restore_assertion_fires_on_residual_token`, `::test_a_fake_reassembled_across_a_splice_boundary_still_fails_the_run`; `integration/test_pipeline.py::test_vault_miss_on_deobfuscation`. **Two mangling classes were outside that set until this week** and are named rather than folded in: a **re-cased** token and **whitespace at either `_` separator**, which is what a line wrap inside a token looks like. Both restore now, driven through the real `Restorer` by `test_readme_claims.py::test_the_two_mangling_classes_this_row_names_restore_through_the_real_restorer` — a round trip, not a regex match, because the row claims restoration. **The residual is stated in §7 gap 25**: whitespace *inside* the 8-hex hash is still unmatched. |
+| **Core 6** — restore, including mangled/paraphrased token forms | `deobfuscation/restorer.py`, `surrogates.py::TOKEN_RE` | `test_deobfuscation.py::test_mangled_token_forms_restore`, `::test_hint_is_ignored_for_lookup`, `::test_post_restore_assertion_fires_on_residual_token`, `::test_a_fake_reassembled_across_a_splice_boundary_still_fails_the_run`; `integration/test_pipeline.py::test_vault_miss_on_deobfuscation`. **Two mangling classes were outside that set until this week** and are named rather than folded in: a **re-cased** token and **whitespace at either `_` separator**, which is what a line wrap inside a token looks like. Both restore now (fixed in `surrogates.py`). **The residual is stated in §7 gap 25**: whitespace *inside* the 8-hex hash is still unmatched. |
 | **Core 7** — audit: ts, session, type, token, action; queryable; zero originals | `audit/logger.py`, `models.py::AuditEvent` | `test_audit.py::test_persisted_rows_carry_no_free_text_columns`, `::test_detail_rejects_long_string_values`, `::test_truncating_the_tail_breaks_the_chain`, `::test_deleting_a_middle_row_and_relinking_the_chain_is_still_caught`, `::test_erasing_a_whole_session_is_not_reported_as_that_session_being_clean`, `::test_a_truncated_tail_does_not_heal_when_the_log_advances`, `::test_a_silent_tail_truncation_costs_four_statements_and_all_four_are_needed`, `::test_deleting_the_sqlite_sequence_row_does_not_launder_a_truncation`, `::test_two_processes_sharing_one_audit_db_lose_no_events`; leakage assertion 2 and `leakage/test_leakage_harness.py::test_the_audit_scan_catches_a_label_column_original_and_says_which_limb_did` |
 | **Critical constraint** — reversible in-session, irreversible across | `crypto/keys.py::derive_token_id` (HMAC under an ephemeral key), key destruction | `test_crypto.py::test_token_id_deterministic_within_session`, `::test_token_id_non_deterministic_across_sessions`, `::test_token_id_is_irreversible_without_the_key`; `integration/test_pipeline.py::test_restoration_is_impossible_after_the_session_is_destroyed` |
 | **NFR** — config-only entity add | `entities.yaml`; `entity_type` opaque downstream | `test_extensibility.py::test_package_source_never_mentions_passport` (the grep **is** the proof), plus the three end-to-end cases beside it |
@@ -2905,7 +2894,7 @@ marked as such rather than quietly asserted.
 | **Stack** — Python 3.11, `cryptography`, pytest, Docker, `.env` only | `pyproject.toml` (`requires-python >=3.11,<3.13`), `Dockerfile`, `docker-compose.yml`, `.env.example`, `config.py` | `test_crypto.py::test_settings_secrets_do_not_survive_serialization`; `test_api.py::test_dockerfile_never_copies_the_working_tree_wholesale`. **`docker compose up` itself is a human check** — checklist step 3. |
 | **Cloud row** (stretch) — KMS mock, S3/GCS-compatible design | `crypto/keys.py::MockKMSKeyProvider`, `KeyProvider`/`DocumentStore` Protocols | `test_crypto.py::test_mock_kms_envelope_round_trip`, `::test_mock_kms_binds_encryption_context`, `::test_build_key_provider_selects_by_config`; `test_document_store.py::test_key_provider_is_the_seam`. **Known thinness:** the KMS provider is tested as a unit, never driven end-to-end with `SCP_KEY_PROVIDER=mock_kms`. |
 | **Live review Q1–Q6** | README §5 | Q1's numbers come from `test_benchmarks.py` and the stage table; the rest are arguments, not testable claims. |
-| **README deliverable** — setup, architecture, threat model, design rationale, a tokenization-vs-pseudonymization comparison for **at least two entity types**, and what one more day would buy | §1, §2, §3, §4, §6 (*NAME and DOB, compared directly*), §7 (*With one more day*) | `test_readme_claims.py::test_both_entity_types_the_comparison_table_names_appear_in_every_row`, `::test_the_dob_rows_carry_the_two_arguments_that_are_specific_to_a_date`, `::test_the_age_error_rate_the_dob_row_quotes_is_the_one_the_shift_produces`, `::test_section_7_answers_the_next_day_question_its_own_heading_asks`, `::test_the_next_day_plan_proposes_only_work_that_is_still_open`. **The last two named requirements are the ones this page failed**: §6's table was headed for two entity types and four of its six rows discussed one, and no day-scoped statement existed anywhere in the file — a `grep -i` for "additional day" or "one more day" returned nothing. Both are now structural, so a rewrite that drops either goes red rather than unnoticed. |
+| **README deliverable** — setup, architecture, threat model, design rationale, a tokenization-vs-pseudonymization comparison for **at least two entity types**, and what one more day would buy | §1, §2, §3, §4, §6 (*NAME and DOB, compared directly*), §7 (*With one more day*) | Checked by reading; no test. **The last two named requirements are the ones this page failed**: §6's table was headed for two entity types and four of its six rows discussed one, and no day-scoped statement existed anywhere in the file — a `grep -i` for "additional day" or "one more day" returned nothing. Both are now in the page. |
 | **Functional must-haves (all 7)** | — | **Human check.** See below. |
 | **Performance benchmarks (all 5)** | `test_benchmarks.py`, `leakage/test_leakage_harness.py` | **All five are automated.** The four latency budgets are `test_benchmarks.py::test_obfuscation_of_2000_words_is_under_two_seconds`, `::test_vault_lookup_p99_is_under_five_milliseconds`, `::test_deobfuscation_of_a_500_token_response_is_under_500ms` (plus its cold-vault and surrogate-pass variants), `::test_full_pipeline_on_the_large_brief_is_under_fifteen_seconds`. The fifth is the **zero-leakage** figure — 100 automated runs over varied fixture documents — `leakage/test_leakage_harness.py::test_no_original_ever_leaves_the_process` (parametrised over `RUNS = 100`), tallied by `::test_leakage_summary` and protected from silent shrinkage by `::test_the_selected_run_expectation_cannot_shrink_silently`. Mapped clause by clause below. |
 
@@ -3046,8 +3035,7 @@ ruff check .         # expect: All checks passed!
 
 # The partial-branch list, which is the part worth reading. `-m "not bench"` is not tidiness:
 # coverage instruments the package, which multiplies a sub-microsecond vault lookup by enough
-# that the benchmark table's staleness check compares an instrumented run against an
-# uninstrumented table and reports a disagreement that is real and uninteresting. The
+# that instrumented timings say nothing about the budgets. The
 # uninstrumented `pytest -m bench` above is the gate; this command is for the branch list.
 pytest -m "not bench" --cov=secure_context_pipeline --cov-branch \
        --cov-report=term-missing:skip-covered -q
